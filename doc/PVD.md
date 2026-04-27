@@ -12,18 +12,19 @@ When in doubt about a feature, scope decision, or trade-off, this document is th
 
 ## 2. Vision Statement
 
-`avr-updi-gdb` delivers a seamless, modern debugging experience for cooperative, single-stack embedded architectures by bridging the AVR UPDI interface directly to standard IDEs with native avrOS state-machine awareness. 
+`avr-updi-gdb` delivers a seamless, modern debugging experience for cooperative, single-stack embedded architectures by bridging the AVR UPDI interface directly to standard IDEs with native avrOS state-machine awareness without requiring JTAG or ICE controllers like Atmel-ICE. Instead it uses the Serial + 1k Resistor mod to enable debugging with just a USB to 5v serial adapter or directly connect to Raspberry Pi UART pins.
 
 Embedded engineers developing for modern AVR microcontrollers (DA/DB families) on Linux and macOS can debug their finite state machines, queues, and memory pools visually in VS Code or Zed, no longer forced to manually parse raw SRAM dumps or fight hardware breakpoint limitations over a command-line interface.
 
 ## 3. Problem Statement
 
-Debugging a cooperative finite state machine (FSM) manager on memory-constrained microcontrollers currently requires high cognitive overhead and manual translation of system state. Standard out-of-the-box GDB RTOS awareness assumes preemptive multitasking and multiple stack pointers, which flatly fails against the lean architecture of avrOS. 
+Debugging an avrOS application with it's finite state machine (FSM) manager on memory-constrained microcontrollers currently requires significant overhead, a different development environment from the native avrOS host environment, and manual translation of system state. Standard out-of-the-box GDB RTOS awareness assumes preemptive multitasking and multiple stack pointers, which flatly fails against the lean architecture of avrOS. 
 
 * Developers are forced to manually dump and decode SRAM to determine which FSM is currently active and which are suspended.
 * Understanding the state of system queues, events, and memory pools requires navigating raw memory addresses and cross-referencing them against FLASH-resident tables manually.
 * The rigid hardware breakpoint limitations of the AVR UPDI interface restrict the ability to trace execution fluidly.
 * Modern IDEs (VS Code, Zed) treat the target as a "dumb" remote core, providing no visual insight into the actual application architecture.
+* Current solutions require external JTAG tools like Atmel-ICE or something comparable.
 
 The cumulative cost of this status quo is delayed bug resolution, over-reliance on `printf` debugging (which alters timing), and significant friction when inspecting the true state of complex, event-driven embedded systems.
 
@@ -44,6 +45,7 @@ The cumulative cost of this status quo is delayed bug resolution, over-reliance 
 2.  **Harvard Architecture Translation** — Automatically parses ELF `.text` sections to locate FLASH-resident system tables, mapping them to their dynamic SRAM status bytes without manual address configuration.
 3.  **FSM Virtual Thread Mapping** — Translates the avrOS state-machine manager into standard GDB threads, exposing the currently executing FSM and all suspended FSM function pointers natively to the IDE's Call Stack UI.
 4.  **System Introspection** — Provides custom `monitor` commands to poll and decode the state of queues, event bitmasks, and memory pools non-intrusively using UPDI background reads.
+5.  **USB serial adaptor connectivity** — Connect cheaply and easily wired directly to a Raspberry Pi and a 1K resistor. Optionally, you can connect directly to a PC using a TTL serial adaptor and the same 1K resistor.
 
 The unifying design choice is **State Over Stacks**: presenting the system exactly as it is architected (cooperative FSMs) rather than attempting to shoehorn it into traditional preemptive RTOS paradigms.
 
@@ -69,6 +71,7 @@ These principles are the tie-breakers when requirements conflict.
 * Virtual thread generation from avrOS FSM tables.
 * Custom `monitor avros events`, `monitor avros queues`, and `monitor avros mempool` commands.
 * Asynchronous memory polling to bypass hardware breakpoint limits where possible.
+* Only requires TTL level UART connection with 1k resistor to the host development workstation. No Atmel-ICE or other external JTAG programmer required.
 
 ### 7.2 Out of Scope
 
