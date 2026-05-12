@@ -65,6 +65,7 @@ These principles are the tie-breakers when requirements conflict.
 ### 7.1 In Scope
 
 * Native compilation for Linux and macOS.
+* Written in C using C99 specfication
 * Full UPDI physical layer communication and timing handling.
 * Implementation of the GDB Remote Serial Protocol (RSP).
 * Automatic ELF parsing for avrOS FLASH table location.
@@ -72,6 +73,9 @@ These principles are the tie-breakers when requirements conflict.
 * Custom `monitor avros events`, `monitor avros queues`, and `monitor avros mempool` commands.
 * Asynchronous memory polling to bypass hardware breakpoint limits where possible.
 * Only requires TTL level UART connection with 1k resistor to the host development workstation. No Atmel-ICE or other external JTAG programmer required.
+* Command line support to load an elf file into flash. Intended to support automated build and test
+* UPDI to console emulation to support avrOS CLI
+* UPDI to stdout to support testing
 
 ### 7.2 Out of Scope
 
