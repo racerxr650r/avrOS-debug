@@ -7,6 +7,7 @@
 #              (used by CI to build a structured test summary)
 #   clean      Remove all build artefacts
 #   install    Install avr-updi-gdb to $(PREFIX)/bin  [default: /usr/local]
+#   help       Print this target list
 #
 # Variables:
 #   ASAN=1     Add -fsanitize=address,undefined to both host and test builds
@@ -256,3 +257,7 @@ install: all
 clean:
 	$(Q)rm -rf $(BUILDDIR)
 	@echo "  CLEAN  $(BUILDDIR)/"
+# ── help target ───────────────────────────────────────────────────────────
+.PHONY: help
+help:
+	@awk '/^# Targets:/{found=1} found{if(/^[^#]/ || /^#$$/)exit; sub(/^# ?/,""); print}' $(MAKEFILE_LIST)
