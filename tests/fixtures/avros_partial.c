@@ -1,21 +1,22 @@
 /* tests/fixtures/avros_partial.c
- * AVR C source that exports only 4 of the 8 avrOS sentinel symbols.
- * Used to test graceful degradation in elf_find_avros_tables().
+ *
+ * Exports only FSM_TABLE sentinels + currStateMachine.  QUE_TABLE and
+ * EVNT_TABLE intentionally absent so elf_find_avros_tables can be
+ * tested for graceful degradation (must return 0, not -1, and leave
+ * absent fields zero-initialised).
  */
 #include <stdint.h>
 
-/* FSM table sentinels only */
-__attribute__((section(".avros_fsm_table")))
-uint32_t __avros_fsm_table_start = 0;
-__attribute__((section(".avros_fsm_table")))
-uint32_t __avros_fsm_table_end   = 0;
+__asm__(
+    ".pushsection FSM_TABLE,\"a\",@progbits\n"
+    ".global __start_FSM_TABLE\n"
+    "__start_FSM_TABLE:\n"
+    "    .zero 9\n"
+    ".global __stop_FSM_TABLE\n"
+    "__stop_FSM_TABLE:\n"
+    ".popsection\n"
+);
 
-/* Event mask (SRAM) */
-volatile uint32_t __avros_event_mask = 0;
+volatile void *currStateMachine = (void *)0;
 
-/* Current FSM pointer (SRAM) */
-volatile uint32_t __avros_current_fsm = 0;
-
-/* Queue and mempool sentinels intentionally absent */
-
-int main(void) { return 0; }
+int main(void) { return currStateMachine ? 1 : 0; }

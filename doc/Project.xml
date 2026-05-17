@@ -36,7 +36,7 @@
       <file path="src/gdb_rsp.c">GDB Remote Serial Protocol server: packet codec, command dispatch, and session lifecycle management.</file>
       <file path="src/elf_parser.c">ELF parser: locates avrOS FLASH-resident system tables and produces the AvrOsSymbolIndex.</file>
       <file path="src/fsm_mapper.c">avrOS FSM-to-GDB virtual thread translator: maps FSM state tables to GDB thread objects and synthesizes per-thread register frames.</file>
-      <file path="src/monitor.c">Custom monitor command handler: implements the avros events, queues, and mempool sub-commands via non-intrusive UPDI reads.</file>
+      <file path="src/monitor.c">Custom monitor command handler: implements the `avros events` and `avros queues` sub-commands via non-intrusive UPDI reads.</file>
       <file path="Makefile">Build orchestration: compile, test, install, uninstall, check-tools, and bundle (Debian .deb, Red Hat .rpm, Homebrew formula) targets.</file>
       <file path="doc/avr-updi-gdb.1">Unix man page: reference documentation for the avr-updi-gdb command.</file>
       <outro><![CDATA[It does not cover the build system, IDE adapter layers (Cortex-Debug, Zed DAP), or Windows support, all of which are out of scope for the initial release (see `doc/PVD.md §7.2`).]]></outro>
@@ -54,7 +54,7 @@
       <term name="RSP"><![CDATA[GDB Remote Serial Protocol — the text-based packet protocol that `avr-gdb` uses to communicate with a remote stub over a socket or serial link.]]></term>
       <term name="FSM"><![CDATA[Finite State Machine — the cooperative task unit in avrOS, represented at runtime by a function pointer into a FLASH-resident state table. All FSMs share the single hardware stack.]]></term>
       <term name="ELF"><![CDATA[Executable and Linkable Format — the binary file produced by `avr-gcc` that carries machine code, DWARF debug information, and the symbol table used to locate avrOS system tables.]]></term>
-      <term name="avrOS"><![CDATA[A cooperative real-time operating system for AVR microcontrollers. Tasks are modelled as FSMs; inter-task communication uses queues, event bitmasks, and memory pools.]]></term>
+      <term name="avrOS"><![CDATA[A cooperative real-time operating system for AVR microcontrollers. Tasks are modelled as FSMs; inter-task communication uses queues and named events.]]></term>
       <term name="Virtual Thread"><![CDATA[A GDB thread object synthesized from an avrOS FSM entry. Each virtual thread has a unique GDB thread ID and a synthesized register frame whose PC is set to the FSM's current state function pointer.]]></term>
       <term name="Harvard Architecture"><![CDATA[The AVR memory model, in which FLASH (program memory) and SRAM (data memory) occupy separate address spaces. ELF virtual addresses must be converted to physical FLASH word addresses during symbol resolution.]]></term>
     </definitions>
@@ -98,7 +98,7 @@
       <component path="src/gdb_rsp.c"><![CDATA[GDB RSP layer; owns the GDB TCP socket, RSP packet codec, and command dispatch table.]]></component>
       <component path="src/elf_parser.c"><![CDATA[ELF parser; produces the `AvrOsSymbolIndex` (FLASH addresses of avrOS system tables) at attach time.]]></component>
       <component path="src/fsm_mapper.c"><![CDATA[FSM mapper; reads UPDI memory using the symbol index and exposes avrOS FSMs as GDB virtual threads.]]></component>
-      <component path="src/monitor.c"><![CDATA[Monitor handler; implements the custom `monitor avros events|queues|mempool` introspection commands without halting the CPU.]]></component>
+      <component path="src/monitor.c"><![CDATA[Monitor handler; implements the custom `monitor avros events|queues` introspection commands without halting the CPU.]]></component>
       <flow>
         <intro>The startup and attach sequence proceeds as follows:</intro>
         <step><![CDATA[`main()` parses argv, opens the UART serial device, and starts the GDB TCP listener socket.]]></step>
@@ -539,8 +539,8 @@ Both `.symtab` and `.strtab` are loaded fully into heap memory at `elf_open()` t
               <step>Iterate over all `sym_count` entries in `ctx->symtab`; skip entries with `st_name == 0` or `st_shndx == SHN_UNDEF`.</step>
               <step><![CDATA[Look up each symbol's name in `ctx->strtab` at offset `sym->st_name` and compare against the avrOS sentinel names (see algorithm section for the full symbol name table).]]></step>
               <step><![CDATA[For `_start` symbols (FLASH-resident table boundaries), call `elf_flash_addr()` to convert the VMA to a physical word address and store in the corresponding `idx` field.]]></step>
-              <step><![CDATA[For `_end` symbols, subtract the paired `_start` VMA and divide by the per-entry struct size to compute the entry count (e.g., `fsm_table_count`).]]></step>
-              <step><![CDATA[For the `__avros_event_mask` and `__avros_current_fsm` symbols (SRAM-resident variables), store the VMA directly without the Harvard offset.]]></step>
+              <step><![CDATA[For `__stop_<NAME>` symbols, subtract the paired `__start_<NAME>` VMA and divide by the per-entry struct size to compute the entry count (e.g., `fsm_table_count`).]]></step>
+              <step><![CDATA[For the `currStateMachine` symbol (SRAM-resident variable), store its VMA directly without the Harvard offset.]]></step>
             </logic>
           </function>
           <function signature="uint32_t elf_flash_addr(const ElfContext *ctx, uint32_t vma)"
@@ -556,18 +556,17 @@ Both `.symtab` and `.strtab` are loaded fully into heap memory at `elf_open()` t
 
 `elf_find_avros_tables()` scans the loaded symbol array for the following names:
 
-| Symbol name | `AvrOsSymbolIndex` field | Address space |
-| ----------- | ------------------------ | ------------- |
-| `__avros_fsm_table_start`     | `fsm_table_addr`      | FLASH (word addr) |
-| `__avros_fsm_table_end`       | (size computation)    | FLASH |
-| `__avros_queue_table_start`   | `queue_table_addr`    | FLASH (word addr) |
-| `__avros_queue_table_end`     | (size computation)    | FLASH |
-| `__avros_event_mask`          | `event_mask_addr`     | SRAM (byte addr) |
-| `__avros_mempool_table_start` | `mempool_table_addr`  | FLASH (word addr) |
-| `__avros_mempool_table_end`   | (size computation)    | FLASH |
-| `__avros_current_fsm`         | `current_fsm_addr`    | SRAM (byte addr) |
+| Symbol name             | `AvrOsSymbolIndex` field | Address space     | Per-entry stride |
+| ----------------------- | ------------------------ | ----------------- | ---------------- |
+| `__start_FSM_TABLE`     | `fsm_table_addr`         | FLASH (word addr) | 9 bytes (`fsmStateMachineDescr_t`)        |
+| `__stop_FSM_TABLE`      | (size computation)       | FLASH             | — |
+| `__start_QUE_TABLE`     | `queue_table_addr`       | FLASH (word addr) | 10 bytes (`queDescriptor_t`)              |
+| `__stop_QUE_TABLE`      | (size computation)       | FLASH             | — |
+| `__start_EVNT_TABLE`    | `event_table_addr`       | FLASH (word addr) | 4 bytes (`evntDescriptor_t`)              |
+| `__stop_EVNT_TABLE`     | (size computation)       | FLASH             | — |
+| `currStateMachine`      | `current_fsm_addr`       | SRAM (byte addr)  | — |
 
-Entry counts (e.g., `fsm_table_count`) are derived by computing `(_end_vma - _start_vma) / sizeof(per_entry_type)` for each table, where the per-entry size is a compile-time constant defined in the avrOS headers.
+The boundary symbols `__start_<NAME>` and `__stop_<NAME>` are emitted by the avrOS application's custom linker script (`avrOS.x`) and bracket the input section that holds the corresponding registration table. Entry counts (e.g., `fsm_table_count`) are derived by computing `(__stop − __start) / sizeof(per_entry_descriptor)`, where the descriptor sizes match the 1-byte-packed AVR layout shown above.
 
 **Heap memory budget for `elf_open()`:**
 
@@ -581,7 +580,7 @@ Both buffers are freed by `elf_close()`. Peak heap usage occurs between `elf_ope
 
 **Parse complexity:** `elf_open()` performs O(e_phnum + e_shnum) file seeks plus two sequential block reads. `elf_find_avros_tables()` performs a single O(sym_count) linear scan with 8 string comparisons per symbol entry.
 
-**Test approach for `src/elf_parser.c`:** Unit-testable using pre-built AVR ELF fixtures. Test cases cover: magic validation rejection, `EM_AVR` check, correct `flash_base` / `sram_base` extraction, all 8 avrOS symbol names found with correct address conversions, partial symbol set (graceful degradation), `malloc` failure via injection shim, and `elf_close()` resource-free correctness.]]></algorithm>
+**Test approach for `src/elf_parser.c`:** Unit-testable using pre-built AVR ELF fixtures. Test cases cover: magic validation rejection, `EM_AVR` check, correct `flash_base` / `sram_base` extraction, all 7 avrOS sentinel symbols found with correct address conversions, partial symbol set (graceful degradation), `malloc` failure via injection shim, and `elf_close()` resource-free correctness.]]></algorithm>
         <dependencies>
           <dep>Standard C file I/O.</dep>
           <dep><![CDATA[ELF header definitions from `<elf.h>` (Linux) or a bundled `elf.h` for macOS portability.]]></dep>
@@ -615,8 +614,8 @@ void fsm_invalidate(FsmContext *ctx);
 /* Per-thread queries */
 int  fsm_get_active_thread(const FsmContext *ctx);
     /* Returns: GDB thread ID of active FSM; 0 if not identified. */
-int  fsm_get_registers(const FsmContext *ctx, int thread_id, uint8_t *reg_buf);
-    /* Fills reg_buf with a 78-character hex string (39 bytes binary, hex-encoded: R0-R31, SREG, SPL, SPH, PC in g-packet order); buf must be >= 79 bytes. */
+int  fsm_get_registers(const FsmContext *ctx, int thread_id, char *reg_buf);
+    /* Fills reg_buf with a 78-character hex string (39 bytes binary, hex-encoded: R0-R31, SREG, SPL, SPH, PC in g-packet order) plus NUL terminator; buf must be >= 79 bytes. */
     /* Returns: 0 on success; -1 if thread_id out of range. */
 ```
 
@@ -629,7 +628,7 @@ The `FsmContext` struct is declared in `src/fsm_mapper.h` and must be zero-initi
 | `gdb_id`    | `int`      | Stable GDB thread ID (1-based); assigned in the order FSM entries appear in the FLASH table and never re-assigned within a session. |
 | `name`      | `char[32]` | Null-terminated human-readable FSM name, read from the FLASH-resident `name_ptr` field of the avrOS FSM table entry. |
 | `state_fn`  | `uint32_t` | Current state function pointer as a FLASH word address; set to the value of the FSM's SRAM state variable at thread-list build time; used directly as the virtual PC. |
-| `is_active` | `bool`     | True when this FSM is the currently executing task, as identified by comparing the FSM's SRAM entry address against the `__avros_current_fsm` scheduler variable. |
+| `is_active` | `bool`     | True when this FSM is the currently executing task, as identified by comparing the FSM's `stateMachine` SRAM pointer against the avrOS `currStateMachine` scheduler variable. |
 
 **`FsmContext`** contains a statically allocated array of `FSM_MAX_THREADS` (32) `FsmThread` entries, eliminating heap allocation in the thread build path.]]></data_structures>
         <functions>
@@ -639,16 +638,17 @@ The `FsmContext` struct is declared in `src/fsm_mapper.h` and must be zero-initi
             <post><![CDATA[`ctx->threads[0..thread_count-1]` contain populated `FsmThread` descriptors; `ctx->active_id` identifies the running FSM; `ctx->valid` is set to true.]]></post>
             <returns>Number of virtual threads populated on success; -1 on UPDI read failure.</returns>
             <logic>
-              <step><![CDATA[Read the FLASH-resident FSM registration table from `idx->fsm_table_addr` using `updi_mem_read()`; each entry is a fixed-size struct `{ uint16_t *state_var_sram_addr; const char *name_flash_ptr; }`.]]></step>
-              <step><![CDATA[For each table entry, read the 2-byte SRAM state variable from `state_var_sram_addr` to obtain the current state function pointer; convert to a FLASH word address and store in `thread->state_fn`.]]></step>
-              <step><![CDATA[Read the null-terminated FSM name from the FLASH address given by `name_flash_ptr` (up to 31 characters) and store in `thread->name`.]]></step>
-              <step><![CDATA[Read the 2-byte SRAM value at `idx->current_fsm_addr`; compare it to each table entry's `state_var_sram_addr` to identify the active FSM and set `thread->is_active` and `ctx->active_id`.]]></step>
-              <step><![CDATA[Assign `thread->gdb_id = loop_index + 1` for each thread (GDB thread IDs are 1-based).]]></step>
+              <step><![CDATA[Read `idx->fsm_table_count` consecutive 9-byte `fsmStateMachineDescr_t` records from FLASH at `idx->fsm_table_addr` using `updi_mem_read()`. Each descriptor contains, in order: `name` (2-byte FLASH ptr), `stateMachine` (2-byte SRAM ptr), `handler` (2-byte fn ptr), `priority` (1 byte), `instance` (2-byte u16).]]></step>
+              <step><![CDATA[If a descriptor's `stateMachine` pointer is NULL (0x0000), treat the entry as an avrOS initializer slot and skip it without consuming a GDB thread ID.]]></step>
+              <step><![CDATA[For each non-NULL `stateMachine` pointer, read 2 bytes from `stateMachine + 9` (SRAM); this is the `currState` field of `fsmStateMachine_t` and yields the current state function pointer (FLASH word address), which is zero-extended into `thread->state_fn`.]]></step>
+              <step><![CDATA[Read the null-terminated FSM name from the FLASH address given by the descriptor's `name` pointer (up to 31 characters) and store in `thread->name`.]]></step>
+              <step><![CDATA[Read the 2-byte SRAM value at `idx->current_fsm_addr` (avrOS `currStateMachine`); compare it to each retained entry's `stateMachine` pointer to identify the active FSM and set `thread->is_active` and `ctx->active_id`. If no entry matches, `ctx->active_id` is 0.]]></step>
+              <step><![CDATA[Assign `thread->gdb_id = produced_index + 1` for each retained thread (GDB thread IDs are 1-based and never reuse a slot from a NULL-skipped initializer entry).]]></step>
             </logic>
           </function>
           <function signature="int fsm_get_active_thread(const FsmContext *ctx)"
                     summary="Return the GDB thread ID of the currently executing FSM."/>
-          <function signature="int fsm_get_registers(const FsmContext *ctx, int thread_id, uint8_t *reg_buf)">
+          <function signature="int fsm_get_registers(const FsmContext *ctx, int thread_id, char *reg_buf)">
             <purpose>Synthesize a GDB g-packet register frame for the requested virtual thread and write it into reg_buf.</purpose>
             <pre><![CDATA[`ctx->valid` is true; `thread_id` is in the range [1, ctx->thread_count]; `reg_buf` points to a caller-allocated buffer of at least 79 bytes (39 binary bytes × 2 hex chars + NUL).]]></pre>
             <post><![CDATA[`reg_buf` contains a 78-character hex string representing the 36 AVR GDB register values (R0–R31, SREG, SPL, SPH, PC) in GDB `g`-packet order.]]></post>
@@ -665,16 +665,19 @@ The `FsmContext` struct is declared in `src/fsm_mapper.h` and must be zero-initi
         </functions>
         <algorithm><![CDATA[**Thread list build sequence:**
 
-Each avrOS FSM is represented in FLASH by a linker-placed table entry of the form:
+Each avrOS FSM is represented in FLASH by a 9-byte `fsmStateMachineDescr_t` entry placed into the `FSM_TABLE` linker section by the `FSM_STATE_MACHINE(...)` registration macro:
 
 ```c
 typedef struct {
-    fsm_state_fn_t *state;   /* pointer to SRAM variable holding current state fn */
-    const char     *name;    /* pointer to FLASH string literal */
-} avros_fsm_entry_t;
+    char                  *name;          /* FLASH pointer to display name string */
+    fsmStateMachine_t     *stateMachine;  /* SRAM pointer to the FSM instance (NULL = init slot) */
+    fsmStateHandler_t      handler;       /* FLASH function pointer */
+    uint8_t                priority;
+    uint16_t               instance;
+} fsmStateMachineDescr_t;  /* 9 bytes, no padding */
 ```
 
-`fsm_build_thread_list()` reads `idx->fsm_table_count` consecutive entries starting at `idx->fsm_table_addr`, dereferences each SRAM state variable pointer to obtain the current state function pointer, and reads the FLASH name pointer to obtain the FSM display name. All UPDI reads are performed while the CPU is halted.
+`fsm_build_thread_list()` reads `idx->fsm_table_count` consecutive entries starting at `idx->fsm_table_addr`. Entries with a NULL `stateMachine` pointer are skipped (these are avrOS initializer slots, not user FSMs). For each retained entry, the function dereferences `stateMachine + 9` in SRAM to obtain the current state function pointer (the `currState` field of `fsmStateMachine_t`) and reads the FLASH `name` pointer to obtain the FSM display name. All UPDI reads are performed while the CPU is halted.
 
 **Cache invalidation:** `fsm_invalidate()` sets `ctx->valid = false`. The RSP layer calls `fsm_invalidate()` immediately after `updi_run()` or `updi_step()` so that the stale thread list is not served to GDB after execution resumes. The cache is rebuilt on the next `fsm_build_thread_list()` call, which the RSP layer triggers when GDB halts the target again.
 
@@ -690,15 +693,15 @@ typedef struct {
 
 Total g-packet payload: 39 bytes × 2 hex chars = 78 hex characters + NUL. (Registers 0–34 each contribute 1 byte; register 35 (PC) contributes 4 bytes.)
 
-**UPDI read budget per `fsm_build_thread_list()` call (N threads):**
+**UPDI read budget per `fsm_build_thread_list()` call (N retained threads):**
 
 | Operation | UPDI transactions | Data volume |
 | --------- | ----------------- | ----------- |
-| Read FSM table (N x 4 bytes) | 1 block read | 4N bytes |
-| Read SRAM state variable per thread (2 bytes each) | N reads | 2N bytes |
-| Read FLASH name string per thread (up to 31 chars) | N reads | <=31N bytes |
-| Read `current_fsm_addr` (2 bytes) | 1 read | 2 bytes |
-| **Total** | 2N+2 transactions | <=37N+6 bytes |
+| Read `currStateMachine` (2 bytes) | 1 read | 2 bytes |
+| Read FSM descriptor per entry (9 bytes each) | N reads | 9N bytes |
+| Read `currState` per retained entry (2 bytes each) | N reads | 2N bytes |
+| Read FLASH name string per retained entry (up to 32 chars) | N reads | <=32N bytes |
+| **Total** | 3N+1 transactions | <=43N+2 bytes |
 
 **Test approach for `src/fsm_mapper.c`:** Unit-testable by providing a pre-populated `AvrOsSymbolIndex` and a mock `updi_mem_read()` returning canned byte sequences. Test cases cover: GDB thread ID assignment (1-based), correct `state_fn` FLASH word-address derivation, active thread identification, `FSM_MAX_THREADS` cap with warning, cache-invalidation round-trip, and `fsm_get_registers()` PC encoding verification.]]></algorithm>
         <dependencies>
@@ -713,7 +716,7 @@ Total g-packet payload: 39 bytes × 2 hex chars = 78 hex characters + NUL. (Regi
       </module>
 
       <module path="src/monitor.c">
-        <purpose><![CDATA[implements the custom `monitor avros` sub-commands that provide non-intrusive, human-readable visibility into the state of avrOS system objects (events, queues, and memory pools) via UPDI background reads.]]></purpose>
+        <purpose><![CDATA[implements the custom `monitor avros` sub-commands that provide non-intrusive, human-readable visibility into the state of avrOS system objects (named events and queues) via UPDI background reads.]]></purpose>
         <responsibility><![CDATA[Parse the `monitor avros <subcommand>` argument string.]]></responsibility>
         <responsibility>Issue UPDI background reads to retrieve the relevant avrOS data structures without halting the CPU.</responsibility>
         <responsibility>Format the decoded state as human-readable text and deliver it to the GDB client as a console-output packet.</responsibility>
@@ -733,11 +736,10 @@ Parameters:
 *   `cmd` — raw ASCII-hex-encoded payload string from a `qRcmd` RSP packet (not yet decoded).
 
 Return values: 0 command recognised and executed; -1 UPDI read failure; -2 unrecognised sub-command.]]></interface>
-          <interface title="GDB Monitor Sub-commands"><![CDATA[Three sub-commands are supported:
+          <interface title="GDB Monitor Sub-commands"><![CDATA[Two sub-commands are supported:
 
-*   `monitor avros events` — display the avrOS event bitmask with each bit decoded to its event name.
-*   `monitor avros queues` — display head, tail, and count for each registered queue.
-*   `monitor avros mempool` — display free-block count and capacity for each registered memory pool.]]></interface>
+*   `monitor avros events` — list each named event registered in `EVNT_TABLE` with its current status flag value.
+*   `monitor avros queues` — list each registered queue's capacity and per-element size from `QUE_TABLE`.]]></interface>
         </interfaces>
         <functions>
           <function signature="int monitor_dispatch(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx, const char *cmd)">
@@ -747,31 +749,23 @@ Return values: 0 command recognised and executed; -1 UPDI read failure; -2 unrec
             <logic>
               <step>Hex-decode the ASCII hex pairs in `cmd` into a plain text command string.</step>
               <step><![CDATA[Verify the string starts with the prefix `"avros "` (case-sensitive); if not, send a usage hint O-packet and return -2.]]></step>
-              <step>Extract the token following the prefix and compare it to `"events"`, `"queues"`, and `"mempool"`.</step>
+              <step>Extract the token following the prefix and compare it to `"events"` and `"queues"`.</step>
               <step>Invoke the matching static handler or send an unknown-subcommand error O-packet.</step>
             </logic>
           </function>
           <function signature="static int cmd_events(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx)">
-            <purpose>Read the avrOS event bitmask from SRAM and send a decoded human-readable listing to the GDB console.</purpose>
+            <purpose>Iterate the avrOS `EVNT_TABLE` and report each named event's current status flag to the GDB console.</purpose>
             <logic>
-              <step><![CDATA[Read 2 bytes from `idx->event_mask_addr` using `updi_mem_read()`.]]></step>
-              <step><![CDATA[For each of the 16 event bits (bit 0 = event 0, bit 15 = event 15), check if the bit is set and append a line `"  event<N>: SET\n"` or `"  event<N>: clear\n"` to an output buffer.]]></step>
-              <step>Hex-encode the output buffer and send it as one or more RSP O-packets via `rsp_send_packet()`.</step>
+              <step><![CDATA[Read `idx->event_count` consecutive `evntDescriptor_t` records (4 bytes each: `char *name`, `event_t *status`) from FLASH at `idx->event_table_addr` using `updi_mem_read()`.]]></step>
+              <step><![CDATA[For each descriptor, follow the FLASH `name` pointer to read the human-readable event name (NUL-terminated) and the SRAM `status` pointer to read the current 1-byte status value.]]></step>
+              <step><![CDATA[Append a line `"  <name>: <status>\n"` to an output buffer, then hex-encode and send as one or more RSP O-packets via `rsp_send_packet()`.]]></step>
             </logic>
           </function>
           <function signature="static int cmd_queues(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx)">
-            <purpose>Read the head, tail, and occupancy count for each registered avrOS queue and send a formatted table to the GDB console.</purpose>
+            <purpose>Read each registered avrOS queue's capacity and per-element size and send a formatted table to the GDB console.</purpose>
             <logic>
-              <step><![CDATA[Read `idx->queue_count` consecutive queue status structures from SRAM at `idx->queue_table_addr` using `updi_mem_read()`.]]></step>
-              <step>For each queue structure, extract the `head`, `tail`, and `count` fields and format a one-line entry.</step>
-              <step>Hex-encode and send the formatted table as RSP O-packets.</step>
-            </logic>
-          </function>
-          <function signature="static int cmd_mempool(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx)">
-            <purpose>Read the free-block count and total capacity for each registered avrOS memory pool and send a formatted summary to the GDB console.</purpose>
-            <logic>
-              <step><![CDATA[Read `idx->mempool_count` consecutive pool status structures from SRAM at `idx->mempool_table_addr` using `updi_mem_read()`.]]></step>
-              <step>For each pool structure, extract the `free_count` and `capacity` fields and format a one-line entry showing both values and a percentage utilisation.</step>
+              <step><![CDATA[Read `idx->queue_count` consecutive `queDescriptor_t` records (10 bytes each: queue/buffer/event pointers + 2-byte capacity + 2-byte sizeOfElement) from FLASH at `idx->queue_table_addr` using `updi_mem_read()`.]]></step>
+              <step>For each descriptor, extract the `capacity` and `sizeOfElement` fields and format a one-line entry.</step>
               <step>Hex-encode and send the formatted table as RSP O-packets.</step>
             </logic>
           </function>
@@ -782,28 +776,28 @@ Return values: 0 command recognised and executed; -1 UPDI read failure; -2 unrec
 
 **avrOS runtime data structure layouts read by monitor commands:**
 
-*Queue status struct* (read by `cmd_queues()`):
+*Queue descriptor* (read by `cmd_queues()`, located in FLASH `QUE_TABLE`):
 ```c
 typedef struct {
-    uint8_t  head;     /* index of next read position */
-    uint8_t  tail;     /* index of next write position */
-    uint8_t  count;    /* number of items currently queued */
-    uint8_t  capacity; /* maximum items the queue can hold */
-} avros_queue_status_t;  /* 4 bytes, SRAM */
+    void    *queue;          /* SRAM ring buffer pointer */
+    void    *buffer;         /* SRAM element-storage pointer */
+    event_t *event;          /* SRAM event flag pointer */
+    uint16_t capacity;       /* maximum items the queue can hold */
+    uint16_t sizeOfElement;  /* bytes per element */
+} queDescriptor_t;  /* 10 bytes, FLASH */
 ```
 
-*Memory pool status struct* (read by `cmd_mempool()`):
+*Event descriptor* (read by `cmd_events()`, located in FLASH `EVNT_TABLE`):
 ```c
 typedef struct {
-    uint8_t  free_count; /* number of free blocks */
-    uint8_t  capacity;   /* total blocks in the pool */
-    uint16_t block_size; /* size of each block in bytes */
-} avros_pool_status_t;   /* 4 bytes, SRAM */
+    char    *name;    /* FLASH pointer to event name string */
+    event_t *status;  /* SRAM pointer to 1-byte status flag  */
+} evntDescriptor_t;  /* 4 bytes, FLASH */
 ```
 
-**O-packet size constraint:** A single RSP O-packet payload is limited to `RSP_PACKET_MAX` bytes (2048). For `cmd_events()` output (16 lines x ~20 chars = ~320 bytes pre-encode = 640 hex chars), one O-packet suffices. For larger `cmd_queues()` and `cmd_mempool()` outputs the 512-byte text buffer is hex-encoded in chunks that each fit within one O-packet before calling `rsp_send_packet()`.
+**O-packet size constraint:** A single RSP O-packet payload is limited to `RSP_PACKET_MAX` bytes (2048). For typical `cmd_events()` and `cmd_queues()` output the 512-byte text buffer is hex-encoded in chunks that each fit within one O-packet before calling `rsp_send_packet()`.
 
-**Test approach for `src/monitor.c`:** Unit-testable by providing a mock `updi_mem_read()` returning canned SRAM bytes and capturing O-packet strings via a pipe replacing `rsp_fd`. Test cases cover: hex-decode of `qRcmd` payload, prefix rejection, all three sub-command dispatch paths, correct bit decoding in `cmd_events()`, correct queue/pool field extraction, and O-packet encoding of all output characters.]]></algorithm>
+**Test approach for `src/monitor.c`:** Unit-testable by providing a mock `updi_mem_read()` returning canned bytes for the `EVNT_TABLE`/`QUE_TABLE` regions and capturing O-packet strings via a pipe replacing `rsp_fd`. Test cases cover: hex-decode of `qRcmd` payload, prefix rejection, both sub-command dispatch paths, correct event-name + status decoding, correct queue-field extraction, and O-packet encoding of all output characters.]]></algorithm>
         <dependencies>
           <dep><![CDATA[`src/updi.c` — `updi_mem_read()` for non-intrusive SRAM reads.]]></dep>
           <dep><![CDATA[`src/elf_parser.c` — `AvrOsSymbolIndex` for data structure addresses.]]></dep>
@@ -828,14 +822,13 @@ typedef struct {
       <type name="AvrOsSymbolIndex"
             header="src/elf_parser.c"
             summary="Index of avrOS system table addresses resolved from the ELF symbol table.">
-        <field name="fsm_table_addr"     type="uint32_t" desc="FLASH word address of the avrOS FSM registration table."/>
-        <field name="fsm_table_count"    type="uint8_t"  desc="Number of FSM entries in the table."/>
-        <field name="queue_table_addr"   type="uint32_t" desc="FLASH word address of the queue registration table."/>
-        <field name="queue_count"        type="uint8_t"  desc="Number of registered queues."/>
-        <field name="event_mask_addr"    type="uint32_t" desc="SRAM byte address of the avrOS event bitmask variable."/>
-        <field name="mempool_table_addr" type="uint32_t" desc="FLASH word address of the memory pool registration table."/>
-        <field name="mempool_count"      type="uint8_t"  desc="Number of registered memory pools."/>
-        <field name="current_fsm_addr"   type="uint32_t" desc="SRAM byte address of the avrOS scheduler current_fsm pointer variable; used by fsm_mapper to identify the active thread."/>
+        <field name="fsm_table_addr"     type="uint32_t" desc="FLASH word address of the avrOS FSM registration table (`__start_FSM_TABLE`)."/>
+        <field name="fsm_table_count"    type="uint8_t"  desc="Number of `fsmStateMachineDescr_t` entries in `FSM_TABLE` (size / 9)."/>
+        <field name="queue_table_addr"   type="uint32_t" desc="FLASH word address of the queue registration table (`__start_QUE_TABLE`)."/>
+        <field name="queue_count"        type="uint8_t"  desc="Number of `queDescriptor_t` entries in `QUE_TABLE` (size / 10)."/>
+        <field name="event_table_addr"   type="uint32_t" desc="FLASH word address of the named-event registration table (`__start_EVNT_TABLE`)."/>
+        <field name="event_count"        type="uint8_t"  desc="Number of `evntDescriptor_t` entries in `EVNT_TABLE` (size / 4)."/>
+        <field name="current_fsm_addr"   type="uint32_t" desc="SRAM byte address of the avrOS scheduler `currStateMachine` pointer variable; used by fsm_mapper to identify the active thread."/>
       </type>
       <type name="FsmThread"
             header="src/fsm_mapper.c"
@@ -974,7 +967,7 @@ Modules should be integrated and verified in the following order to isolate fail
 | 3 | `src/updi.c` + `src/elf_parser.c` | Halt, read FLASH/SRAM at resolved symbol addresses, resume | Live hardware: read FSM table bytes, verify against expected avrOS registration. |
 | 4 | `src/fsm_mapper.c` | Thread-list build and register frame synthesis | Offline test with mock UPDI reads; live hardware to verify correct FSM names and state pointers. |
 | 5 | `src/gdb_rsp.c` alone | TCP accept, packet codec, dispatch to stub handlers | Loopback socket: drive with `avr-gdb`'s `target extended-remote localhost:1234`, issue `info threads`. |
-| 6 | `src/monitor.c` | `monitor avros events/queues/mempool` output | Live hardware: run target, issue monitor commands from GDB, verify output format and values. |
+| 6 | `src/monitor.c` | `monitor avros events/queues` output | Live hardware: run target, issue monitor commands from GDB, verify output format and values. |
 | 7 | All modules | Full session: attach, set breakpoint, halt, inspect threads, resume | End-to-end GDB script driven test against live AVR hardware. |
 
 ---
@@ -1206,7 +1199,7 @@ Errors are propagated upward through the module stack without retrying:
       <intro><![CDATA[Requirements in this section govern how the server locates avrOS system tables in the target firmware and handles missing or incomplete debug information.]]></intro>
 
       <hlr id="HLR-021" name="ELF Binary Parsing">
-        <text><![CDATA[The application shall parse the AVR ELF binary provided at launch to validate its architecture, locate the symbol table section, and build an index of avrOS system table symbols (FSM registration table, queue table, event bitmask, and memory pool table).]]></text>
+        <text><![CDATA[The application shall parse the AVR ELF binary provided at launch to validate its architecture, locate the symbol table section, and build an index of avrOS system table symbols (`FSM_TABLE`, `QUE_TABLE`, `EVNT_TABLE`, and `currStateMachine`).]]></text>
         <traces>
           <trace target="SDD" ref="6.1"/>
           <trace target="SDD" ref="6.3.1"/>
@@ -1276,7 +1269,7 @@ Errors are propagated upward through the module stack without retrying:
       <intro><![CDATA[Requirements in this section govern the custom `monitor avros` commands that expose avrOS runtime object state to the developer without halting the target CPU.]]></intro>
 
       <hlr id="HLR-029" name="Monitor Events Command">
-        <text><![CDATA[The application shall implement a `monitor avros events` command that reads the avrOS event bitmask from the target via UPDI background read and returns a human-readable report to the GDB console, decoding each set bit to its symbolic event name, without halting the CPU core.]]></text>
+        <text><![CDATA[The application shall implement a `monitor avros events` command that iterates the avrOS `EVNT_TABLE` and, for each registered named event, reads the current 1-byte status flag from SRAM via UPDI background read and returns a human-readable `<name>: <status>` listing to the GDB console, without halting the CPU core.]]></text>
         <traces>
           <trace target="SDD" ref="8.2.2"/>
           <trace target="SDD" ref="8.3.1"/>
@@ -1284,15 +1277,7 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-030" name="Monitor Queues Command">
-        <text><![CDATA[The application shall implement a `monitor avros queues` command that reads each registered avrOS queue's head index, tail index, and current occupancy count from the target via UPDI background read and returns a human-readable report to the GDB console, without halting the CPU core.]]></text>
-        <traces>
-          <trace target="SDD" ref="8.2.2"/>
-          <trace target="SDD" ref="8.3.1"/>
-        </traces>
-      </hlr>
-
-      <hlr id="HLR-031" name="Monitor Memory Pool Command">
-        <text><![CDATA[The application shall implement a `monitor avros mempool` command that reads each registered avrOS memory pool's free-block count and total capacity from the target via UPDI background read and returns a human-readable report to the GDB console, without halting the CPU core.]]></text>
+        <text><![CDATA[The application shall implement a `monitor avros queues` command that iterates the avrOS `QUE_TABLE` and reports each registered queue's `capacity` and `sizeOfElement` from the FLASH descriptor via UPDI background read, returning a human-readable table to the GDB console without halting the CPU core.]]></text>
         <traces>
           <trace target="SDD" ref="8.2.2"/>
           <trace target="SDD" ref="8.3.1"/>
@@ -1300,7 +1285,7 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-032" name="Introspection Reliability">
-        <text><![CDATA[The `monitor avros events` command shall accurately reflect the current pending event bits across at least 10,000 consecutive invocations of `monitor_dispatch()` with the `avros events` sub-command without producing a UPDI protocol desync, a corrupted response, or a server crash.]]></text>
+        <text><![CDATA[The `monitor avros events` command shall accurately reflect the current event status flags across at least 10,000 consecutive invocations of `monitor_dispatch()` with the `avros events` sub-command without producing a UPDI protocol desync, a corrupted response, or a server crash.]]></text>
         <traces>
           <trace target="SDD" ref="4.3.1"/>
           <trace target="SDD" ref="8.1"/>
@@ -1632,7 +1617,6 @@ Errors are propagated upward through the module stack without retrying:
         <traces>
           <trace target="HLR" ref="HLR-029" name="Monitor Events Command"/>
           <trace target="HLR" ref="HLR-030" name="Monitor Queues Command"/>
-          <trace target="HLR" ref="HLR-031" name="Monitor Memory Pool Command"/>
         </traces>
       </llr>
 
@@ -1710,7 +1694,7 @@ Errors are propagated upward through the module stack without retrying:
       <intro><![CDATA[Requirements for `fsm_build_thread_list()`, `fsm_invalidate()`, `fsm_get_active_thread()`, and `fsm_get_registers()`.]]></intro>
 
       <llr id="LLR-FSM-01">
-        <text><![CDATA[`fsm_build_thread_list()` shall read `idx->fsm_table_count` consecutive `avros_fsm_entry_t` records from the FLASH address `idx->fsm_table_addr` via `updi_mem_read()`. A UPDI read failure at any point shall cause the function to return -1.]]></text>
+        <text><![CDATA[`fsm_build_thread_list()` shall read `idx->fsm_table_count` consecutive 9-byte `fsmStateMachineDescr_t` records from the FLASH address `idx->fsm_table_addr` via `updi_mem_read()`. Each descriptor carries a 2-byte `name` pointer (FLASH), a 2-byte `stateMachine` pointer (SRAM, or NULL for an initializer slot that shall be skipped), a 2-byte `handler` function pointer, a 1-byte `priority`, and a 2-byte `instance`. For each non-NULL `stateMachine` pointer, the function shall read 2 bytes from `stateMachine + 9` (the `currState` field of `fsmStateMachine_t`) to obtain the current state function pointer and store it in `thread->state_fn`. A UPDI read failure at any point shall cause the function to return -1.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-024" name="FSM Thread Enumeration"/>
         </traces>
@@ -1724,7 +1708,7 @@ Errors are propagated upward through the module stack without retrying:
       </llr>
 
       <llr id="LLR-FSM-03">
-        <text><![CDATA[`fsm_build_thread_list()` shall read the 2-byte SRAM value at `idx->current_fsm_addr` and compare it against each FSM entry's `state_var_sram_addr`. The matching entry shall have `thread->is_active = true` and its `gdb_id` stored in `ctx->active_id`. If no entry matches, `ctx->active_id` shall be set to 0.]]></text>
+        <text><![CDATA[`fsm_build_thread_list()` shall read the 2-byte SRAM value at `idx->current_fsm_addr` (avrOS `currStateMachine`) and compare it against each retained FSM entry's `stateMachine` pointer. The matching entry shall have `thread->is_active = true` and its `gdb_id` stored in `ctx->active_id`. If no entry matches, `ctx->active_id` shall be set to 0.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-025" name="Active Thread Identification"/>
         </traces>
@@ -1753,7 +1737,7 @@ Errors are propagated upward through the module stack without retrying:
     </function>
 
     <function number="7" title="src/monitor.c — avrOS System Introspection" name="monitor" source="src/monitor.c">
-      <intro><![CDATA[Requirements for `monitor_dispatch()` and its static sub-command helpers `cmd_events()`, `cmd_queues()`, and `cmd_mempool()`.]]></intro>
+      <intro><![CDATA[Requirements for `monitor_dispatch()` and its static sub-command helpers `cmd_events()` and `cmd_queues()`.]]></intro>
 
       <llr id="LLR-MON-01">
         <text><![CDATA[`monitor_dispatch()` shall hex-decode the ASCII-hex-encoded `cmd` string (pairs of hex digit characters) into a plain-text command string before any prefix or sub-command matching is attempted. An odd-length or invalid hex-digit sequence shall be treated as an unrecognised command.]]></text>
@@ -1767,28 +1751,20 @@ Errors are propagated upward through the module stack without retrying:
         <traces>
           <trace target="HLR" ref="HLR-029" name="Monitor Events Command"/>
           <trace target="HLR" ref="HLR-030" name="Monitor Queues Command"/>
-          <trace target="HLR" ref="HLR-031" name="Monitor Memory Pool Command"/>
         </traces>
       </llr>
 
       <llr id="LLR-MON-03">
-        <text><![CDATA[`cmd_events()` shall call `updi_mem_read()` to read 2 bytes from `idx->event_mask_addr`. For each of the 16 bits (N=0 for the least-significant bit through N=15 for the most-significant bit), it shall test bit N of the 16-bit event mask word and append a line of the form `"  event<N>: SET\n"` if the bit is set, or `"  event<N>: clear\n"` if not, and send the complete buffer as RSP O-packets.]]></text>
+        <text><![CDATA[`cmd_events()` shall call `updi_mem_read()` to read `idx->event_count` consecutive 4-byte `evntDescriptor_t` records from FLASH at `idx->event_table_addr`. For each descriptor it shall dereference the `name` pointer (FLASH) to read the event's NUL-terminated display name (up to 31 chars) and the `status` pointer (SRAM) to read the 1-byte status flag, then append a line of the form `"  <name>: <status>\n"` and send the complete buffer as RSP O-packets.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-029" name="Monitor Events Command"/>
         </traces>
       </llr>
 
       <llr id="LLR-MON-04">
-        <text><![CDATA[`cmd_queues()` shall call `updi_mem_read()` to read `idx->queue_count` consecutive queue status structures from `idx->queue_table_addr`. For each structure, it shall extract and format the `head`, `tail`, and `count` fields as a one-line entry and send the complete table as RSP O-packets.]]></text>
+        <text><![CDATA[`cmd_queues()` shall call `updi_mem_read()` to read `idx->queue_count` consecutive 10-byte `queDescriptor_t` records from FLASH at `idx->queue_table_addr`. For each descriptor it shall extract and format the `capacity` and `sizeOfElement` fields as a one-line entry and send the complete table as RSP O-packets.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-030" name="Monitor Queues Command"/>
-        </traces>
-      </llr>
-
-      <llr id="LLR-MON-05">
-        <text><![CDATA[`cmd_mempool()` shall call `updi_mem_read()` to read `idx->mempool_count` consecutive pool status structures from `idx->mempool_table_addr`. For each structure, it shall extract and format the `free_count` and `capacity` fields with a percentage utilisation figure and send the complete table as RSP O-packets.]]></text>
-        <traces>
-          <trace target="HLR" ref="HLR-031" name="Monitor Memory Pool Command"/>
         </traces>
       </llr>
 
@@ -1797,12 +1773,11 @@ Errors are propagated upward through the module stack without retrying:
         <traces>
           <trace target="HLR" ref="HLR-029" name="Monitor Events Command"/>
           <trace target="HLR" ref="HLR-030" name="Monitor Queues Command"/>
-          <trace target="HLR" ref="HLR-031" name="Monitor Memory Pool Command"/>
         </traces>
       </llr>
 
       <llr id="LLR-MON-07">
-        <text><![CDATA[`monitor_dispatch()` and all of its static helpers (`cmd_events()`, `cmd_queues()`, `cmd_mempool()`) shall use `updi_mem_read()` exclusively for all target memory access. None of these functions shall call `updi_halt()`, ensuring that monitor commands never interrupt firmware execution.]]></text>
+        <text><![CDATA[`monitor_dispatch()` and all of its static helpers (`cmd_events()`, `cmd_queues()`) shall use `updi_mem_read()` exclusively for all target memory access. None of these functions shall call `updi_halt()`, ensuring that monitor commands never interrupt firmware execution.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-011" name="Non-Intrusive Background Memory Read"/>
           <trace target="HLR" ref="HLR-032" name="Introspection Reliability"/>
@@ -2256,8 +2231,8 @@ Errors are propagated upward through the module stack without retrying:
         <traces><trace target="LLR" ref="LLR-ELF-03"/></traces>
       </test>
 
-      <test name="elf_find_avros_tables_populates_all_8_avros_sentinel_fields">
-        <purpose><![CDATA[Call `elf_find_avros_tables()` with a fixture ELF that contains all 8 avrOS sentinels and verify every field of `AvrOsSymbolIndex` is non-zero.]]></purpose>
+      <test name="elf_find_avros_tables_populates_all_7_avros_sentinel_fields">
+        <purpose><![CDATA[Call `elf_find_avros_tables()` with a fixture ELF that contains all 7 avrOS sentinel symbols (`__start_FSM_TABLE`, `__stop_FSM_TABLE`, `__start_QUE_TABLE`, `__stop_QUE_TABLE`, `__start_EVNT_TABLE`, `__stop_EVNT_TABLE`, `currStateMachine`) and verify every populated field of `AvrOsSymbolIndex` is non-zero.]]></purpose>
         <traces><trace target="LLR" ref="LLR-ELF-03"/></traces>
       </test>
 
@@ -2304,7 +2279,7 @@ Errors are propagated upward through the module stack without retrying:
       <header><![CDATA[Unit tests for `src/fsm_mapper.c`: FSM table reading, stable GDB thread ID assignment, active-thread identification, g-packet register frame construction, thread count capping, and stack-free guarantees. All UPDI calls are stubbed via a mock layer.]]></header>
 
       <test name="fsm_build_thread_list_reads_fsm_table_from_flash_via_updi">
-        <purpose><![CDATA[Verify that `fsm_build_thread_list()` calls `updi_mem_read()` targeting `idx->fsm_table_addr` and reads `idx->fsm_table_count` consecutive `avros_fsm_entry_t` records.]]></purpose>
+        <purpose><![CDATA[Verify that `fsm_build_thread_list()` calls `updi_mem_read()` targeting `idx->fsm_table_addr` and reads `idx->fsm_table_count` consecutive 9-byte `fsmStateMachineDescr_t` records.]]></purpose>
         <traces><trace target="LLR" ref="LLR-FSM-01"/></traces>
       </test>
 
@@ -2324,7 +2299,7 @@ Errors are propagated upward through the module stack without retrying:
       </test>
 
       <test name="fsm_build_thread_list_sets_active_thread_from_current_fsm_ptr">
-        <purpose><![CDATA[Inject a mock `current_fsm` SRAM value matching the second FSM entry's `state_var_sram_addr` and verify that only that entry has `is_active == true` and `ctx->active_id == 2`.]]></purpose>
+        <purpose><![CDATA[Inject a mock `currStateMachine` SRAM value matching the second FSM entry's `stateMachine` pointer and verify that only that entry has `is_active == true` and `ctx->active_id == 2`.]]></purpose>
         <traces><trace target="LLR" ref="LLR-FSM-03"/></traces>
       </test>
 
@@ -2362,7 +2337,7 @@ Errors are propagated upward through the module stack without retrying:
     <!-- ============================================================ -->
     <!-- src/monitor.c unit tests                                     -->
     <!-- ============================================================ -->
-    <file path="tests/test_monitor.c" role="unit" count="13">
+    <file path="tests/test_monitor.c" role="unit" count="10">
       <header><![CDATA[Unit tests for `src/monitor.c`: hex command decoding, prefix matching, per-sub-command UPDI reads, O-packet output formatting, 512-byte buffer constraint, and the no-halt guarantee. All UPDI calls are intercepted by a mock layer that records calls and returns injected data.]]></header>
 
       <test name="monitor_dispatch_hex_decodes_cmd_before_prefix_matching">
@@ -2385,8 +2360,8 @@ Errors are propagated upward through the module stack without retrying:
         <traces><trace target="LLR" ref="LLR-MON-02"/></traces>
       </test>
 
-      <test name="cmd_events_reads_2_bytes_from_event_mask_addr">
-        <purpose><![CDATA[Dispatch `"avros events"` and verify that `updi_mem_read()` is called once with address `idx->event_mask_addr` and length 2.]]></purpose>
+      <test name="cmd_events_reads_event_count_descriptors_from_evnt_table">
+        <purpose><![CDATA[Dispatch `"avros events"` and verify that `updi_mem_read()` is called with address `idx->event_table_addr` and a length equal to `idx->event_count` × 4 bytes (`evntDescriptor_t` size).]]></purpose>
         <traces><trace target="LLR" ref="LLR-MON-03"/></traces>
       </test>
 
@@ -2410,23 +2385,13 @@ Errors are propagated upward through the module stack without retrying:
         <traces><trace target="LLR" ref="LLR-MON-04"/></traces>
       </test>
 
-      <test name="cmd_mempool_reads_pool_count_structures_from_table">
-        <purpose><![CDATA[Dispatch `"avros mempool"` and verify that `updi_mem_read()` is called with `idx->mempool_table_addr` and the correct total byte count.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-MON-05"/></traces>
-      </test>
-
-      <test name="cmd_mempool_formats_free_count_capacity_and_utilisation">
-        <purpose><![CDATA[Inject a pool structure with `free_count = 3` and `capacity = 10` and verify the output contains both counts and a formatted `70%` utilisation figure.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-MON-05"/></traces>
-      </test>
-
       <test name="monitor_output_assembled_in_512_byte_buffer_sent_as_o_packets">
         <purpose><![CDATA[Inject an event mask that produces near-maximum output and verify that the total assembled output does not exceed 512 bytes and is transmitted via `rsp_send_packet()` as RSP O-packets.]]></purpose>
         <traces><trace target="LLR" ref="LLR-MON-06"/></traces>
       </test>
 
       <test name="monitor_dispatch_and_helpers_never_call_updi_halt">
-        <purpose><![CDATA[Execute all three sub-commands (`events`, `queues`, `mempool`) through `monitor_dispatch()` and verify that `updi_halt()` is never called by inspecting the mock call log.]]></purpose>
+        <purpose><![CDATA[Execute both sub-commands (`events`, `queues`) through `monitor_dispatch()` and verify that `updi_halt()` is never called by inspecting the mock call log.]]></purpose>
         <traces><trace target="LLR" ref="LLR-MON-07"/></traces>
       </test>
     </file>

@@ -111,7 +111,7 @@ Role: **unit**. **14 test(s).**
 | 4 | <a id="elf_open_loads_symtab_and_strtab_into_heap_buffers"></a>`elf_open_loads_symtab_and_strtab_into_heap_buffers` | `LLR-ELF-02` | After a successful `elf_open()`, verify that `ctx.symtab` and `ctx.strtab` are non-NULL heap pointers, and that `ctx.sym_count` and `ctx.strtab_size` reflect the actual section sizes. |
 | 5 | <a id="elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure"></a>`elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure` | `LLR-ELF-02` | Inject a mock `malloc()` that fails on the second allocation, call `elf_open()`, and verify the return value is -1 and no heap memory remains allocated. |
 | 6 | <a id="elf_find_avros_tables_performs_single_linear_scan"></a>`elf_find_avros_tables_performs_single_linear_scan` | `LLR-ELF-03` | Instrument `elf_find_avros_tables()` with a mock symbol table and verify that each symbol entry is examined at most once regardless of how many avrOS sentinels are present. |
-| 7 | <a id="elf_find_avros_tables_populates_all_8_avros_sentinel_fields"></a>`elf_find_avros_tables_populates_all_8_avros_sentinel_fields` | `LLR-ELF-03` | Call `elf_find_avros_tables()` with a fixture ELF that contains all 8 avrOS sentinels and verify every field of `AvrOsSymbolIndex` is non-zero. |
+| 7 | <a id="elf_find_avros_tables_populates_all_7_avros_sentinel_fields"></a>`elf_find_avros_tables_populates_all_7_avros_sentinel_fields` | `LLR-ELF-03` | Call `elf_find_avros_tables()` with a fixture ELF that contains all 7 avrOS sentinel symbols (`__start_FSM_TABLE`, `__stop_FSM_TABLE`, `__start_QUE_TABLE`, `__stop_QUE_TABLE`, `__start_EVNT_TABLE`, `__stop_EVNT_TABLE`, `currStateMachine`) and verify every populated field of `AvrOsSymbolIndex` is non-zero. |
 | 8 | <a id="elf_flash_addr_applies_vma_minus_base_over_2_formula"></a>`elf_flash_addr_applies_vma_minus_base_over_2_formula` | `LLR-ELF-04` | Call `elf_flash_addr()` with known `vma` and `ctx.flash_base` values and verify the return equals `(vma - flash_base) / 2`. |
 | 9 | <a id="elf_flash_addr_all_avros_symbol_addresses_use_word_formula"></a>`elf_flash_addr_all_avros_symbol_addresses_use_word_formula` | `LLR-ELF-04` | After `elf_find_avros_tables()`, verify that every FLASH-resident address stored in `AvrOsSymbolIndex` was computed via `elf_flash_addr()`, not as a raw VMA. |
 | 10 | <a id="elf_find_avros_tables_returns_0_on_partial_symbol_match"></a>`elf_find_avros_tables_returns_0_on_partial_symbol_match` | `LLR-ELF-05` | Call `elf_find_avros_tables()` with a fixture ELF containing only 4 of the 8 avrOS sentinels and verify the return value is 0 (not -1). |
@@ -126,11 +126,11 @@ Role: **unit**. **11 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
-| 1 | <a id="fsm_build_thread_list_reads_fsm_table_from_flash_via_updi"></a>`fsm_build_thread_list_reads_fsm_table_from_flash_via_updi` | `LLR-FSM-01` | Verify that `fsm_build_thread_list()` calls `updi_mem_read()` targeting `idx->fsm_table_addr` and reads `idx->fsm_table_count` consecutive `avros_fsm_entry_t` records. |
+| 1 | <a id="fsm_build_thread_list_reads_fsm_table_from_flash_via_updi"></a>`fsm_build_thread_list_reads_fsm_table_from_flash_via_updi` | `LLR-FSM-01` | Verify that `fsm_build_thread_list()` calls `updi_mem_read()` targeting `idx->fsm_table_addr` and reads `idx->fsm_table_count` consecutive 9-byte `fsmStateMachineDescr_t` records. |
 | 2 | <a id="fsm_build_thread_list_returns_minus1_on_updi_failure"></a>`fsm_build_thread_list_returns_minus1_on_updi_failure` | `LLR-FSM-01` | Inject a mock `updi_mem_read()` that returns -1 and verify that `fsm_build_thread_list()` propagates the error by returning -1. |
 | 3 | <a id="fsm_build_thread_list_assigns_1_based_thread_ids_in_order"></a>`fsm_build_thread_list_assigns_1_based_thread_ids_in_order` | `LLR-FSM-02` | Build a thread list from 3 FSM entries and verify that the resulting `gdb_id` values are 1, 2, and 3, in the order the entries appear in the FLASH table. |
 | 4 | <a id="fsm_build_thread_list_thread_ids_stable_across_calls"></a>`fsm_build_thread_list_thread_ids_stable_across_calls` | `LLR-FSM-02` | Call `fsm_build_thread_list()` twice with the same FSM table content and verify that each FSM entry maps to the same `gdb_id` on both calls. |
-| 5 | <a id="fsm_build_thread_list_sets_active_thread_from_current_fsm_ptr"></a>`fsm_build_thread_list_sets_active_thread_from_current_fsm_ptr` | `LLR-FSM-03` | Inject a mock `current_fsm` SRAM value matching the second FSM entry's `state_var_sram_addr` and verify that only that entry has `is_active == true` and `ctx->active_id == 2`. |
+| 5 | <a id="fsm_build_thread_list_sets_active_thread_from_current_fsm_ptr"></a>`fsm_build_thread_list_sets_active_thread_from_current_fsm_ptr` | `LLR-FSM-03` | Inject a mock `currStateMachine` SRAM value matching the second FSM entry's `stateMachine` pointer and verify that only that entry has `is_active == true` and `ctx->active_id == 2`. |
 | 6 | <a id="fsm_build_thread_list_sets_active_id_0_when_no_entry_matches"></a>`fsm_build_thread_list_sets_active_id_0_when_no_entry_matches` | `LLR-FSM-03` | Inject a `current_fsm` SRAM value that does not match any registered FSM and verify that `ctx->active_id == 0`. |
 | 7 | <a id="fsm_get_registers_places_state_fn_as_pc_at_hex_positions_70_77"></a>`fsm_get_registers_places_state_fn_as_pc_at_hex_positions_70_77` | `LLR-FSM-04` | Call `fsm_get_registers()` for a thread whose `state_fn = 0xABCD` and verify that the 78-character g-packet buffer contains the little-endian encoding of 0xABCD at hex character positions 70–77. |
 | 8 | <a id="fsm_get_registers_non_active_r0_r31_sreg_spl_sph_all_zero"></a>`fsm_get_registers_non_active_r0_r31_sreg_spl_sph_all_zero` | `LLR-FSM-04` | Call `fsm_get_registers()` for a non-active thread and verify that hex positions 0–69 of the 78-character buffer are all `'0'`. |
@@ -140,7 +140,7 @@ Role: **unit**. **11 test(s).**
 
 ### 3.6. [tests/test_monitor.c](../tests/test_monitor.c)
 
-Role: **unit**. **13 test(s).**
+Role: **unit**. **10 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -148,15 +148,13 @@ Role: **unit**. **13 test(s).**
 | 2 | <a id="monitor_dispatch_treats_invalid_hex_sequence_as_unrecognised"></a>`monitor_dispatch_treats_invalid_hex_sequence_as_unrecognised` | `LLR-MON-01` | Pass `monitor_dispatch()` an odd-length hex string and verify it returns -2 without crashing or producing partial output. |
 | 3 | <a id="monitor_dispatch_rejects_cmd_without_avros_space_prefix"></a>`monitor_dispatch_rejects_cmd_without_avros_space_prefix` | `LLR-MON-02` | Pass a hex-encoded command that decodes to `"other events"` and verify `monitor_dispatch()` returns -2. |
 | 4 | <a id="monitor_dispatch_sends_usage_hint_o_packet_on_bad_prefix"></a>`monitor_dispatch_sends_usage_hint_o_packet_on_bad_prefix` | `LLR-MON-02` | Pass a command with an unrecognised prefix and verify that `monitor_dispatch()` sends at least one RSP O-packet containing a usage-hint string before returning -2. |
-| 5 | <a id="cmd_events_reads_2_bytes_from_event_mask_addr"></a>`cmd_events_reads_2_bytes_from_event_mask_addr` | `LLR-MON-03` | Dispatch `"avros events"` and verify that `updi_mem_read()` is called once with address `idx->event_mask_addr` and length 2. |
+| 5 | <a id="cmd_events_reads_event_count_descriptors_from_evnt_table"></a>`cmd_events_reads_event_count_descriptors_from_evnt_table` | `LLR-MON-03` | Dispatch `"avros events"` and verify that `updi_mem_read()` is called with address `idx->event_table_addr` and a length equal to `idx->event_count` × 4 bytes (`evntDescriptor_t` size). |
 | 6 | <a id="cmd_events_reports_set_bits_as_SET_clear_bits_as_clear"></a>`cmd_events_reports_set_bits_as_SET_clear_bits_as_clear` | `LLR-MON-03` | Inject an event mask of 0x0003 (bits 0 and 1 set, rest clear) and verify the output contains `"event0: SET"`, `"event1: SET"`, and `"event2: clear"`. |
 | 7 | <a id="cmd_events_bit0_is_lsb_event0_bit15_is_msb_event15"></a>`cmd_events_bit0_is_lsb_event0_bit15_is_msb_event15` | `LLR-MON-03` | Inject a mask of 0x8001 and verify `"event0: SET"` (bit 0, LSB) and `"event15: SET"` (bit 15, MSB), with all intermediate bits reported as `"clear"`. |
 | 8 | <a id="cmd_queues_reads_queue_count_structures_from_table"></a>`cmd_queues_reads_queue_count_structures_from_table` | `LLR-MON-04` | Dispatch `"avros queues"` and verify that `updi_mem_read()` is called with `idx->queue_table_addr` and a length equal to `idx->queue_count` times the size of the queue status structure. |
 | 9 | <a id="cmd_queues_formats_head_tail_count_for_each_entry"></a>`cmd_queues_formats_head_tail_count_for_each_entry` | `LLR-MON-04` | Inject two queue structures with known `head`, `tail`, and `count` fields and verify that both entries appear in the O-packet output with the correct formatted values. |
-| 10 | <a id="cmd_mempool_reads_pool_count_structures_from_table"></a>`cmd_mempool_reads_pool_count_structures_from_table` | `LLR-MON-05` | Dispatch `"avros mempool"` and verify that `updi_mem_read()` is called with `idx->mempool_table_addr` and the correct total byte count. |
-| 11 | <a id="cmd_mempool_formats_free_count_capacity_and_utilisation"></a>`cmd_mempool_formats_free_count_capacity_and_utilisation` | `LLR-MON-05` | Inject a pool structure with `free_count = 3` and `capacity = 10` and verify the output contains both counts and a formatted `70%` utilisation figure. |
-| 12 | <a id="monitor_output_assembled_in_512_byte_buffer_sent_as_o_packets"></a>`monitor_output_assembled_in_512_byte_buffer_sent_as_o_packets` | `LLR-MON-06` | Inject an event mask that produces near-maximum output and verify that the total assembled output does not exceed 512 bytes and is transmitted via `rsp_send_packet()` as RSP O-packets. |
-| 13 | <a id="monitor_dispatch_and_helpers_never_call_updi_halt"></a>`monitor_dispatch_and_helpers_never_call_updi_halt` | `LLR-MON-07` | Execute all three sub-commands (`events`, `queues`, `mempool`) through `monitor_dispatch()` and verify that `updi_halt()` is never called by inspecting the mock call log. |
+| 10 | <a id="monitor_output_assembled_in_512_byte_buffer_sent_as_o_packets"></a>`monitor_output_assembled_in_512_byte_buffer_sent_as_o_packets` | `LLR-MON-06` | Inject an event mask that produces near-maximum output and verify that the total assembled output does not exceed 512 bytes and is transmitted via `rsp_send_packet()` as RSP O-packets. |
+| 11 | <a id="monitor_dispatch_and_helpers_never_call_updi_halt"></a>`monitor_dispatch_and_helpers_never_call_updi_halt` | `LLR-MON-07` | Execute both sub-commands (`events`, `queues`) through `monitor_dispatch()` and verify that `updi_halt()` is never called by inspecting the mock call log. |
 
 ### 3.7. [tests/test_integration.c](../tests/test_integration.c)
 
@@ -226,11 +224,11 @@ verified by code review — see
 | `LLR-RSP-12` | `rsp` | `HLR-019` | `rsp_dispatch_qsupported_returns_feature_string_no_target_access`, `rsp_dispatch_qattached_returns_1_no_target_access` |
 | `LLR-RSP-13` | `rsp` | `HLR-019` | `on_detach_D_resumes_target_closes_socket_resets_gdb_fd` |
 | `LLR-RSP-14` | `rsp` | `HLR-019`, `HLR-035` | `on_kill_k_sets_g_quit_to_1` |
-| `LLR-RSP-15` | `rsp` | `HLR-029`, `HLR-030`, `HLR-031` | `on_monitor_qRcmd_passes_hex_body_to_monitor_dispatch`, `on_monitor_returns_ok_when_monitor_dispatch_succeeds`, `on_monitor_sends_o_packet_error_on_updi_failure` |
+| `LLR-RSP-15` | `rsp` | `HLR-029`, `HLR-030` | `on_monitor_qRcmd_passes_hex_body_to_monitor_dispatch`, `on_monitor_returns_ok_when_monitor_dispatch_succeeds`, `on_monitor_sends_o_packet_error_on_updi_failure` |
 | `LLR-RSP-16` | `rsp` | `HLR-025` | `H_packet_stores_thread_id_for_register_operations`, `H_packet_minus1_and_0_both_map_to_active_fsm_thread` |
 | `LLR-ELF-01` | `elf` | `HLR-021` | `elf_open_accepts_valid_avr_elf32_binary`, `elf_open_returns_minus1_on_invalid_elf_magic`, `elf_open_returns_minus1_on_wrong_machine_type` |
 | `LLR-ELF-02` | `elf` | `HLR-021`, `HLR-040` | `elf_open_loads_symtab_and_strtab_into_heap_buffers`, `elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure` |
-| `LLR-ELF-03` | `elf` | `HLR-021` | `elf_find_avros_tables_performs_single_linear_scan`, `elf_find_avros_tables_populates_all_8_avros_sentinel_fields` |
+| `LLR-ELF-03` | `elf` | `HLR-021` | `elf_find_avros_tables_performs_single_linear_scan`, `elf_find_avros_tables_populates_all_7_avros_sentinel_fields` |
 | `LLR-ELF-04` | `elf` | `HLR-022` | `elf_flash_addr_applies_vma_minus_base_over_2_formula`, `elf_flash_addr_all_avros_symbol_addresses_use_word_formula` |
 | `LLR-ELF-05` | `elf` | `HLR-023` | `elf_find_avros_tables_returns_0_on_partial_symbol_match`, `elf_find_avros_tables_zero_initialises_absent_symbol_fields` |
 | `LLR-ELF-06` | `elf` | `HLR-040` | `elf_close_frees_symtab_strtab_and_closes_fd`, `elf_close_safe_on_partially_initialised_context` |
@@ -243,11 +241,10 @@ verified by code review — see
 | `LLR-FSM-05` | `fsm` | `HLR-027` | `fsm_build_thread_list_caps_at_32_entries_and_logs_warning` |
 | `LLR-FSM-06` | `fsm` | `HLR-028` | `fsm_get_registers_non_active_no_updi_read_of_stack` |
 | `LLR-MON-01` | `monitor` | `HLR-029` | `monitor_dispatch_hex_decodes_cmd_before_prefix_matching`, `monitor_dispatch_treats_invalid_hex_sequence_as_unrecognised` |
-| `LLR-MON-02` | `monitor` | `HLR-029`, `HLR-030`, `HLR-031` | `monitor_dispatch_rejects_cmd_without_avros_space_prefix`, `monitor_dispatch_sends_usage_hint_o_packet_on_bad_prefix` |
-| `LLR-MON-03` | `monitor` | `HLR-029` | `cmd_events_reads_2_bytes_from_event_mask_addr`, `cmd_events_reports_set_bits_as_SET_clear_bits_as_clear`, `cmd_events_bit0_is_lsb_event0_bit15_is_msb_event15` |
+| `LLR-MON-02` | `monitor` | `HLR-029`, `HLR-030` | `monitor_dispatch_rejects_cmd_without_avros_space_prefix`, `monitor_dispatch_sends_usage_hint_o_packet_on_bad_prefix` |
+| `LLR-MON-03` | `monitor` | `HLR-029` | `cmd_events_reads_event_count_descriptors_from_evnt_table`, `cmd_events_reports_set_bits_as_SET_clear_bits_as_clear`, `cmd_events_bit0_is_lsb_event0_bit15_is_msb_event15` |
 | `LLR-MON-04` | `monitor` | `HLR-030` | `cmd_queues_reads_queue_count_structures_from_table`, `cmd_queues_formats_head_tail_count_for_each_entry` |
-| `LLR-MON-05` | `monitor` | `HLR-031` | `cmd_mempool_reads_pool_count_structures_from_table`, `cmd_mempool_formats_free_count_capacity_and_utilisation` |
-| `LLR-MON-06` | `monitor` | `HLR-029`, `HLR-030`, `HLR-031` | `monitor_output_assembled_in_512_byte_buffer_sent_as_o_packets` |
+| `LLR-MON-06` | `monitor` | `HLR-029`, `HLR-030` | `monitor_output_assembled_in_512_byte_buffer_sent_as_o_packets` |
 | `LLR-MON-07` | `monitor` | `HLR-011`, `HLR-032` | `monitor_dispatch_and_helpers_never_call_updi_halt` |
 | `LLR-INST-01` | `inst` | `HLR-041` | `check_tools_exits_nonzero_when_required_tool_is_absent` |
 | `LLR-INST-02` | `inst` | `HLR-041` | `make_install_places_binary_at_prefix_bin`, `make_install_places_man_page_at_prefix_man1` |

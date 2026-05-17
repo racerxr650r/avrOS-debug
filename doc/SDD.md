@@ -19,7 +19,7 @@ This document describes the design of the source modules that implement the avr-
 *   [src/gdb_rsp.c](../src/gdb_rsp.c): GDB Remote Serial Protocol server: packet codec, command dispatch, and session lifecycle management.
 *   [src/elf_parser.c](../src/elf_parser.c): ELF parser: locates avrOS FLASH-resident system tables and produces the AvrOsSymbolIndex.
 *   [src/fsm_mapper.c](../src/fsm_mapper.c): avrOS FSM-to-GDB virtual thread translator: maps FSM state tables to GDB thread objects and synthesizes per-thread register frames.
-*   [src/monitor.c](../src/monitor.c): Custom monitor command handler: implements the avros events, queues, and mempool sub-commands via non-intrusive UPDI reads.
+*   [src/monitor.c](../src/monitor.c): Custom monitor command handler: implements the `avros events` and `avros queues` sub-commands via non-intrusive UPDI reads.
 *   [Makefile](../Makefile): Build orchestration: compile, test, install, uninstall, check-tools, and bundle (Debian .deb, Red Hat .rpm, Homebrew formula) targets.
 *   [doc/avr-updi-gdb.1](../doc/avr-updi-gdb.1): Unix man page: reference documentation for the avr-updi-gdb command.
 
@@ -39,7 +39,7 @@ The project ships with a `make install` target that installs the compiled binary
 *   **RSP:** GDB Remote Serial Protocol — the text-based packet protocol that `avr-gdb` uses to communicate with a remote stub over a socket or serial link.
 *   **FSM:** Finite State Machine — the cooperative task unit in avrOS, represented at runtime by a function pointer into a FLASH-resident state table. All FSMs share the single hardware stack.
 *   **ELF:** Executable and Linkable Format — the binary file produced by `avr-gcc` that carries machine code, DWARF debug information, and the symbol table used to locate avrOS system tables.
-*   **avrOS:** A cooperative real-time operating system for AVR microcontrollers. Tasks are modelled as FSMs; inter-task communication uses queues, event bitmasks, and memory pools.
+*   **avrOS:** A cooperative real-time operating system for AVR microcontrollers. Tasks are modelled as FSMs; inter-task communication uses queues and named events.
 *   **Virtual Thread:** A GDB thread object synthesized from an avrOS FSM entry. Each virtual thread has a unique GDB thread ID and a synthesized register frame whose PC is set to the FSM's current state function pointer.
 *   **Harvard Architecture:** The AVR memory model, in which FLASH (program memory) and SRAM (data memory) occupy separate address spaces. ELF virtual addresses must be converted to physical FLASH word addresses during symbol resolution.
 
@@ -96,7 +96,7 @@ The project ships with a `make install` target that installs the compiled binary
 *   **[src/gdb_rsp.c](../src/gdb_rsp.c)** — GDB RSP layer; owns the GDB TCP socket, RSP packet codec, and command dispatch table.
 *   **[src/elf_parser.c](../src/elf_parser.c)** — ELF parser; produces the `AvrOsSymbolIndex` (FLASH addresses of avrOS system tables) at attach time.
 *   **[src/fsm_mapper.c](../src/fsm_mapper.c)** — FSM mapper; reads UPDI memory using the symbol index and exposes avrOS FSMs as GDB virtual threads.
-*   **[src/monitor.c](../src/monitor.c)** — Monitor handler; implements the custom `monitor avros events|queues|mempool` introspection commands without halting the CPU.
+*   **[src/monitor.c](../src/monitor.c)** — Monitor handler; implements the custom `monitor avros events|queues` introspection commands without halting the CPU.
 
 The startup and attach sequence proceeds as follows:
 
@@ -586,8 +586,8 @@ Both `.symtab` and `.strtab` are loaded fully into heap memory at `elf_open()` t
         1.  Iterate over all `sym_count` entries in `ctx->symtab`; skip entries with `st_name == 0` or `st_shndx == SHN_UNDEF`.
         2.  Look up each symbol's name in `ctx->strtab` at offset `sym->st_name` and compare against the avrOS sentinel names (see algorithm section for the full symbol name table).
         3.  For `_start` symbols (FLASH-resident table boundaries), call `elf_flash_addr()` to convert the VMA to a physical word address and store in the corresponding `idx` field.
-        4.  For `_end` symbols, subtract the paired `_start` VMA and divide by the per-entry struct size to compute the entry count (e.g., `fsm_table_count`).
-        5.  For the `__avros_event_mask` and `__avros_current_fsm` symbols (SRAM-resident variables), store the VMA directly without the Harvard offset.
+        4.  For `__stop_<NAME>` symbols, subtract the paired `__start_<NAME>` VMA and divide by the per-entry struct size to compute the entry count (e.g., `fsm_table_count`).
+        5.  For the `currStateMachine` symbol (SRAM-resident variable), store its VMA directly without the Harvard offset.
 
 *   **`uint32_t elf_flash_addr(const ElfContext *ctx, uint32_t vma)`** — Convert an ELF virtual memory address to a physical FLASH word address.
 
@@ -603,18 +603,17 @@ Both `.symtab` and `.strtab` are loaded fully into heap memory at `elf_open()` t
 
 `elf_find_avros_tables()` scans the loaded symbol array for the following names:
 
-| Symbol name | `AvrOsSymbolIndex` field | Address space |
-| ----------- | ------------------------ | ------------- |
-| `__avros_fsm_table_start`     | `fsm_table_addr`      | FLASH (word addr) |
-| `__avros_fsm_table_end`       | (size computation)    | FLASH |
-| `__avros_queue_table_start`   | `queue_table_addr`    | FLASH (word addr) |
-| `__avros_queue_table_end`     | (size computation)    | FLASH |
-| `__avros_event_mask`          | `event_mask_addr`     | SRAM (byte addr) |
-| `__avros_mempool_table_start` | `mempool_table_addr`  | FLASH (word addr) |
-| `__avros_mempool_table_end`   | (size computation)    | FLASH |
-| `__avros_current_fsm`         | `current_fsm_addr`    | SRAM (byte addr) |
+| Symbol name             | `AvrOsSymbolIndex` field | Address space     | Per-entry stride |
+| ----------------------- | ------------------------ | ----------------- | ---------------- |
+| `__start_FSM_TABLE`     | `fsm_table_addr`         | FLASH (word addr) | 9 bytes (`fsmStateMachineDescr_t`)        |
+| `__stop_FSM_TABLE`      | (size computation)       | FLASH             | — |
+| `__start_QUE_TABLE`     | `queue_table_addr`       | FLASH (word addr) | 10 bytes (`queDescriptor_t`)              |
+| `__stop_QUE_TABLE`      | (size computation)       | FLASH             | — |
+| `__start_EVNT_TABLE`    | `event_table_addr`       | FLASH (word addr) | 4 bytes (`evntDescriptor_t`)              |
+| `__stop_EVNT_TABLE`     | (size computation)       | FLASH             | — |
+| `currStateMachine`      | `current_fsm_addr`       | SRAM (byte addr)  | — |
 
-Entry counts (e.g., `fsm_table_count`) are derived by computing `(_end_vma - _start_vma) / sizeof(per_entry_type)` for each table, where the per-entry size is a compile-time constant defined in the avrOS headers.
+The boundary symbols `__start_<NAME>` and `__stop_<NAME>` are emitted by the avrOS application's custom linker script (`avrOS.x`) and bracket the input section that holds the corresponding registration table. Entry counts (e.g., `fsm_table_count`) are derived by computing `(__stop − __start) / sizeof(per_entry_descriptor)`, where the descriptor sizes match the 1-byte-packed AVR layout shown above.
 
 **Heap memory budget for `elf_open()`:**
 
@@ -628,7 +627,7 @@ Both buffers are freed by `elf_close()`. Peak heap usage occurs between `elf_ope
 
 **Parse complexity:** `elf_open()` performs O(e_phnum + e_shnum) file seeks plus two sequential block reads. `elf_find_avros_tables()` performs a single O(sym_count) linear scan with 8 string comparisons per symbol entry.
 
-**Test approach for `src/elf_parser.c`:** Unit-testable using pre-built AVR ELF fixtures. Test cases cover: magic validation rejection, `EM_AVR` check, correct `flash_base` / `sram_base` extraction, all 8 avrOS symbol names found with correct address conversions, partial symbol set (graceful degradation), `malloc` failure via injection shim, and `elf_close()` resource-free correctness.
+**Test approach for `src/elf_parser.c`:** Unit-testable using pre-built AVR ELF fixtures. Test cases cover: magic validation rejection, `EM_AVR` check, correct `flash_base` / `sram_base` extraction, all 7 avrOS sentinel symbols found with correct address conversions, partial symbol set (graceful degradation), `malloc` failure via injection shim, and `elf_close()` resource-free correctness.
 
 ### 6.4 Dependencies
 
@@ -669,8 +668,8 @@ void fsm_invalidate(FsmContext *ctx);
 /* Per-thread queries */
 int  fsm_get_active_thread(const FsmContext *ctx);
     /* Returns: GDB thread ID of active FSM; 0 if not identified. */
-int  fsm_get_registers(const FsmContext *ctx, int thread_id, uint8_t *reg_buf);
-    /* Fills reg_buf with a 78-character hex string (39 bytes binary, hex-encoded: R0-R31, SREG, SPL, SPH, PC in g-packet order); buf must be >= 79 bytes. */
+int  fsm_get_registers(const FsmContext *ctx, int thread_id, char *reg_buf);
+    /* Fills reg_buf with a 78-character hex string (39 bytes binary, hex-encoded: R0-R31, SREG, SPL, SPH, PC in g-packet order) plus NUL terminator; buf must be >= 79 bytes. */
     /* Returns: 0 on success; -1 if thread_id out of range. */
 ```
 
@@ -687,7 +686,7 @@ The `FsmContext` struct is declared in `src/fsm_mapper.h` and must be zero-initi
 | `gdb_id`    | `int`      | Stable GDB thread ID (1-based); assigned in the order FSM entries appear in the FLASH table and never re-assigned within a session. |
 | `name`      | `char[32]` | Null-terminated human-readable FSM name, read from the FLASH-resident `name_ptr` field of the avrOS FSM table entry. |
 | `state_fn`  | `uint32_t` | Current state function pointer as a FLASH word address; set to the value of the FSM's SRAM state variable at thread-list build time; used directly as the virtual PC. |
-| `is_active` | `bool`     | True when this FSM is the currently executing task, as identified by comparing the FSM's SRAM entry address against the `__avros_current_fsm` scheduler variable. |
+| `is_active` | `bool`     | True when this FSM is the currently executing task, as identified by comparing the FSM's `stateMachine` SRAM pointer against the avrOS `currStateMachine` scheduler variable. |
 
 **`FsmContext`** contains a statically allocated array of `FSM_MAX_THREADS` (32) `FsmThread` entries, eliminating heap allocation in the thread build path.
 
@@ -700,14 +699,15 @@ The `FsmContext` struct is declared in `src/fsm_mapper.h` and must be zero-initi
     *   Post-condition: `ctx->threads[0..thread_count-1]` contain populated `FsmThread` descriptors; `ctx->active_id` identifies the running FSM; `ctx->valid` is set to true.
     *   Return Value: Number of virtual threads populated on success; -1 on UPDI read failure.
     *   Logic:
-        1.  Read the FLASH-resident FSM registration table from `idx->fsm_table_addr` using `updi_mem_read()`; each entry is a fixed-size struct `{ uint16_t *state_var_sram_addr; const char *name_flash_ptr; }`.
-        2.  For each table entry, read the 2-byte SRAM state variable from `state_var_sram_addr` to obtain the current state function pointer; convert to a FLASH word address and store in `thread->state_fn`.
-        3.  Read the null-terminated FSM name from the FLASH address given by `name_flash_ptr` (up to 31 characters) and store in `thread->name`.
-        4.  Read the 2-byte SRAM value at `idx->current_fsm_addr`; compare it to each table entry's `state_var_sram_addr` to identify the active FSM and set `thread->is_active` and `ctx->active_id`.
-        5.  Assign `thread->gdb_id = loop_index + 1` for each thread (GDB thread IDs are 1-based).
+        1.  Read `idx->fsm_table_count` consecutive 9-byte `fsmStateMachineDescr_t` records from FLASH at `idx->fsm_table_addr` using `updi_mem_read()`. Each descriptor contains, in order: `name` (2-byte FLASH ptr), `stateMachine` (2-byte SRAM ptr), `handler` (2-byte fn ptr), `priority` (1 byte), `instance` (2-byte u16).
+        2.  If a descriptor's `stateMachine` pointer is NULL (0x0000), treat the entry as an avrOS initializer slot and skip it without consuming a GDB thread ID.
+        3.  For each non-NULL `stateMachine` pointer, read 2 bytes from `stateMachine + 9` (SRAM); this is the `currState` field of `fsmStateMachine_t` and yields the current state function pointer (FLASH word address), which is zero-extended into `thread->state_fn`.
+        4.  Read the null-terminated FSM name from the FLASH address given by the descriptor's `name` pointer (up to 31 characters) and store in `thread->name`.
+        5.  Read the 2-byte SRAM value at `idx->current_fsm_addr` (avrOS `currStateMachine`); compare it to each retained entry's `stateMachine` pointer to identify the active FSM and set `thread->is_active` and `ctx->active_id`. If no entry matches, `ctx->active_id` is 0.
+        6.  Assign `thread->gdb_id = produced_index + 1` for each retained thread (GDB thread IDs are 1-based and never reuse a slot from a NULL-skipped initializer entry).
 
 *   **`int fsm_get_active_thread(const FsmContext *ctx)`** — Return the GDB thread ID of the currently executing FSM.
-*   **`int fsm_get_registers(const FsmContext *ctx, int thread_id, uint8_t *reg_buf)`**
+*   **`int fsm_get_registers(const FsmContext *ctx, int thread_id, char *reg_buf)`**
     *   Purpose: Synthesize a GDB g-packet register frame for the requested virtual thread and write it into reg_buf.
     *   Pre-condition: `ctx->valid` is true; `thread_id` is in the range [1, ctx->thread_count]; `reg_buf` points to a caller-allocated buffer of at least 79 bytes (39 binary bytes × 2 hex chars + NUL).
     *   Post-condition: `reg_buf` contains a 78-character hex string representing the 36 AVR GDB register values (R0–R31, SREG, SPL, SPH, PC) in GDB `g`-packet order.
@@ -724,16 +724,19 @@ The `FsmContext` struct is declared in `src/fsm_mapper.h` and must be zero-initi
 
 **Thread list build sequence:**
 
-Each avrOS FSM is represented in FLASH by a linker-placed table entry of the form:
+Each avrOS FSM is represented in FLASH by a 9-byte `fsmStateMachineDescr_t` entry placed into the `FSM_TABLE` linker section by the `FSM_STATE_MACHINE(...)` registration macro:
 
 ```c
 typedef struct {
-    fsm_state_fn_t *state;   /* pointer to SRAM variable holding current state fn */
-    const char     *name;    /* pointer to FLASH string literal */
-} avros_fsm_entry_t;
+    char                  *name;          /* FLASH pointer to display name string */
+    fsmStateMachine_t     *stateMachine;  /* SRAM pointer to the FSM instance (NULL = init slot) */
+    fsmStateHandler_t      handler;       /* FLASH function pointer */
+    uint8_t                priority;
+    uint16_t               instance;
+} fsmStateMachineDescr_t;  /* 9 bytes, no padding */
 ```
 
-`fsm_build_thread_list()` reads `idx->fsm_table_count` consecutive entries starting at `idx->fsm_table_addr`, dereferences each SRAM state variable pointer to obtain the current state function pointer, and reads the FLASH name pointer to obtain the FSM display name. All UPDI reads are performed while the CPU is halted.
+`fsm_build_thread_list()` reads `idx->fsm_table_count` consecutive entries starting at `idx->fsm_table_addr`. Entries with a NULL `stateMachine` pointer are skipped (these are avrOS initializer slots, not user FSMs). For each retained entry, the function dereferences `stateMachine + 9` in SRAM to obtain the current state function pointer (the `currState` field of `fsmStateMachine_t`) and reads the FLASH `name` pointer to obtain the FSM display name. All UPDI reads are performed while the CPU is halted.
 
 **Cache invalidation:** `fsm_invalidate()` sets `ctx->valid = false`. The RSP layer calls `fsm_invalidate()` immediately after `updi_run()` or `updi_step()` so that the stale thread list is not served to GDB after execution resumes. The cache is rebuilt on the next `fsm_build_thread_list()` call, which the RSP layer triggers when GDB halts the target again.
 
@@ -749,15 +752,15 @@ typedef struct {
 
 Total g-packet payload: 39 bytes × 2 hex chars = 78 hex characters + NUL. (Registers 0–34 each contribute 1 byte; register 35 (PC) contributes 4 bytes.)
 
-**UPDI read budget per `fsm_build_thread_list()` call (N threads):**
+**UPDI read budget per `fsm_build_thread_list()` call (N retained threads):**
 
 | Operation | UPDI transactions | Data volume |
 | --------- | ----------------- | ----------- |
-| Read FSM table (N x 4 bytes) | 1 block read | 4N bytes |
-| Read SRAM state variable per thread (2 bytes each) | N reads | 2N bytes |
-| Read FLASH name string per thread (up to 31 chars) | N reads | <=31N bytes |
-| Read `current_fsm_addr` (2 bytes) | 1 read | 2 bytes |
-| **Total** | 2N+2 transactions | <=37N+6 bytes |
+| Read `currStateMachine` (2 bytes) | 1 read | 2 bytes |
+| Read FSM descriptor per entry (9 bytes each) | N reads | 9N bytes |
+| Read `currState` per retained entry (2 bytes each) | N reads | 2N bytes |
+| Read FLASH name string per retained entry (up to 32 chars) | N reads | <=32N bytes |
+| **Total** | 3N+1 transactions | <=43N+2 bytes |
 
 **Test approach for `src/fsm_mapper.c`:** Unit-testable by providing a pre-populated `AvrOsSymbolIndex` and a mock `updi_mem_read()` returning canned byte sequences. Test cases cover: GDB thread ID assignment (1-based), correct `state_fn` FLASH word-address derivation, active thread identification, `FSM_MAX_THREADS` cap with warning, cache-invalidation round-trip, and `fsm_get_registers()` PC encoding verification.
 
@@ -775,7 +778,7 @@ Total g-packet payload: 39 bytes × 2 hex chars = 78 hex characters + NUL. (Regi
 ## 8. Detailed Design for [src/monitor.c](../src/monitor.c)
 
 ### 8.1 Purpose and Responsibilities
-[src/monitor.c](../src/monitor.c) implements the custom `monitor avros` sub-commands that provide non-intrusive, human-readable visibility into the state of avrOS system objects (events, queues, and memory pools) via UPDI background reads.
+[src/monitor.c](../src/monitor.c) implements the custom `monitor avros` sub-commands that provide non-intrusive, human-readable visibility into the state of avrOS system objects (named events and queues) via UPDI background reads.
 
 *   Parse the `monitor avros <subcommand>` argument string.
 *   Issue UPDI background reads to retrieve the relevant avrOS data structures without halting the CPU.
@@ -802,11 +805,10 @@ Return values: 0 command recognised and executed; -1 UPDI read failure; -2 unrec
 
 #### 8.2.2 GDB Monitor Sub-commands
 
-Three sub-commands are supported:
+Two sub-commands are supported:
 
-*   `monitor avros events` — display the avrOS event bitmask with each bit decoded to its event name.
-*   `monitor avros queues` — display head, tail, and count for each registered queue.
-*   `monitor avros mempool` — display free-block count and capacity for each registered memory pool.
+*   `monitor avros events` — list each named event registered in `EVNT_TABLE` with its current status flag value.
+*   `monitor avros queues` — list each registered queue's capacity and per-element size from `QUE_TABLE`.
 
 
 ### 8.3 Internal Structure
@@ -819,28 +821,21 @@ Three sub-commands are supported:
     *   Logic:
         1.  Hex-decode the ASCII hex pairs in `cmd` into a plain text command string.
         2.  Verify the string starts with the prefix `"avros "` (case-sensitive); if not, send a usage hint O-packet and return -2.
-        3.  Extract the token following the prefix and compare it to `"events"`, `"queues"`, and `"mempool"`.
+        3.  Extract the token following the prefix and compare it to `"events"` and `"queues"`.
         4.  Invoke the matching static handler or send an unknown-subcommand error O-packet.
 
 *   **`static int cmd_events(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx)`**
-    *   Purpose: Read the avrOS event bitmask from SRAM and send a decoded human-readable listing to the GDB console.
+    *   Purpose: Iterate the avrOS `EVNT_TABLE` and report each named event's current status flag to the GDB console.
     *   Logic:
-        1.  Read 2 bytes from `idx->event_mask_addr` using `updi_mem_read()`.
-        2.  For each of the 16 event bits (bit 0 = event 0, bit 15 = event 15), check if the bit is set and append a line `"  event<N>: SET\n"` or `"  event<N>: clear\n"` to an output buffer.
-        3.  Hex-encode the output buffer and send it as one or more RSP O-packets via `rsp_send_packet()`.
+        1.  Read `idx->event_count` consecutive `evntDescriptor_t` records (4 bytes each: `char *name`, `event_t *status`) from FLASH at `idx->event_table_addr` using `updi_mem_read()`.
+        2.  For each descriptor, follow the FLASH `name` pointer to read the human-readable event name (NUL-terminated) and the SRAM `status` pointer to read the current 1-byte status value.
+        3.  Append a line `"  <name>: <status>\n"` to an output buffer, then hex-encode and send as one or more RSP O-packets via `rsp_send_packet()`.
 
 *   **`static int cmd_queues(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx)`**
-    *   Purpose: Read the head, tail, and occupancy count for each registered avrOS queue and send a formatted table to the GDB console.
+    *   Purpose: Read each registered avrOS queue's capacity and per-element size and send a formatted table to the GDB console.
     *   Logic:
-        1.  Read `idx->queue_count` consecutive queue status structures from SRAM at `idx->queue_table_addr` using `updi_mem_read()`.
-        2.  For each queue structure, extract the `head`, `tail`, and `count` fields and format a one-line entry.
-        3.  Hex-encode and send the formatted table as RSP O-packets.
-
-*   **`static int cmd_mempool(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx)`**
-    *   Purpose: Read the free-block count and total capacity for each registered avrOS memory pool and send a formatted summary to the GDB console.
-    *   Logic:
-        1.  Read `idx->mempool_count` consecutive pool status structures from SRAM at `idx->mempool_table_addr` using `updi_mem_read()`.
-        2.  For each pool structure, extract the `free_count` and `capacity` fields and format a one-line entry showing both values and a percentage utilisation.
+        1.  Read `idx->queue_count` consecutive `queDescriptor_t` records (10 bytes each: queue/buffer/event pointers + 2-byte capacity + 2-byte sizeOfElement) from FLASH at `idx->queue_table_addr` using `updi_mem_read()`.
+        2.  For each descriptor, extract the `capacity` and `sizeOfElement` fields and format a one-line entry.
         3.  Hex-encode and send the formatted table as RSP O-packets.
 
 
@@ -852,28 +847,28 @@ Three sub-commands are supported:
 
 **avrOS runtime data structure layouts read by monitor commands:**
 
-*Queue status struct* (read by `cmd_queues()`):
+*Queue descriptor* (read by `cmd_queues()`, located in FLASH `QUE_TABLE`):
 ```c
 typedef struct {
-    uint8_t  head;     /* index of next read position */
-    uint8_t  tail;     /* index of next write position */
-    uint8_t  count;    /* number of items currently queued */
-    uint8_t  capacity; /* maximum items the queue can hold */
-} avros_queue_status_t;  /* 4 bytes, SRAM */
+    void    *queue;          /* SRAM ring buffer pointer */
+    void    *buffer;         /* SRAM element-storage pointer */
+    event_t *event;          /* SRAM event flag pointer */
+    uint16_t capacity;       /* maximum items the queue can hold */
+    uint16_t sizeOfElement;  /* bytes per element */
+} queDescriptor_t;  /* 10 bytes, FLASH */
 ```
 
-*Memory pool status struct* (read by `cmd_mempool()`):
+*Event descriptor* (read by `cmd_events()`, located in FLASH `EVNT_TABLE`):
 ```c
 typedef struct {
-    uint8_t  free_count; /* number of free blocks */
-    uint8_t  capacity;   /* total blocks in the pool */
-    uint16_t block_size; /* size of each block in bytes */
-} avros_pool_status_t;   /* 4 bytes, SRAM */
+    char    *name;    /* FLASH pointer to event name string */
+    event_t *status;  /* SRAM pointer to 1-byte status flag  */
+} evntDescriptor_t;  /* 4 bytes, FLASH */
 ```
 
-**O-packet size constraint:** A single RSP O-packet payload is limited to `RSP_PACKET_MAX` bytes (2048). For `cmd_events()` output (16 lines x ~20 chars = ~320 bytes pre-encode = 640 hex chars), one O-packet suffices. For larger `cmd_queues()` and `cmd_mempool()` outputs the 512-byte text buffer is hex-encoded in chunks that each fit within one O-packet before calling `rsp_send_packet()`.
+**O-packet size constraint:** A single RSP O-packet payload is limited to `RSP_PACKET_MAX` bytes (2048). For typical `cmd_events()` and `cmd_queues()` output the 512-byte text buffer is hex-encoded in chunks that each fit within one O-packet before calling `rsp_send_packet()`.
 
-**Test approach for `src/monitor.c`:** Unit-testable by providing a mock `updi_mem_read()` returning canned SRAM bytes and capturing O-packet strings via a pipe replacing `rsp_fd`. Test cases cover: hex-decode of `qRcmd` payload, prefix rejection, all three sub-command dispatch paths, correct bit decoding in `cmd_events()`, correct queue/pool field extraction, and O-packet encoding of all output characters.
+**Test approach for `src/monitor.c`:** Unit-testable by providing a mock `updi_mem_read()` returning canned bytes for the `EVNT_TABLE`/`QUE_TABLE` regions and capturing O-packet strings via a pipe replacing `rsp_fd`. Test cases cover: hex-decode of `qRcmd` payload, prefix rejection, both sub-command dispatch paths, correct event-name + status decoding, correct queue-field extraction, and O-packet encoding of all output characters.
 
 ### 8.4 Dependencies
 
@@ -899,14 +894,13 @@ typedef struct {
 
     | Field | Type | Description |
     | ----- | ---- | ----------- |
-| `fsm_table_addr` | `uint32_t` | FLASH word address of the avrOS FSM registration table. |
-| `fsm_table_count` | `uint8_t` | Number of FSM entries in the table. |
-| `queue_table_addr` | `uint32_t` | FLASH word address of the queue registration table. |
-| `queue_count` | `uint8_t` | Number of registered queues. |
-| `event_mask_addr` | `uint32_t` | SRAM byte address of the avrOS event bitmask variable. |
-| `mempool_table_addr` | `uint32_t` | FLASH word address of the memory pool registration table. |
-| `mempool_count` | `uint8_t` | Number of registered memory pools. |
-| `current_fsm_addr` | `uint32_t` | SRAM byte address of the avrOS scheduler current_fsm pointer variable; used by fsm_mapper to identify the active thread. |
+| `fsm_table_addr` | `uint32_t` | FLASH word address of the avrOS FSM registration table (`__start_FSM_TABLE`). |
+| `fsm_table_count` | `uint8_t` | Number of `fsmStateMachineDescr_t` entries in `FSM_TABLE` (size / 9). |
+| `queue_table_addr` | `uint32_t` | FLASH word address of the queue registration table (`__start_QUE_TABLE`). |
+| `queue_count` | `uint8_t` | Number of `queDescriptor_t` entries in `QUE_TABLE` (size / 10). |
+| `event_table_addr` | `uint32_t` | FLASH word address of the named-event registration table (`__start_EVNT_TABLE`). |
+| `event_count` | `uint8_t` | Number of `evntDescriptor_t` entries in `EVNT_TABLE` (size / 4). |
+| `current_fsm_addr` | `uint32_t` | SRAM byte address of the avrOS scheduler `currStateMachine` pointer variable; used by fsm_mapper to identify the active thread. |
 *   **`FsmThread`** (defined in [src/fsm_mapper.c](../src/fsm_mapper.c)) — Descriptor for a single avrOS FSM virtual thread, stored in the FsmContext thread array.
 
     | Field | Type | Description |
@@ -1046,7 +1040,7 @@ Modules should be integrated and verified in the following order to isolate fail
 | 3 | `src/updi.c` + `src/elf_parser.c` | Halt, read FLASH/SRAM at resolved symbol addresses, resume | Live hardware: read FSM table bytes, verify against expected avrOS registration. |
 | 4 | `src/fsm_mapper.c` | Thread-list build and register frame synthesis | Offline test with mock UPDI reads; live hardware to verify correct FSM names and state pointers. |
 | 5 | `src/gdb_rsp.c` alone | TCP accept, packet codec, dispatch to stub handlers | Loopback socket: drive with `avr-gdb`'s `target extended-remote localhost:1234`, issue `info threads`. |
-| 6 | `src/monitor.c` | `monitor avros events/queues/mempool` output | Live hardware: run target, issue monitor commands from GDB, verify output format and values. |
+| 6 | `src/monitor.c` | `monitor avros events/queues` output | Live hardware: run target, issue monitor commands from GDB, verify output format and values. |
 | 7 | All modules | Full session: attach, set breakpoint, halt, inspect threads, resume | End-to-end GDB script driven test against live AVR hardware. |
 
 ---

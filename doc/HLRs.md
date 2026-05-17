@@ -117,7 +117,7 @@ Requirements in this section govern the GDB RSP server behaviour, covering packe
 Requirements in this section govern how the server locates avrOS system tables in the target firmware and handles missing or incomplete debug information.
 
 *   <a id="HLR-021"></a>**HLR-021: ELF Binary Parsing.**
-    The application shall parse the AVR ELF binary provided at launch to validate its architecture, locate the symbol table section, and build an index of avrOS system table symbols (FSM registration table, queue table, event bitmask, and memory pool table).
+    The application shall parse the AVR ELF binary provided at launch to validate its architecture, locate the symbol table section, and build an index of avrOS system table symbols (`FSM_TABLE`, `QUE_TABLE`, `EVNT_TABLE`, and `currStateMachine`).
     *Trace:* [SDD Section 6.1](SDD.md), [SDD Section 6.3.1](SDD.md).
 
 *   <a id="HLR-022"></a>**HLR-022: Harvard Architecture Address Mapping.**
@@ -157,19 +157,15 @@ Requirements in this section govern how the server translates the avrOS cooperat
 Requirements in this section govern the custom `monitor avros` commands that expose avrOS runtime object state to the developer without halting the target CPU.
 
 *   <a id="HLR-029"></a>**HLR-029: Monitor Events Command.**
-    The application shall implement a `monitor avros events` command that reads the avrOS event bitmask from the target via UPDI background read and returns a human-readable report to the GDB console, decoding each set bit to its symbolic event name, without halting the CPU core.
+    The application shall implement a `monitor avros events` command that iterates the avrOS `EVNT_TABLE` and, for each registered named event, reads the current 1-byte status flag from SRAM via UPDI background read and returns a human-readable `<name>: <status>` listing to the GDB console, without halting the CPU core.
     *Trace:* [SDD Section 8.2.2](SDD.md), [SDD Section 8.3.1](SDD.md).
 
 *   <a id="HLR-030"></a>**HLR-030: Monitor Queues Command.**
-    The application shall implement a `monitor avros queues` command that reads each registered avrOS queue's head index, tail index, and current occupancy count from the target via UPDI background read and returns a human-readable report to the GDB console, without halting the CPU core.
-    *Trace:* [SDD Section 8.2.2](SDD.md), [SDD Section 8.3.1](SDD.md).
-
-*   <a id="HLR-031"></a>**HLR-031: Monitor Memory Pool Command.**
-    The application shall implement a `monitor avros mempool` command that reads each registered avrOS memory pool's free-block count and total capacity from the target via UPDI background read and returns a human-readable report to the GDB console, without halting the CPU core.
+    The application shall implement a `monitor avros queues` command that iterates the avrOS `QUE_TABLE` and reports each registered queue's `capacity` and `sizeOfElement` from the FLASH descriptor via UPDI background read, returning a human-readable table to the GDB console without halting the CPU core.
     *Trace:* [SDD Section 8.2.2](SDD.md), [SDD Section 8.3.1](SDD.md).
 
 *   <a id="HLR-032"></a>**HLR-032: Introspection Reliability.**
-    The `monitor avros events` command shall accurately reflect the current pending event bits across at least 10,000 consecutive invocations of `monitor_dispatch()` with the `avros events` sub-command without producing a UPDI protocol desync, a corrupted response, or a server crash.
+    The `monitor avros events` command shall accurately reflect the current event status flags across at least 10,000 consecutive invocations of `monitor_dispatch()` with the `avros events` sub-command without producing a UPDI protocol desync, a corrupted response, or a server crash.
     *Trace:* [SDD Section 4.3.1](SDD.md), [SDD Section 8.1](SDD.md).
 
 ## 7. Platform and Build
