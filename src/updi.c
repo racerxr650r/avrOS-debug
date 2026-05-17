@@ -225,6 +225,15 @@ int updi_open(const char *device, int baud)
             continue;
         }
         tcdrain(fd);
+        /* Discard the half-duplex echo of the BREAK pattern (and any
+         * spurious bytes the kernel queued while the line settled).
+         * Without this flush the leftover BREAK echo bytes shift the
+         * echo-byte accounting in every subsequent updi_write_bytes()
+         * call by one byte, which causes the first updi_mem_read() to
+         * mistake an echo byte for the ACK and abort.  Real UARTs
+         * (e.g. Raspberry Pi PL011) reproduce this in any session that
+         * runs back-to-back with the SIGROW read.                     */
+        tcflush(fd, TCIFLUSH);
 
         if (updi_write_bytes(fd, &synch, 1) < 0)
             continue;
