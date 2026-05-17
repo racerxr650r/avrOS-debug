@@ -7,6 +7,8 @@
 #              (used by CI to build a structured test summary)
 #   clean      Remove all build artefacts
 #   install    Install avr-updi-gdb to $(PREFIX)/bin  [default: /usr/local]
+#   prereqs    Install all dev prerequisites via apt and download the AVR-Dx DFP
+#              (Debian/Ubuntu only; requires sudo)
 #   help       Print this target list
 #
 # Variables:
@@ -83,8 +85,17 @@ UNITY_INC  := -I$(UNITYDIR)
 
 # ── AVR ELF fixtures ──────────────────────────────────────────────────────────
 # These are compiled with avr-gcc to produce genuine AVR ELF32 files.
-AVR_MCU        := atmega4809
-AVR_CFLAGS     := -mmcu=$(AVR_MCU) -Os -g
+# AVR-Dx devices require the Microchip Device Family Pack (DFP).
+# Run 'make prereqs' once to install the DFP.  When the DFP directory
+# does not exist avr-gcc 14+ has native AVR-Dx support and no -B is needed.
+AVR_MCU    := avr128da28
+DFP_VER    := 2.4.286
+DFP_PACK   := Atmel.AVR-Dx_DFP.$(DFP_VER).atpack
+DFP_URL    := http://packs.download.atmel.com/$(DFP_PACK)
+DFP        := /usr/lib/gcc/avr/5.4.0/Atmel.AVR-Dx_DFP.$(DFP_VER)
+DFP_FLAGS  := $(if $(wildcard $(DFP)/gcc/dev/$(AVR_MCU)),\
+                   -B $(DFP)/gcc/dev/$(AVR_MCU) -I$(DFP)/include,)
+AVR_CFLAGS := -mmcu=$(AVR_MCU) $(DFP_FLAGS) -Os -g
 FIXTURE_SRCS   := $(FIXTUREDIR)/avros_full.c \
                   $(FIXTUREDIR)/avros_partial.c
 FIXTURE_ELFS   := $(patsubst $(FIXTUREDIR)/%.c,$(FIXBINDIR)/%.elf,$(FIXTURE_SRCS))
@@ -251,7 +262,23 @@ install: all
 	install -d $(DESTDIR)$(PREFIX)/bin
 	install -m 755 $(BUILDDIR)/$(TARGET) $(DESTDIR)$(PREFIX)/bin/$(TARGET)
 	@echo "  INSTALL  $(PREFIX)/bin/$(TARGET)"
-
+# ── prereqs target ───────────────────────────────────────────────────────────
+# Install all development prerequisites (Debian/Ubuntu; requires sudo).
+# Installs host build tools via apt, then downloads and installs the
+# Microchip AVR-Dx Device Family Pack so avr-gcc can target AVR DA/DB parts.
+.PHONY: prereqs
+prereqs:
+	@echo "── Installing apt packages ──────────────────────────────────────"
+	sudo apt-get update -q
+	sudo apt-get install -y --no-install-recommends \
+	    make gcc binutils gcc-avr binutils-avr avr-libc wget unzip
+	@echo "── Installing AVR-Dx DFP $(DFP_VER) ──────────────────────────"
+	wget -q -O /tmp/$(DFP_PACK) $(DFP_URL)
+	unzip -q -o /tmp/$(DFP_PACK) -d /tmp/Atmel.AVR-Dx_DFP.$(DFP_VER)
+	sudo mkdir -p $(dir $(DFP))
+	sudo cp -R /tmp/Atmel.AVR-Dx_DFP.$(DFP_VER) $(DFP)
+	rm -rf /tmp/Atmel.AVR-Dx_DFP.$(DFP_VER) /tmp/$(DFP_PACK)
+	@echo "── Prerequisites installed successfully ──────────────────────"
 # ── clean target ──────────────────────────────────────────────────────────────
 .PHONY: clean
 clean:

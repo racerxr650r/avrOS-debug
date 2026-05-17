@@ -2298,7 +2298,7 @@ Errors are propagated upward through the module stack without retrying:
       </test>
 
       <test name="elf_open_sets_flash_base_and_sram_base_from_pt_load_segments">
-        <purpose><![CDATA[After a successful `elf_open()` on the full fixture, verify that `ctx.flash_base` equals the VMA of the first `PT_LOAD` segment (0x00000000 for the fixture) and `ctx.sram_base` equals the VMA of the second `PT_LOAD` segment (0x00802800 for the ATmega4809 fixture).]]></purpose>
+        <purpose><![CDATA[After a successful `elf_open()` on the full fixture, verify that `ctx.flash_base` equals the VMA of the first `PT_LOAD` segment (0x00000000 for the fixture) and `ctx.sram_base` equals the VMA of the second `PT_LOAD` segment (0x00804000 for the AVR128DA28 fixture).]]></purpose>
         <traces><trace target="LLR" ref="LLR-ELF-08"/></traces>
       </test>
     </file>

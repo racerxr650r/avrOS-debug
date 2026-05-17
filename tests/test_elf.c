@@ -388,11 +388,11 @@ void test_elf_open_sets_flash_base_and_sram_base_from_pt_load_segments(void)
     memset(&ctx, 0, sizeof(ctx));
     TEST_ASSERT_EQUAL_INT(0, elf_open(FIXTURE_FULL, &ctx));
 
-    /* avros_full.elf is built for ATmega4809:
+    /* avros_full.elf is built for AVR128DA28:
      *   first  PT_LOAD → FLASH  VMA 0x00000000
-     *   second PT_LOAD → SRAM   VMA 0x00802800 */
+     *   second PT_LOAD → SRAM   VMA 0x00804000 */
     TEST_ASSERT_EQUAL_UINT32(0x00000000UL, ctx.flash_base);
-    TEST_ASSERT_EQUAL_UINT32(0x00802800UL, ctx.sram_base);
+    TEST_ASSERT_EQUAL_UINT32(0x00804000UL, ctx.sram_base);
     TEST_ASSERT_GREATER_THAN(0, (int)ctx.flash_size);
 
     elf_close(&ctx);
