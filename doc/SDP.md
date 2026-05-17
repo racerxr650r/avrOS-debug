@@ -13,7 +13,7 @@
 > Delivery section as work progresses. Link phase names in the Status
 > table to their detailed descriptions in §8.
 
-**Status:** Phase 1 complete (commit `6ef89d2`). Phases 2–5 not yet started.
+**Status:** Phases 1–6 complete. Phase 7 (device-signature diagnostic mode) in progress.
 
 ## Status
 
@@ -481,12 +481,11 @@ AVR BREAK opcode: `0x9598` (16-bit instruction, written as little-endian bytes `
 1. **`make check-tools`** — pre-flight target that validates all required host tools are present (`gcc`/`cc`, `make`, `avr-gcc`, `avr-nm`). Prints a diagnostic naming each missing tool and exits non-zero if any are absent. This target must complete successfully before any build attempt.
 2. **`make install`** — installs the compiled `avr-updi-gdb` binary to `$(PREFIX)/bin/` (default `PREFIX=/usr/local`) and the man page to `$(PREFIX)/share/man/man1/`. Creates missing intermediate directories via `install -d`. Binary installed mode 0755; man page mode 0644.
 3. **`make uninstall`** — removes `$(PREFIX)/bin/avr-updi-gdb` and `$(PREFIX)/share/man/man1/avr-updi-gdb.1` with `rm -f`. Idempotent — exits 0 even if files are already absent.
-4. **`make bundle`** — produces native distribution packages under `dist/` for three platforms:
+4. **`make bundle`** — produces native distribution packages under `dist/` for two platforms:
    - `dist/avr-updi-gdb_$(VERSION)_amd64.deb` — Debian/Ubuntu binary package built with `dpkg-deb`. Includes binary (mode 0755) and man page (mode 0644). `DEBIAN/control` declares `Package`, `Version`, `Architecture: amd64`, `Maintainer`, `Description`.
    - `dist/avr-updi-gdb-$(VERSION)-1.x86_64.rpm` — Red Hat/Fedora RPM built with `rpmbuild`. Generated `.spec` declares `Name`, `Version`, `Release`, `Summary`, `License`, `%install`, `%files`.
-   - `dist/avr-updi-gdb.rb` — Homebrew formula (macOS). Valid Ruby usable with `brew install --formula`. Declares `desc`, `homepage`, `url`, `sha256`, `version`, `license`, and an `install` block using `bin.install` / `man1.install`.
-   A `VERSION` variable (default: `git describe --tags --always`) parameterises all three package version strings.
-5. **`doc/UserManual.md`** — hand-authored user manual covering: prerequisites + minimum versions, build instructions (`make`, `make test`, `make install`), connection wiring for the UPDI serial adapter (1 kΩ resistor, TX/RX orientation), all CLI options, and at least two complete usage examples (one with `--load`, one without).
+   A `VERSION` variable (default: `git describe --tags --always`) parameterises all three package version strings. This is found in the file called `VERSION` in the project root directory
+5. **`doc/UserManual.md`** — hand-authored user manual covering: prerequisites + minimum versions, build instructions (`make`, `make test`, `make install`), connection wiring for the UPDI serial adapter (1 kΩ resistor, TX/RX orientation), all CLI options, at least two complete usage examples (one with `--load`, one without), and a desciption of how to integrate with VS Code's built in debuger.
 6. **`doc/avr-updi-gdb.1`** — Unix man page in `groff` format. Required sections: NAME, SYNOPSIS, DESCRIPTION, OPTIONS, OPERANDS, EXIT STATUS, EXAMPLES, SEE ALSO. Must parse cleanly under `man -l doc/avr-updi-gdb.1` on Linux.
 7. **`tests/test_install.c`** — 8 integration-style tests: (a) `check-tools` exits non-zero on missing tool; (b) `make install` places binary at correct prefix path; (c) `make install` places man page and it renders without error; (d) `make uninstall` removes installed files; (e) user manual exists and contains all required section headings; (f) `make bundle` produces a valid `.deb`; (g) `make bundle` produces a valid `.rpm`; (h) `make bundle` produces a valid Homebrew formula.
 
@@ -527,6 +526,52 @@ check-tools:
 | `EXAMPLES` | `avr-updi-gdb /dev/ttyUSB0 firmware.elf` and `avr-updi-gdb --load --port 1234 /dev/ttyUSB0 firmware.elf` |
 | `SEE ALSO` | `avr-gdb(1)`, `avrdude(1)` |
 
+### Phase 7 — Device-Signature Diagnostic Mode
+
+1. **`--device` CLI flag** — when present on the command line, `avr-updi-gdb` shall enter a one-shot diagnostic mode that opens the UPDI link, reads the target SIGROW and ASI status registers, prints a verbose human-readable report to `stdout`, and exits without binding the GDB listener. The `<elf-file>` operand shall be optional in this mode. Mode is mutually exclusive with `--load`; specifying both is a usage error.
+
+2. **`updi_read_device_info()`** — new public function in `src/updi.c`/`src/updi.h`. Returns a populated `UpdiDeviceInfo` struct (DEVICEID0..2, REVID, 10-byte SERNUM, ASI_SYS_STATUS, ASI_KEY_STATUS, ASI_STATUSB, and any UPDI errors encountered during the read). The function shall be non-destructive — no CPU halt and no NVM activity — and shall return 0 on success or a negative UPDI error code on failure. SIGROW is read from physical address 0x1100; REVID from SYSCFG offset 0x0F01.
+
+3. **Verbose error reporting.** Every UPDI operation invoked from `--device` mode shall, on failure, print a diagnostic line to `stderr` that names the operation, the address attempted, the bytes received (if any), and a human-readable interpretation of the UPDI status flags. The intent is that a wiring or fuse problem (UPDIDIS asserted, line stuck low, no SYNCH response) produces an actionable message rather than a silent `exit 1`.
+
+4. **Device-family lookup table.** A static table in `src/main.c` maps the 3-byte SIGROW signature to a human-readable AVR DA/DB/DD/EA part name. Unknown signatures shall be printed as `unknown device (signature %02X %02X %02X)`. The table covers at minimum: `AVR32DA28`, `AVR64DA28/32/48`, `AVR128DA28/32/48/64`, `AVR32DB28`, `AVR64DB28/32/48`, `AVR128DB28/32/48/64`.
+
+5. **Documentation updates.**
+   - `doc/UserManual.md` shall gain a new top-level section (between current §4 Command-Line Invocation and §5 Examples) describing `--device` and showing one annotated example output.
+   - `doc/avr-updi-gdb.1` shall add `--device` under OPTIONS and a third example under EXAMPLES.
+
+6. **`tests/test_device.c`** — 6 tests:
+   - (a) `parse_args` accepts `--device` and clears the `<elf-file>` mandatory-operand rule.
+   - (b) `parse_args` rejects `--device` combined with `--load` (exit 1, diagnostic on stderr).
+   - (c) `updi_read_device_info()` returns success and the expected struct fields when fed a mocked SIGROW byte stream over a PTY.
+   - (d) `updi_read_device_info()` returns a negative error code and `g_last_updi_error` carries a descriptive string when the target sends a NAK.
+   - (e) End-to-end: subprocess invocation with `--device` and a mock-PTY-backed serial device produces stdout output containing `Signature:`, `Family:`, `UPDI status:`, and `Serial:` lines.
+   - (f) The device-mode path does **not** call `rsp_listen()` (verified by linking against a stub that aborts the test if invoked).
+
+**Acceptance:** `make test` shows `tests/test_device` passing 6/6. `avr-updi-gdb --device /dev/ttyUSB0` against real hardware prints a recognisable signature and exits 0. Against a disconnected adapter the same command exits 1 with a diagnostic that explicitly names the failed UPDI operation (BREAK, SYNCH, or first CS read). `python3 tools/lint_project.py` reports 0 errors, 0 warnings after Project.xml is updated with HLR-044 and the new LLRs.
+
+**CLI synopsis after Phase 7:**
+
+```
+avr-updi-gdb [--port port] [--baud baud] [--load] <serial-device> <elf-file>
+avr-updi-gdb --device [--baud baud] <serial-device> [elf-file]
+```
+
+**Example output (real `AVR128DA48`):**
+
+```
+$ avr-updi-gdb --device /dev/ttyUSB0
+Serial device:   /dev/ttyUSB0
+Baud rate:       115200
+UPDI link:       up (SYNCH ack in 412 µs)
+Signature:       1E 97 0A
+Family:          AVR128DA48
+Revision:        A6
+Serial:          00 1A 2B 3C 4D 5E 6F 70 81 92
+UPDI status:     SYS_STATUS=0x82  KEY_STATUS=0x10  STATUSB=0x00
+NVM state:       idle, no programming key active
+```
+
 ## 9. Risks & Open Questions
 
 *   **Half-duplex echo cancellation in UPDI tests.** Every byte transmitted over the UPDI UART is echoed back on the RX line by the hardware. PTY pairs do not auto-echo, so the PTY test harness must explicitly write back the echo bytes before injecting each simulated AVR response. If this is omitted, UPDI functions will block waiting to drain echoes that never arrive, causing PTY tests to time out even though the production logic is correct.
@@ -550,6 +595,7 @@ T-shirt sizes relative to Phase 0.
 | 4 | Monitor + RSP | XL — 15 RSP handler table entries, 29 test cases, O-packet hex encoding, circular header dependency |
 | 5 | Application Entry Point + Integration | L — `main.c` itself is thin; integration test harness (fork/PTY/TCP) is the dominant effort |
 | 6 | Installation Targets + Documentation | S/M — Makefile targets are ~30 lines each; RPM spec and `.deb` control boilerplate add moderate complexity; Homebrew formula is straightforward Ruby; most effort is writing user manual and man page prose |
+| 7 | Device-Signature Diagnostic Mode | S — one new UPDI helper, one new CLI flag, a family-name lookup table, a PTY-driven test file; touches only `main.c` and `updi.c`, no protocol changes |
 
 ## 11. Out-of-Scope Follow-ups
 
