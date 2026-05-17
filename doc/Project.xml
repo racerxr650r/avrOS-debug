@@ -1,0 +1,2360 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Project.xml — single source of truth for this project's spec stack.
+  See tools/Developers_Guide.md for the schema reference.
+
+  This file was created by `render_doc.py` in init mode. Fill in the
+  payload sections (sdd, stp, hlrs, llrs, tests) as the project takes
+  shape, then regenerate the markdown specs with `render_doc.py`.
+-->
+<project name="avrOS-debug" short_name="aod" schema_version="1.3"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:noNamespaceSchemaLocation="../../../.vscode/extensions/tracer.vscode-project-xml-0.1.0/dist/python/project.xsd">
+  <metadata>
+    <document id="SDD"          title="Software Design Document"     source="doc/SDD.md"          version="0.1" date="2026-05-16" author="John Anderson"/>
+    <document id="HLRs"         title="High-Level Requirements"      source="doc/HLRs.md"         version="0.1" date="2026-05-16" author="John Anderson"/>
+    <document id="LLRs"         title="Low-Level Requirements"       source="doc/LLRs.md"         version="0.1" date="2026-05-16" author="John Anderson"/>
+    <document id="STP"          title="Software Test Plan"           source="doc/STP.md"          version="0.1" date="2026-05-16" author="John Anderson"/>
+    <document id="Traceability" title="Traceability Matrix"          source="doc/Traceability.md" version="0.1" date="2026-05-16" author="John Anderson"/>
+    <counts>
+      <count name="hlrs"       value="40"/>
+      <count name="llrs"       value="54"/>
+      <count name="tests"      value="106"/>
+      <count name="test_files" value="7"/>
+    </counts>
+  </metadata>
+
+  <!-- Software Design Document payload (see tools/Developers_Guide.md §3). -->
+  <sdd>
+    <kind>command-line GDB stub application</kind>
+    <audience>embedded application developers and toolchain integrators</audience>
+
+    <scope>
+      <intro>describes the design of the source modules that implement the avr-updi-gdb server</intro>
+      <file path="src/main.c">Entry point, CLI argument parsing, and the top-level select()-based event loop.</file>
+      <file path="src/updi.c">UPDI physical layer: UART serial management, UPDI protocol framing, NVM flash programming, and UPDI console bridge.</file>
+      <file path="src/gdb_rsp.c">GDB Remote Serial Protocol server: packet codec, command dispatch, and session lifecycle management.</file>
+      <file path="src/elf_parser.c">ELF parser: locates avrOS FLASH-resident system tables and produces the AvrOsSymbolIndex.</file>
+      <file path="src/fsm_mapper.c">avrOS FSM-to-GDB virtual thread translator: maps FSM state tables to GDB thread objects and synthesizes per-thread register frames.</file>
+      <file path="src/monitor.c">Custom monitor command handler: implements the avros events, queues, and mempool sub-commands via non-intrusive UPDI reads.</file>
+      <outro><![CDATA[It does not cover the build system, IDE adapter layers (Cortex-Debug, Zed DAP), or Windows support, all of which are out of scope for the initial release (see `doc/PVD.md §7.2`).]]></outro>
+    </scope>
+
+    <overview>
+      <para><![CDATA[`avr-updi-gdb` is a POSIX C99 GDB stub that bridges the UPDI debug interface of modern AVR microcontrollers (DA/DB families) to standard IDEs over the GDB Remote Serial Protocol (RSP). A developer launches the stub, points it at a serial device and an ELF binary, and connects any GDB-compatible front-end — VS Code with Cortex-Debug, Zed with its DAP adapter, or bare `avr-gdb` — using the standard `target extended-remote` command.]]></para>
+      <para><![CDATA[The server connects to the target via a TTL-level UART serial adapter with a 1 kΩ resistor on the UPDI line. No external JTAG programmer or proprietary debugger hardware is required — only a USB-to-serial adapter or direct Raspberry Pi UART pins.]]></para>
+      <para><![CDATA[Unlike conventional GDB stubs that expose a flat memory model, `avr-updi-gdb` provides native avrOS state-machine awareness. At attach time it parses the supplied ELF binary to locate the avrOS FSM registration tables in FLASH, then presents each registered finite state machine as a standard GDB virtual thread. The currently executing FSM appears as the active thread; all suspended FSMs appear as additional threads, each with a synthetic register frame whose PC points to the FSM's current state function pointer.]]></para>
+    </overview>
+
+    <definitions>
+      <term name="UPDI"><![CDATA[Unified Program and Debug Interface — the single-wire debug protocol used by AVR DA/DB-family microcontrollers. Carried over a UART at the configured baud rate with a 1 kΩ isolation resistor on the UPDI pin.]]></term>
+      <term name="RSP"><![CDATA[GDB Remote Serial Protocol — the text-based packet protocol that `avr-gdb` uses to communicate with a remote stub over a socket or serial link.]]></term>
+      <term name="FSM"><![CDATA[Finite State Machine — the cooperative task unit in avrOS, represented at runtime by a function pointer into a FLASH-resident state table. All FSMs share the single hardware stack.]]></term>
+      <term name="ELF"><![CDATA[Executable and Linkable Format — the binary file produced by `avr-gcc` that carries machine code, DWARF debug information, and the symbol table used to locate avrOS system tables.]]></term>
+      <term name="avrOS"><![CDATA[A cooperative real-time operating system for AVR microcontrollers. Tasks are modelled as FSMs; inter-task communication uses queues, event bitmasks, and memory pools.]]></term>
+      <term name="Virtual Thread"><![CDATA[A GDB thread object synthesized from an avrOS FSM entry. Each virtual thread has a unique GDB thread ID and a synthesized register frame whose PC is set to the FSM's current state function pointer.]]></term>
+      <term name="Harvard Architecture"><![CDATA[The AVR memory model, in which FLASH (program memory) and SRAM (data memory) occupy separate address spaces. ELF virtual addresses must be converted to physical FLASH word addresses during symbol resolution.]]></term>
+    </definitions>
+
+    <references>
+      <ref><![CDATA[Product Vision Document: [doc/PVD.md](PVD.md)]]></ref>
+      <ref><![CDATA[GDB Remote Serial Protocol: https://sourceware.org/gdb/current/onlinedocs/gdb.html/Remote-Protocol.html]]></ref>
+      <ref><![CDATA[Microchip AVR UPDI Programming Reference (AN3272): https://www.microchip.com/en-us/application-notes/an3272]]></ref>
+      <ref><![CDATA[System V ABI ELF Specification: https://refspecs.linuxfoundation.org/elf/elf.pdf]]></ref>
+      <ref><![CDATA[AVR-LibC Reference Manual: https://avrdudes.github.io/avr-libc/]]></ref>
+    </references>
+
+    <architecture>
+      <intro><![CDATA[`avr-updi-gdb` is a single-process C99 application. Responsibilities are divided into six source modules arranged in protocol layers: an entry-point and event-loop layer, a hardware layer (UPDI), a network layer (GDB RSP), and three application-layer modules (ELF parser, FSM mapper, monitor handler).
+
+**Concurrency model:** The application is entirely single-threaded. All I/O multiplexing is performed by a single `select()` call inside `event_loop()`. No POSIX threads (`pthreads`) are used at any point. All module entry points are called synchronously and must return before the next I/O event can be processed. Long-blocking operations (e.g., NVM flash write, UPDI link initialisation) are therefore only permitted at startup or in response to explicit GDB commands, never in the event-loop hot path.
+
+**Inter-module data flow:**
+
+| Producing module | Data produced | Consuming module |
+| ---------------- | ------------- | ---------------- |
+| `src/main.c` | `AppConfig` (argv, fd values) | All modules (passed by pointer at init) |
+| `src/updi.c` | Raw target memory bytes, execution-control status | `src/gdb_rsp.c`, `src/fsm_mapper.c`, `src/monitor.c` |
+| `src/elf_parser.c` | `AvrOsSymbolIndex` (resolved FLASH/SRAM addresses) | `src/fsm_mapper.c`, `src/monitor.c` |
+| `src/fsm_mapper.c` | `FsmContext` (virtual thread list, synthesized register frames) | `src/gdb_rsp.c` |
+| `src/monitor.c` | Formatted O-packet text | `src/gdb_rsp.c` (via `rsp_send_packet()`) |
+| `src/gdb_rsp.c` | Decoded RSP packet payload strings, thread-selection state | `src/updi.c`, `src/fsm_mapper.c`, `src/monitor.c` |
+
+**Resource ownership:**
+
+| Resource | Owner module | Lifetime | Open call | Close call |
+| -------- | ------------ | -------- | --------- | ---------- |
+| UART serial fd | `src/updi.c` | Process | `updi_open()` | `updi_close()` |
+| GDB TCP listen socket | `src/gdb_rsp.c` | Process | `rsp_listen()` | `rsp_close()` |
+| GDB TCP client socket | `src/gdb_rsp.c` | Session | `rsp_accept()` | detach / `rsp_close()` |
+| ELF file descriptor + heap buffers | `src/elf_parser.c` | Session | `elf_open()` | `elf_close()` |
+| `FsmContext` static array | `src/fsm_mapper.c` | Session | `fsm_build_thread_list()` | `fsm_invalidate()` |
+| `AppConfig` struct | `src/main.c` (stack) | Process | `parse_args()` | implicit on `main()` return |]]></intro>
+      <component path="src/main.c"><![CDATA[Entry point; owns the top-level `select()`-based event loop and coordinates all other layers.]]></component>
+      <component path="src/updi.c"><![CDATA[UPDI physical layer; owns the UART serial file descriptor, UPDI protocol framing, execution-control primitives (halt, run, step), NVM flash programming, and the UPDI console bridge.]]></component>
+      <component path="src/gdb_rsp.c"><![CDATA[GDB RSP layer; owns the GDB TCP socket, RSP packet codec, and command dispatch table.]]></component>
+      <component path="src/elf_parser.c"><![CDATA[ELF parser; produces the `AvrOsSymbolIndex` (FLASH addresses of avrOS system tables) at attach time.]]></component>
+      <component path="src/fsm_mapper.c"><![CDATA[FSM mapper; reads UPDI memory using the symbol index and exposes avrOS FSMs as GDB virtual threads.]]></component>
+      <component path="src/monitor.c"><![CDATA[Monitor handler; implements the custom `monitor avros events|queues|mempool` introspection commands without halting the CPU.]]></component>
+      <flow>
+        <intro>The startup and attach sequence proceeds as follows:</intro>
+        <step><![CDATA[`main()` parses argv, opens the UART serial device, and starts the GDB TCP listener socket.]]></step>
+        <step><![CDATA[A GDB client connects; the RSP layer sends the initial hello and negotiates capabilities via `qSupported`.]]></step>
+        <step><![CDATA[On the first `vAttach` or `?` packet, the ELF parser scans the supplied `.elf` file and populates the `AvrOsSymbolIndex` with avrOS FSM table addresses.]]></step>
+        <step>The FSM mapper reads the FLASH-resident tables via UPDI background reads and builds the virtual thread list.</step>
+        <step><![CDATA[Subsequent GDB packets (register reads, memory reads, breakpoints, step/continue) are dispatched through the RSP layer to the UPDI layer.]]></step>
+        <step><![CDATA[`monitor avros` commands are intercepted by the monitor handler, which issues UPDI background reads without halting the CPU core.]]></step>
+      </flow>
+    </architecture>
+
+    <design_goals>
+      <goal name="FSM-First Visualization"><![CDATA[Virtual threads map 1-to-1 to avrOS FSM table entries. The server never attempts to unwind dormant stack frames; execution context is defined solely by the FSM's current state function pointer.]]></goal>
+      <goal name="Lean Host Architecture"><![CDATA[The server is a single C99 process. Runtime dependencies are limited to libc and the POSIX serial and socket APIs. No Java, Python virtualization, or Electron runtime is required on the host.]]></goal>
+      <goal name="Editor-Agnostic Core"><![CDATA[The server exposes only standard GDB RSP. IDE-specific integration (Cortex-Debug, Zed DAP adapter) is handled entirely by the GDB client; the server does not implement any IDE extension protocol.]]></goal>
+      <goal name="Non-Intrusive Polling"><![CDATA[`monitor avros` commands use UPDI background reads, which can be issued while the CPU is running. The core is halted only by an explicit user breakpoint or a step/continue boundary.]]></goal>
+      <goal name="Fail-Safe Address Resolution"><![CDATA[If ELF symbol resolution fails to locate the avrOS system tables, the server degrades gracefully to a standard bare-metal GDB stub rather than refusing to connect.]]></goal>
+      <goal name="Single-Threaded Concurrency Model"><![CDATA[The server uses a single POSIX `select()` event loop with no POSIX threads. All module entry points are synchronous and return to the event loop promptly. Long-blocking operations (NVM programming, UPDI link initialisation) are permitted only at startup or in direct response to an explicit GDB command, never during the event-loop hot path.]]></goal>
+      <goal name="Deterministic Memory Allocation"><![CDATA[Static and stack allocation are used for all hot-path data structures (`AppConfig`, `FsmContext`, RSP packet buffers, breakpoint table). The only heap (`malloc`) usage is in `elf_open()` to load the ELF symbol and string tables; this allocation is bounded by the size of the ELF binary and occurs once per session at attach time. `elf_close()` frees all heap memory on detach.]]></goal>
+      <goal name="POSIX C99 Build"><![CDATA[The stub is compiled with a host C99 compiler (gcc ≥ 4.8 or clang ≥ 3.4) against the POSIX.1-2008 API. No compiler-specific extensions, no C11 atomics, and no dynamic libraries beyond libc are required. The Makefile produces a standalone executable with no runtime package dependencies.]]></goal>
+      <goal name="Modular Test Isolation"><![CDATA[Each module exposes a public C API declared in a matching `.h` header. The UPDI layer can be exercised against a loopback serial device or pre-recorded byte stream. The ELF parser and FSM mapper can be driven against any AVR ELF binary without live hardware. The RSP layer can be tested over a loopback TCP socket. No module requires a live AVR target to run its unit tests.]]></goal>
+    </design_goals>
+
+    <modules>
+      <module path="src/main.c">
+        <purpose><![CDATA[is the entry point for the `avr-updi-gdb` executable, providing CLI argument parsing, resource initialization, and the top-level `select()`-based event loop that multiplexes the GDB client socket and the UPDI serial device.]]></purpose>
+        <responsibility><![CDATA[Define `main()` and parse command-line arguments into an `AppConfig` struct.]]></responsibility>
+        <responsibility>Open the UART serial device and pass the file descriptor to the UPDI layer.</responsibility>
+        <responsibility>Create the GDB listener socket and pass it to the RSP layer.</responsibility>
+        <responsibility><![CDATA[Run the event loop, dispatching each ready file descriptor to the appropriate layer until the GDB client disconnects.]]></responsibility>
+        <responsibility>Release all resources on exit and return an appropriate exit code.</responsibility>
+        <interfaces>
+          <interface title="Public C API"><![CDATA[`src/main.c` has no exported public API; all functions are `static` or `main()` itself. It is the top-level consumer of all other module APIs. The only externally visible symbol is:
+
+```c
+extern volatile sig_atomic_t g_quit;  /* set to 1 by SIGINT/SIGTERM handler */
+```
+
+This variable is checked at the top of each `event_loop()` iteration and is also accessible to any module that needs to detect a shutdown-in-progress condition.]]></interface>
+          <interface title="Command-Line Arguments"><![CDATA[`avr-updi-gdb [--port <port>] [--baud <baud>] [--load] <serial-device> <elf-file>`
+
+*   `--port <port>` — TCP port for the GDB listener (default: `1234`).
+*   `--baud <baud>` — UART baud rate (default: `115200`).
+*   `--load` — flash the ELF binary to the target before attaching.
+*   `<serial-device>` — path to the UART device (e.g. `/dev/ttyUSB0`).
+*   `<elf-file>` — path to the AVR ELF binary.]]></interface>
+        </interfaces>
+        <data_structures><![CDATA[The event loop multiplexes three file descriptors using POSIX `select()`:
+
+*   **`int listen_fd`** — passive TCP listener socket; present in `fd_set` at all times.
+*   **`int gdb_fd`** — active GDB client socket; `-1` when no client is connected; added to `fd_set` only while a session is active.
+*   **`int updi_fd`** — UART serial device; added to `fd_set` while a GDB session is active to forward unsolicited console traffic.
+
+All three file descriptors are stored directly in `AppConfig`. The maximum fd value is recomputed before each `select()` call to keep the fd_set range tight.]]></data_structures>
+        <functions>
+          <function signature="int main(int argc, char *argv[])"
+                    summary="Parse argv, open resources, run the event loop, and return an exit code."/>
+          <function signature="static void parse_args(int argc, char *argv[], AppConfig *cfg)"
+                    summary="Walk argv and populate cfg; print usage to stderr and exit on error."/>
+          <function signature="static void event_loop(AppConfig *cfg)">
+            <purpose>Run the top-level select()-based multiplexer until the process receives a termination signal.</purpose>
+            <pre><![CDATA[`cfg->listen_fd` and `cfg->updi_fd` are valid open file descriptors; `cfg->gdb_fd` is -1.]]></pre>
+            <logic>
+              <step><![CDATA[Build an `fd_set` from `listen_fd` and, when `gdb_fd >= 0`, from `gdb_fd` and `updi_fd`.]]></step>
+              <step><![CDATA[Call `select()` with no timeout; block until at least one descriptor becomes readable.]]></step>
+              <step><![CDATA[If `listen_fd` is ready and `gdb_fd` is -1, call `rsp_accept()` to accept the incoming GDB client; store the returned fd in `cfg->gdb_fd` and call `elf_find_avros_tables()` / `fsm_build_thread_list()` to initialise the session.]]></step>
+              <step><![CDATA[If `updi_fd` is ready, call `updi_console_poll()` and write any returned bytes to `stdout`.]]></step>
+              <step><![CDATA[If `gdb_fd` is ready, call `rsp_recv_packet()` followed by `rsp_dispatch()`; on a zero-byte read (client disconnect) close `gdb_fd` and reset it to -1.]]></step>
+              <step>Repeat until a SIGINT or SIGTERM is caught, then fall through to resource cleanup.</step>
+            </logic>
+          </function>
+        </functions>
+        <algorithm><![CDATA[**Signal handling:** `main()` registers a `SIGINT`/`SIGTERM` handler that sets a global `volatile sig_atomic_t g_quit` flag. The `event_loop()` tests this flag at the top of each iteration and returns cleanly, allowing `main()` to call `updi_close()`, `rsp_close()`, and `elf_close()` before `exit(0)`.
+
+If the `--load` flag is set, `main()` invokes `updi_nvm_write_flash()` for each ELF `PT_LOAD` segment before entering `event_loop()`. A progress line is printed to `stdout` for each FLASH page written.
+
+**Exit code table:**
+
+| Exit code | Condition |
+| --------- | --------- |
+| `0` | Normal exit after SIGINT/SIGTERM or GDB `k` (kill) packet. |
+| `1` | Fatal startup error: bad arguments, serial device open failure, or socket bind failure. |
+| `1` | `--load` flash write failure (UPDI error or write-protection). |
+
+**Resource teardown sequence** (guaranteed order on all exit paths):
+
+1.  `rsp_close(cfg.gdb_fd)` — close the active client socket if present.
+2.  `rsp_close(cfg.listen_fd)` — close the listener socket.
+3.  `elf_close(&ctx)` — free ELF heap buffers and close ELF file descriptor.
+4.  `updi_close(cfg.updi_fd)` — drain and close the serial port.
+5.  `return exit_code` from `main()`.
+
+**Test approach for `src/main.c`:** Integration-level only. Verified by launching the compiled binary with valid and invalid argument combinations and checking exit codes and stderr output. Full session flow is tested by driving a GDB client script against a loopback serial device.]]></algorithm>
+        <dependencies>
+          <dep><![CDATA[`src/updi.c` — `updi_open()` / `updi_close()` / `updi_console_poll()`]]></dep>
+          <dep><![CDATA[`src/gdb_rsp.c` — `rsp_listen()` / `rsp_accept()` / `rsp_recv_packet()` / `rsp_dispatch()` / `rsp_close()`]]></dep>
+          <dep><![CDATA[`src/elf_parser.c` — `elf_open()` / `elf_find_avros_tables()` / `elf_close()`]]></dep>
+          <dep><![CDATA[`src/fsm_mapper.c` — `fsm_build_thread_list()`]]></dep>
+        </dependencies>
+        <error_handling>
+          <case name="Missing or invalid arguments"><![CDATA[Print usage string to `stderr` and `exit(1)`.]]></case>
+          <case name="Serial device open failure"><![CDATA[Print `strerror(errno)` to `stderr` and `exit(1)`.]]></case>
+          <case name="GDB socket bind failure"><![CDATA[Print `strerror(errno)` to `stderr` and `exit(1)`.]]></case>
+          <case name="--load flash write failure"><![CDATA[Print the UPDI error message to `stderr` and `exit(1)`; the target is left in an indeterminate state.]]></case>
+        </error_handling>
+      </module>
+
+      <module path="src/updi.c">
+        <purpose><![CDATA[implements the UPDI physical layer, managing the UART serial port and encoding/decoding UPDI protocol frames for memory access, execution control, NVM flash programming, and UPDI-based console bridging.]]></purpose>
+        <responsibility>Open, configure (8N2, half-duplex), and close the UART serial device.</responsibility>
+        <responsibility><![CDATA[Encode and transmit UPDI commands (`STCS`, `LDCS`, `ST`, `LD`, `KEY`, `REPEAT`) over the UART.]]></responsibility>
+        <responsibility>Receive UPDI response frames and validate ACK/NAK bytes.</responsibility>
+        <responsibility>Provide non-intrusive background memory reads while the CPU is running.</responsibility>
+        <responsibility>Implement NVM write sequences for FLASH page erase and program.</responsibility>
+        <responsibility>Export execution-control primitives: halt, run, and single-step.</responsibility>
+        <responsibility>Bridge the avrOS software UART console channel to host stdout for CLI and automated test use.</responsibility>
+        <interfaces>
+          <interface title="Public C API (src/updi.h)"><![CDATA[All functions exported from `src/updi.c` and declared in `src/updi.h`:
+
+```c
+/* Lifecycle */
+int  updi_open(const char *device, int baud);
+void updi_close(int fd);
+
+/* Memory access */
+int  updi_mem_read (int fd, uint32_t addr,       uint8_t *buf, size_t len);
+int  updi_mem_write(int fd, uint32_t addr, const uint8_t *buf, size_t len);
+
+/* Execution control */
+int  updi_halt(int fd);
+int  updi_run (int fd);
+int  updi_step(int fd);
+
+/* NVM programming */
+int  updi_nvm_write_flash(int fd, uint32_t word_addr,
+                          const uint8_t *data, size_t len);
+
+/* Console bridge */
+int  updi_console_poll(int fd, char *buf, size_t cap);
+```
+
+Error return convention: all functions return 0 on success and -1 on error (errno not set); `updi_nvm_write_flash()` additionally returns `UPDI_ERR_WP` (-2) when FLASH write-protection is active.]]></interface>
+          <interface title="Hardware Connection"><![CDATA[Half-duplex UART at the configured baud rate (default 115200). The AVR UPDI pin is connected to both TX and RX on the host adapter through a 1 kΩ isolation resistor. The UPDI protocol requires 8N2 framing (8 data bits, no parity, 2 stop bits).]]></interface>
+        </interfaces>
+        <data_structures><![CDATA[UPDI protocol constants used throughout the module:
+
+| Constant | Value | Description |
+| -------- | ----- | ----------- |
+| `UPDI_SYNCH`       | `0x55` | UPDI synchronisation character sent after BREAK. |
+| `UPDI_ACK`         | `0x40` | Acknowledgement byte returned by the target after each data byte. |
+| `UPDI_MAX_BLOCK`   | `256`  | Maximum bytes transferred in a single REPEAT+LD/ST burst. |
+| `UPDI_BREAK_BAUD`  | `300`  | Temporary baud rate used to generate the BREAK condition. |
+
+UPDI ASI (Application System Interface) registers used for execution control:
+
+| Register | Offset | Description |
+| -------- | ------ | ----------- |
+| `ASI_SYS_STATUS` | `0x0B` | System status; bit 3 = STOPPED (CPU halted). |
+| `ASI_SYS_CTRL`   | `0x0C` | System control; bit 5 = CLKREQ. |
+| `ASI_RESET_REQ`  | `0x08` | Write `0x59` to request CPU reset; write `0x00` to release. |
+| `ASI_CTRLA`      | `0x02` | UPDI control register A; bit 2 = IBD (inter-byte delay enable). |
+
+NVM controller registers (accessed via UPDI ST/LD at base address `0x1000`):
+
+| Register | Offset | Description |
+| -------- | ------ | ----------- |
+| `NVMCTRL_CTRLA`  | `0x00` | NVM command register; write command code to initiate NVM operation. |
+| `NVMCTRL_STATUS` | `0x02` | Status register; bit 0 = BUSY. |]]></data_structures>
+        <functions>
+          <function signature="int updi_open(const char *device, int baud)"
+                    summary="Open and configure the serial port for UPDI; return fd or -1 on error."/>
+          <function signature="void updi_close(int fd)"
+                    summary="Drain pending output and close the serial port."/>
+          <function signature="int updi_mem_read(int fd, uint32_t addr, uint8_t *buf, size_t len)">
+            <purpose>Read len bytes from target address addr via UPDI LD commands; supports both SRAM and FLASH address spaces.</purpose>
+            <pre><![CDATA[`fd` is a valid UPDI serial file descriptor; `buf` points to a caller-allocated buffer of at least `len` bytes; the UPDI link has been initialised by `updi_open()`.]]></pre>
+            <post>On success, `buf` contains the verbatim target memory contents at the requested address range.</post>
+            <returns>0 on success; -1 on UART framing error, timeout, or UPDI NAK.</returns>
+            <logic>
+              <step><![CDATA[If `len` is greater than `UPDI_MAX_BLOCK`, split the read into consecutive transactions each transferring up to `UPDI_MAX_BLOCK` bytes.]]></step>
+              <step><![CDATA[For each block: transmit SYNCH byte (`0x55`), the REPEAT opcode with count `(block_len - 1)`, then the LD (pointer auto-increment) opcode and the 16-bit address in little-endian order.]]></step>
+              <step>Read `block_len` response bytes from the UART into the destination buffer, accumulating ACK bytes between data bytes as required by the UPDI framing spec.</step>
+              <step><![CDATA[Return -1 immediately on any `read()` timeout (no byte received within 100 ms) or on a framing error (unexpected byte in place of ACK).]]></step>
+            </logic>
+          </function>
+          <function signature="int updi_mem_write(int fd, uint32_t addr, const uint8_t *buf, size_t len)"
+                    summary="Write len bytes to target address addr via UPDI ST; return 0 or -1."/>
+          <function signature="int updi_halt(int fd)">
+            <purpose>Halt the CPU core by asserting the UPDI ASI halt request and polling until STOPPED.</purpose>
+            <returns>0 when the CPU reports STOPPED within 50 ms; -1 on timeout or UPDI error.</returns>
+            <logic>
+              <step>Write `0x01` to `ASI_SYS_CTRL` to request a halt via the STCS opcode.</step>
+              <step><![CDATA[Poll `ASI_SYS_STATUS` via LDCS at 1 ms intervals until bit 3 (STOPPED) is set or 50 ms elapses.]]></step>
+              <step>Return 0 on success; return -1 on timeout.</step>
+            </logic>
+          </function>
+          <function signature="int updi_run(int fd)"
+                    summary="Resume CPU execution; return 0 or -1."/>
+          <function signature="int updi_step(int fd)"
+                    summary="Single-step one instruction and halt; return 0 or -1."/>
+          <function signature="int updi_nvm_write_flash(int fd, uint32_t word_addr, const uint8_t *data, size_t len)">
+            <purpose>Erase and program one or more FLASH pages starting at word_addr using the UPDI NVM controller write-page sequence.</purpose>
+            <pre><![CDATA[Target CPU is halted (`updi_halt()` has been called); `word_addr` is aligned to a FLASH page boundary; `len` is a non-zero multiple of the target FLASH page size (512 bytes for AVR DA/DB).]]></pre>
+            <returns><![CDATA[0 on success; -1 on NVM timeout or UPDI communication error; `UPDI_ERR_WP` (a distinct negative constant) if FLASH write protection is detected in `NVMCTRL_STATUS`.]]></returns>
+            <logic>
+              <step><![CDATA[Enter NVM programming mode: transmit the UPDI KEY command with the 8-byte NVM key string `"NVMProg "`.]]></step>
+              <step><![CDATA[Poll `ASI_SYS_STATUS` until bit 4 (NVMPROG) is set; timeout after 100 ms.]]></step>
+              <step><![CDATA[For each FLASH page: write the page-sized data block via `updi_mem_write()` using a REPEAT+ST burst to the target page buffer address.]]></step>
+              <step>Issue the NVMCTRL ERWP (Erase + Write Page) command: write the command code `0x03` to `NVMCTRL_CTRLA`.</step>
+              <step><![CDATA[Poll `NVMCTRL_STATUS` bit 0 (BUSY) until clear; timeout after 20 ms per page.]]></step>
+              <step><![CDATA[Check `NVMCTRL_STATUS` bit 2 (WRERROR); if set, return `UPDI_ERR_WP`.]]></step>
+              <step>After all pages are written, exit NVM mode by writing the UPDI LDCS/STCS sequence to clear NVMPROG.</step>
+            </logic>
+          </function>
+          <function signature="int updi_console_poll(int fd, char *buf, size_t cap)"
+                    summary="Poll the UPDI console channel and copy any pending bytes to buf; return byte count or -1."/>
+        </functions>
+        <algorithm><![CDATA[**UPDI link initialisation sequence (performed inside `updi_open()`):**
+
+1.  Open the serial port with `O_RDWR | O_NOCTTY | O_NONBLOCK`; apply `fcntl()` to restore blocking mode with a 100 ms read timeout via `VTIME`.
+2.  Configure `termios` for raw 8N2 mode: `cfmakeraw()`, set 2 stop bits (`CSTOPB`), disable parity, disable flow control, and apply `cfsetispeed()` / `cfsetospeed()` for the operating baud rate.
+3.  Generate a BREAK condition: temporarily lower the baud rate to 300 baud, write a single `0x00` byte (which occupies the line for ≥ 24.6 µs — the UPDI minimum break duration), then flush and restore the operating baud rate.
+4.  Transmit the SYNCH byte (`0x55`) and discard the half-duplex loopback echo.
+5.  Transmit an `LDCS ASI_SYS_STATUS` command and read the response byte; verify the target is reachable. Retry the BREAK+SYNCH sequence up to three times before returning -1.
+
+**Half-duplex echo cancellation:** Because TX and RX share the same physical wire, every transmitted byte is echoed back on the RX line. All UPDI transmit helpers skip one echo byte per transmitted byte before reading response data.
+
+**UPDI timing budget:**
+
+| Operation | Timeout | Notes |
+| --------- | ------- | ----- |
+| `read()` per byte | 100 ms (`VTIME=1`) | Applied via `termios` `VTIME`; any idle gap triggers a framing error. |
+| `updi_halt()` poll interval | 1 ms | `nanosleep(1 ms)` between `LDCS ASI_SYS_STATUS` reads. |
+| `updi_halt()` total timeout | 50 ms | Returns -1 if CPU does not enter STOPPED state within 50 polls. |
+| `updi_nvm_write_flash()` NVMPROG wait | 100 ms | Timeout on `ASI_SYS_STATUS` bit 4 (NVMPROG). |
+| `updi_nvm_write_flash()` page BUSY poll | 20 ms per page | Timeout on `NVMCTRL_STATUS` bit 0 (BUSY). |
+| BREAK condition duration | ≥ 24.6 µs | One `0x00` byte at 300 baud = 33.3 µs; safely exceeds UPDI minimum. |
+
+**UPDI command opcode encoding:** Each command frame begins with the SYNCH byte `0x55` followed by a command byte. Key opcodes:
+
+| Opcode mnemonic | Byte value | Purpose |
+| --------------- | ---------- | ------- |
+| `LDCS rd, cs`   | `0x80\|cs` | Load Control/Status register `cs`. |
+| `STCS cs, rr`   | `0xC0\|cs` | Store to Control/Status register `cs`. |
+| `ST ptr++, rr`  | `0x64`     | Store with pointer post-increment (burst write). |
+| `LD rd, ptr++`  | `0x24`     | Load with pointer post-increment (burst read). |
+| `REPEAT`        | `0xA0`     | Set repeat count for next bulk transfer (n-1 in operand). |
+| `KEY`           | `0xE0`     | Transmit 8-byte key to unlock a privileged mode. |
+
+**Test approach for `src/updi.c`:** Unit-testable using a POSIX pseudo-terminal pair (`openpty()`): one end is passed to `updi_open()`, the other is driven by the test harness. Test cases cover: correct SYNCH/ACK exchange, BREAK regeneration, echo-cancellation correctness, block-split boundary at `UPDI_MAX_BLOCK`, halt-timeout expiry, NVM ERWP sequence byte order, and `UPDI_ERR_WP` detection.]]></algorithm>
+        <dependencies>
+          <dep><![CDATA[POSIX `termios` serial API (`tcgetattr`, `tcsetattr`, `cfsetspeed`, `cfmakeraw`).]]></dep>
+          <dep><![CDATA[Standard POSIX file I/O (`open`, `read`, `write`, `close`, `fcntl`, `tcdrain`).]]></dep>
+        </dependencies>
+        <error_handling>
+          <case name="UART framing error or UPDI NAK">Return -1 to the caller; the caller decides whether to retry or abort the session.</case>
+          <case name="NVM write protection"><![CDATA[Return `UPDI_ERR_WP` so the caller can report `"Flash write-protected"` to the GDB console.]]></case>
+          <case name="UPDI link lost mid-session"><![CDATA[Any `read()` returning 0 or any unexpected byte sequence causes the current operation to return -1; the RSP layer then sends a GDB error packet and awaits the next client command.]]></case>
+        </error_handling>
+      </module>
+
+      <module path="src/gdb_rsp.c">
+        <purpose><![CDATA[implements the GDB Remote Serial Protocol server, accepting a single GDB client connection on a TCP port, decoding RSP packets, dispatching them to command handlers, and encoding response packets.]]></purpose>
+        <responsibility>Bind and accept a single GDB client connection on the configured TCP port.</responsibility>
+        <responsibility><![CDATA[Decode incoming RSP packets (`$<data>#<checksum>`), verify checksums, and send ACK (`+`) or NAK (`-`).]]></responsibility>
+        <responsibility>Dispatch decoded packets to command handlers for register access, memory access, breakpoints, step/continue, and monitor commands.</responsibility>
+        <responsibility>Encode and transmit RSP response packets.</responsibility>
+        <responsibility><![CDATA[Handle lifecycle packets: `qSupported`, `qAttached`, `vAttach`, `D` (detach), and `k` (kill).]]></responsibility>
+        <interfaces>
+          <interface title="Public C API (src/gdb_rsp.h)"><![CDATA[All functions exported from `src/gdb_rsp.c` and declared in `src/gdb_rsp.h`:
+
+```c
+/* Lifecycle */
+int  rsp_listen(uint16_t port);      /* create + bind + listen; return fd or -1 */
+int  rsp_accept(int listen_fd);      /* block until client; return client fd */
+void rsp_close (int fd);             /* close client or listen fd */
+
+/* Packet codec */
+int  rsp_recv_packet(int fd, char *buf, size_t cap);
+    /* Returns: payload byte count; 0 on disconnect; -1 on error */
+int  rsp_send_packet(int fd, const char *payload);
+    /* Returns: 0 on success; -1 on write error */
+
+/* Dispatch */
+void rsp_dispatch(int fd, const char *packet, RspHandlers *h);
+```
+
+The `RspHandlers` struct is also declared in `src/gdb_rsp.h` and must be populated by the caller before passing to `rsp_dispatch()`. Socket options applied by `rsp_listen()`: `SO_REUSEADDR` (allow rapid server restart) and `TCP_NODELAY` (disable Nagle algorithm to minimise GDB round-trip latency).]]></interface>
+          <interface title="GDB Network Interface"><![CDATA[TCP server socket on the configured port (default `1234`). Accepts exactly one client connection at a time; a new connection is accepted after the previous client detaches.]]></interface>
+        </interfaces>
+        <data_structures><![CDATA[**`RspHandlers`** — Function pointer table dispatched by `rsp_dispatch()`. Each handler receives the raw packet payload string, the client socket fd, and a pointer to the shared application context.
+
+| Field | Packet(s) handled | Description |
+| ----- | ----------------- | ----------- |
+| `on_halt_reason`  | `?`                       | Stop-reason query; returns `T05thread:<id>;` |
+| `on_read_regs`    | `g`                       | Read all 35 AVR registers as hex. |
+| `on_write_regs`   | `G`                       | Write all registers (used by GDB for register restore). |
+| `on_read_mem`     | `m addr,len`              | Read memory; dispatches to UPDI for both FLASH and SRAM addresses. |
+| `on_write_mem`    | `M addr,len:data`         | Write memory via UPDI ST. |
+| `on_continue`     | `c`, `vCont;c`            | Resume target; calls `updi_run()` and `fsm_invalidate()`. |
+| `on_step`         | `s`, `vCont;s`            | Single-step; calls `updi_step()`. |
+| `on_insert_bp`    | `Z0 addr,kind`            | Insert software breakpoint by patching FLASH with AVR BREAK opcode. |
+| `on_remove_bp`    | `z0 addr,kind`            | Remove software breakpoint by restoring the saved instruction word. |
+| `on_thread_info`  | `qfThreadInfo`/`qsThreadInfo` | Enumerate virtual thread IDs from `FsmContext`. |
+| `on_thread_extra` | `qThreadExtraInfo`        | Return FSM name string as hex-encoded ASCII. |
+| `on_monitor`      | `qRcmd`                   | Hex-decode the command body and forward to `monitor_dispatch()`. |
+| `on_detach`       | `D`, `k`                  | Detach: resume target and close client fd. |
+
+**Breakpoint table:** `RSP_MAX_BREAKPOINTS` (16) software breakpoint slots are maintained as a static array of `{ uint32_t addr; uint16_t saved_word; }` structures. The AVR BREAK opcode (`0x9598`) is written to the target via `updi_nvm_write_flash()` on insertion and the saved instruction word is restored on removal.
+
+**Packet buffer:** `RSP_PACKET_MAX` (2048 bytes) is the compile-time maximum for a single RSP payload, sized to accommodate a full AVR `g`-packet response (35 registers × 2 hex chars/byte = 70 bytes) plus worst-case `qXfer` memory-map XML overhead.]]></data_structures>
+        <functions>
+          <function signature="int rsp_listen(uint16_t port)"
+                    summary="Create, bind, and listen on the GDB TCP socket; return the listen fd or -1."/>
+          <function signature="int rsp_accept(int listen_fd)"
+                    summary="Block until a GDB client connects; return the client fd."/>
+          <function signature="int rsp_recv_packet(int fd, char *buf, size_t cap)">
+            <purpose>Read one complete RSP packet from the client socket into buf, verify its checksum, and send ACK or NAK.</purpose>
+            <pre><![CDATA[`fd` is a connected GDB client socket; `buf` points to a caller-allocated buffer of at least `cap` bytes; `cap` is at least `RSP_PACKET_MAX`.]]></pre>
+            <post>On success, `buf` holds the null-terminated payload string (between `$` and `#`); the checksum bytes have been consumed from the socket.</post>
+            <returns>Number of payload bytes written to buf on success; 0 on client disconnect; -1 on checksum mismatch (NAK sent) or socket error.</returns>
+            <logic>
+              <step><![CDATA[Read bytes one at a time until `$` is received; discard any `+`/`-` ACK/NAK bytes that precede it.]]></step>
+              <step><![CDATA[Accumulate payload bytes into `buf`, computing a running XOR checksum, until `#` is received.]]></step>
+              <step>Read the two ASCII hex checksum bytes that follow `#` and parse them to a single byte value.</step>
+              <step><![CDATA[Compare computed checksum to received checksum. On match, write `+` to `fd` and return payload length. On mismatch, write `-` to `fd` and return -1.]]></step>
+            </logic>
+          </function>
+          <function signature="int rsp_send_packet(int fd, const char *payload)"
+                    summary="Frame payload as an RSP packet and transmit; return 0 or -1."/>
+          <function signature="void rsp_dispatch(int fd, const char *packet, RspHandlers *h)">
+            <purpose>Identify the RSP packet type from the first character (and optionally subsequent characters) of packet and invoke the matching handler in h.</purpose>
+            <logic>
+              <step><![CDATA[Match the leading characters of `packet` against the handler table using a switch on `packet[0]` with secondary string comparisons for multi-character commands (`qS`, `qf`, `vC`, `Z0`, `z0`).]]></step>
+              <step>Invoke the matching handler function pointer from `h`, passing `fd`, `packet`, and the shared application context pointer.</step>
+              <step><![CDATA[If no handler matches, call `rsp_send_packet(fd, "")` to send the mandatory empty response `$#00`.]]></step>
+            </logic>
+            <notes><![CDATA[`qSupported` and `qAttached` are handled inline (not via the `RspHandlers` table) because their responses are fixed strings that do not require target interaction.]]></notes>
+          </function>
+        </functions>
+        <algorithm><![CDATA[**RSP packet codec:**
+
+*Reception* (`rsp_recv_packet`): reads bytes until `$`, then accumulates payload until `#`, then reads two hex checksum digits. Computes XOR of all payload bytes. Sends `+` on match, `-` on mismatch. After `QStartNoAckMode` is negotiated, the server stops sending `+`/`-` as the client will not retransmit.
+
+*Transmission* (`rsp_send_packet`): computes XOR checksum over the payload string, formats the frame as `$<payload>#<XX>` and writes it in a single `write()` call to minimise TCP segment fragmentation.
+
+**Capability negotiation:** On the `qSupported` packet the server replies with the feature string `"PacketSize=800;QStartNoAckMode+;multiprocess-;vContSupported+"`. The server enables no-ack mode immediately upon receiving `QStartNoAckMode+`.
+
+**Thread context:** GDB selects a thread with `Hg<tid>` and `Hc<tid>`. The server stores the selected thread IDs in `RspHandlers.g_thread` and `RspHandlers.c_thread`. Register reads use `g_thread`; continue/step use `c_thread`.
+
+**Static memory layout of `src/gdb_rsp.c`:**
+
+| Variable | Type | Size | Purpose |
+| -------- | ---- | ---- | ------- |
+| `pkt_buf[RSP_PACKET_MAX]` | `char[2048]` | 2 KiB | Receive buffer for one RSP packet payload. |
+| `rsp_buf[RSP_PACKET_MAX+8]` | `char[2056]` | 2 KiB | Transmit buffer: framed `$payload#XX`. |
+| `bp_table[RSP_MAX_BREAKPOINTS]` | `struct { uint32_t addr; uint16_t saved_word; }[16]` | 96 B | Software breakpoint table. |
+| `g_thread`, `c_thread` | `int` | 8 B | Selected GDB thread IDs for register and continue operations. |
+
+Total static BSS in `src/gdb_rsp.c`: approximately 4.2 KiB.
+
+**TCP socket options applied by `rsp_listen()`:**
+
+*   `SO_REUSEADDR` — allows rapid server restart without waiting for TIME_WAIT to expire.
+*   `TCP_NODELAY` — disables Nagle's algorithm; each `write()` is sent immediately, which is critical for GDB round-trip latency (GDB sends many small packets and waits for each response before continuing).
+
+**Test approach for `src/gdb_rsp.c`:** Unit-testable using a pair of connected loopback sockets. Test cases cover: packet reception with correct and incorrect checksums, ACK/NAK behaviour before and after `QStartNoAckMode`, `rsp_dispatch()` routing to each handler, empty-response for unknown packets, breakpoint table insert/remove/overflow, and client disconnect detection.]]></algorithm>
+        <dependencies>
+          <dep><![CDATA[`src/updi.c` — execution control and memory access.]]></dep>
+          <dep><![CDATA[`src/fsm_mapper.c` — virtual thread enumeration and per-thread register state.]]></dep>
+          <dep><![CDATA[`src/monitor.c` — custom `monitor avros` commands.]]></dep>
+          <dep>POSIX socket API.</dep>
+        </dependencies>
+        <error_handling>
+          <case name="Checksum mismatch"><![CDATA[Send `-` (NAK) and await retransmit from the GDB client.]]></case>
+          <case name="Unrecognized packet type"><![CDATA[Send the empty response `$#00` as required by the RSP specification.]]></case>
+          <case name="Client disconnect">Close the client fd, reopen the listener, and wait for the next GDB connection.</case>
+          <case name="Breakpoint table full"><![CDATA[Return GDB error packet `E08`; no breakpoint is installed.]]></case>
+        </error_handling>
+      </module>
+
+      <module path="src/elf_parser.c">
+        <purpose><![CDATA[parses the AVR ELF binary to extract the FLASH addresses and sizes of the avrOS system tables and to produce the `AvrOsSymbolIndex` consumed by the FSM mapper.]]></purpose>
+        <responsibility>Open and validate the ELF file header and target architecture.</responsibility>
+        <responsibility>Locate the symbol table section and iterate over symbol entries.</responsibility>
+        <responsibility>Apply the Harvard architecture offset to convert ELF virtual addresses to physical FLASH word addresses.</responsibility>
+        <responsibility><![CDATA[Populate an `AvrOsSymbolIndex` with the FLASH address, SRAM status address, and entry count for each detected avrOS table.]]></responsibility>
+        <responsibility>Provide ELF program-header metadata to the RSP layer for memory-map query responses.</responsibility>
+        <interfaces>
+          <interface title="Public C API (src/elf_parser.h)"><![CDATA[All functions exported from `src/elf_parser.c` and declared in `src/elf_parser.h`:
+
+```c
+/* Lifecycle */
+int  elf_open (const char *path, ElfContext *ctx);
+    /* Validates magic/arch, loads .symtab and .strtab into ctx. */
+    /* Returns: 0 on success; -1 on I/O error, bad magic, or malloc failure. */
+void elf_close(ElfContext *ctx);
+    /* Frees ctx->symtab and ctx->strtab; closes ctx->fd. */
+
+/* Symbol resolution */
+int      elf_find_avros_tables(ElfContext *ctx, AvrOsSymbolIndex *idx);
+    /* Returns: 0 (partial or full success); -1 on internal ELF read error. */
+uint32_t elf_flash_addr(const ElfContext *ctx, uint32_t vma);
+    /* Applies: physical_word_addr = (vma - ctx->flash_base) / 2 */
+```
+
+The `ElfContext` and `AvrOsSymbolIndex` struct definitions are also declared in `src/elf_parser.h`.  Callers must zero-initialise `AvrOsSymbolIndex` before passing it to `elf_find_avros_tables()`.]]></interface>
+        </interfaces>
+        <data_structures><![CDATA[**`ElfContext`** — All ELF parsing state maintained between `elf_open()` and `elf_close()`.
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `fd`          | `int`         | Open file descriptor for the ELF binary (kept open for lazy section reads). |
+| `ehdr`        | `Elf32_Ehdr`  | Cached ELF32 file header (magic, machine, entry point, section count). |
+| `symtab`      | `Elf32_Sym *` | Heap-allocated copy of the `.symtab` section contents. |
+| `sym_count`   | `size_t`      | Number of `Elf32_Sym` entries in `symtab`. |
+| `strtab`      | `char *`      | Heap-allocated copy of the `.strtab` string table used for symbol names. |
+| `strtab_size` | `size_t`      | Byte size of the `strtab` buffer. |
+| `flash_base`  | `uint32_t`    | ELF VMA of the first `PT_LOAD` segment (FLASH); used as Harvard offset base. |
+| `flash_size`  | `uint32_t`    | Byte size of the FLASH load segment. |
+| `sram_base`   | `uint32_t`    | ELF VMA of the SRAM segment. |
+| `sram_size`   | `uint32_t`    | Byte size of the SRAM segment. |
+
+Harvard address conversion formula applied by `elf_flash_addr()`:
+`physical_word_addr = (vma − flash_base) / 2`
+
+Both `.symtab` and `.strtab` are loaded fully into heap memory at `elf_open()` time and freed by `elf_close()`, so no file seeks are required during symbol lookup.]]></data_structures>
+        <functions>
+          <function signature="int elf_open(const char *path, ElfContext *ctx)"
+                    summary="Open and parse the ELF file; populate ctx; return 0 or -1."/>
+          <function signature="void elf_close(ElfContext *ctx)"
+                    summary="Release all resources held by ctx."/>
+          <function signature="int elf_find_avros_tables(ElfContext *ctx, AvrOsSymbolIndex *idx)">
+            <purpose>Search the loaded symbol table for the avrOS system table boundary symbols and populate idx with resolved FLASH and SRAM addresses.</purpose>
+            <pre><![CDATA[`ctx` has been successfully initialised by `elf_open()`; `idx` points to a zero-initialised `AvrOsSymbolIndex`.]]></pre>
+            <post>All fields of `idx` that correspond to symbols found in the ELF are populated. Fields for missing symbols retain their zero-initialised values.</post>
+            <returns>0 if at least the FSM table symbols were found and resolved; 0 with `idx` partially populated if only some symbols were found; -1 only on an internal ELF read error.</returns>
+            <logic>
+              <step>Iterate over all `sym_count` entries in `ctx->symtab`; skip entries with `st_name == 0` or `st_shndx == SHN_UNDEF`.</step>
+              <step><![CDATA[Look up each symbol's name in `ctx->strtab` at offset `sym->st_name` and compare against the avrOS sentinel names (see algorithm section for the full symbol name table).]]></step>
+              <step><![CDATA[For `_start` symbols (FLASH-resident table boundaries), call `elf_flash_addr()` to convert the VMA to a physical word address and store in the corresponding `idx` field.]]></step>
+              <step><![CDATA[For `_end` symbols, subtract the paired `_start` VMA and divide by the per-entry struct size to compute the entry count (e.g., `fsm_table_count`).]]></step>
+              <step><![CDATA[For the `__avros_event_mask` and `__avros_current_fsm` symbols (SRAM-resident variables), store the VMA directly without the Harvard offset.]]></step>
+            </logic>
+          </function>
+          <function signature="uint32_t elf_flash_addr(const ElfContext *ctx, uint32_t vma)"
+                    summary="Convert an ELF virtual memory address to a physical FLASH word address."/>
+        </functions>
+        <algorithm><![CDATA[`elf_open()` validates and loads the ELF as follows:
+
+1.  Read the first 4 bytes; verify the ELF magic (`0x7F 'E' 'L' 'F'`). Verify `e_ident[EI_CLASS] == ELFCLASS32`.
+2.  Verify `e_machine == EM_AVR` (0x0053); reject non-AVR ELF files with a warning.
+3.  Scan `e_phnum` program headers at offset `e_phoff`; for each `PT_LOAD` segment, record the segment VMA (`p_vaddr`) and size (`p_filesz`) to populate `flash_base` / `flash_size` (first LOAD segment) and `sram_base` / `sram_size` (second LOAD segment).
+4.  Scan `e_shnum` section headers at offset `e_shoff`; find the section with `sh_type == SHT_SYMTAB`. Read its `sh_size / sizeof(Elf32_Sym)` entries into a heap buffer.
+5.  Load the associated string table section (index given by `sh_link` on the `.symtab` section header) into a second heap buffer.
+
+`elf_find_avros_tables()` scans the loaded symbol array for the following names:
+
+| Symbol name | `AvrOsSymbolIndex` field | Address space |
+| ----------- | ------------------------ | ------------- |
+| `__avros_fsm_table_start`     | `fsm_table_addr`      | FLASH (word addr) |
+| `__avros_fsm_table_end`       | (size computation)    | FLASH |
+| `__avros_queue_table_start`   | `queue_table_addr`    | FLASH (word addr) |
+| `__avros_queue_table_end`     | (size computation)    | FLASH |
+| `__avros_event_mask`          | `event_mask_addr`     | SRAM (byte addr) |
+| `__avros_mempool_table_start` | `mempool_table_addr`  | FLASH (word addr) |
+| `__avros_mempool_table_end`   | (size computation)    | FLASH |
+| `__avros_current_fsm`         | `current_fsm_addr`    | SRAM (byte addr) |
+
+Entry counts (e.g., `fsm_table_count`) are derived by computing `(_end_vma - _start_vma) / sizeof(per_entry_type)` for each table, where the per-entry size is a compile-time constant defined in the avrOS headers.
+
+**Heap memory budget for `elf_open()`:**
+
+| Buffer | Formula | Typical size (1000-symbol AVR ELF) |
+| ------ | ------- | ---------------------------------- |
+| `ctx->symtab` | `sym_count x sizeof(Elf32_Sym)` = `sym_count x 16` B | ~16 KiB |
+| `ctx->strtab` | `.strtab` section `sh_size` | ~8 KiB |
+| Total | | ~24 KiB per session |
+
+Both buffers are freed by `elf_close()`. Peak heap usage occurs between `elf_open()` and the first `elf_close()`.
+
+**Parse complexity:** `elf_open()` performs O(e_phnum + e_shnum) file seeks plus two sequential block reads. `elf_find_avros_tables()` performs a single O(sym_count) linear scan with 8 string comparisons per symbol entry.
+
+**Test approach for `src/elf_parser.c`:** Unit-testable using pre-built AVR ELF fixtures. Test cases cover: magic validation rejection, `EM_AVR` check, correct `flash_base` / `sram_base` extraction, all 8 avrOS symbol names found with correct address conversions, partial symbol set (graceful degradation), `malloc` failure via injection shim, and `elf_close()` resource-free correctness.]]></algorithm>
+        <dependencies>
+          <dep>Standard C file I/O.</dep>
+          <dep><![CDATA[ELF header definitions from `<elf.h>` (Linux) or a bundled `elf.h` for macOS portability.]]></dep>
+        </dependencies>
+        <error_handling>
+          <case name="Non-ELF or wrong architecture magic">Log a warning message and return -1.</case>
+          <case name="Missing avrOS symbols"><![CDATA[Log an informational message and return 0 with an empty `AvrOsSymbolIndex`; the server continues in bare-metal stub mode.]]></case>
+          <case name="Memory allocation failure"><![CDATA[Return -1; the caller falls back to bare-metal stub mode.]]></case>
+        </error_handling>
+      </module>
+
+      <module path="src/fsm_mapper.c">
+        <purpose><![CDATA[translates the runtime state of avrOS FSM registration tables — read from the target via UPDI — into GDB virtual threads, providing per-thread synthetic register frames to the RSP layer.]]></purpose>
+        <responsibility><![CDATA[Use the `AvrOsSymbolIndex` to read FSM state bytes from the target's SRAM over UPDI.]]></responsibility>
+        <responsibility>Assign a stable GDB thread ID to each registered FSM entry.</responsibility>
+        <responsibility>Identify and report which FSM is currently executing as the active GDB thread.</responsibility>
+        <responsibility>Synthesize a minimal GDB register frame for each virtual thread, setting PC to the FSM's current state function pointer.</responsibility>
+        <responsibility>Cache the thread list and invalidate it whenever the CPU resumes.</responsibility>
+        <interfaces>
+          <interface title="Public C API (src/fsm_mapper.h)"><![CDATA[All functions exported from `src/fsm_mapper.c` and declared in `src/fsm_mapper.h`:
+
+```c
+/* Thread-list management */
+int  fsm_build_thread_list(FsmContext *ctx,
+                           const AvrOsSymbolIndex *idx,
+                           int updi_fd);
+    /* Requires: CPU halted. Returns: thread count (>= 0); -1 on UPDI error. */
+void fsm_invalidate(FsmContext *ctx);
+    /* Marks ctx->valid = false; called immediately after updi_run()/updi_step(). */
+
+/* Per-thread queries */
+int  fsm_get_active_thread(const FsmContext *ctx);
+    /* Returns: GDB thread ID of active FSM; 0 if not identified. */
+int  fsm_get_registers(const FsmContext *ctx, int thread_id, uint8_t *reg_buf);
+    /* Fills reg_buf with a 78-character hex string (39 bytes binary, hex-encoded: R0-R31, SREG, SPL, SPH, PC in g-packet order); buf must be >= 79 bytes. */
+    /* Returns: 0 on success; -1 if thread_id out of range. */
+```
+
+The `FsmContext` struct is declared in `src/fsm_mapper.h` and must be zero-initialised by the caller before the first `fsm_build_thread_list()` call.]]></interface>
+        </interfaces>
+        <data_structures><![CDATA[**`FsmThread`** — Descriptor for a single avrOS FSM virtual thread. One per registered FSM entry; stored in the static array `FsmContext.threads`.
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `gdb_id`    | `int`      | Stable GDB thread ID (1-based); assigned in the order FSM entries appear in the FLASH table and never re-assigned within a session. |
+| `name`      | `char[32]` | Null-terminated human-readable FSM name, read from the FLASH-resident `name_ptr` field of the avrOS FSM table entry. |
+| `state_fn`  | `uint32_t` | Current state function pointer as a FLASH word address; set to the value of the FSM's SRAM state variable at thread-list build time; used directly as the virtual PC. |
+| `is_active` | `bool`     | True when this FSM is the currently executing task, as identified by comparing the FSM's SRAM entry address against the `__avros_current_fsm` scheduler variable. |
+
+**`FsmContext`** contains a statically allocated array of `FSM_MAX_THREADS` (32) `FsmThread` entries, eliminating heap allocation in the thread build path.]]></data_structures>
+        <functions>
+          <function signature="int fsm_build_thread_list(FsmContext *ctx, const AvrOsSymbolIndex *idx, int updi_fd)">
+            <purpose>Read the avrOS FSM registration table and SRAM state variables from the target via UPDI and populate the virtual thread cache.</purpose>
+            <pre><![CDATA[Target CPU is halted; `idx->fsm_table_addr` and `idx->fsm_table_count` are valid; `updi_fd` is a valid UPDI serial fd.]]></pre>
+            <post><![CDATA[`ctx->threads[0..thread_count-1]` contain populated `FsmThread` descriptors; `ctx->active_id` identifies the running FSM; `ctx->valid` is set to true.]]></post>
+            <returns>Number of virtual threads populated on success; -1 on UPDI read failure.</returns>
+            <logic>
+              <step><![CDATA[Read the FLASH-resident FSM registration table from `idx->fsm_table_addr` using `updi_mem_read()`; each entry is a fixed-size struct `{ uint16_t *state_var_sram_addr; const char *name_flash_ptr; }`.]]></step>
+              <step><![CDATA[For each table entry, read the 2-byte SRAM state variable from `state_var_sram_addr` to obtain the current state function pointer; convert to a FLASH word address and store in `thread->state_fn`.]]></step>
+              <step><![CDATA[Read the null-terminated FSM name from the FLASH address given by `name_flash_ptr` (up to 31 characters) and store in `thread->name`.]]></step>
+              <step><![CDATA[Read the 2-byte SRAM value at `idx->current_fsm_addr`; compare it to each table entry's `state_var_sram_addr` to identify the active FSM and set `thread->is_active` and `ctx->active_id`.]]></step>
+              <step><![CDATA[Assign `thread->gdb_id = loop_index + 1` for each thread (GDB thread IDs are 1-based).]]></step>
+            </logic>
+          </function>
+          <function signature="int fsm_get_active_thread(const FsmContext *ctx)"
+                    summary="Return the GDB thread ID of the currently executing FSM."/>
+          <function signature="int fsm_get_registers(const FsmContext *ctx, int thread_id, uint8_t *reg_buf)">
+            <purpose>Synthesize a GDB g-packet register frame for the requested virtual thread and write it into reg_buf.</purpose>
+            <pre><![CDATA[`ctx->valid` is true; `thread_id` is in the range [1, ctx->thread_count]; `reg_buf` points to a caller-allocated buffer of at least 79 bytes (39 binary bytes × 2 hex chars + NUL).]]></pre>
+            <post><![CDATA[`reg_buf` contains a 78-character hex string representing the 36 AVR GDB register values (R0–R31, SREG, SPL, SPH, PC) in GDB `g`-packet order.]]></post>
+            <returns>0 on success; -1 if thread_id is out of range.</returns>
+            <logic>
+              <step>Zero-initialise all 79 bytes of the register buffer.</step>
+              <step><![CDATA[Set the PC field (GDB register index 35, 4-byte little-endian) at hex positions 70–77 of the buffer to `thread->state_fn`.]]></step>
+              <step><![CDATA[If `thread->is_active` is true, read SREG (register 32), SPL (register 33), and SPH (register 34) from the target SRAM via `updi_mem_read()` and write them at hex positions 64–65, 66–67, and 68–69, respectively.]]></step>
+            </logic>
+            <notes>Non-active threads return zeroed R0–R31 and SREG; only PC and SP are meaningful for suspended FSMs in the avrOS cooperative model.</notes>
+          </function>
+          <function signature="void fsm_invalidate(FsmContext *ctx)"
+                    summary="Clear the cached thread list; called on every CPU resume."/>
+        </functions>
+        <algorithm><![CDATA[**Thread list build sequence:**
+
+Each avrOS FSM is represented in FLASH by a linker-placed table entry of the form:
+
+```c
+typedef struct {
+    fsm_state_fn_t *state;   /* pointer to SRAM variable holding current state fn */
+    const char     *name;    /* pointer to FLASH string literal */
+} avros_fsm_entry_t;
+```
+
+`fsm_build_thread_list()` reads `idx->fsm_table_count` consecutive entries starting at `idx->fsm_table_addr`, dereferences each SRAM state variable pointer to obtain the current state function pointer, and reads the FLASH name pointer to obtain the FSM display name. All UPDI reads are performed while the CPU is halted.
+
+**Cache invalidation:** `fsm_invalidate()` sets `ctx->valid = false`. The RSP layer calls `fsm_invalidate()` immediately after `updi_run()` or `updi_step()` so that the stale thread list is not served to GDB after execution resumes. The cache is rebuilt on the next `fsm_build_thread_list()` call, which the RSP layer triggers when GDB halts the target again.
+
+**AVR GDB register layout (g-packet order):**
+
+| GDB register index | AVR register | Size | Notes |
+| ------------------ | ------------ | ---- | ----- |
+| 0-31 | R0-R31 | 1 byte each | General-purpose; zeroed for non-active threads. |
+| 32 | SREG | 1 byte | Status register; zeroed for non-active threads. |
+| 33 | SPL | 1 byte | Stack pointer low byte; live value for active thread only. |
+| 34 | SPH | 1 byte | Stack pointer high byte; live value for active thread only. |
+| 35 | PC | 4 bytes LE | Set to `thread->state_fn` (FLASH word address) for all threads. |
+
+Total g-packet payload: 39 bytes × 2 hex chars = 78 hex characters + NUL. (Registers 0–34 each contribute 1 byte; register 35 (PC) contributes 4 bytes.)
+
+**UPDI read budget per `fsm_build_thread_list()` call (N threads):**
+
+| Operation | UPDI transactions | Data volume |
+| --------- | ----------------- | ----------- |
+| Read FSM table (N x 4 bytes) | 1 block read | 4N bytes |
+| Read SRAM state variable per thread (2 bytes each) | N reads | 2N bytes |
+| Read FLASH name string per thread (up to 31 chars) | N reads | <=31N bytes |
+| Read `current_fsm_addr` (2 bytes) | 1 read | 2 bytes |
+| **Total** | 2N+2 transactions | <=37N+6 bytes |
+
+**Test approach for `src/fsm_mapper.c`:** Unit-testable by providing a pre-populated `AvrOsSymbolIndex` and a mock `updi_mem_read()` returning canned byte sequences. Test cases cover: GDB thread ID assignment (1-based), correct `state_fn` FLASH word-address derivation, active thread identification, `FSM_MAX_THREADS` cap with warning, cache-invalidation round-trip, and `fsm_get_registers()` PC encoding verification.]]></algorithm>
+        <dependencies>
+          <dep><![CDATA[`src/updi.c` — `updi_mem_read()` for SRAM reads.]]></dep>
+          <dep><![CDATA[`src/elf_parser.c` — `AvrOsSymbolIndex` for table addresses and entry counts.]]></dep>
+        </dependencies>
+        <error_handling>
+          <case name="UPDI read failure during thread build">Return -1; the RSP layer reports a GDB error packet to the client.</case>
+          <case name="Thread ID out of range"><![CDATA[Return -1 and cause the RSP layer to send error response `E01`.]]></case>
+          <case name="FSM count exceeds FSM_MAX_THREADS"><![CDATA[Cap the build at `FSM_MAX_THREADS` entries and log a warning; excess FSMs are silently omitted from the thread list.]]></case>
+        </error_handling>
+      </module>
+
+      <module path="src/monitor.c">
+        <purpose><![CDATA[implements the custom `monitor avros` sub-commands that provide non-intrusive, human-readable visibility into the state of avrOS system objects (events, queues, and memory pools) via UPDI background reads.]]></purpose>
+        <responsibility><![CDATA[Parse the `monitor avros <subcommand>` argument string.]]></responsibility>
+        <responsibility>Issue UPDI background reads to retrieve the relevant avrOS data structures without halting the CPU.</responsibility>
+        <responsibility>Format the decoded state as human-readable text and deliver it to the GDB client as a console-output packet.</responsibility>
+        <interfaces>
+          <interface title="Public C API (src/monitor.h)"><![CDATA[Single function exported from `src/monitor.c` and declared in `src/monitor.h`:
+
+```c
+int monitor_dispatch(int rsp_fd, int updi_fd,
+                     const AvrOsSymbolIndex *idx,
+                     const char *cmd);
+```
+
+Parameters:
+*   `rsp_fd` — connected GDB client socket fd; used to send O-packet responses via `rsp_send_packet()`.
+*   `updi_fd` — UART serial fd; used for `updi_mem_read()` background reads.
+*   `idx` — resolved avrOS symbol index from `elf_find_avros_tables()`; must not be NULL.
+*   `cmd` — raw ASCII-hex-encoded payload string from a `qRcmd` RSP packet (not yet decoded).
+
+Return values: 0 command recognised and executed; -1 UPDI read failure; -2 unrecognised sub-command.]]></interface>
+          <interface title="GDB Monitor Sub-commands"><![CDATA[Three sub-commands are supported:
+
+*   `monitor avros events` — display the avrOS event bitmask with each bit decoded to its event name.
+*   `monitor avros queues` — display head, tail, and count for each registered queue.
+*   `monitor avros mempool` — display free-block count and capacity for each registered memory pool.]]></interface>
+        </interfaces>
+        <functions>
+          <function signature="int monitor_dispatch(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx, const char *cmd)">
+            <purpose>Hex-decode the qRcmd payload, match the sub-command token, and invoke the appropriate handler.</purpose>
+            <pre><![CDATA[`cmd` is the raw ASCII-hex-encoded command body extracted from a `qRcmd` RSP packet (not yet decoded).]]></pre>
+            <returns>0 if the command was recognised and the handler returned without error; -1 on UPDI failure; -2 on unrecognised sub-command.</returns>
+            <logic>
+              <step>Hex-decode the ASCII hex pairs in `cmd` into a plain text command string.</step>
+              <step><![CDATA[Verify the string starts with the prefix `"avros "` (case-sensitive); if not, send a usage hint O-packet and return -2.]]></step>
+              <step>Extract the token following the prefix and compare it to `"events"`, `"queues"`, and `"mempool"`.</step>
+              <step>Invoke the matching static handler or send an unknown-subcommand error O-packet.</step>
+            </logic>
+          </function>
+          <function signature="static int cmd_events(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx)">
+            <purpose>Read the avrOS event bitmask from SRAM and send a decoded human-readable listing to the GDB console.</purpose>
+            <logic>
+              <step><![CDATA[Read 2 bytes from `idx->event_mask_addr` using `updi_mem_read()`.]]></step>
+              <step><![CDATA[For each of the 16 event bits (bit 0 = event 0, bit 15 = event 15), check if the bit is set and append a line `"  event<N>: SET\n"` or `"  event<N>: clear\n"` to an output buffer.]]></step>
+              <step>Hex-encode the output buffer and send it as one or more RSP O-packets via `rsp_send_packet()`.</step>
+            </logic>
+          </function>
+          <function signature="static int cmd_queues(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx)">
+            <purpose>Read the head, tail, and occupancy count for each registered avrOS queue and send a formatted table to the GDB console.</purpose>
+            <logic>
+              <step><![CDATA[Read `idx->queue_count` consecutive queue status structures from SRAM at `idx->queue_table_addr` using `updi_mem_read()`.]]></step>
+              <step>For each queue structure, extract the `head`, `tail`, and `count` fields and format a one-line entry.</step>
+              <step>Hex-encode and send the formatted table as RSP O-packets.</step>
+            </logic>
+          </function>
+          <function signature="static int cmd_mempool(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx)">
+            <purpose>Read the free-block count and total capacity for each registered avrOS memory pool and send a formatted summary to the GDB console.</purpose>
+            <logic>
+              <step><![CDATA[Read `idx->mempool_count` consecutive pool status structures from SRAM at `idx->mempool_table_addr` using `updi_mem_read()`.]]></step>
+              <step>For each pool structure, extract the `free_count` and `capacity` fields and format a one-line entry showing both values and a percentage utilisation.</step>
+              <step>Hex-encode and send the formatted table as RSP O-packets.</step>
+            </logic>
+          </function>
+        </functions>
+        <algorithm><![CDATA[**O-packet encoding:** All console output is delivered to the GDB client via RSP O-packets. The RSP specification requires the human-readable text to be hex-encoded: each ASCII character is converted to two hex digits. For example, the character `'A'` (0x41) is encoded as the two-character string `"41"`. `monitor_dispatch()` builds the human-readable text into a temporary 512-byte buffer, then hex-encodes it before calling `rsp_send_packet()` with the `O` prefix.
+
+**Non-intrusive reads:** All three sub-commands use `updi_mem_read()` exclusively; none call `updi_halt()`. The UPDI background read mechanism allows SRAM to be sampled while the CPU is running, at the cost of a possible read-during-write data race for multi-byte fields. This is acceptable for the observational, non-critical nature of the monitor commands.
+
+**avrOS runtime data structure layouts read by monitor commands:**
+
+*Queue status struct* (read by `cmd_queues()`):
+```c
+typedef struct {
+    uint8_t  head;     /* index of next read position */
+    uint8_t  tail;     /* index of next write position */
+    uint8_t  count;    /* number of items currently queued */
+    uint8_t  capacity; /* maximum items the queue can hold */
+} avros_queue_status_t;  /* 4 bytes, SRAM */
+```
+
+*Memory pool status struct* (read by `cmd_mempool()`):
+```c
+typedef struct {
+    uint8_t  free_count; /* number of free blocks */
+    uint8_t  capacity;   /* total blocks in the pool */
+    uint16_t block_size; /* size of each block in bytes */
+} avros_pool_status_t;   /* 4 bytes, SRAM */
+```
+
+**O-packet size constraint:** A single RSP O-packet payload is limited to `RSP_PACKET_MAX` bytes (2048). For `cmd_events()` output (16 lines x ~20 chars = ~320 bytes pre-encode = 640 hex chars), one O-packet suffices. For larger `cmd_queues()` and `cmd_mempool()` outputs the 512-byte text buffer is hex-encoded in chunks that each fit within one O-packet before calling `rsp_send_packet()`.
+
+**Test approach for `src/monitor.c`:** Unit-testable by providing a mock `updi_mem_read()` returning canned SRAM bytes and capturing O-packet strings via a pipe replacing `rsp_fd`. Test cases cover: hex-decode of `qRcmd` payload, prefix rejection, all three sub-command dispatch paths, correct bit decoding in `cmd_events()`, correct queue/pool field extraction, and O-packet encoding of all output characters.]]></algorithm>
+        <dependencies>
+          <dep><![CDATA[`src/updi.c` — `updi_mem_read()` for non-intrusive SRAM reads.]]></dep>
+          <dep><![CDATA[`src/elf_parser.c` — `AvrOsSymbolIndex` for data structure addresses.]]></dep>
+        </dependencies>
+        <error_handling>
+          <case name="Unrecognized sub-command">Return a human-readable error message to the GDB console output packet.</case>
+          <case name="UPDI read failure">Report partial data alongside an error message to the GDB console; do not abort the server.</case>
+        </error_handling>
+      </module>
+    </modules>
+
+    <data_dictionary>
+      <type name="AppConfig"
+            header="src/main.c"
+            summary="Application-wide configuration populated by parse_args().">
+        <field name="serial_device" type="const char *" desc="Path to the UART serial device."/>
+        <field name="elf_path"      type="const char *" desc="Path to the AVR ELF binary."/>
+        <field name="gdb_port"      type="uint16_t"     desc="TCP port for the GDB listener (default 1234)."/>
+        <field name="baud_rate"     type="int"          desc="UART baud rate (default 115200)."/>
+        <field name="load_flash"    type="bool"         desc="When true, flash the ELF to the target before attaching."/>
+      </type>
+      <type name="AvrOsSymbolIndex"
+            header="src/elf_parser.c"
+            summary="Index of avrOS system table addresses resolved from the ELF symbol table.">
+        <field name="fsm_table_addr"     type="uint32_t" desc="FLASH word address of the avrOS FSM registration table."/>
+        <field name="fsm_table_count"    type="uint8_t"  desc="Number of FSM entries in the table."/>
+        <field name="queue_table_addr"   type="uint32_t" desc="FLASH word address of the queue registration table."/>
+        <field name="queue_count"        type="uint8_t"  desc="Number of registered queues."/>
+        <field name="event_mask_addr"    type="uint32_t" desc="SRAM byte address of the avrOS event bitmask variable."/>
+        <field name="mempool_table_addr" type="uint32_t" desc="FLASH word address of the memory pool registration table."/>
+        <field name="mempool_count"      type="uint8_t"  desc="Number of registered memory pools."/>
+        <field name="current_fsm_addr"   type="uint32_t" desc="SRAM byte address of the avrOS scheduler current_fsm pointer variable; used by fsm_mapper to identify the active thread."/>
+      </type>
+      <type name="FsmThread"
+            header="src/fsm_mapper.c"
+            summary="Descriptor for a single avrOS FSM virtual thread, stored in the FsmContext thread array.">
+        <field name="gdb_id"   type="int"      desc="Stable GDB thread ID (1-based); assigned at thread-list build time and never re-used within a session."/>
+        <field name="name"     type="char[32]" desc="Null-terminated human-readable FSM name read from the FLASH-resident table entry name pointer."/>
+        <field name="state_fn" type="uint32_t" desc="Current state function pointer as a FLASH word address; used directly as the virtual PC in the synthesized register frame."/>
+        <field name="is_active" type="bool"    desc="True when this FSM is the currently executing task as identified from the avrOS current_fsm scheduler variable."/>
+      </type>
+      <type name="ElfContext"
+            header="src/elf_parser.c"
+            summary="All ELF parsing state maintained between elf_open() and elf_close().">
+        <field name="fd"           type="int"         desc="Open file descriptor for the ELF binary."/>
+        <field name="ehdr"         type="Elf32_Ehdr"  desc="Cached ELF32 file header (magic, machine type, entry point, section/program header counts)."/>
+        <field name="symtab"       type="Elf32_Sym *" desc="Heap-allocated copy of the .symtab section."/>
+        <field name="sym_count"    type="size_t"      desc="Number of Elf32_Sym entries in symtab."/>
+        <field name="strtab"       type="char *"      desc="Heap-allocated copy of the .strtab string table used for symbol name lookup."/>
+        <field name="strtab_size"  type="size_t"      desc="Byte size of the strtab buffer."/>
+        <field name="flash_base"   type="uint32_t"    desc="ELF VMA of the first PT_LOAD segment; used as the Harvard FLASH base for address conversion."/>
+        <field name="flash_size"   type="uint32_t"    desc="Byte size of the FLASH load segment."/>
+        <field name="sram_base"    type="uint32_t"    desc="ELF VMA of the SRAM segment."/>
+        <field name="sram_size"    type="uint32_t"    desc="Byte size of the SRAM segment."/>
+      </type>
+      <type name="FsmContext"
+            header="src/fsm_mapper.c"
+            summary="Runtime cache of the avrOS virtual thread list.">
+        <field name="threads"      type="FsmThread[FSM_MAX_THREADS]" desc="Statically allocated array of virtual thread descriptors (one per FSM entry)."/>
+        <field name="thread_count" type="int"         desc="Number of valid entries populated in the threads array."/>
+        <field name="active_id"    type="int"         desc="GDB thread ID of the currently executing FSM; 0 if none identified."/>
+        <field name="valid"        type="bool"        desc="True when the cache reflects current target state; cleared to false by fsm_invalidate() on every CPU resume."/>
+      </type>
+      <constants header="src/updi.c">
+        <constant name="UPDI_SYNCH"          value="0x55"  purpose="UPDI synchronisation byte transmitted at the start of each command."/>
+        <constant name="UPDI_ACK"            value="0x40"  purpose="Acknowledgement byte returned by the target after each received data byte."/>
+        <constant name="UPDI_MAX_BLOCK"      value="256"   purpose="Maximum byte count for a single REPEAT+LD/ST burst transaction."/>
+        <constant name="UPDI_BREAK_BAUD"     value="300"   purpose="Temporary baud rate used to assert the BREAK condition during link initialisation."/>
+        <constant name="UPDI_ERR_WP"         value="-2"    purpose="Distinct error code returned by updi_nvm_write_flash() when FLASH write protection is active."/>
+      </constants>
+      <other><![CDATA[*   **Compile-time constants** (in [src/gdb_rsp.c](../src/gdb_rsp.c)):
+
+    | Name | Value | Purpose |
+    | ---- | ----- | ------- |
+    | `RSP_PACKET_MAX`      | `2048` | Maximum RSP payload size in bytes; sized for a full AVR register dump plus `qXfer` XML overhead. |
+    | `RSP_MAX_BREAKPOINTS` | `16`   | Capacity of the static software breakpoint table. |
+
+*   **Compile-time constants** (in [src/fsm_mapper.c](../src/fsm_mapper.c)):
+
+    | Name | Value | Purpose |
+    | ---- | ----- | ------- |
+    | `FSM_MAX_THREADS` | `32` | Maximum number of virtual threads supported in a single session; caps the static `FsmContext` thread array. |
+
+---
+
+### Build Toolchain and Host Environment
+
+**Host compiler requirements:**
+
+| Requirement | Minimum | Notes |
+| ----------- | ------- | ----- |
+| C standard | C99 | `--std=c99`; no GNU extensions required. |
+| GCC | 4.8 | Or Clang ≥ 3.4. |
+| POSIX API | POSIX.1-2008 | `-D_POSIX_C_SOURCE=200809L` |
+| ELF headers | `<elf.h>` | Provided by `glibc-headers` on Linux; bundled `elf.h` on macOS. |
+| libc | any POSIX libc | No additional shared libraries required. |
+
+**Recommended compile flags:**
+
+```
+CFLAGS = -std=c99 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Wpedantic
+         -Wstrict-prototypes -Wmissing-prototypes -Wshadow
+         -O2 -g
+```
+
+Debug builds add `-fsanitize=address,undefined` for runtime error detection.
+
+**Supported host platforms:**
+
+| Platform | Status | Notes |
+| -------- | ------ | ----- |
+| Linux (x86-64, ARM64) | Primary target | Tested on Ubuntu 22.04 and Raspberry Pi OS. |
+| macOS (Intel, Apple Silicon) | Secondary target | Requires bundled `elf.h`; uses `/dev/cu.usbserial-*` device paths. |
+| Windows (native) | Out of scope | See `doc/PVD.md §7.2`; WSL2 may work but is not supported. |
+
+**Build targets (Makefile):**
+
+| Target | Description |
+| ------ | ----------- |
+| `all` | Build the `avr-updi-gdb` binary (default). |
+| `clean` | Remove build artefacts. |
+| `test` | Build and run the unit test suite. |
+| `install` | Copy the binary to `$(PREFIX)/bin` (default `/usr/local/bin`). |
+
+---
+
+### Target MCU Memory Constraints
+
+The following constraints govern the AVR DA/DB-family target assumed by the implementation:
+
+| Parameter | Value | Notes |
+| --------- | ----- | ----- |
+| FLASH word size | 2 bytes | AVR is a 16-bit instruction machine; word addresses = byte addresses / 2. |
+| FLASH page size | 512 bytes | Page boundary alignment required for `updi_nvm_write_flash()`. |
+| Maximum FLASH | 128 KiB | AVR128DA/DB; upper bound for `ElfContext.flash_size`. |
+| Maximum SRAM | 16 KiB | AVR128DA/DB; upper bound for `ElfContext.sram_size`. |
+| FLASH base VMA | `0x0000` | ELF virtual address of the first instruction word. |
+| SRAM base VMA | `0x0200` | Lowest SRAM address on AVR DA/DB (I/O registers below this). |
+| UPDI base address | `0x1000` | NVM controller register base used for flash programming. |
+| AVR BREAK opcode | `0x9598` | Two-byte instruction used for software breakpoints. |
+
+---
+
+### Static Memory Footprint Summary
+
+Approximate static (BSS + data) memory consumed by each module in the host process:
+
+| Module | Major static buffers | Approximate size |
+| ------ | -------------------- | ---------------- |
+| `src/main.c` | `AppConfig` struct (stack-allocated in `main`) | ~32 bytes |
+| `src/updi.c` | `termios` structs, internal staging buffer | ~256 bytes |
+| `src/gdb_rsp.c` | Receive + transmit packet buffers, breakpoint table | ~4.2 KiB |
+| `src/elf_parser.c` | Heap: `.symtab` + `.strtab` (per session) | ~24 KiB (heap) |
+| `src/fsm_mapper.c` | `FsmContext` static thread array (32 x `FsmThread`) | ~2.1 KiB |
+| `src/monitor.c` | Output text staging buffer | ~512 bytes |
+| **Total static** | | **~7 KiB static + ~24 KiB heap per session** |
+
+---
+
+### Module Integration Sequence
+
+Modules should be integrated and verified in the following order to isolate failures:
+
+| Step | Modules | Integration milestone | Verification method |
+| ---- | ------- | --------------------- | ------------------- |
+| 1 | `src/updi.c` alone | UPDI link initialisation and basic memory read/write | Loopback pseudo-terminal test; compare read-back bytes against written values. |
+| 2 | `src/elf_parser.c` alone | ELF open, symbol scan, `AvrOsSymbolIndex` population | Offline test against a known AVR ELF binary; compare resolved addresses against `avr-nm` output. |
+| 3 | `src/updi.c` + `src/elf_parser.c` | Halt, read FLASH/SRAM at resolved symbol addresses, resume | Live hardware: read FSM table bytes, verify against expected avrOS registration. |
+| 4 | `src/fsm_mapper.c` | Thread-list build and register frame synthesis | Offline test with mock UPDI reads; live hardware to verify correct FSM names and state pointers. |
+| 5 | `src/gdb_rsp.c` alone | TCP accept, packet codec, dispatch to stub handlers | Loopback socket: drive with `avr-gdb`'s `target extended-remote localhost:1234`, issue `info threads`. |
+| 6 | `src/monitor.c` | `monitor avros events/queues/mempool` output | Live hardware: run target, issue monitor commands from GDB, verify output format and values. |
+| 7 | All modules | Full session: attach, set breakpoint, halt, inspect threads, resume | End-to-end GDB script driven test against live AVR hardware. |
+
+---
+
+### Error Propagation Model
+
+Errors are propagated upward through the module stack without retrying:
+
+| Layer | Error type | Propagation rule |
+| ----- | ---------- | ---------------- |
+| `src/updi.c` | UART timeout, framing error, UPDI NAK | Return -1 to caller. No retry at this layer. |
+| `src/elf_parser.c` | I/O error, bad ELF, malloc failure | Return -1; server enters bare-metal stub mode (no FSM threads). |
+| `src/fsm_mapper.c` | UPDI read failure | Return -1; RSP layer sends `E02` error packet to GDB. |
+| `src/gdb_rsp.c` | Socket error, checksum mismatch | NAK on mismatch; close socket on disconnect; send `E` packet on UPDI errors. |
+| `src/monitor.c` | UPDI read failure | Send partial output with error message as O-packet; return -1 but do not abort server. |
+| `src/main.c` | Fatal startup error | `exit(1)` with message to stderr. Mid-session UPDI loss: close client, await next connection. |]]></other>
+    </data_dictionary>
+
+    <traceability>
+      <theme name="CLI and Initialization"            sections="§3 (src/main.c)"/>
+      <theme name="UPDI Physical Layer"               sections="§4 (src/updi.c)"/>
+      <theme name="GDB RSP Server"                    sections="§5 (src/gdb_rsp.c)"/>
+      <theme name="ELF Parsing and Symbol Resolution" sections="§6 (src/elf_parser.c)"/>
+      <theme name="FSM Virtual Thread Mapping"        sections="§7 (src/fsm_mapper.c)"/>
+      <theme name="System Introspection"              sections="§8 (src/monitor.c)"/>
+      <theme name="Flash Programming"                 sections="§4 (src/updi.c)"/>
+      <theme name="Console Bridge"                    sections="§4 (src/updi.c)"/>
+    </traceability>
+  </sdd>
+
+  <!-- Software Test Plan payload (see tools/Developers_Guide.md §4). -->
+  <stp>
+  </stp>
+
+  <!-- High-Level Requirements (see tools/Developers_Guide.md §5). -->
+  <hlrs>
+
+    <section number="1" title="System Startup and Command-Line Interface">
+      <intro><![CDATA[Requirements in this section govern how `avr-updi-gdb` is invoked, how it initialises its resources, and how quickly it becomes ready for a GDB connection.]]></intro>
+
+      <hlr id="HLR-001" name="CLI Argument Parsing">
+        <text><![CDATA[The application shall accept the following command-line arguments: a required positional `<serial-device>` path, a required positional `<elf-file>` path, an optional `--port <port>` TCP port (default `1234`), an optional `--baud <baud>` UART baud rate (default `115200`), and an optional `--load` flag. Any unrecognised argument shall cause the application to print a usage message to `stderr` and exit with a non-zero status.]]></text>
+        <traces>
+          <trace target="SDD" ref="3.2.2"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-002" name="Serial Device Initialisation">
+        <text><![CDATA[The application shall open the specified UART serial device and configure it for UPDI communication (8N2, half-duplex) at the specified baud rate before accepting any GDB client connection.]]></text>
+        <traces>
+          <trace target="SDD" ref="3.1"/>
+          <trace target="SDD" ref="4.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-003" name="GDB Listener Startup">
+        <text><![CDATA[The application shall bind and listen on the configured TCP port for incoming GDB client connections. Exactly one GDB client connection shall be active at a time; after a client detaches the server shall re-enter the listening state.]]></text>
+        <traces>
+          <trace target="SDD" ref="3.1"/>
+          <trace target="SDD" ref="5.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-004" name="ELF Flash Load Option">
+        <text><![CDATA[When the `--load` flag is provided, the application shall erase and program the target FLASH with the content of the specified ELF binary via UPDI NVM write sequences before entering the GDB listener loop.]]></text>
+        <traces>
+          <trace target="SDD" ref="3.2.2"/>
+          <trace target="SDD" ref="4.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-005" name="Attach Time Constraint">
+        <text><![CDATA[The server shall complete initialisation, locate avrOS system tables in FLASH, and be ready to respond to GDB packets within 2.0 seconds of the GDB client connection being accepted.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-035" name="Graceful Shutdown and Resource Release">
+        <text><![CDATA[On receipt of SIGINT, SIGTERM, a GDB `k` (kill) packet, or a GDB `D` (detach) packet, the application shall release all allocated resources in the following order: restore any patched FLASH breakpoint locations via UPDI NVM write, free the ELF symbol table heap allocation, close the GDB client socket file descriptor, close the UPDI serial device file descriptor, and close the TCP listener socket file descriptor. The server shall exit with status 0 on a clean shutdown and status 1 on a fatal initialisation failure.]]></text>
+        <traces>
+          <trace target="SDD" ref="3.3.3"/>
+        </traces>
+      </hlr>
+    </section>
+
+    <section number="2" title="UPDI Physical Layer">
+      <intro><![CDATA[Requirements in this section govern the hardware connection to the AVR target and all UPDI protocol operations.]]></intro>
+
+      <hlr id="HLR-006" name="UPDI Hardware Connection">
+        <text><![CDATA[The application shall communicate with the AVR target exclusively over a TTL-level UART serial link using UPDI framing. The connection shall require only a 1 kΩ resistor between the host adapter TX/RX and the target UPDI pin; no JTAG controller, proprietary programmer, or external hardware debugger shall be required.]]></text>
+        <traces>
+          <trace target="SDD" ref="4.2.2"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-007" name="Target Memory Read">
+        <text><![CDATA[The application shall read arbitrary byte ranges from both the SRAM and FLASH address spaces of the connected AVR target via UPDI LD commands.]]></text>
+        <traces>
+          <trace target="SDD" ref="4.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-008" name="Target Memory Write">
+        <text><![CDATA[The application shall write arbitrary byte ranges to the SRAM address space of the connected AVR target via UPDI ST commands.]]></text>
+        <traces>
+          <trace target="SDD" ref="4.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-009" name="FLASH Programming">
+        <text><![CDATA[The application shall erase and program pages of the target FLASH using the UPDI NVM controller write sequence, enabling both the `--load` startup option and software breakpoint insertion.]]></text>
+        <traces>
+          <trace target="SDD" ref="4.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-010" name="Execution Control">
+        <text><![CDATA[The application shall halt, resume, and single-step the AVR CPU core via the UPDI Application System Interface (ASI), mapping directly to GDB continue, step, and stop operations.]]></text>
+        <traces>
+          <trace target="SDD" ref="4.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-011" name="Non-Intrusive Background Memory Read">
+        <text><![CDATA[The application shall read target memory regions via UPDI background reads while the CPU core is running, without issuing a halt. This mechanism shall be used for all system introspection operations that do not require a stopped core.]]></text>
+        <traces>
+          <trace target="SDD" ref="4.1"/>
+          <trace target="SDD" ref="4.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-012" name="UPDI Console Bridge">
+        <text><![CDATA[The application shall poll the avrOS software UART console channel via UPDI and forward any received bytes to host `stdout`, enabling interactive CLI sessions with the running firmware and automated test output capture without halting the CPU.]]></text>
+        <traces>
+          <trace target="SDD" ref="4.1"/>
+          <trace target="SDD" ref="4.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-036" name="UPDI Link Initialisation Timing and Retry">
+        <text><![CDATA[The UPDI initialisation sequence shall assert a BREAK condition by holding the TX line low for at least 24.6 µs before transmitting the SYNCH character (0x55). If the target does not acknowledge the SYNCH within the expected window, the server shall retry the BREAK+SYNCH sequence up to three times before declaring a link failure and exiting with a fatal error.]]></text>
+        <traces>
+          <trace target="SDD" ref="4.3.3"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-037" name="UPDI Operation Timeout Bounds">
+        <text><![CDATA[All UPDI polling loops shall implement explicit timeouts to prevent indefinite blocking: the halt-acknowledgement poll shall time out after 50 milliseconds; the NVMPROG mode entry poll shall time out after 100 milliseconds; the per-page NVM BUSY poll shall time out after 20 milliseconds per page. On any timeout the failing UPDI function shall return an error code rather than blocking or spinning.]]></text>
+        <traces>
+          <trace target="SDD" ref="4.3.3"/>
+        </traces>
+      </hlr>
+    </section>
+
+    <section number="3" title="GDB Remote Serial Protocol Server">
+      <intro><![CDATA[Requirements in this section govern the GDB RSP server behaviour, covering packet handling, register and memory access, breakpoint management, and session lifecycle.]]></intro>
+
+      <hlr id="HLR-013" name="RSP Server Accessibility">
+        <text><![CDATA[The application shall implement a GDB Remote Serial Protocol server accessible via a standard `target extended-remote <host>:<port>` command from `avr-gdb` or any GDB-compatible front-end (VS Code Cortex-Debug, Zed DAP adapter).]]></text>
+        <traces>
+          <trace target="SDD" ref="5.2.2"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-014" name="Register Read and Write">
+        <text><![CDATA[The application shall respond to GDB register read (`g`) and write (`G`, `P`) packets, returning or updating the current AVR CPU register state (32 general-purpose registers, PC, SP, and status register) obtained from or written to the target via UPDI.]]></text>
+        <traces>
+          <trace target="SDD" ref="5.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-015" name="Memory Read and Write">
+        <text><![CDATA[The application shall respond to GDB memory read (`m`) and write (`M`, `X`) packets, mapping each request to the corresponding UPDI memory operation on the target. Requests addressing the FLASH region shall be routed to NVM read or write sequences as appropriate.]]></text>
+        <traces>
+          <trace target="SDD" ref="5.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-016" name="Software Breakpoints">
+        <text><![CDATA[The application shall implement software breakpoints by inserting a `BREAK` instruction at the requested FLASH address via UPDI NVM write, and restoring the original instruction on removal. The server shall support up to `RSP_MAX_BREAKPOINTS` (16) simultaneous software breakpoints; attempting to insert a breakpoint when the table is full shall return GDB error reply `E08`.]]></text>
+        <traces>
+          <trace target="SDD" ref="4.3.1"/>
+          <trace target="SDD" ref="5.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-017" name="Single-Step Execution">
+        <text><![CDATA[The application shall respond to the GDB single-step (`s`/`S`) packet by executing exactly one AVR instruction on the target CPU via the UPDI step primitive and reporting the resulting stop reason.]]></text>
+        <traces>
+          <trace target="SDD" ref="4.3.1"/>
+          <trace target="SDD" ref="5.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-018" name="Continue Execution">
+        <text><![CDATA[The application shall respond to the GDB continue (`c`/`C`) packet by resuming target CPU execution via the UPDI run primitive and blocking until a breakpoint, halt, or error condition is signalled.]]></text>
+        <traces>
+          <trace target="SDD" ref="4.3.1"/>
+          <trace target="SDD" ref="5.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-019" name="RSP Capability Negotiation and Lifecycle">
+        <text><![CDATA[The application shall negotiate RSP capabilities with the GDB client via `qSupported` and shall handle the standard lifecycle packets `qAttached`, `vAttach`, `D` (detach), and `k` (kill). On detach the server shall re-enter the listen state without requiring a restart.]]></text>
+        <traces>
+          <trace target="SDD" ref="5.1"/>
+          <trace target="SDD" ref="5.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-020" name="Editor-Agnostic Protocol">
+        <text><![CDATA[The server shall communicate exclusively over standard GDB RSP. No IDE-specific protocol extensions (DAP, Cortex-Debug custom packets, or similar) shall be implemented inside the server; all IDE integration shall be the responsibility of the client-side adapter.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+          <trace target="SDD" ref="5.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-038" name="GDB Session Response Latency">
+        <text><![CDATA[The GDB client socket shall be configured with `TCP_NODELAY` to disable Nagle's algorithm, ensuring that each RSP response packet is transmitted without artificial buffering delay. The listener socket shall be configured with `SO_REUSEADDR` so that the server may be restarted on the same port immediately after process exit without waiting for the TCP TIME_WAIT state to expire.]]></text>
+        <traces>
+          <trace target="SDD" ref="5.3.3"/>
+        </traces>
+      </hlr>
+    </section>
+
+    <section number="4" title="ELF Parsing and Symbol Resolution">
+      <intro><![CDATA[Requirements in this section govern how the server locates avrOS system tables in the target firmware and handles missing or incomplete debug information.]]></intro>
+
+      <hlr id="HLR-021" name="ELF Binary Parsing">
+        <text><![CDATA[The application shall parse the AVR ELF binary provided at launch to validate its architecture, locate the symbol table section, and build an index of avrOS system table symbols (FSM registration table, queue table, event bitmask, and memory pool table).]]></text>
+        <traces>
+          <trace target="SDD" ref="6.1"/>
+          <trace target="SDD" ref="6.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-022" name="Harvard Architecture Address Mapping">
+        <text><![CDATA[The application shall apply the AVR Harvard architecture offset when converting ELF virtual memory addresses to physical FLASH word addresses, ensuring that all symbol references resolve to correct target locations regardless of the ELF's load segment layout.]]></text>
+        <traces>
+          <trace target="SDD" ref="6.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-023" name="Fail-Safe Degradation on Missing Symbols">
+        <text><![CDATA[When the ELF binary does not contain the expected avrOS system table symbols (e.g., firmware compiled without debug symbols, or non-avrOS firmware), the application shall log an informational diagnostic and degrade gracefully to a standard bare-metal GDB stub, rather than aborting the session or returning an error to the GDB client.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+          <trace target="SDD" ref="6.5"/>
+        </traces>
+      </hlr>
+    </section>
+
+    <section number="5" title="FSM Virtual Thread Mapping">
+      <intro><![CDATA[Requirements in this section govern how the server translates the avrOS cooperative scheduler state into GDB virtual threads visible in the IDE's call-stack and thread panes.]]></intro>
+
+      <hlr id="HLR-024" name="FSM Thread Enumeration">
+        <text><![CDATA[Upon halting the target, the application shall read the avrOS FSM registration table from target SRAM via UPDI and present each registered FSM entry as a distinct GDB virtual thread, identified by a stable thread ID.]]></text>
+        <traces>
+          <trace target="SDD" ref="7.1"/>
+          <trace target="SDD" ref="7.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-025" name="Active Thread Identification">
+        <text><![CDATA[The application shall identify the currently executing avrOS FSM from the runtime state read via UPDI and report it to the GDB client as the active thread. All register reads and memory operations issued without an explicit thread context shall operate on the active thread's context.]]></text>
+        <traces>
+          <trace target="SDD" ref="7.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-026" name="Virtual Thread Register Frame">
+        <text><![CDATA[Each virtual thread shall present a synthesized GDB register frame in which the program counter (PC) is set to the function pointer of the FSM's current state handler. For the active virtual thread, SP and SREG shall be read live from the target's hardware registers and inserted into the register frame. For all non-active virtual threads, SP and SREG shall be set to zero, as dormant FSMs do not maintain independent stacks in the avrOS cooperative scheduler model.]]></text>
+        <traces>
+          <trace target="SDD" ref="7.1"/>
+          <trace target="SDD" ref="7.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-027" name="Complete FSM Thread Coverage">
+        <text><![CDATA[All FSMs registered in the avrOS FSM table shall appear as virtual threads in the GDB client thread pane upon halting at or after `main()`, up to a maximum of `FSM_MAX_THREADS` (32) entries. If more than `FSM_MAX_THREADS` FSMs are registered, the server shall silently cap the virtual thread list at 32 and log a diagnostic warning; no registered FSM within the cap shall be omitted.]]></text>
+        <traces>
+          <trace target="SDD" ref="7.1"/>
+          <trace target="SDD" ref="7.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-028" name="Stack-Free Thread Model">
+        <text><![CDATA[The application shall not attempt to unwind stack frames for suspended FSMs. The execution context of a non-active virtual thread shall be defined solely by its state function pointer; the server shall never dereference a dormant stack pointer to infer thread state.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+          <trace target="SDD" ref="7.1"/>
+        </traces>
+      </hlr>
+    </section>
+
+    <section number="6" title="System Introspection">
+      <intro><![CDATA[Requirements in this section govern the custom `monitor avros` commands that expose avrOS runtime object state to the developer without halting the target CPU.]]></intro>
+
+      <hlr id="HLR-029" name="Monitor Events Command">
+        <text><![CDATA[The application shall implement a `monitor avros events` command that reads the avrOS event bitmask from the target via UPDI background read and returns a human-readable report to the GDB console, decoding each set bit to its symbolic event name, without halting the CPU core.]]></text>
+        <traces>
+          <trace target="SDD" ref="8.2.2"/>
+          <trace target="SDD" ref="8.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-030" name="Monitor Queues Command">
+        <text><![CDATA[The application shall implement a `monitor avros queues` command that reads each registered avrOS queue's head index, tail index, and current occupancy count from the target via UPDI background read and returns a human-readable report to the GDB console, without halting the CPU core.]]></text>
+        <traces>
+          <trace target="SDD" ref="8.2.2"/>
+          <trace target="SDD" ref="8.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-031" name="Monitor Memory Pool Command">
+        <text><![CDATA[The application shall implement a `monitor avros mempool` command that reads each registered avrOS memory pool's free-block count and total capacity from the target via UPDI background read and returns a human-readable report to the GDB console, without halting the CPU core.]]></text>
+        <traces>
+          <trace target="SDD" ref="8.2.2"/>
+          <trace target="SDD" ref="8.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-032" name="Introspection Reliability">
+        <text><![CDATA[The `monitor avros events` command shall accurately reflect the current pending event bits across at least 10,000 consecutive invocations of `monitor_dispatch()` with the `avros events` sub-command without producing a UPDI protocol desync, a corrupted response, or a server crash.]]></text>
+        <traces>
+          <trace target="SDD" ref="4.3.1"/>
+          <trace target="SDD" ref="8.1"/>
+        </traces>
+      </hlr>
+    </section>
+
+    <section number="7" title="Platform and Build">
+      <intro><![CDATA[Requirements in this section govern the host platforms the server must support and the constraints on its runtime dependencies.]]></intro>
+
+      <hlr id="HLR-033" name="Native Linux and macOS Build">
+        <text><![CDATA[The application shall compile and execute natively on Linux (x86-64 and ARM) and macOS (x86-64 and Apple Silicon) using a C99-conforming toolchain. The build shall not require any platform-specific preprocessor workarounds beyond what the C99 standard and POSIX.1-2008 provide.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-034" name="Lean Host Runtime Dependencies">
+        <text><![CDATA[The application runtime shall depend only on the host C standard library and POSIX serial and socket APIs. No Java runtime, Python interpreter, Electron-based framework, or other heavyweight dependency shall be required to launch or operate the server.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-039" name="Single-Threaded Event Loop Architecture">
+        <text><![CDATA[The server shall multiplex all I/O using a single POSIX `select()`-based event loop with no POSIX threads. All module entry points shall be called synchronously from the event loop and shall return to it promptly. Long-blocking operations (NVM flash programming and UPDI link initialisation) shall be permitted only during server startup or in direct response to an explicit GDB command, and shall not block the event loop in any other context.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.1"/>
+          <trace target="SDD" ref="2.2"/>
+          <trace target="SDD" ref="3.3.2"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-040" name="Bounded Heap Allocation">
+        <text><![CDATA[The server shall not allocate heap memory on any hot path (packet processing, UPDI reads, FSM enumeration, monitor commands). Heap allocation via `malloc` shall be used exclusively inside `elf_open()` to load the ELF symbol and string table sections; this allocation shall be bounded by the size of the ELF binary and shall occur at most once per GDB session. All heap memory shall be freed by `elf_close()` at session end or on error.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+          <trace target="SDD" ref="9"/>
+        </traces>
+      </hlr>
+    </section>
+
+  </hlrs>
+
+  <!-- Low-Level Requirements (see tools/Developers_Guide.md §6). -->
+  <llrs>
+    <function number="1" title="Introduction" name="intro">
+      <intro><![CDATA[Each LLR ID follows the pattern `LLR-XXX-NN`, where `XXX` is a module code and `NN` is a zero-padded two-digit sequence number. Module codes: `MAIN` (`src/main.c`), `UPDI` (`src/updi.c`), `RSP` (`src/gdb_rsp.c`), `ELF` (`src/elf_parser.c`), `FSM` (`src/fsm_mapper.c`), `MON` (`src/monitor.c`). IDs are permanent contracts and may not be renumbered or reused once allocated.]]></intro>
+    </function>
+
+    <function number="2" title="src/main.c — Entry Point and Event Loop" name="main" source="src/main.c">
+      <intro><![CDATA[Requirements for `main()`, `parse_args()`, and `event_loop()`. These functions own the application lifecycle from argument parsing through resource cleanup.]]></intro>
+
+      <llr id="LLR-MAIN-01">
+        <text><![CDATA[`parse_args()` shall populate an `AppConfig` struct from `argc`/`argv`. If any unrecognised argument is encountered, it shall print a usage message to `stderr` and call `exit(1)`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-001" name="CLI Argument Parsing"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MAIN-02">
+        <text><![CDATA[When not supplied on the command line, `parse_args()` shall apply the following default values: `--port` = 1234, `--baud` = 115200, `--load` = false. The `<serial-device>` and `<elf-file>` positional arguments are mandatory; absence of either shall trigger the usage error path.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-001" name="CLI Argument Parsing"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MAIN-03">
+        <text><![CDATA[`main()` shall call `updi_open()` and validate the returned file descriptor before calling `rsp_listen()`. A failure from either shall cause `main()` to release any already-open resources and return exit code 1.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-002" name="Serial Device Initialisation"/>
+          <trace target="HLR" ref="HLR-003" name="GDB Listener Startup"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MAIN-04">
+        <text><![CDATA[When the `--load` flag is set, `main()` shall iterate over all `PT_LOAD` ELF segments and call `updi_nvm_write_flash()` for each segment before entering `event_loop()`. A flash write failure shall cause `main()` to print an error to `stderr` and return exit code 1.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-004" name="ELF Flash Load Option"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MAIN-05">
+        <text><![CDATA[`event_loop()` shall multiplex `listen_fd`, `gdb_fd`, and `updi_fd` using a single POSIX `select()` call with no timeout. On each iteration it shall: accept a GDB client on `listen_fd` if `gdb_fd` is -1; forward console bytes from `updi_fd` to `stdout` via `updi_console_poll()`; dispatch RSP packets from `gdb_fd` via `rsp_recv_packet()` and `rsp_dispatch()`. No POSIX threads shall be created.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-003" name="GDB Listener Startup"/>
+          <trace target="HLR" ref="HLR-039" name="Single-Threaded Event Loop Architecture"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MAIN-06">
+        <text><![CDATA[`main()` shall register a `SIGINT`/`SIGTERM` handler that sets the global `volatile sig_atomic_t g_quit` flag to 1. `event_loop()` shall test `g_quit` at the top of each loop iteration and return immediately when the flag is set, without closing any file descriptors itself.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-035" name="Graceful Shutdown and Resource Release"/>
+          <trace target="HLR" ref="HLR-039" name="Single-Threaded Event Loop Architecture"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MAIN-07">
+        <text><![CDATA[On all exit paths, `main()` shall release resources in this exact order: (1) `rsp_close(cfg.gdb_fd)` if `gdb_fd >= 0`, (2) `rsp_close(cfg.listen_fd)`, (3) `elf_close(&ctx)`, (4) `updi_close(cfg.updi_fd)`. The process shall exit with code 0 on normal termination and code 1 on any fatal initialisation or flash-write failure.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-035" name="Graceful Shutdown and Resource Release"/>
+        </traces>
+      </llr>
+    </function>
+
+    <function number="3" title="src/updi.c — UPDI Physical Layer" name="updi" source="src/updi.c">
+      <intro><![CDATA[Requirements for all public functions in `src/updi.c`: link initialisation, memory access, execution control, NVM programming, and console bridging.]]></intro>
+
+      <llr id="LLR-UPDI-01">
+        <text><![CDATA[`updi_open()` shall open the UART device and configure it for 8N2 framing (8 data bits, no parity, 2 stop bits) in raw half-duplex mode using `termios`. `cfmakeraw()`, `CSTOPB`, and explicit baud setting via `cfsetispeed()`/`cfsetospeed()` shall be applied. The function shall return the open file descriptor on success or -1 on failure.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-006" name="UPDI Hardware Connection"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-UPDI-02">
+        <text><![CDATA[`updi_open()` shall generate the UPDI BREAK condition by temporarily switching the UART baud rate to `UPDI_BREAK_BAUD` (300 baud), transmitting a 0x00 framing byte (which holds TX low for at least 24.6 µs at 300 baud, satisfying the UPDI BREAK timing requirement), then restoring the session baud rate before transmitting the SYNCH character (0x55).]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-006" name="UPDI Hardware Connection"/>
+          <trace target="HLR" ref="HLR-036" name="UPDI Link Initialisation Timing and Retry"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-UPDI-03">
+        <text><![CDATA[If the target does not respond to the BREAK+SYNCH sequence with a UPDI ACK (0x40) within the expected window, `updi_open()` shall retry the entire BREAK+SYNCH sequence. After 3 consecutive failures, `updi_open()` shall return -1 and the caller shall treat the link as unavailable.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-036" name="UPDI Link Initialisation Timing and Retry"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-UPDI-04">
+        <text><![CDATA[`updi_mem_read()` shall transfer up to `UPDI_MAX_BLOCK` (256) bytes per UPDI burst using the REPEAT+LD auto-increment sequence. If `len` exceeds `UPDI_MAX_BLOCK`, the function shall split the request into consecutive block reads automatically, with no size restriction imposed on the caller.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-007" name="Target Memory Read"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-UPDI-05">
+        <text><![CDATA[`updi_mem_read()` shall use `select()` with a 100 ms timeout before each `read()` call on the UART file descriptor to enforce a per-byte inactivity deadline. If `select()` returns zero (timeout) before a byte is available, the function shall abandon the current transaction and return -1.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-007" name="Target Memory Read"/>
+          <trace target="HLR" ref="HLR-037" name="UPDI Operation Timeout Bounds"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-UPDI-06">
+        <text><![CDATA[`updi_mem_write()` shall write arbitrary byte ranges to the SRAM address space of the target using UPDI ST commands and return 0 on success or -1 on UART framing error, timeout, or UPDI NAK.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-008" name="Target Memory Write"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-UPDI-07">
+        <text><![CDATA[`updi_nvm_write_flash()` shall require `word_addr` to be aligned to a 512-byte FLASH page boundary and `len` to be a non-zero multiple of 512. The function shall poll `NVMCTRL_STATUS` BUSY for up to 100 ms before issuing the NVM write command, and poll the BUSY bit for up to 20 ms after each page write. Timeout of either poll shall cause the function to return -1. FLASH write-protection detection shall return `UPDI_ERR_WP`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-009" name="FLASH Programming"/>
+          <trace target="HLR" ref="HLR-037" name="UPDI Operation Timeout Bounds"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-UPDI-08">
+        <text><![CDATA[`updi_halt()` shall write 0x01 to `ASI_SYS_CTRL` to request a halt, then poll `ASI_SYS_STATUS` at 1 ms intervals for bit 3 (STOPPED). The function shall return 0 when STOPPED is observed within 50 ms, or -1 if the bit has not been set after 50 polling intervals.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-010" name="Execution Control"/>
+          <trace target="HLR" ref="HLR-037" name="UPDI Operation Timeout Bounds"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-UPDI-09">
+        <text><![CDATA[`updi_step()` shall issue the UPDI ASI single-instruction-step command, then verify that the STOPPED bit is set in `ASI_SYS_STATUS` before returning. It shall return 0 on success or -1 on timeout or UPDI error.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-010" name="Execution Control"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-UPDI-10">
+        <text><![CDATA[`updi_run()` shall clear the UPDI ASI halt request and verify that the STOPPED bit in `ASI_SYS_STATUS` is no longer set before returning. It shall return 0 on success or -1 on UPDI error.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-010" name="Execution Control"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-UPDI-11">
+        <text><![CDATA[`updi_mem_read()` shall be callable while the target CPU is in the RUNNING state (not halted). The function shall not call `updi_halt()` internally, permitting non-intrusive SRAM sampling for the monitor sub-commands and console polling without interrupting firmware execution.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-011" name="Non-Intrusive Background Memory Read"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-UPDI-12">
+        <text><![CDATA[`updi_console_poll()` shall perform a background `updi_mem_read()` of the avrOS software UART output buffer and return any pending bytes to the caller without halting the CPU. The function shall return the number of bytes read (0 if none pending) or -1 on UPDI error.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-012" name="UPDI Console Bridge"/>
+        </traces>
+      </llr>
+    </function>
+
+    <function number="4" title="src/gdb_rsp.c — GDB Remote Serial Protocol Server" name="rsp" source="src/gdb_rsp.c">
+      <intro><![CDATA[Requirements for RSP packet framing, dispatch, GDB packet handlers, session lifecycle, and socket configuration.]]></intro>
+
+      <llr id="LLR-RSP-01">
+        <text><![CDATA[`rsp_listen()` shall set `SO_REUSEADDR` on the listener socket before calling `bind()`. After `rsp_accept()` returns a connected client socket, the client socket shall have `TCP_NODELAY` set to disable Nagle's algorithm.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-003" name="GDB Listener Startup"/>
+          <trace target="HLR" ref="HLR-038" name="GDB Session Response Latency"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-02">
+        <text><![CDATA[`rsp_recv_packet()` shall scan incoming bytes discarding pre-packet ACK/NAK characters until a `$` delimiter is received. It shall accumulate the payload with a running XOR checksum until `#` is received, then compare the computed checksum against the two ASCII-hex checksum bytes that follow. On match it shall write `+` to the socket and return the payload length; on mismatch it shall write `-` and return -1.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-013" name="RSP Server Accessibility"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-03">
+        <text><![CDATA[The `on_read_regs` handler for the `g` packet shall read all 36 AVR CPU register values (R0–R31, SREG, SPL, SPH, and PC) from the target via `updi_mem_read()` and return them as a 78-character hex string in GDB g-packet register order (R0–R31 at hex positions 0–63, SREG at 64–65, SPL at 66–67, SPH at 68–69, PC as 4-byte little-endian at 70–77).]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-014" name="Register Read and Write"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-04">
+        <text><![CDATA[The `on_write_regs` handler for the `G` packet and the single-register `P` handler shall write the supplied register values to the target's CPU register file via `updi_mem_write()` and return `OK` on success or an error reply on UPDI failure.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-014" name="Register Read and Write"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-05">
+        <text><![CDATA[The `on_read_mem` handler for `m addr,len` shall call `updi_mem_read()` with the decoded address and length, and return the result as a hex string. Both FLASH and SRAM addresses shall be accepted; address-space routing is handled by `updi_mem_read()` based on the raw address value.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-015" name="Memory Read and Write"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-06">
+        <text><![CDATA[The `on_write_mem` handler for `M addr,len:data` (hex-encoded) and `X addr,len:data` (binary-encoded) packets shall call `updi_mem_write()` for SRAM addresses and `updi_nvm_write_flash()` for FLASH addresses, returning `OK` on success or an error reply on failure.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-015" name="Memory Read and Write"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-07">
+        <text><![CDATA[The `on_insert_bp` handler for `Z0 addr,kind` shall: (1) check the breakpoint table for an existing entry at the requested address; if not present, (2) read and save the 2-byte instruction word via `updi_mem_read()`, (3) write the AVR BREAK opcode (0x9598) via `updi_nvm_write_flash()`, and (4) return `OK`. A duplicate insert shall return `OK` without a second flash write.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-016" name="Software Breakpoints"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-08">
+        <text><![CDATA[The `on_remove_bp` handler for `z0 addr,kind` shall look up the requested address in the breakpoint table, restore the saved 2-byte instruction word via `updi_nvm_write_flash()`, remove the entry from the table, and return `OK`. If the address is not in the table, the handler shall return an error reply.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-016" name="Software Breakpoints"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-09">
+        <text><![CDATA[When `on_insert_bp` is called and all `RSP_MAX_BREAKPOINTS` (16) breakpoint table slots are occupied, it shall not write to FLASH and shall return the GDB error reply `E08`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-016" name="Software Breakpoints"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-10">
+        <text><![CDATA[The `on_step` handler for `s`/`vCont;s` shall call `updi_step()` and, on success, send a stop-reason packet of the form `T05thread:<active_thread_id>;` to the GDB client.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-017" name="Single-Step Execution"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-11">
+        <text><![CDATA[The `on_continue` handler for `c`/`vCont;c` shall call `updi_run()` followed by `fsm_invalidate()`, then poll by calling `updi_halt()` until the CPU stops. On halt, it shall call `fsm_build_thread_list()` to rebuild the thread list and send a stop-reason packet to the GDB client.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-018" name="Continue Execution"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-12">
+        <text><![CDATA[`rsp_dispatch()` shall handle `qSupported` inline, responding with a fixed string advertising the supported feature set. It shall handle `qAttached` inline, responding `1` (attached to an existing process). Neither packet requires target interaction or handler table dispatch.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-019" name="RSP Capability Negotiation and Lifecycle"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-13">
+        <text><![CDATA[The `on_detach` handler for the `D` packet shall call `updi_run()` to resume the target, close the GDB client socket, reset `cfg->gdb_fd` to -1, and allow the event loop to re-enter the listening state. The server process shall not exit.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-019" name="RSP Capability Negotiation and Lifecycle"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-14">
+        <text><![CDATA[The `on_detach` handler for the `k` (kill) packet shall set `g_quit = 1` to cause the event loop to exit, triggering the full resource teardown sequence defined by LLR-MAIN-07.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-019" name="RSP Capability Negotiation and Lifecycle"/>
+          <trace target="HLR" ref="HLR-035" name="Graceful Shutdown and Resource Release"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-15">
+        <text><![CDATA[The `on_monitor` handler for `qRcmd` shall pass the raw ASCII-hex-encoded command body directly to `monitor_dispatch()` without pre-decoding it, and relay the return code to the GDB client as `OK` on success (return 0), an O-packet error message on UPDI failure (return -1), or an empty reply on unrecognised sub-command (return -2).]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-029" name="Monitor Events Command"/>
+          <trace target="HLR" ref="HLR-030" name="Monitor Queues Command"/>
+          <trace target="HLR" ref="HLR-031" name="Monitor Memory Pool Command"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-16">
+        <text><![CDATA[The `H` (set-thread) packet handler shall store the requested GDB thread ID in the session context and use it to select the virtual thread for subsequent `g`/`G`/`P` register operations. Thread ID -1 (all threads) and 0 (any thread) shall both be interpreted as selecting the active FSM thread.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-025" name="Active Thread Identification"/>
+        </traces>
+      </llr>
+    </function>
+
+    <function number="5" title="src/elf_parser.c — ELF Binary Parser" name="elf" source="src/elf_parser.c">
+      <intro><![CDATA[Requirements for `elf_open()`, `elf_close()`, `elf_find_avros_tables()`, and `elf_flash_addr()`.]]></intro>
+
+      <llr id="LLR-ELF-01">
+        <text><![CDATA[`elf_open()` shall read the first 16 bytes of the ELF binary and verify: the 4-byte magic sequence (0x7F `'E'` `'L'` `'F'`), `EI_CLASS == ELFCLASS32`, and `e_machine == EM_AVR` (0x0053). Any validation failure shall cause `elf_open()` to log a warning and return -1 without any heap allocation.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-021" name="ELF Binary Parsing"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-ELF-02">
+        <text><![CDATA[`elf_open()` shall locate the `.symtab` section (type `SHT_SYMTAB`) and its associated string table section (index given by `sh_link`), and load both into heap-allocated buffers stored in `ctx->symtab` and `ctx->strtab`. `ctx->sym_count` and `ctx->strtab_size` shall be set accordingly. On any `malloc` failure, `elf_open()` shall free all partial allocations and return -1.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-021" name="ELF Binary Parsing"/>
+          <trace target="HLR" ref="HLR-040" name="Bounded Heap Allocation"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-ELF-03">
+        <text><![CDATA[`elf_find_avros_tables()` shall perform a single O(sym_count) linear scan of `ctx->symtab`, compare each symbol name against the 8 avrOS sentinel names defined in SDD §6.3.3, and populate the corresponding fields of `AvrOsSymbolIndex` for each match. The function shall return 0 (success, even if partial) or -1 only on an internal ELF read error.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-021" name="ELF Binary Parsing"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-ELF-04">
+        <text><![CDATA[`elf_flash_addr()` shall convert an ELF virtual memory address to a physical FLASH word address using the formula: `physical_word_addr = (vma - ctx->flash_base) / 2`. All FLASH-resident avrOS symbol addresses stored in `AvrOsSymbolIndex` shall be computed via this function.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-022" name="Harvard Architecture Address Mapping"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-ELF-05">
+        <text><![CDATA[When `elf_find_avros_tables()` completes the symbol scan and fewer than the expected avrOS symbols were found, it shall return 0 (not -1). Fields of `AvrOsSymbolIndex` for absent symbols shall retain their zero-initialised values, and the function shall log an informational message identifying which symbols were not found.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-023" name="Fail-Safe Degradation on Missing Symbols"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-ELF-06">
+        <text><![CDATA[`elf_close()` shall free `ctx->symtab`, free `ctx->strtab`, and close `ctx->fd`. After returning, `ctx->symtab` and `ctx->strtab` shall be set to NULL and `ctx->fd` to -1. `elf_close()` shall be safe to call on a partially initialised `ElfContext` (e.g., after a failed `elf_open()`).]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-040" name="Bounded Heap Allocation"/>
+        </traces>
+      </llr>
+    </function>
+
+    <function number="6" title="src/fsm_mapper.c — FSM Virtual Thread Mapper" name="fsm" source="src/fsm_mapper.c">
+      <intro><![CDATA[Requirements for `fsm_build_thread_list()`, `fsm_invalidate()`, `fsm_get_active_thread()`, and `fsm_get_registers()`.]]></intro>
+
+      <llr id="LLR-FSM-01">
+        <text><![CDATA[`fsm_build_thread_list()` shall read `idx->fsm_table_count` consecutive `avros_fsm_entry_t` records from the FLASH address `idx->fsm_table_addr` via `updi_mem_read()`. A UPDI read failure at any point shall cause the function to return -1.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-024" name="FSM Thread Enumeration"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-FSM-02">
+        <text><![CDATA[`fsm_build_thread_list()` shall assign `thread->gdb_id = loop_index + 1` (1-based) to each FSM entry in the order the entries appear in the FLASH table. Thread IDs shall not be reassigned within a debug session, ensuring the same FSM always maps to the same GDB thread ID.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-024" name="FSM Thread Enumeration"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-FSM-03">
+        <text><![CDATA[`fsm_build_thread_list()` shall read the 2-byte SRAM value at `idx->current_fsm_addr` and compare it against each FSM entry's `state_var_sram_addr`. The matching entry shall have `thread->is_active = true` and its `gdb_id` stored in `ctx->active_id`. If no entry matches, `ctx->active_id` shall be set to 0.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-025" name="Active Thread Identification"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-FSM-04">
+        <text><![CDATA[`fsm_get_registers()` shall set the PC field (GDB register index 35, 4-byte little-endian at hex positions 70–77 of the 78-character g-packet buffer) to `thread->state_fn`. For non-active threads, R0–R31 (indices 0–31) and SREG (index 32) shall be zero-filled, and SPL (index 33) and SPH (index 34) shall be set to zero. For the active thread, SREG (index 32, hex positions 64–65), SPL (index 33, hex positions 66–67), and SPH (index 34, hex positions 68–69) shall be read from the target SRAM via `updi_mem_read()`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-026" name="Virtual Thread Register Frame"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-FSM-05">
+        <text><![CDATA[`fsm_build_thread_list()` shall process at most `FSM_MAX_THREADS` (32) entries from the FSM registration table regardless of `idx->fsm_table_count`. If `idx->fsm_table_count` exceeds `FSM_MAX_THREADS`, the function shall log a diagnostic warning and return `FSM_MAX_THREADS` as the thread count without returning an error to the GDB client.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-027" name="Complete FSM Thread Coverage"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-FSM-06">
+        <text><![CDATA[`fsm_get_registers()` shall not issue any UPDI memory read targeting a non-active thread's stack region. The suspended FSM register frame shall be constructed entirely from the cached `thread->state_fn` value; the SP field shall be zeroed for non-active threads.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-028" name="Stack-Free Thread Model"/>
+        </traces>
+      </llr>
+    </function>
+
+    <function number="7" title="src/monitor.c — avrOS System Introspection" name="monitor" source="src/monitor.c">
+      <intro><![CDATA[Requirements for `monitor_dispatch()` and its static sub-command helpers `cmd_events()`, `cmd_queues()`, and `cmd_mempool()`.]]></intro>
+
+      <llr id="LLR-MON-01">
+        <text><![CDATA[`monitor_dispatch()` shall hex-decode the ASCII-hex-encoded `cmd` string (pairs of hex digit characters) into a plain-text command string before any prefix or sub-command matching is attempted. An odd-length or invalid hex-digit sequence shall be treated as an unrecognised command.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-029" name="Monitor Events Command"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MON-02">
+        <text><![CDATA[`monitor_dispatch()` shall verify that the decoded command string begins with the prefix `"avros "` (case-sensitive, including the trailing space). If the prefix does not match, the function shall send a usage-hint O-packet to the GDB console and return -2.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-029" name="Monitor Events Command"/>
+          <trace target="HLR" ref="HLR-030" name="Monitor Queues Command"/>
+          <trace target="HLR" ref="HLR-031" name="Monitor Memory Pool Command"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MON-03">
+        <text><![CDATA[`cmd_events()` shall call `updi_mem_read()` to read 2 bytes from `idx->event_mask_addr`. For each of the 16 bits (N=0 for the least-significant bit through N=15 for the most-significant bit), it shall test bit N of the 16-bit event mask word and append a line of the form `"  event<N>: SET\n"` if the bit is set, or `"  event<N>: clear\n"` if not, and send the complete buffer as RSP O-packets.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-029" name="Monitor Events Command"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MON-04">
+        <text><![CDATA[`cmd_queues()` shall call `updi_mem_read()` to read `idx->queue_count` consecutive queue status structures from `idx->queue_table_addr`. For each structure, it shall extract and format the `head`, `tail`, and `count` fields as a one-line entry and send the complete table as RSP O-packets.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-030" name="Monitor Queues Command"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MON-05">
+        <text><![CDATA[`cmd_mempool()` shall call `updi_mem_read()` to read `idx->mempool_count` consecutive pool status structures from `idx->mempool_table_addr`. For each structure, it shall extract and format the `free_count` and `capacity` fields with a percentage utilisation figure and send the complete table as RSP O-packets.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-031" name="Monitor Memory Pool Command"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MON-06">
+        <text><![CDATA[All monitor output shall be assembled into a temporary buffer of at most 512 bytes, hex-encoded (each ASCII byte converted to 2 hex characters per RSP O-packet spec), and transmitted to the GDB client as one or more RSP O-packets via `rsp_send_packet()`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-029" name="Monitor Events Command"/>
+          <trace target="HLR" ref="HLR-030" name="Monitor Queues Command"/>
+          <trace target="HLR" ref="HLR-031" name="Monitor Memory Pool Command"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MON-07">
+        <text><![CDATA[`monitor_dispatch()` and all of its static helpers (`cmd_events()`, `cmd_queues()`, `cmd_mempool()`) shall use `updi_mem_read()` exclusively for all target memory access. None of these functions shall call `updi_halt()`, ensuring that monitor commands never interrupt firmware execution.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-011" name="Non-Intrusive Background Memory Read"/>
+          <trace target="HLR" ref="HLR-032" name="Introspection Reliability"/>
+        </traces>
+      </llr>
+    </function>
+  </llrs>
+
+  <!-- Test sources (see tools/Developers_Guide.md §7). -->
+  <tests>
+
+    <!-- ============================================================ -->
+    <!-- src/main.c unit tests                                        -->
+    <!-- ============================================================ -->
+    <file path="tests/test_main.c" role="unit" count="14">
+      <header><![CDATA[Unit tests for `src/main.c`: argument parsing, event loop, signal handling, and resource teardown. Uses `fork()`/`waitpid()` to test `exit()` paths and a mock UPDI/RSP layer to exercise the event loop without real hardware.]]></header>
+
+      <test name="parse_args_valid_positional_args_populate_config">
+        <purpose><![CDATA[Call `parse_args()` with a valid `<serial-device>` and `<elf-file>` and verify that the returned `AppConfig` carries the correct device path and ELF path.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-01"/></traces>
+      </test>
+
+      <test name="parse_args_unrecognised_flag_exits_1">
+        <purpose><![CDATA[Call `parse_args()` with an unrecognised flag and assert that the process exits with status 1 and that a usage message is present on `stderr`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-01"/></traces>
+      </test>
+
+      <test name="parse_args_default_port_baud_load_when_not_supplied">
+        <purpose><![CDATA[Call `parse_args()` with only the two mandatory positional arguments and verify that `cfg.port == 1234`, `cfg.baud == 115200`, and `cfg.load == false`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-02"/></traces>
+      </test>
+
+      <test name="parse_args_missing_serial_device_exits_1">
+        <purpose><![CDATA[Call `parse_args()` with no positional arguments and assert that the process exits with status 1 and emits a usage message.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-02"/></traces>
+      </test>
+
+      <test name="parse_args_missing_elf_file_exits_1">
+        <purpose><![CDATA[Call `parse_args()` with only `<serial-device>` and no `<elf-file>` and assert that the process exits with status 1.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-02"/></traces>
+      </test>
+
+      <test name="main_updi_open_failure_releases_resources_and_returns_1">
+        <purpose><![CDATA[Inject a mock `updi_open()` that returns -1 and verify that `main()` does not call `rsp_listen()`, releases any already-opened resources, and returns exit code 1.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-03"/></traces>
+      </test>
+
+      <test name="main_rsp_listen_failure_closes_updi_and_returns_1">
+        <purpose><![CDATA[Inject a mock `rsp_listen()` that returns -1 and verify that `main()` calls `updi_close()` before returning exit code 1.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-03"/></traces>
+      </test>
+
+      <test name="main_load_flag_writes_all_pt_load_segments_to_flash">
+        <purpose><![CDATA[With `cfg.load = true` and a mock ELF context containing two `PT_LOAD` segments, verify that `main()` calls `updi_nvm_write_flash()` exactly twice, once per segment, before entering `event_loop()`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-04"/></traces>
+      </test>
+
+      <test name="main_load_nvm_write_failure_prints_error_and_returns_1">
+        <purpose><![CDATA[With `cfg.load = true` and a mock `updi_nvm_write_flash()` that returns -1, verify that `main()` prints an error to `stderr` and returns exit code 1 without entering `event_loop()`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-04"/></traces>
+      </test>
+
+      <test name="event_loop_uses_single_select_no_pthread_create">
+        <purpose><![CDATA[Instrument `event_loop()` with mock file descriptors and verify that `select()` is called with all three fds (`listen_fd`, `gdb_fd`, `updi_fd`) in the read set, and that no calls to `pthread_create()` occur.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-05"/></traces>
+      </test>
+
+      <test name="event_loop_accepts_gdb_client_when_gdb_fd_is_minus1">
+        <purpose><![CDATA[With `cfg.gdb_fd == -1` and `listen_fd` readable, verify that `event_loop()` calls `accept()` and updates `cfg.gdb_fd`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-05"/></traces>
+      </test>
+
+      <test name="sigint_handler_sets_g_quit_to_1">
+        <purpose><![CDATA[Send SIGINT to the test process and verify that the signal handler installed by `main()` sets `g_quit` to 1 without performing any other operation.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-06"/></traces>
+      </test>
+
+      <test name="event_loop_exits_immediately_when_g_quit_is_1">
+        <purpose><![CDATA[Set `g_quit = 1` before calling `event_loop()` and verify that the function returns immediately without calling `select()`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-06"/></traces>
+      </test>
+
+      <test name="main_cleanup_closes_gdb_elf_updi_in_order">
+        <purpose><![CDATA[On a simulated clean shutdown, verify that `main()` calls `rsp_close(gdb_fd)`, `rsp_close(listen_fd)`, `elf_close()`, and `updi_close()` in that exact order, and returns exit code 0.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-07"/></traces>
+      </test>
+    </file>
+
+    <!-- ============================================================ -->
+    <!-- src/updi.c unit tests                                        -->
+    <!-- ============================================================ -->
+    <file path="tests/test_updi.c" role="unit" count="23">
+      <header><![CDATA[Unit tests for `src/updi.c`: UART configuration, BREAK/SYNCH link initialisation, block memory read/write, NVM flash programming, execution control, and console polling. A loopback PTY pair substitutes for real UART hardware.]]></header>
+
+      <test name="updi_open_sets_8n2_raw_half_duplex_via_termios">
+        <purpose><![CDATA[Open a PTY pair, call `updi_open()` on the slave side, and inspect the resulting `termios` structure to confirm 8 data bits, no parity, 2 stop bits (`CSTOPB`), and raw mode (`cfmakeraw()`).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-01"/></traces>
+      </test>
+
+      <test name="updi_open_returns_minus1_on_device_open_failure">
+        <purpose><![CDATA[Call `updi_open()` with a path that does not exist and verify the return value is -1.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-01"/></traces>
+      </test>
+
+      <test name="updi_open_asserts_break_at_300_baud_before_synch">
+        <purpose><![CDATA[Verify that `updi_open()` temporarily sets the baud rate to `UPDI_BREAK_BAUD` (300) and transmits a 0x00 byte before transmitting 0x55, confirming the BREAK-before-SYNCH ordering.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-02"/></traces>
+      </test>
+
+      <test name="updi_open_restores_session_baud_after_break">
+        <purpose><![CDATA[Verify that `updi_open()` restores the configured session baud rate after the BREAK condition and before transmitting the SYNCH character (0x55).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-02"/></traces>
+      </test>
+
+      <test name="updi_open_retries_break_synch_3_times_on_no_ack">
+        <purpose><![CDATA[Simulate a target that never returns ACK (0x40) and verify that `updi_open()` repeats the BREAK+SYNCH sequence exactly 3 times before giving up.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-03"/></traces>
+      </test>
+
+      <test name="updi_open_returns_minus1_after_3_consecutive_link_failures">
+        <purpose><![CDATA[After 3 failed BREAK+SYNCH attempts with no ACK, verify that `updi_open()` returns -1.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-03"/></traces>
+      </test>
+
+      <test name="updi_mem_read_splits_request_larger_than_256_bytes">
+        <purpose><![CDATA[Request a read of 512 bytes and verify that `updi_mem_read()` issues two consecutive 256-byte REPEAT+LD bursts rather than a single oversized transfer.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-04"/></traces>
+      </test>
+
+      <test name="updi_mem_read_uses_repeat_ld_auto_increment_sequence">
+        <purpose><![CDATA[Capture the bytes written to the UART and verify that each block begins with the UPDI REPEAT opcode followed by a LD-auto-increment command, confirming the correct UPDI framing.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-04"/></traces>
+      </test>
+
+      <test name="updi_mem_read_calls_select_with_100ms_timeout_before_read">
+        <purpose><![CDATA[Using a mock `select()` that records its timeout argument, verify that `updi_mem_read()` passes a `timeval` of 0 seconds and 100,000 microseconds before every `read()` call.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-05"/></traces>
+      </test>
+
+      <test name="updi_mem_read_returns_minus1_on_select_timeout">
+        <purpose><![CDATA[Inject a mock `select()` that returns 0 (timeout) and verify that `updi_mem_read()` immediately returns -1 without calling `read()`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-05"/></traces>
+      </test>
+
+      <test name="updi_mem_write_returns_0_on_success">
+        <purpose><![CDATA[Call `updi_mem_write()` targeting a SRAM address with a loopback PTY that echoes the expected ACK and verify the return value is 0.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-06"/></traces>
+      </test>
+
+      <test name="updi_mem_write_returns_minus1_on_updi_nak">
+        <purpose><![CDATA[Inject a mock that returns a UPDI NAK instead of ACK and verify that `updi_mem_write()` returns -1.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-06"/></traces>
+      </test>
+
+      <test name="updi_nvm_write_flash_rejects_unaligned_address">
+        <purpose><![CDATA[Call `updi_nvm_write_flash()` with a `word_addr` that is not a multiple of 512 and verify the function returns -1 without issuing any UART traffic.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-07"/></traces>
+      </test>
+
+      <test name="updi_nvm_write_flash_rejects_non_multiple_of_512_length">
+        <purpose><![CDATA[Call `updi_nvm_write_flash()` with a `len` that is not a non-zero multiple of 512 and verify the function returns -1.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-07"/></traces>
+      </test>
+
+      <test name="updi_nvm_write_flash_nvmprog_poll_timeout_returns_minus1">
+        <purpose><![CDATA[Inject a mock target that never clears the NVMPROG BUSY bit and verify that `updi_nvm_write_flash()` returns -1 after 100 ms.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-07"/></traces>
+      </test>
+
+      <test name="updi_nvm_write_flash_per_page_busy_timeout_returns_minus1">
+        <purpose><![CDATA[Inject a mock target that never clears the NVM BUSY bit after a page write and verify that `updi_nvm_write_flash()` returns -1 after 20 ms.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-07"/></traces>
+      </test>
+
+      <test name="updi_halt_returns_0_when_stopped_bit_set_within_50ms">
+        <purpose><![CDATA[Inject a mock `ASI_SYS_STATUS` that sets the STOPPED bit (bit 3) on the first poll and verify that `updi_halt()` returns 0.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-08"/></traces>
+      </test>
+
+      <test name="updi_halt_returns_minus1_after_50ms_timeout">
+        <purpose><![CDATA[Inject a mock `ASI_SYS_STATUS` that never sets the STOPPED bit and verify that `updi_halt()` returns -1 after 50 polling intervals.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-08"/></traces>
+      </test>
+
+      <test name="updi_step_issues_asi_step_command_and_confirms_stopped_bit">
+        <purpose><![CDATA[Verify that `updi_step()` writes the ASI single-step command and then reads `ASI_SYS_STATUS` to confirm the STOPPED bit is set before returning 0.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-09"/></traces>
+      </test>
+
+      <test name="updi_run_clears_halt_request_and_verifies_stopped_cleared">
+        <purpose><![CDATA[Verify that `updi_run()` clears the ASI halt request and confirms the STOPPED bit is no longer set in `ASI_SYS_STATUS` before returning 0.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-10"/></traces>
+      </test>
+
+      <test name="updi_mem_read_callable_while_cpu_running_no_halt_issued">
+        <purpose><![CDATA[With the mock target in RUNNING state (STOPPED bit clear), call `updi_mem_read()` and verify that no halt request is written to `ASI_SYS_CTRL`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-11"/></traces>
+      </test>
+
+      <test name="updi_console_poll_returns_pending_bytes_without_halting">
+        <purpose><![CDATA[Inject a mock avrOS software UART buffer containing 4 bytes and verify that `updi_console_poll()` returns 4 and copies the bytes to the output buffer without calling `updi_halt()`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-12"/></traces>
+      </test>
+
+      <test name="updi_console_poll_returns_0_when_output_buffer_empty">
+        <purpose><![CDATA[With the mock avrOS software UART buffer empty, verify that `updi_console_poll()` returns 0.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-12"/></traces>
+      </test>
+    </file>
+
+    <!-- ============================================================ -->
+    <!-- src/gdb_rsp.c unit tests                                     -->
+    <!-- ============================================================ -->
+    <file path="tests/test_rsp.c" role="unit" count="28">
+      <header><![CDATA[Unit tests for `src/gdb_rsp.c`: socket configuration, RSP packet framing, register and memory handlers, breakpoint management, session lifecycle packets, and monitor relay. Uses a `socketpair()` as a drop-in socket substitute so all tests run without a real GDB client.]]></header>
+
+      <test name="rsp_listen_sets_so_reuseaddr_before_bind">
+        <purpose><![CDATA[Verify that `rsp_listen()` calls `setsockopt()` with `SO_REUSEADDR` enabled before calling `bind()`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-01"/></traces>
+      </test>
+
+      <test name="rsp_accept_sets_tcp_nodelay_on_client_socket">
+        <purpose><![CDATA[After `rsp_accept()` returns a client socket, verify that `TCP_NODELAY` has been set on that socket via `getsockopt()`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-01"/></traces>
+      </test>
+
+      <test name="rsp_recv_packet_discards_leading_ack_nak_bytes">
+        <purpose><![CDATA[Feed a byte stream that begins with `+` and `-` characters before the `$` delimiter and verify that `rsp_recv_packet()` discards them and correctly decodes the payload that follows.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-02"/></traces>
+      </test>
+
+      <test name="rsp_recv_packet_sends_plus_on_valid_checksum">
+        <purpose><![CDATA[Feed a well-formed RSP packet with a correct XOR checksum and verify that `rsp_recv_packet()` writes `+` to the socket and returns the payload length.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-02"/></traces>
+      </test>
+
+      <test name="rsp_recv_packet_sends_minus_and_returns_minus1_on_bad_checksum">
+        <purpose><![CDATA[Feed an RSP packet with a deliberately corrupted checksum and verify that `rsp_recv_packet()` writes `-` to the socket and returns -1.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-02"/></traces>
+      </test>
+
+      <test name="on_read_regs_g_returns_78_char_hex_string">
+        <purpose><![CDATA[Invoke the `g` packet handler via `rsp_dispatch()` and verify that the RSP reply payload is exactly 78 hex characters, representing all 36 GDB AVR register values.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-03"/></traces>
+      </test>
+
+      <test name="on_read_regs_g_places_pc_little_endian_at_positions_70_77">
+        <purpose><![CDATA[Inject a known PC value via the mock UPDI and verify that hex characters at positions 70–77 of the `g` reply encode the PC as 4-byte little-endian.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-03"/></traces>
+      </test>
+
+      <test name="on_write_regs_G_writes_all_registers_via_updi_mem_write">
+        <purpose><![CDATA[Dispatch a `G` packet containing 78 hex characters and verify that the handler calls `updi_mem_write()` with the decoded register values and returns `OK`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-04"/></traces>
+      </test>
+
+      <test name="on_write_regs_P_writes_single_register_via_updi_mem_write">
+        <purpose><![CDATA[Dispatch a `P` packet specifying register index 5 and a new value, and verify that the handler calls `updi_mem_write()` targeting only the R5 SRAM address and returns `OK`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-04"/></traces>
+      </test>
+
+      <test name="on_read_mem_m_calls_updi_mem_read_and_returns_hex">
+        <purpose><![CDATA[Dispatch an `m addr,4` packet for a SRAM address and verify that the handler calls `updi_mem_read()` with the decoded address and length and returns an 8-character hex string.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-05"/></traces>
+      </test>
+
+      <test name="on_write_mem_M_calls_updi_mem_write_for_sram_address">
+        <purpose><![CDATA[Dispatch an `M addr,4:data` packet targeting a SRAM address and verify that the handler calls `updi_mem_write()` and returns `OK`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-06"/></traces>
+      </test>
+
+      <test name="on_write_mem_X_calls_nvm_write_flash_for_flash_address">
+        <purpose><![CDATA[Dispatch an `X addr,2:data` packet targeting a FLASH address and verify that the handler calls `updi_nvm_write_flash()` and returns `OK`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-06"/></traces>
+      </test>
+
+      <test name="on_insert_bp_writes_break_opcode_and_saves_original_word">
+        <purpose><![CDATA[Dispatch a `Z0 addr,2` packet and verify that the handler reads and saves the original 2-byte instruction word, writes the AVR BREAK opcode (0x9598) via `updi_nvm_write_flash()`, and returns `OK`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-07"/></traces>
+      </test>
+
+      <test name="on_insert_bp_duplicate_returns_ok_without_reflash">
+        <purpose><![CDATA[Dispatch the same `Z0 addr,2` breakpoint insert twice and verify that `updi_nvm_write_flash()` is called only once, and that the second call returns `OK` immediately.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-07"/></traces>
+      </test>
+
+      <test name="on_remove_bp_restores_saved_instruction_word">
+        <purpose><![CDATA[After inserting a breakpoint with `Z0`, dispatch `z0` for the same address and verify that `updi_nvm_write_flash()` is called with the original saved instruction word.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-08"/></traces>
+      </test>
+
+      <test name="on_remove_bp_unknown_address_returns_error_reply">
+        <purpose><![CDATA[Dispatch `z0` for an address that has no entry in the breakpoint table and verify that the handler returns a GDB error reply.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-08"/></traces>
+      </test>
+
+      <test name="on_insert_bp_returns_E08_when_table_full">
+        <purpose><![CDATA[Fill all `RSP_MAX_BREAKPOINTS` (16) breakpoint table slots with distinct addresses, then dispatch one more `Z0` insert and verify the response is `E08`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-09"/></traces>
+      </test>
+
+      <test name="on_step_s_calls_updi_step_and_sends_T05_stop_reason">
+        <purpose><![CDATA[Dispatch an `s` packet and verify that the handler calls `updi_step()` once and sends a stop-reason reply of the form `T05thread:<id>;`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-10"/></traces>
+      </test>
+
+      <test name="on_continue_calls_updi_run_then_fsm_invalidate">
+        <purpose><![CDATA[Dispatch a `c` packet and verify that the handler calls `updi_run()` and then `fsm_invalidate()` in that order before polling for a halt.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-11"/></traces>
+      </test>
+
+      <test name="on_continue_rebuilds_thread_list_after_halt_and_sends_stop">
+        <purpose><![CDATA[After the simulated halt triggered by `on_continue`, verify that `fsm_build_thread_list()` is called and the handler sends a stop-reason packet to the GDB client.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-11"/></traces>
+      </test>
+
+      <test name="rsp_dispatch_qsupported_returns_feature_string_no_target_access">
+        <purpose><![CDATA[Dispatch a `qSupported` packet and verify that a non-empty feature string is returned and that no UPDI calls are made.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-12"/></traces>
+      </test>
+
+      <test name="rsp_dispatch_qattached_returns_1_no_target_access">
+        <purpose><![CDATA[Dispatch a `qAttached` packet and verify the reply is `1` and that no UPDI calls are made.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-12"/></traces>
+      </test>
+
+      <test name="on_detach_D_resumes_target_closes_socket_resets_gdb_fd">
+        <purpose><![CDATA[Dispatch a `D` packet and verify that the handler calls `updi_run()`, closes the GDB client socket, and sets `cfg->gdb_fd` to -1 without exiting the server process.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-13"/></traces>
+      </test>
+
+      <test name="on_kill_k_sets_g_quit_to_1">
+        <purpose><![CDATA[Dispatch a `k` packet and verify that `g_quit` is set to 1, causing the event loop to exit on its next iteration.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-14"/></traces>
+      </test>
+
+      <test name="on_monitor_qRcmd_passes_hex_body_to_monitor_dispatch">
+        <purpose><![CDATA[Dispatch a `qRcmd` packet with a hex-encoded command body and verify that `monitor_dispatch()` receives the same hex-encoded string without any pre-decoding.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-15"/></traces>
+      </test>
+
+      <test name="on_monitor_returns_ok_when_monitor_dispatch_succeeds">
+        <purpose><![CDATA[Inject a mock `monitor_dispatch()` that returns 0 and verify that the `qRcmd` handler sends `OK` to the GDB client.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-15"/></traces>
+      </test>
+
+      <test name="on_monitor_sends_o_packet_error_on_updi_failure">
+        <purpose><![CDATA[Inject a mock `monitor_dispatch()` that returns -1 and verify that the `qRcmd` handler sends an O-packet error message to the GDB console.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-15"/></traces>
+      </test>
+
+      <test name="H_packet_stores_thread_id_for_register_operations">
+        <purpose><![CDATA[Dispatch `Hg3` (set thread 3 for register operations) and then a `g` packet, and verify that `fsm_get_registers()` is called with the thread entry for GDB thread ID 3.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-16"/></traces>
+      </test>
+
+      <test name="H_packet_minus1_and_0_both_map_to_active_fsm_thread">
+        <purpose><![CDATA[Dispatch `Hg-1` and `Hg0` in turn, each followed by a `g` packet, and verify that both select the active FSM thread's register frame.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-16"/></traces>
+      </test>
+    </file>
+
+    <!-- ============================================================ -->
+    <!-- src/elf_parser.c unit tests                                  -->
+    <!-- ============================================================ -->
+    <file path="tests/test_elf.c" role="unit" count="13">
+      <header><![CDATA[Unit tests for `src/elf_parser.c`: ELF validation, symbol table loading, avrOS sentinel symbol discovery, Harvard address conversion, fail-safe degradation, and context cleanup. Fixture ELF binaries are generated by a helper script in `tests/fixtures/`.]]></header>
+
+      <test name="elf_open_accepts_valid_avr_elf32_binary">
+        <purpose><![CDATA[Call `elf_open()` with a well-formed AVR ELF32 fixture file and verify the return value is non-negative and `ctx.sym_count > 0`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-01"/></traces>
+      </test>
+
+      <test name="elf_open_returns_minus1_on_invalid_elf_magic">
+        <purpose><![CDATA[Call `elf_open()` with a file whose first 4 bytes are not the ELF magic sequence and verify the return value is -1.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-01"/></traces>
+      </test>
+
+      <test name="elf_open_returns_minus1_on_wrong_machine_type">
+        <purpose><![CDATA[Call `elf_open()` with a valid ELF32 file that has `e_machine != EM_AVR` and verify the return value is -1.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-01"/></traces>
+      </test>
+
+      <test name="elf_open_loads_symtab_and_strtab_into_heap_buffers">
+        <purpose><![CDATA[After a successful `elf_open()`, verify that `ctx.symtab` and `ctx.strtab` are non-NULL heap pointers, and that `ctx.sym_count` and `ctx.strtab_size` reflect the actual section sizes.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-02"/></traces>
+      </test>
+
+      <test name="elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure">
+        <purpose><![CDATA[Inject a mock `malloc()` that fails on the second allocation, call `elf_open()`, and verify the return value is -1 and no heap memory remains allocated.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-02"/></traces>
+      </test>
+
+      <test name="elf_find_avros_tables_performs_single_linear_scan">
+        <purpose><![CDATA[Instrument `elf_find_avros_tables()` with a mock symbol table and verify that each symbol entry is examined at most once regardless of how many avrOS sentinels are present.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-03"/></traces>
+      </test>
+
+      <test name="elf_find_avros_tables_populates_all_8_avros_sentinel_fields">
+        <purpose><![CDATA[Call `elf_find_avros_tables()` with a fixture ELF that contains all 8 avrOS sentinels and verify every field of `AvrOsSymbolIndex` is non-zero.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-03"/></traces>
+      </test>
+
+      <test name="elf_flash_addr_applies_vma_minus_base_over_2_formula">
+        <purpose><![CDATA[Call `elf_flash_addr()` with known `vma` and `ctx.flash_base` values and verify the return equals `(vma - flash_base) / 2`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-04"/></traces>
+      </test>
+
+      <test name="elf_flash_addr_all_avros_symbol_addresses_use_word_formula">
+        <purpose><![CDATA[After `elf_find_avros_tables()`, verify that every FLASH-resident address stored in `AvrOsSymbolIndex` was computed via `elf_flash_addr()`, not as a raw VMA.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-04"/></traces>
+      </test>
+
+      <test name="elf_find_avros_tables_returns_0_on_partial_symbol_match">
+        <purpose><![CDATA[Call `elf_find_avros_tables()` with a fixture ELF containing only 4 of the 8 avrOS sentinels and verify the return value is 0 (not -1).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-05"/></traces>
+      </test>
+
+      <test name="elf_find_avros_tables_zero_initialises_absent_symbol_fields">
+        <purpose><![CDATA[After `elf_find_avros_tables()` on a partial-symbol ELF, verify that each field in `AvrOsSymbolIndex` that corresponds to a missing symbol is zero.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-05"/></traces>
+      </test>
+
+      <test name="elf_close_frees_symtab_strtab_and_closes_fd">
+        <purpose><![CDATA[After a successful `elf_open()`, call `elf_close()` and verify that the file descriptor is closed and no memory is leaked (checked via Valgrind or AddressSanitizer).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-06"/></traces>
+      </test>
+
+      <test name="elf_close_safe_on_partially_initialised_context">
+        <purpose><![CDATA[Construct an `ElfContext` with `symtab = NULL`, `strtab` allocated, and `fd = -1`, call `elf_close()`, and verify no crash or double-free occurs.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-06"/></traces>
+      </test>
+    </file>
+
+    <!-- ============================================================ -->
+    <!-- src/fsm_mapper.c unit tests                                  -->
+    <!-- ============================================================ -->
+    <file path="tests/test_fsm.c" role="unit" count="11">
+      <header><![CDATA[Unit tests for `src/fsm_mapper.c`: FSM table reading, stable GDB thread ID assignment, active-thread identification, g-packet register frame construction, thread count capping, and stack-free guarantees. All UPDI calls are stubbed via a mock layer.]]></header>
+
+      <test name="fsm_build_thread_list_reads_fsm_table_from_flash_via_updi">
+        <purpose><![CDATA[Verify that `fsm_build_thread_list()` calls `updi_mem_read()` targeting `idx->fsm_table_addr` and reads `idx->fsm_table_count` consecutive `avros_fsm_entry_t` records.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-FSM-01"/></traces>
+      </test>
+
+      <test name="fsm_build_thread_list_returns_minus1_on_updi_failure">
+        <purpose><![CDATA[Inject a mock `updi_mem_read()` that returns -1 and verify that `fsm_build_thread_list()` propagates the error by returning -1.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-FSM-01"/></traces>
+      </test>
+
+      <test name="fsm_build_thread_list_assigns_1_based_thread_ids_in_order">
+        <purpose><![CDATA[Build a thread list from 3 FSM entries and verify that the resulting `gdb_id` values are 1, 2, and 3, in the order the entries appear in the FLASH table.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-FSM-02"/></traces>
+      </test>
+
+      <test name="fsm_build_thread_list_thread_ids_stable_across_calls">
+        <purpose><![CDATA[Call `fsm_build_thread_list()` twice with the same FSM table content and verify that each FSM entry maps to the same `gdb_id` on both calls.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-FSM-02"/></traces>
+      </test>
+
+      <test name="fsm_build_thread_list_sets_active_thread_from_current_fsm_ptr">
+        <purpose><![CDATA[Inject a mock `current_fsm` SRAM value matching the second FSM entry's `state_var_sram_addr` and verify that only that entry has `is_active == true` and `ctx->active_id == 2`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-FSM-03"/></traces>
+      </test>
+
+      <test name="fsm_build_thread_list_sets_active_id_0_when_no_entry_matches">
+        <purpose><![CDATA[Inject a `current_fsm` SRAM value that does not match any registered FSM and verify that `ctx->active_id == 0`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-FSM-03"/></traces>
+      </test>
+
+      <test name="fsm_get_registers_places_state_fn_as_pc_at_hex_positions_70_77">
+        <purpose><![CDATA[Call `fsm_get_registers()` for a thread whose `state_fn = 0xABCD` and verify that the 78-character g-packet buffer contains the little-endian encoding of 0xABCD at hex character positions 70–77.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-FSM-04"/></traces>
+      </test>
+
+      <test name="fsm_get_registers_non_active_r0_r31_sreg_spl_sph_all_zero">
+        <purpose><![CDATA[Call `fsm_get_registers()` for a non-active thread and verify that hex positions 0–69 of the 78-character buffer are all `'0'`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-FSM-04"/></traces>
+      </test>
+
+      <test name="fsm_get_registers_active_thread_reads_live_sreg_spl_sph">
+        <purpose><![CDATA[Call `fsm_get_registers()` for the active thread with a mock that returns known SREG, SPL, and SPH values, and verify they appear at hex positions 64–65, 66–67, and 68–69 respectively.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-FSM-04"/></traces>
+      </test>
+
+      <test name="fsm_build_thread_list_caps_at_32_entries_and_logs_warning">
+        <purpose><![CDATA[Inject an FSM table with 33 entries and verify that `fsm_build_thread_list()` returns `FSM_MAX_THREADS` (32) and emits a diagnostic warning without returning an error.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-FSM-05"/></traces>
+      </test>
+
+      <test name="fsm_get_registers_non_active_no_updi_read_of_stack">
+        <purpose><![CDATA[Call `fsm_get_registers()` for a non-active thread and verify that `updi_mem_read()` is never called with any stack-region address.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-FSM-06"/></traces>
+      </test>
+    </file>
+
+    <!-- ============================================================ -->
+    <!-- src/monitor.c unit tests                                     -->
+    <!-- ============================================================ -->
+    <file path="tests/test_monitor.c" role="unit" count="13">
+      <header><![CDATA[Unit tests for `src/monitor.c`: hex command decoding, prefix matching, per-sub-command UPDI reads, O-packet output formatting, 512-byte buffer constraint, and the no-halt guarantee. All UPDI calls are intercepted by a mock layer that records calls and returns injected data.]]></header>
+
+      <test name="monitor_dispatch_hex_decodes_cmd_before_prefix_matching">
+        <purpose><![CDATA[Pass `monitor_dispatch()` a hex-encoded `"avros events"` command and verify the function routes to `cmd_events()`, confirming that decoding occurs before prefix matching.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-01"/></traces>
+      </test>
+
+      <test name="monitor_dispatch_treats_invalid_hex_sequence_as_unrecognised">
+        <purpose><![CDATA[Pass `monitor_dispatch()` an odd-length hex string and verify it returns -2 without crashing or producing partial output.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-01"/></traces>
+      </test>
+
+      <test name="monitor_dispatch_rejects_cmd_without_avros_space_prefix">
+        <purpose><![CDATA[Pass a hex-encoded command that decodes to `"other events"` and verify `monitor_dispatch()` returns -2.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-02"/></traces>
+      </test>
+
+      <test name="monitor_dispatch_sends_usage_hint_o_packet_on_bad_prefix">
+        <purpose><![CDATA[Pass a command with an unrecognised prefix and verify that `monitor_dispatch()` sends at least one RSP O-packet containing a usage-hint string before returning -2.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-02"/></traces>
+      </test>
+
+      <test name="cmd_events_reads_2_bytes_from_event_mask_addr">
+        <purpose><![CDATA[Dispatch `"avros events"` and verify that `updi_mem_read()` is called once with address `idx->event_mask_addr` and length 2.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-03"/></traces>
+      </test>
+
+      <test name="cmd_events_reports_set_bits_as_SET_clear_bits_as_clear">
+        <purpose><![CDATA[Inject an event mask of 0x0003 (bits 0 and 1 set, rest clear) and verify the output contains `"event0: SET"`, `"event1: SET"`, and `"event2: clear"`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-03"/></traces>
+      </test>
+
+      <test name="cmd_events_bit0_is_lsb_event0_bit15_is_msb_event15">
+        <purpose><![CDATA[Inject a mask of 0x8001 and verify `"event0: SET"` (bit 0, LSB) and `"event15: SET"` (bit 15, MSB), with all intermediate bits reported as `"clear"`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-03"/></traces>
+      </test>
+
+      <test name="cmd_queues_reads_queue_count_structures_from_table">
+        <purpose><![CDATA[Dispatch `"avros queues"` and verify that `updi_mem_read()` is called with `idx->queue_table_addr` and a length equal to `idx->queue_count` times the size of the queue status structure.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-04"/></traces>
+      </test>
+
+      <test name="cmd_queues_formats_head_tail_count_for_each_entry">
+        <purpose><![CDATA[Inject two queue structures with known `head`, `tail`, and `count` fields and verify that both entries appear in the O-packet output with the correct formatted values.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-04"/></traces>
+      </test>
+
+      <test name="cmd_mempool_reads_pool_count_structures_from_table">
+        <purpose><![CDATA[Dispatch `"avros mempool"` and verify that `updi_mem_read()` is called with `idx->mempool_table_addr` and the correct total byte count.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-05"/></traces>
+      </test>
+
+      <test name="cmd_mempool_formats_free_count_capacity_and_utilisation">
+        <purpose><![CDATA[Inject a pool structure with `free_count = 3` and `capacity = 10` and verify the output contains both counts and a formatted `70%` utilisation figure.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-05"/></traces>
+      </test>
+
+      <test name="monitor_output_assembled_in_512_byte_buffer_sent_as_o_packets">
+        <purpose><![CDATA[Inject an event mask that produces near-maximum output and verify that the total assembled output does not exceed 512 bytes and is transmitted via `rsp_send_packet()` as RSP O-packets.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-06"/></traces>
+      </test>
+
+      <test name="monitor_dispatch_and_helpers_never_call_updi_halt">
+        <purpose><![CDATA[Execute all three sub-commands (`events`, `queues`, `mempool`) through `monitor_dispatch()` and verify that `updi_halt()` is never called by inspecting the mock call log.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-07"/></traces>
+      </test>
+    </file>
+
+    <!-- ============================================================ -->
+    <!-- Integration tests (system-level HLR properties)             -->
+    <!-- ============================================================ -->
+    <file path="tests/test_integration.c" role="integration" count="4">
+      <header><![CDATA[Integration tests validating system-level properties not covered by per-LLR unit tests: server startup latency (HLR-005), RSP protocol purity (HLR-020), and build portability (HLR-033, HLR-034).]]></header>
+
+      <test name="integration_server_ready_within_2_seconds_of_client_connect">
+        <purpose><![CDATA[Launch `avr-updi-gdb` against a loopback UPDI stub and a fixture ELF, connect a GDB client, and measure the elapsed time from TCP accept to the first valid RSP response. Assert the elapsed time is less than 2.0 seconds.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-005"/></traces>
+      </test>
+
+      <test name="integration_server_emits_only_standard_rsp_no_ide_extensions">
+        <purpose><![CDATA[Capture all TCP traffic from a full debug session (connect, register read, memory read, continue, breakpoint, detach) and verify that every server-originated packet conforms to the GDB RSP specification with no DAP, Cortex-Debug, or other IDE-specific packet types present.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-020"/></traces>
+      </test>
+
+      <test name="build_compiles_clean_on_linux_with_c99_and_posix">
+        <purpose><![CDATA[Execute `make` with `CC=gcc CFLAGS="-std=c99 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L"` and assert that the build exits with status 0 and produces no compiler warnings or errors on a Linux x86-64 host.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-033"/></traces>
+      </test>
+
+      <test name="runtime_links_only_libc_no_heavyweight_deps">
+        <purpose><![CDATA[Run `ldd avr-updi-gdb` on the linked binary and verify that the only shared-library dependency is `libc.so`. Assert that no Java runtime, Python interpreter, Electron libraries, or other non-POSIX dependencies appear.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-034"/></traces>
+      </test>
+    </file>
+
+  </tests>
+</project>
