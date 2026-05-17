@@ -336,7 +336,9 @@ static int build_min_elf(uint32_t *vmas, uint32_t *sizes, int n,
     for (int i = 0; i < n; i++) {
         if (sizes[i] == 0) continue;
         uint8_t *z = calloc(1, sizes[i]);
-        (void)write(fd, z, sizes[i]);
+        if (write(fd, z, sizes[i]) != (ssize_t)sizes[i]) {
+            free(z); close(fd); return -1;
+        }
         free(z);
     }
     if (out_ehdr) *out_ehdr = eh;

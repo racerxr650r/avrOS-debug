@@ -221,7 +221,9 @@ int updi_open(const char *device, int baud)
         uint8_t brk_pat[2] = { 0x00u, 0x00u };
         uint8_t synch      = UPDI_SYNCH;
 
-        (void)write(fd, brk_pat, sizeof(brk_pat));
+        if (write(fd, brk_pat, sizeof(brk_pat)) != (ssize_t)sizeof(brk_pat)) {
+            continue;
+        }
         tcdrain(fd);
 
         if (updi_write_bytes(fd, &synch, 1) < 0)
