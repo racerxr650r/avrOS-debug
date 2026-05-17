@@ -175,8 +175,23 @@ TEST_SRCS_test_install := $(TESTDIR)/test_install.c
 TEST_WRAP_test_install  :=
 TEST_EXTRA_LDFLAGS_test_install :=
 
+# test_device — Phase 7 --device diagnostic mode. test_device.c #includes
+# src/main.c so it can reach parse_args / run_device_mode / app_main.
+# updi.c is linked in real so updi_read_device_info exercises the PTY
+# harness; updi_open / updi_close are wrapped to substitute a pre-opened
+# PTY slave fd.
+TEST_SRCS_test_device := $(TESTDIR)/test_device.c $(SRCDIR)/updi.c
+TEST_WRAP_test_device  := select updi_open updi_close \
+                          updi_nvm_write_flash updi_console_poll \
+                          rsp_listen rsp_accept rsp_close \
+                          rsp_recv_packet rsp_dispatch \
+                          rsp_default_handlers \
+                          elf_open elf_close elf_find_avros_tables \
+                          fsm_build_thread_list
+TEST_EXTRA_LDFLAGS_test_device := $(LUTIL) -lpthread
+
 # Master list
-TEST_NAMES := test_elf test_updi test_fsm test_monitor test_rsp test_main test_integration test_install
+TEST_NAMES := test_elf test_updi test_fsm test_monitor test_rsp test_main test_integration test_install test_device
 
 # Build a --wrap flag string from a space-separated list of symbols
 wrap_flags = $(foreach sym,$(1),-Wl,--wrap,$(sym))

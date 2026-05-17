@@ -181,6 +181,19 @@ Role: **integration**. **8 test(s).**
 | 7 | <a id="make_bundle_produces_rpm_package"></a>`make_bundle_produces_rpm_package` | `LLR-INST-07` | Run `make bundle VERSION=0.1.0` and verify that `dist/avr-updi-gdb-0.1.0-1.x86_64.rpm` exists and that `rpm -qp --list` exits 0 and lists both `/usr/bin/avr-updi-gdb` and `/usr/share/man/man1/avr-updi-gdb.1`. |
 | 8 | <a id="make_bundle_produces_homebrew_formula"></a>`make_bundle_produces_homebrew_formula` | `LLR-INST-08` | Run `make bundle VERSION=0.1.0` and verify that `dist/avr-updi-gdb.rb` exists, is valid Ruby syntax (parseable by `ruby -c`), and contains the required fields: `desc`, `url`, `sha256`, `version`, and an `install` block. |
 
+### 3.9. [tests/test_device.c](../tests/test_device.c)
+
+Role: **unit**. **6 test(s).**
+
+| # | Test | Verifies | Purpose |
+| - | ---- | -------- | ------- |
+| 1 | <a id="parse_args_accepts_device_flag_without_elf_operand"></a>`parse_args_accepts_device_flag_without_elf_operand` | `LLR-MAIN-08` | Invoke `parse_args()` with `argv = {"avr-updi-gdb", "--device", "/dev/ttyUSB0"}` and assert `cfg.device_info == true`, `cfg.serial_device == "/dev/ttyUSB0"`, `cfg.elf_path == NULL`, and `parse_args()` returns without exiting. |
+| 2 | <a id="parse_args_rejects_device_combined_with_load"></a>`parse_args_rejects_device_combined_with_load` | `LLR-MAIN-08` | Fork a subprocess that calls `parse_args()` with `--device --load /dev/ttyUSB0 fw.elf`; assert the child exits with status 1 and that captured stderr contains `"--device is mutually exclusive with --load"`. |
+| 3 | <a id="updi_read_device_info_returns_sigrow_and_asi_bytes"></a>`updi_read_device_info_returns_sigrow_and_asi_bytes` | `LLR-UPDI-13` | Open a PTY pair; in a helper thread script the slave end to echo half-duplex bytes and respond to a SIGROW read at `0x1100`-`0x1119` with canned signature `0x1E 0x97 0x0A`, REVID `0xA6`, and a 10-byte serial number, and to LDCS reads of SYS_STATUS / KEY_STATUS / STATUSB. Call `updi_read_device_info()` and assert all struct fields match the canned values and that the function returns 0 with `info.fail_op == NULL`. |
+| 4 | <a id="updi_read_device_info_reports_failed_step_on_nak"></a>`updi_read_device_info_reports_failed_step_on_nak` | `LLR-UPDI-13` | Drive the PTY harness to return an unexpected byte in place of the SIGROW response. Assert `updi_read_device_info()` returns -1, `info.fail_op` equals the string `"sigrow"`, and `info.fail_errno` is negative. |
+| 5 | <a id="run_device_mode_prints_report_to_stdout"></a>`run_device_mode_prints_report_to_stdout` | `LLR-MAIN-09` | Capture `stdout` from `run_device_mode()` driven by the PTY harness with signature `0x1E 0x97 0x0A`. Assert the captured output contains the literal lines `Serial device:`, `Baud rate:`, `Signature:`, `Family:`, `Revision:`, `Serial:`, and `UPDI status:` (case-sensitive prefix match). |
+| 6 | <a id="device_mode_does_not_call_rsp_listen"></a>`device_mode_does_not_call_rsp_listen` | `LLR-MAIN-09` | Link the test binary with a stub `rsp_listen()` that flags a global. Invoke `run_device_mode()` to completion and assert the flag remains clear, proving the diagnostic path bypasses GDB listener startup. |
+
 ## 4. LLR Coverage Matrix
 
 Every LLR in [LLRs.md](LLRs.md) and the test(s) that verify it.
@@ -197,6 +210,8 @@ verified by code review — see
 | `LLR-MAIN-05` | `main` | `HLR-003`, `HLR-039` | `event_loop_uses_single_select_no_pthread_create`, `event_loop_accepts_gdb_client_when_gdb_fd_is_minus1` |
 | `LLR-MAIN-06` | `main` | `HLR-035`, `HLR-039` | `sigint_handler_sets_g_quit_to_1`, `event_loop_exits_immediately_when_g_quit_is_1` |
 | `LLR-MAIN-07` | `main` | `HLR-035` | `main_cleanup_closes_gdb_elf_updi_in_order` |
+| `LLR-MAIN-08` | `main` | `HLR-044` | `parse_args_accepts_device_flag_without_elf_operand`, `parse_args_rejects_device_combined_with_load` |
+| `LLR-MAIN-09` | `main` | `HLR-044` | `run_device_mode_prints_report_to_stdout`, `device_mode_does_not_call_rsp_listen` |
 | `LLR-UPDI-01` | `updi` | `HLR-006` | `updi_open_sets_8e2_raw_half_duplex_via_termios`, `updi_open_returns_minus1_on_device_open_failure` |
 | `LLR-UPDI-02` | `updi` | `HLR-006`, `HLR-036` | `updi_open_asserts_two_breaks_then_synch`, `updi_open_restores_session_baud_after_break` |
 | `LLR-UPDI-03` | `updi` | `HLR-036` | `updi_open_issues_ldcs_statusb_after_synch`, `updi_open_retries_break_synch_3_times_on_no_ack`, `updi_open_returns_minus1_after_3_consecutive_link_failures` |
@@ -209,6 +224,7 @@ verified by code review — see
 | `LLR-UPDI-10` | `updi` | `HLR-010` | `updi_run_returns_minus1_stub_until_ocd_layer` |
 | `LLR-UPDI-11` | `updi` | `HLR-011` | `updi_console_poll_returns_pending_bytes_without_halting` |
 | `LLR-UPDI-12` | `updi` | `HLR-012` | `updi_console_poll_returns_pending_bytes_without_halting`, `updi_console_poll_returns_0_when_output_buffer_empty` |
+| `LLR-UPDI-13` | `updi` | `HLR-044` | `updi_read_device_info_returns_sigrow_and_asi_bytes`, `updi_read_device_info_reports_failed_step_on_nak` |
 | `LLR-RSP-01` | `rsp` | `HLR-003`, `HLR-038` | `rsp_listen_sets_so_reuseaddr_before_bind`, `rsp_accept_sets_tcp_nodelay_on_client_socket` |
 | `LLR-RSP-02` | `rsp` | `HLR-013` | `rsp_recv_packet_discards_leading_ack_nak_bytes`, `rsp_recv_packet_sends_plus_on_valid_checksum`, `rsp_recv_packet_sends_minus_and_returns_minus1_on_bad_checksum` |
 | `LLR-RSP-03` | `rsp` | `HLR-014` | `on_read_regs_g_returns_78_char_hex_string`, `on_read_regs_g_places_pc_little_endian_at_positions_70_77` |

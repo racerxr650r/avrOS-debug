@@ -10,6 +10,13 @@ avr-updi-gdb \- UPDI-to-GDB debug stub with avrOS FSM awareness
 .RB [ \-\-load ]
 .I serial-device
 .I elf-file
+.br
+.B avr-updi-gdb
+.B \-\-device
+.RB [ \-\-baud
+.IR baud ]
+.I serial-device
+.RI [ elf-file ]
 .SH DESCRIPTION
 .B avr-updi-gdb
 is a host-side GDB Remote Serial Protocol (RSP) server that bridges
@@ -51,6 +58,18 @@ Before entering the event loop, program
 .I elf-file
 into target FLASH via the UPDI NVM controller. On any write failure
 the process exits 1 without opening the GDB listener.
+.TP
+.B \-\-device
+One-shot diagnostic. Open UPDI, read the SIGROW signature, revision,
+serial number and ASI status registers, print a human-readable report
+to standard output and exit. No TCP listener is opened, no ELF is
+loaded, and the target CPU is not halted. Useful as a first-line check
+for wiring, target power, and the UPDIDIS fuse. Mutually exclusive
+with
+.BR \-\-load .
+The
+.I elf-file
+operand is optional in this mode.
 .SH OPERANDS
 .TP
 .I serial-device
@@ -73,9 +92,11 @@ or GDB
 kill packet).
 .TP
 .B 1
-Bad arguments, serial-device open failure, TCP bind failure, or
+Bad arguments, serial-device open failure, TCP bind failure,
 .B \-\-load
-flash write failure.
+flash write failure, or
+.B \-\-device
+SIGROW read failure.
 .SH EXAMPLES
 Attach to a running target without flashing:
 .PP
@@ -102,6 +123,14 @@ avr-gdb firmware.elf
 (gdb) target remote :1234
 (gdb) info threads
 (gdb) monitor avros events
+.EE
+.RE
+.PP
+Verify the UPDI link without starting a GDB listener:
+.PP
+.RS
+.EX
+avr-updi-gdb \-\-device /dev/ttyUSB0
 .EE
 .RE
 .SH SEE ALSO

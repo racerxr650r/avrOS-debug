@@ -120,6 +120,18 @@ int __wrap_updi_console_poll(int fd, char *buf, size_t cap)
     return 0;
 }
 
+/* updi.c is not linked into test_main; main.c references
+ * updi_read_device_info() from run_device_mode(). The --device path
+ * is exercised by tests/test_device.c, so a simple stub satisfies the
+ * link here. */
+int updi_read_device_info(int fd, UpdiDeviceInfo *info);
+int updi_read_device_info(int fd, UpdiDeviceInfo *info)
+{
+    (void)fd;
+    if (info) { info->fail_op = "stub"; info->fail_errno = -1; }
+    return -1;
+}
+
 int __wrap_updi_nvm_write_flash(int fd, uint32_t a, const uint8_t *d, size_t n);
 int __wrap_updi_nvm_write_flash(int fd, uint32_t a, const uint8_t *d, size_t n)
 {

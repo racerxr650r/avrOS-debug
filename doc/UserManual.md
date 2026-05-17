@@ -134,6 +134,7 @@ CP210x) or `/dev/ttyACM0` (CDC ACM). On macOS the path is
 
 ```
 avr-updi-gdb [--port <port>] [--baud <baud>] [--load] <serial-device> <elf-file>
+avr-updi-gdb --device [--baud <baud>] <serial-device> [elf-file]
 ```
 
 ### Options
@@ -143,6 +144,7 @@ avr-updi-gdb [--port <port>] [--baud <baud>] [--load] <serial-device> <elf-file>
 | `--port <port>` | uint16_t | `1234` | TCP port to listen on for the `avr-gdb` client. Range: `1 ≤ port ≤ 65535`. |
 | `--baud <baud>` | int | `115200` | UART baud rate to the UPDI adapter. Must be a positive integer accepted by the host `termios` layer. |
 | `--load` | flag | unset | Before entering the event loop, program the supplied ELF into target FLASH via the UPDI NVM controller. |
+| `--device` | flag | unset | One-shot diagnostic: open UPDI, read the SIGROW signature + serial number and ASI status bytes, print a human-readable report to stdout and exit. No TCP listener is opened, no ELF is loaded, the target CPU is not halted. Mutually exclusive with `--load`. Makes `<elf-file>` optional. |
 
 ### Operands
 
@@ -155,8 +157,8 @@ avr-updi-gdb [--port <port>] [--baud <baud>] [--load] <serial-device> <elf-file>
 
 | Code | Condition |
 | ---- | --------- |
-| `0` | Normal shutdown (SIGINT, SIGTERM, or GDB `k` kill packet). |
-| `1` | Bad arguments, serial open failure, TCP bind failure, or `--load` write failure. |
+| `0` | Normal shutdown (SIGINT, SIGTERM, or GDB `k` kill packet). Also returned by a successful `--device` report. |
+| `1` | Bad arguments, serial open failure, TCP bind failure, `--load` write failure, or `--device` SIGROW read failure. |
 
 ---
 
@@ -198,6 +200,38 @@ the `(gdb)` prompt:
 (gdb) monitor avros queues       # dump all message-queue depths
 (gdb) monitor avros mempool      # dump memory-pool free-block counts
 ```
+
+### 5.4 Verify the wiring with `--device`
+
+When a target refuses to attach the first question to answer is
+“does the UPDI link work at all?” The `--device` switch performs a
+non-destructive read of the SIGROW signature and ASI status registers,
+prints a one-shot report, and exits without starting a GDB listener.
+
+```bash
+avr-updi-gdb --device /dev/ttyUSB0
+```
+
+Sample output:
+
+```
+Serial device:   /dev/ttyUSB0
+Baud rate:       115200
+Signature:       1E 97 0A
+Family:          AVR128DA28
+Revision:        A6
+Serial:          00 1A 2B 3C 4D 5E 6F 70 81 92
+UPDI status:     SYS_STATUS=0x82  KEY_STATUS=0x10  STATUSB=0x00
+```
+
+If this command succeeds the physical link, target power, and the UPDI
+enable fuse (`UPDIDIS`) are all healthy. If it fails the diagnostic
+printed on stderr names the step that failed (`sigrow`, `revid`,
+`sernum`, `sys-status`, `key-status`, `asi-statusb`); inspect wiring,
+target supply, and pull-ups before retrying.
+
+`--device` is mutually exclusive with `--load`. The `<elf-file>`
+operand is optional in this mode.
 
 Output is delivered as RSP `O`-packets and printed directly in the GDB
 console.

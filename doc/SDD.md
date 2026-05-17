@@ -128,6 +128,7 @@ The startup and attach sequence proceeds as follows:
 *   Create the GDB listener socket and pass it to the RSP layer.
 *   Run the event loop, dispatching each ready file descriptor to the appropriate layer until the GDB client disconnects.
 *   Release all resources on exit and return an appropriate exit code.
+*   When `--device` is supplied, execute the one-shot device-info diagnostic path: open UPDI, call `updi_read_device_info()`, print the formatted report to `stdout`, and return without entering `event_loop()`. Every failure on this path emits a verbose diagnostic on `stderr` that names the failed UPDI step.
 
 ### 3.2 External Interfaces
 #### 3.2.1 Public C API
@@ -143,10 +144,12 @@ This variable is checked at the top of each `event_loop()` iteration and is also
 #### 3.2.2 Command-Line Arguments
 
 `avr-updi-gdb [--port <port>] [--baud <baud>] [--load] <serial-device> <elf-file>`
+`avr-updi-gdb --device [--baud <baud>] <serial-device> [elf-file]`
 
 *   `--port <port>` — TCP port for the GDB listener (default: `1234`).
 *   `--baud <baud>` — UART baud rate (default: `115200`).
-*   `--load` — flash the ELF binary to the target before attaching.
+*   `--load` — flash the ELF binary to the target before attaching. Mutually exclusive with `--device`.
+*   `--device` — one-shot diagnostic mode: open the UPDI link, read the target SIGROW and ASI status, print a verbose human-readable report to `stdout`, and exit without binding the GDB listener. `<elf-file>` is optional in this mode. Mutually exclusive with `--load`.
 *   `<serial-device>` — path to the UART device (e.g. `/dev/ttyUSB0`).
 *   `<elf-file>` — path to the AVR ELF binary.
 
@@ -167,6 +170,17 @@ All three file descriptors are stored directly in `AppConfig`. The maximum fd va
 
 *   **`int main(int argc, char *argv[])`** — Parse argv, open resources, run the event loop, and return an exit code.
 *   **`static void parse_args(int argc, char *argv[], AppConfig *cfg)`** — Walk argv and populate cfg; print usage to stderr and exit on error.
+*   **`static int run_device_mode(const AppConfig *cfg)`**
+    *   Purpose: Diagnostic path taken when `cfg->device_info` is true. Opens the UPDI link, invokes `updi_read_device_info()`, prints a verbose human-readable report to `stdout`, and returns the process exit code (0 on success, 1 on any UPDI failure). Skips ELF loading, `rsp_listen()`, and the entire event loop.
+    *   Pre-condition: `cfg->serial_device` is non-NULL; `cfg->baud_rate` is positive; `cfg->device_info` is true.
+    *   Post-condition: UPDI fd is closed before return; no other resources are allocated.
+    *   Return Value: 0 on success; 1 on any failure (UPDI open, BREAK/SYNCH, or any SIGROW/ASI read).
+    *   Logic:
+        1.  `updi_open(cfg->serial_device, cfg->baud_rate)` \u2014 on failure, print `"error: cannot open UPDI device '<dev>': <errno-text>"` to `stderr` and return 1.
+        2.  `updi_read_device_info()` \u2014 on failure, print `"error: <fail_op> failed (rc=<fail_errno>) \u2014 check wiring, target power, UPDIDIS fuse"` to `stderr`, close UPDI, and return 1.
+        3.  Look up the 3-byte signature in the static `device_family[]` table; print `Serial device`, `Baud rate`, `Signature`, `Family`, `Revision`, `Serial`, and `UPDI status` lines to `stdout`.
+        4.  Close UPDI and return 0.
+
 *   **`static void event_loop(AppConfig *cfg)`**
     *   Purpose: Run the top-level select()-based multiplexer until the process receives a termination signal.
     *   Pre-condition: `cfg->listen_fd` and `cfg->updi_fd` are valid open file descriptors; `cfg->gdb_fd` is -1.
@@ -192,6 +206,8 @@ If the `--load` flag is set, `main()` invokes `updi_nvm_write_flash()` for each 
 | `0` | Normal exit after SIGINT/SIGTERM or GDB `k` (kill) packet. |
 | `1` | Fatal startup error: bad arguments, serial device open failure, or socket bind failure. |
 | `1` | `--load` flash write failure (UPDI error or write-protection). |
+| `0` | `--device` diagnostic mode completed; device info printed to stdout. |
+| `1` | `--device` diagnostic mode failed at any UPDI step (BREAK/SYNCH, SIGROW read, ASI read). |
 
 **Resource teardown sequence** (guaranteed order on all exit paths):
 
@@ -216,6 +232,8 @@ If the `--load` flag is set, `main()` invokes `updi_nvm_write_flash()` for each 
 *   **Serial device open failure** Print `strerror(errno)` to `stderr` and `exit(1)`.
 *   **GDB socket bind failure** Print `strerror(errno)` to `stderr` and `exit(1)`.
 *   **--load flash write failure** Print the UPDI error message to `stderr` and `exit(1)`; the target is left in an indeterminate state.
+*   **--device combined with --load** `parse_args()` detects the conflict, prints `"error: --device is mutually exclusive with --load"` to `stderr`, prints the usage line, and calls `exit(1)`.
+*   **--device UPDI link failure** `run_device_mode()` emits a verbose `stderr` diagnostic naming the failed UPDI step (open, BREAK, SYNCH, SIGROW read, ASI read) and returns 1. No GDB listener is bound; no event loop is entered.
 
 ## 4. Detailed Design for [src/updi.c](../src/updi.c)
 
@@ -255,6 +273,20 @@ int  updi_nvm_write_flash(int fd, uint32_t word_addr,
 
 /* Console bridge */
 int  updi_console_poll(int fd, char *buf, size_t cap);
+
+/* Device-signature diagnostics (Phase 7) */
+typedef struct {
+    uint8_t  device_id[3];     /* SIGROW DEVICEID0..2 @ 0x1100-0x1102 */
+    uint8_t  revid;            /* SIGROW REVID         @ 0x1103       */
+    uint8_t  serial[10];       /* SIGROW SERNUM0..9    @ 0x1110-0x1119 */
+    uint8_t  asi_sys_status;
+    uint8_t  asi_key_status;
+    uint8_t  asi_statusb;
+    const char *fail_op;       /* NULL on success      */
+    int         fail_errno;    /* negative updi error  */
+} UpdiDeviceInfo;
+
+int  updi_read_device_info(int fd, UpdiDeviceInfo *info);
 ```
 
 Error return convention: all functions return 0 on success and -1 on error (errno not set); `updi_nvm_write_flash()` additionally returns `UPDI_ERR_WP` (-2) when FLASH write-protection is active.
@@ -331,6 +363,18 @@ NVM controller registers (accessed via UPDI ST/LD at base address `0x1000`):
         7.  After all pages are written, exit NVM mode with `STCS ASI_RESET_REQ = 0x59` followed by `STCS ASI_RESET_REQ = 0x00`.
 
 *   **`int updi_console_poll(int fd, char *buf, size_t cap)`** — Poll the UPDI console channel and copy any pending bytes to buf; return byte count or -1.
+*   **`int updi_read_device_info(int fd, UpdiDeviceInfo *info)`**
+    *   Purpose: Read the AVR-Dx SIGROW (DEVICEID0..2 at `0x1100`–`0x1102`, REVID at `0x1103`, 10-byte SERNUM at `0x1110`–`0x1119`) and the UPDI ASI status registers (`ASI_SYS_STATUS`, `ASI_KEY_STATUS`, `ASI_STATUSB`), populating the caller-supplied `UpdiDeviceInfo` struct. The operation is non-destructive — the CPU is **not** halted and no NVM activity is initiated.
+    *   Pre-condition: `fd` is a valid UPDI serial file descriptor; `info` points to a caller-allocated `UpdiDeviceInfo` struct; the UPDI link has been initialised by `updi_open()`.
+    *   Post-condition: On success, every field of `*info` carries verbatim bytes from the target; on failure, `info->fail_op` carries a short identifier of the failed UPDI step (one of `"break"`, `"synch"`, `"asi-statusb"`, `"sigrow"`, `"revid"`, `"sernum"`, `"sys-status"`, `"key-status"`) and `info->fail_errno` carries either the negative `updi_mem_read` return or 0.
+    *   Return Value: 0 on success; -1 on any UPDI read failure.
+    *   Logic:
+        1.  Read three bytes at `0x1100` via `updi_mem_read()` into `info->device_id[0..2]`; on failure record `"sigrow"` and return -1.
+        2.  Read one byte at `0x1103` (REVID) into `info->revid`; on failure record `"revid"` and return -1.
+        3.  Read ten bytes at `0x1110` into `info->serial[0..9]`; on failure record `"sernum"` and return -1.
+        4.  Read `ASI_SYS_STATUS`, `ASI_KEY_STATUS`, and `ASI_STATUSB` via three `LDCS` opcodes; record `"sys-status"` / `"key-status"` / `"asi-statusb"` on failure.
+        5.  On success, clear `info->fail_op` to `NULL` and return 0.
+
 
 #### 4.3.3 Parsing Strategy / Algorithm
 
