@@ -409,11 +409,19 @@ int  rsp_recv_packet(int fd, char *buf, size_t cap);
 int  rsp_send_packet(int fd, const char *payload);
     /* Returns: 0 on success; -1 on write error */
 
+/* No-ack mode (toggled by QStartNoAckMode) */
+void rsp_set_noack(bool enabled);
+bool rsp_get_noack(void);
+
 /* Dispatch */
-void rsp_dispatch(int fd, const char *packet, RspHandlers *h);
+int  rsp_dispatch(int fd, const char *packet, RspHandlers *h);
+    /* Returns: 0 on success; -1 on write error from a handler */
+
+/* Default handlers (used by main; tests may override individual slots) */
+void rsp_default_handlers(RspHandlers *h, RspContext *ctx);
 ```
 
-The `RspHandlers` struct is also declared in `src/gdb_rsp.h` and must be populated by the caller before passing to `rsp_dispatch()`. Socket options applied by `rsp_listen()`: `SO_REUSEADDR` (allow rapid server restart) and `TCP_NODELAY` (disable Nagle algorithm to minimise GDB round-trip latency).
+The `RspHandlers` and `RspContext` structs are declared in `src/gdb_rsp.h`. The caller normally invokes `rsp_default_handlers()` to populate `RspHandlers` with the production handler set before passing it to `rsp_dispatch()`. `RspContext` carries the shared session state (UPDI fd, FSM context, symbol index, selected thread IDs, GDB client fd pointer, and quit flag pointer) and is stored in `RspHandlers.ctx`. Socket options applied by `rsp_listen()`: `SO_REUSEADDR` (allow rapid server restart) and `TCP_NODELAY` (disable Nagle algorithm to minimise GDB round-trip latency).
 
 #### 5.2.2 GDB Network Interface
 
@@ -428,18 +436,20 @@ TCP server socket on the configured port (default `1234`). Accepts exactly one c
 | Field | Packet(s) handled | Description |
 | ----- | ----------------- | ----------- |
 | `on_halt_reason`  | `?`                       | Stop-reason query; returns `T05thread:<id>;` |
-| `on_read_regs`    | `g`                       | Read all 35 AVR registers as hex. |
-| `on_write_regs`   | `G`                       | Write all registers (used by GDB for register restore). |
+| `on_read_regs`    | `g`                       | Read all 36 GDB AVR registers (R0-R31, SREG, SPL, SPH, PC) by delegating to `fsm_get_registers()`, which synthesizes the per-thread register frame from the cached FSM state and the live SREG/SP read via `updi_mem_read()` for the active thread. |
+| `on_write_regs`   | `G`, `P`                  | Write all registers (`G`) or a single register (`P n=vv`); both call `updi_mem_write()` against the CPU register file (base 0x1000). |
 | `on_read_mem`     | `m addr,len`              | Read memory; dispatches to UPDI for both FLASH and SRAM addresses. |
-| `on_write_mem`    | `M addr,len:data`         | Write memory via UPDI ST. |
+| `on_write_mem`    | `M addr,len:data`, `X addr,len:bin` | Write memory: `updi_nvm_write_flash()` for FLASH addresses, `updi_mem_write()` for SRAM addresses (selected by the GDB-unified 0x800000 bit). |
 | `on_continue`     | `c`, `vCont;c`            | Resume target; calls `updi_run()` and `fsm_invalidate()`. |
 | `on_step`         | `s`, `vCont;s`            | Single-step; calls `updi_step()`. |
 | `on_insert_bp`    | `Z0 addr,kind`            | Insert software breakpoint by patching FLASH with AVR BREAK opcode. |
 | `on_remove_bp`    | `z0 addr,kind`            | Remove software breakpoint by restoring the saved instruction word. |
 | `on_thread_info`  | `qfThreadInfo`/`qsThreadInfo` | Enumerate virtual thread IDs from `FsmContext`. |
 | `on_thread_extra` | `qThreadExtraInfo`        | Return FSM name string as hex-encoded ASCII. |
-| `on_monitor`      | `qRcmd`                   | Hex-decode the command body and forward to `monitor_dispatch()`. |
-| `on_detach`       | `D`, `k`                  | Detach: resume target and close client fd. |
+| `on_set_thread_g` | `Hg<tid>`                 | Select virtual thread for subsequent `g`/`G`/`P` operations; thread IDs -1 and 0 both map to the active FSM thread. |
+| `on_set_thread_c` | `Hc<tid>`                 | Select virtual thread for subsequent `c`/`s` operations. |
+| `on_monitor`      | `qRcmd`                   | Forward the raw ASCII-hex command body to `monitor_dispatch()`. |
+| `on_detach`       | `D`, `k`                  | Detach (`D`: resume target and close client fd) or kill (`k`: set the global quit flag). |
 
 **Breakpoint table:** `RSP_MAX_BREAKPOINTS` (16) software breakpoint slots are maintained as a static array of `{ uint32_t addr; uint16_t saved_word; }` structures. The AVR BREAK opcode (`0x9598`) is written to the target via `updi_nvm_write_flash()` on insertion and the saved instruction word is restored on removal.
 
@@ -462,14 +472,17 @@ TCP server socket on the configured port (default `1234`). Accepts exactly one c
         4.  Compare computed checksum to received checksum. On match, write `+` to `fd` and return payload length. On mismatch, write `-` to `fd` and return -1.
 
 *   **`int rsp_send_packet(int fd, const char *payload)`** — Frame payload as an RSP packet and transmit; return 0 or -1.
-*   **`void rsp_dispatch(int fd, const char *packet, RspHandlers *h)`**
-    *   Purpose: Identify the RSP packet type from the first character (and optionally subsequent characters) of packet and invoke the matching handler in h.
+*   **`int rsp_dispatch(int fd, const char *packet, RspHandlers *h)`**
+    *   Purpose: Identify the RSP packet type from the first character (and optionally subsequent characters) of packet and invoke the matching handler in h. Returns 0 on success or -1 if the selected handler reports a write error.
     *   Logic:
-        1.  Match the leading characters of `packet` against the handler table using a switch on `packet[0]` with secondary string comparisons for multi-character commands (`qS`, `qf`, `vC`, `Z0`, `z0`).
+        1.  Match the leading characters of `packet` against the handler table using a switch on `packet[0]` with secondary string comparisons for multi-character commands (`qS`, `qA`, `qf`, `qs`, `qR`, `QS`, `vC`, `Hg`, `Hc`, `Z0`, `z0`).
         2.  Invoke the matching handler function pointer from `h`, passing `fd`, `packet`, and the shared application context pointer.
         3.  If no handler matches, call `rsp_send_packet(fd, "")` to send the mandatory empty response `$#00`.
-    *   Notes: `qSupported` and `qAttached` are handled inline (not via the `RspHandlers` table) because their responses are fixed strings that do not require target interaction.
+    *   Notes: The following packets are handled inline (not via the `RspHandlers` table) because their responses are fixed strings that require no target interaction: `qSupported` (feature string), `qAttached` (returns `1`), `QStartNoAckMode` (calls `rsp_set_noack(true)` and returns `OK`), and `vCont?` (returns the supported vCont actions string `vCont;c;s`).
 
+*   **`void rsp_set_noack(bool enabled)`** — Toggle no-ack mode after a successful QStartNoAckMode negotiation; suppresses both the sending and the expectation of +/- ack bytes.
+*   **`bool rsp_get_noack(void)`** — Returns the current no-ack mode flag; primarily for tests and diagnostics.
+*   **`void rsp_default_handlers(RspHandlers *h, RspContext *ctx)`** — Populate every slot in *h with the production handler implementations and bind the shared session state pointer ctx to h->ctx.
 
 #### 5.3.3 Parsing Strategy / Algorithm
 
