@@ -1,26 +1,39 @@
 # Makefile — avrOS-debug (aod)
 #
 # Targets:
-#   all        Build the avr-updi-gdb host binary
-#   test       Build ELF fixtures, build all test binaries, run them
-#   test-ci    Like test, but writes per-suite output to build/test-results/*.txt
-#              (used by CI to build a structured test summary)
-#   clean      Remove all build artefacts
-#   install    Install avr-updi-gdb to $(PREFIX)/bin  [default: /usr/local]
-#   prereqs    Install all dev prerequisites via apt and download the AVR-Dx DFP
-#              (Debian/Ubuntu only; requires sudo)
-#   help       Print this target list
+#   all          Build the avr-updi-gdb host binary
+#   test         Build ELF fixtures, build all test binaries, run them
+#   test-ci      Like test, but writes per-suite output to build/test-results/*.txt
+#                (used by CI to build a structured test summary)
+#   clean        Remove all build artefacts
+#   check-tools  Verify all required host tools are present on PATH
+#   install      Install binary + man page under $(PREFIX) [default: /usr/local]
+#   uninstall    Remove files placed by `install` (idempotent)
+#   bundle       Build dist/ packages: .deb, .rpm, Homebrew formula
+#   prereqs      Install all dev prerequisites via apt and download the AVR-Dx DFP
+#                (Debian/Ubuntu only; requires sudo)
+#   help         Print this target list
 #
 # Variables:
 #   ASAN=1     Add -fsanitize=address,undefined to both host and test builds
 #   PREFIX     Install prefix (default: /usr/local)
+#   VERSION    Package version string (default: `git describe` or 0.0.0)
 #   V=1        Verbose build (show full commands)
 
 # ── Toolchain ────────────────────────────────────────────────────────────────
 CC        := gcc
 AVR_CC    := avr-gcc
 AVR_STRIP := avr-strip
-PREFIX    := /usr/local
+PREFIX    ?= /usr/local
+BINDIR    := $(PREFIX)/bin
+MANDIR    := $(PREFIX)/share/man/man1
+MANPAGE   := doc/avr-updi-gdb.1
+
+# Version string: command-line override > VERSION file > git describe > 0.0.0
+VERSION   ?= $(strip $(or $(shell cat VERSION 2>/dev/null),\
+                          $(shell git describe --tags --always 2>/dev/null),\
+                          0.0.0))
+DISTDIR   := dist
 
 # ── Platform detection ────────────────────────────────────────────────────────
 OS := $(shell uname -s)
@@ -157,8 +170,13 @@ TEST_SRCS_test_integration := $(TESTDIR)/test_integration.c
 TEST_WRAP_test_integration  :=
 TEST_EXTRA_LDFLAGS_test_integration :=
 
+# test_install (no source wrapping — runs `make` sub-invocations and inspects fs)
+TEST_SRCS_test_install := $(TESTDIR)/test_install.c
+TEST_WRAP_test_install  :=
+TEST_EXTRA_LDFLAGS_test_install :=
+
 # Master list
-TEST_NAMES := test_elf test_updi test_fsm test_monitor test_rsp test_main test_integration
+TEST_NAMES := test_elf test_updi test_fsm test_monitor test_rsp test_main test_integration test_install
 
 # Build a --wrap flag string from a space-separated list of symbols
 wrap_flags = $(foreach sym,$(1),-Wl,--wrap,$(sym))
@@ -258,22 +276,101 @@ test-ci: fixtures $(addprefix $(TESTBINDIR)/,$(TEST_NAMES))
 	done; \
 	exit $$FAIL
 
+# ── check-tools target ────────────────────────────────────────────────────────
+# LLR-INST-01: verify every required host tool is on PATH.
+.PHONY: check-tools
+check-tools:
+	@missing=0; \
+	for tool in $(CC) make $(AVR_CC) avr-nm; do \
+	    if ! command -v $$tool >/dev/null 2>&1; then \
+	        echo "ERROR: required tool not found: $$tool" >&2; \
+	        missing=1; \
+	    fi; \
+	done; \
+	if [ $$missing -ne 0 ]; then exit 1; fi; \
+	echo "All required tools found."
+
 # ── install target ────────────────────────────────────────────────────────────
+# LLR-INST-02: install binary (0755) and man page (0644) under $(PREFIX).
 .PHONY: install
 install: all
-	install -d $(DESTDIR)$(PREFIX)/bin
-	install -m 755 $(BUILDDIR)/$(TARGET) $(DESTDIR)$(PREFIX)/bin/$(TARGET)
-	@echo "  INSTALL  $(PREFIX)/bin/$(TARGET)"
+	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(MANDIR)
+	install -m 0755 $(BUILDDIR)/$(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)
+	install -m 0644 $(MANPAGE) $(DESTDIR)$(MANDIR)/$(notdir $(MANPAGE))
+	@echo "  INSTALL  $(BINDIR)/$(TARGET)"
+	@echo "  INSTALL  $(MANDIR)/$(notdir $(MANPAGE))"
+
+# ── uninstall target ──────────────────────────────────────────────────────────
+# LLR-INST-03: idempotent removal of files placed by `install`.
+.PHONY: uninstall
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/$(TARGET) $(DESTDIR)$(MANDIR)/$(notdir $(MANPAGE))
+	@echo "  UNINSTALL  $(BINDIR)/$(TARGET)"
+	@echo "  UNINSTALL  $(MANDIR)/$(notdir $(MANPAGE))"
+
+# ── bundle target ─────────────────────────────────────────────────────────────
+# LLR-INST-06..08: build dist/*.deb, dist/*.rpm, dist/*.rb (Homebrew formula).
+DEB_PKG   := $(DISTDIR)/avr-updi-gdb_$(VERSION)_amd64.deb
+RPM_PKG   := $(DISTDIR)/avr-updi-gdb-$(VERSION)-1.x86_64.rpm
+BREW_FILE := $(DISTDIR)/avr-updi-gdb.rb
+
+.PHONY: bundle bundle-deb bundle-rpm bundle-brew
+bundle: bundle-deb bundle-rpm bundle-brew
+
+# .deb — uses dpkg-deb if present; otherwise emits a clear error.
+bundle-deb: $(BUILDDIR)/$(TARGET) $(MANPAGE)
+	@command -v dpkg-deb >/dev/null 2>&1 || { \
+	    echo "ERROR: dpkg-deb not found; cannot build $(DEB_PKG)" >&2; exit 1; }
+	@mkdir -p $(DISTDIR)
+	$(Q)rm -rf $(BUILDDIR)/deb
+	$(Q)install -d $(BUILDDIR)/deb/DEBIAN \
+	              $(BUILDDIR)/deb/usr/bin \
+	              $(BUILDDIR)/deb/usr/share/man/man1
+	$(Q)install -m 0755 $(BUILDDIR)/$(TARGET) $(BUILDDIR)/deb/usr/bin/$(TARGET)
+	$(Q)install -m 0644 $(MANPAGE) $(BUILDDIR)/deb/usr/share/man/man1/$(notdir $(MANPAGE))
+	$(Q)printf 'Package: avr-updi-gdb\nVersion: %s\nArchitecture: amd64\nMaintainer: John Anderson <racerxr650r@example.com>\nDescription: UPDI-to-GDB debug stub with avrOS FSM awareness\n .\n A GDB Remote Serial Protocol server bridging avr-gdb to AVR DA/DB\n targets over the UPDI single-wire debug interface. Adds first-class\n awareness of avrOS cooperative FSM tasks as GDB virtual threads.\nSection: devel\nPriority: optional\n' $(VERSION) > $(BUILDDIR)/deb/DEBIAN/control
+	$(Q)dpkg-deb --build --root-owner-group $(BUILDDIR)/deb $(DEB_PKG) >/dev/null
+	@echo "  BUNDLE  $(DEB_PKG)"
+
+# .rpm — uses rpmbuild if present; otherwise emits a clear error.
+bundle-rpm: $(BUILDDIR)/$(TARGET) $(MANPAGE)
+	@command -v rpmbuild >/dev/null 2>&1 || { \
+	    echo "ERROR: rpmbuild not found; cannot build $(RPM_PKG)" >&2; exit 1; }
+	@mkdir -p $(DISTDIR)
+	$(Q)rm -rf $(BUILDDIR)/rpm
+	$(Q)install -d $(BUILDDIR)/rpm/BUILD $(BUILDDIR)/rpm/RPMS $(BUILDDIR)/rpm/SOURCES \
+	              $(BUILDDIR)/rpm/SPECS $(BUILDDIR)/rpm/SRPMS \
+	              $(BUILDDIR)/rpm/buildroot/usr/bin \
+	              $(BUILDDIR)/rpm/buildroot/usr/share/man/man1
+	$(Q)install -m 0755 $(BUILDDIR)/$(TARGET) $(BUILDDIR)/rpm/buildroot/usr/bin/$(TARGET)
+	$(Q)install -m 0644 $(MANPAGE) $(BUILDDIR)/rpm/buildroot/usr/share/man/man1/$(notdir $(MANPAGE))
+	$(Q)printf 'Name:    avr-updi-gdb\nVersion: %s\nRelease: 1\nSummary: UPDI-to-GDB debug stub with avrOS FSM awareness\nLicense: MIT\nBuildArch: x86_64\n\n%%description\nA GDB Remote Serial Protocol server bridging avr-gdb to AVR DA/DB\ntargets over the UPDI single-wire debug interface.\n\n%%install\nmkdir -p %%{buildroot}/usr/bin %%{buildroot}/usr/share/man/man1\ncp -a $(abspath $(BUILDDIR))/rpm/buildroot/usr/bin/$(TARGET) %%{buildroot}/usr/bin/\ncp -a $(abspath $(BUILDDIR))/rpm/buildroot/usr/share/man/man1/$(notdir $(MANPAGE)) %%{buildroot}/usr/share/man/man1/\n\n%%files\n/usr/bin/avr-updi-gdb\n/usr/share/man/man1/avr-updi-gdb.1\n' $(VERSION) > $(BUILDDIR)/rpm/SPECS/avr-updi-gdb.spec
+	$(Q)rpmbuild --quiet --define "_topdir $(abspath $(BUILDDIR))/rpm" \
+	             --define "_rpmdir $(abspath $(DISTDIR))" \
+	             --define "_rpmfilename avr-updi-gdb-$(VERSION)-1.x86_64.rpm" \
+	             --define "_build_id_links none" \
+	             --target x86_64-linux \
+	             -bb $(BUILDDIR)/rpm/SPECS/avr-updi-gdb.spec >/dev/null
+	@echo "  BUNDLE  $(RPM_PKG)"
+
+# Homebrew formula — a self-contained .rb file (no tarball download required).
+bundle-brew: $(BUILDDIR)/$(TARGET) $(MANPAGE)
+	@mkdir -p $(DISTDIR)
+	$(Q)printf 'class AvrUpdiGdb < Formula\n  desc "UPDI-to-GDB debug stub with avrOS FSM awareness"\n  homepage "https://github.com/racerxr650r/avrOS-debug"\n  url "https://github.com/racerxr650r/avrOS-debug/archive/refs/tags/v%s.tar.gz"\n  sha256 "0000000000000000000000000000000000000000000000000000000000000000"\n  version "%s"\n  license "MIT"\n\n  def install\n    system "make"\n    bin.install "build/avr-updi-gdb"\n    man1.install "doc/avr-updi-gdb.1"\n  end\n\n  test do\n    assert_match "avr-updi-gdb", shell_output("#{bin}/avr-updi-gdb --help 2>&1", 1)\n  end\nend\n' $(VERSION) $(VERSION) > $(BREW_FILE)
+	@echo "  BUNDLE  $(BREW_FILE)"
 # ── prereqs target ───────────────────────────────────────────────────────────
 # Install all development prerequisites (Debian/Ubuntu; requires sudo).
 # Installs host build tools via apt, then downloads and installs the
 # Microchip AVR-Dx Device Family Pack so avr-gcc can target AVR DA/DB parts.
+# Also installs the packaging tools required by `make bundle`
+# (dpkg-deb, rpmbuild, ruby) and the man(1) renderer used by tests.
 .PHONY: prereqs
 prereqs:
 	@echo "── Installing apt packages ──────────────────────────────────────"
 	sudo apt-get update -q
 	sudo apt-get install -y --no-install-recommends \
-	    make gcc binutils gcc-avr binutils-avr avr-libc wget unzip
+	    make gcc binutils gcc-avr binutils-avr avr-libc wget unzip \
+	    dpkg-dev rpm ruby man-db groff
 	@echo "── Installing AVR-Dx DFP $(DFP_VER) ──────────────────────────"
 	wget -q -O /tmp/$(DFP_PACK) $(DFP_URL)
 	unzip -q -o /tmp/$(DFP_PACK) -d /tmp/Atmel.AVR-Dx_DFP.$(DFP_VER)
@@ -284,8 +381,8 @@ prereqs:
 # ── clean target ──────────────────────────────────────────────────────────────
 .PHONY: clean
 clean:
-	$(Q)rm -rf $(BUILDDIR)
-	@echo "  CLEAN  $(BUILDDIR)/"
+	$(Q)rm -rf $(BUILDDIR) $(DISTDIR)
+	@echo "  CLEAN  $(BUILDDIR)/ $(DISTDIR)/"
 # ── help target ───────────────────────────────────────────────────────────
 .PHONY: help
 help:

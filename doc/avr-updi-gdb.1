@@ -1,0 +1,110 @@
+.TH AVR-UPDI-GDB 1 "2026-05-17" "avr-updi-gdb 0.1" "User Commands"
+.SH NAME
+avr-updi-gdb \- UPDI-to-GDB debug stub with avrOS FSM awareness
+.SH SYNOPSIS
+.B avr-updi-gdb
+.RB [ \-\-port
+.IR port ]
+.RB [ \-\-baud
+.IR baud ]
+.RB [ \-\-load ]
+.I serial-device
+.I elf-file
+.SH DESCRIPTION
+.B avr-updi-gdb
+is a host-side GDB Remote Serial Protocol (RSP) server that bridges
+.BR avr-gdb (1)
+to AVR DA/DB targets over the UPDI single-wire debug interface.
+It exposes each cooperative FSM task registered with the avrOS
+runtime as a GDB virtual thread, so standard
+.B info threads
+and per-thread breakpoints work against an RTOS-aware view of the
+target.
+.PP
+The server reads symbols and avrOS sentinel-table addresses from
+.IR elf-file ,
+opens
+.I serial-device
+as the UPDI UART, and listens on a TCP port for a single
+.BR avr-gdb (1)
+client. All UPDI memory access is non-intrusive when the CPU is
+halted by GDB; no heap allocation occurs on the hot path.
+.SH OPTIONS
+.TP
+.BI \-\-port " port"
+TCP port to listen on for the
+.BR avr-gdb (1)
+client. Must satisfy
+.RI 1 " " \(<= " " port " " \(<= " " 65535 .
+Defaults to
+.BR 1234 .
+.TP
+.BI \-\-baud " baud"
+UART baud rate to the UPDI adapter. Must be a positive integer
+accepted by the host
+.BR termios (3)
+layer. Defaults to
+.BR 115200 .
+.TP
+.B \-\-load
+Before entering the event loop, program
+.I elf-file
+into target FLASH via the UPDI NVM controller. On any write failure
+the process exits 1 without opening the GDB listener.
+.SH OPERANDS
+.TP
+.I serial-device
+Path to the USB-serial adapter
+.RI ( /dev/ttyUSB0 ", " /dev/cu.usbserial-* ", \(or similar)").
+.TP
+.I elf-file
+AVR ELF binary used for symbol lookup and avrOS table discovery.
+With
+.B \-\-load
+this file is also written to FLASH.
+.SH EXIT STATUS
+.TP
+.B 0
+Normal shutdown
+.RB ( SIGINT ,
+.BR SIGTERM ,
+or GDB
+.B k
+kill packet).
+.TP
+.B 1
+Bad arguments, serial-device open failure, TCP bind failure, or
+.B \-\-load
+flash write failure.
+.SH EXAMPLES
+Attach to a running target without flashing:
+.PP
+.RS
+.EX
+avr-updi-gdb /dev/ttyUSB0 firmware.elf
+.EE
+.RE
+.PP
+Flash and debug from cold on a non-default port:
+.PP
+.RS
+.EX
+avr-updi-gdb \-\-load \-\-port 1234 \-\-baud 115200 \\
+             /dev/ttyUSB0 firmware.elf
+.EE
+.RE
+.PP
+Once the server is listening, in another terminal:
+.PP
+.RS
+.EX
+avr-gdb firmware.elf
+(gdb) target remote :1234
+(gdb) info threads
+(gdb) monitor avros events
+.EE
+.RE
+.SH SEE ALSO
+.BR avr-gdb (1),
+.BR avrdude (1),
+.BR termios (3)
