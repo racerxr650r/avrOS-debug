@@ -25,14 +25,13 @@ typedef struct {
 } ElfContext;
 
 typedef struct {
-    uint32_t fsm_table_addr;
-    uint8_t  fsm_table_count;
-    uint32_t queue_table_addr;
-    uint8_t  queue_count;
-    uint32_t event_mask_addr;
-    uint32_t mempool_table_addr;
-    uint8_t  mempool_count;
-    uint32_t current_fsm_addr;
+    uint32_t fsm_table_addr;     /* FLASH word addr of FSM_TABLE   */
+    uint8_t  fsm_table_count;    /* entries: stride 9              */
+    uint32_t queue_table_addr;   /* FLASH word addr of QUE_TABLE   */
+    uint8_t  queue_count;        /* entries: stride 10             */
+    uint32_t event_table_addr;   /* FLASH word addr of EVNT_TABLE  */
+    uint8_t  event_count;        /* entries: stride 4              */
+    uint32_t current_fsm_addr;   /* SRAM VMA of currStateMachine   */
 } AvrOsSymbolIndex;
 
 int      elf_open(const char *path, ElfContext *ctx);

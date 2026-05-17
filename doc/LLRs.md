@@ -120,7 +120,7 @@ Requirements for RSP packet framing, dispatch, GDB packet handlers, session life
     *Trace:* HLR-019 (RSP Capability Negotiation and Lifecycle), HLR-035 (Graceful Shutdown and Resource Release).
 
 *   <a id="LLR-RSP-15"></a>**LLR-RSP-15** — The `on_monitor` handler for `qRcmd` shall pass the raw ASCII-hex-encoded command body directly to `monitor_dispatch()` without pre-decoding it, and relay the return code to the GDB client as `OK` on success (return 0), an O-packet error message on UPDI failure (return -1), or an empty reply on unrecognised sub-command (return -2).
-    *Trace:* HLR-029 (Monitor Events Command), HLR-030 (Monitor Queues Command), HLR-031 (Monitor Memory Pool Command).
+    *Trace:* HLR-029 (Monitor Events Command), HLR-030 (Monitor Queues Command).
 
 *   <a id="LLR-RSP-16"></a>**LLR-RSP-16** — The `H` (set-thread) packet handler shall store the requested GDB thread ID in the session context and use it to select the virtual thread for subsequent `g`/`G`/`P` register operations. Thread ID -1 (all threads) and 0 (any thread) shall both be interpreted as selecting the active FSM thread.
     *Trace:* HLR-025 (Active Thread Identification).
@@ -157,13 +157,13 @@ Requirements for `elf_open()`, `elf_close()`, `elf_find_avros_tables()`, and `el
 
 Requirements for `fsm_build_thread_list()`, `fsm_invalidate()`, `fsm_get_active_thread()`, and `fsm_get_registers()`.
 
-*   <a id="LLR-FSM-01"></a>**LLR-FSM-01** — `fsm_build_thread_list()` shall read `idx->fsm_table_count` consecutive `avros_fsm_entry_t` records from the FLASH address `idx->fsm_table_addr` via `updi_mem_read()`. A UPDI read failure at any point shall cause the function to return -1.
+*   <a id="LLR-FSM-01"></a>**LLR-FSM-01** — `fsm_build_thread_list()` shall read `idx->fsm_table_count` consecutive 9-byte `fsmStateMachineDescr_t` records from the FLASH address `idx->fsm_table_addr` via `updi_mem_read()`. Each descriptor carries a 2-byte `name` pointer (FLASH), a 2-byte `stateMachine` pointer (SRAM, or NULL for an initializer slot that shall be skipped), a 2-byte `handler` function pointer, a 1-byte `priority`, and a 2-byte `instance`. For each non-NULL `stateMachine` pointer, the function shall read 2 bytes from `stateMachine + 9` (the `currState` field of `fsmStateMachine_t`) to obtain the current state function pointer and store it in `thread->state_fn`. A UPDI read failure at any point shall cause the function to return -1.
     *Trace:* HLR-024 (FSM Thread Enumeration).
 
 *   <a id="LLR-FSM-02"></a>**LLR-FSM-02** — `fsm_build_thread_list()` shall assign `thread->gdb_id = loop_index + 1` (1-based) to each FSM entry in the order the entries appear in the FLASH table. Thread IDs shall not be reassigned within a debug session, ensuring the same FSM always maps to the same GDB thread ID.
     *Trace:* HLR-024 (FSM Thread Enumeration).
 
-*   <a id="LLR-FSM-03"></a>**LLR-FSM-03** — `fsm_build_thread_list()` shall read the 2-byte SRAM value at `idx->current_fsm_addr` and compare it against each FSM entry's `state_var_sram_addr`. The matching entry shall have `thread->is_active = true` and its `gdb_id` stored in `ctx->active_id`. If no entry matches, `ctx->active_id` shall be set to 0.
+*   <a id="LLR-FSM-03"></a>**LLR-FSM-03** — `fsm_build_thread_list()` shall read the 2-byte SRAM value at `idx->current_fsm_addr` (avrOS `currStateMachine`) and compare it against each retained FSM entry's `stateMachine` pointer. The matching entry shall have `thread->is_active = true` and its `gdb_id` stored in `ctx->active_id`. If no entry matches, `ctx->active_id` shall be set to 0.
     *Trace:* HLR-025 (Active Thread Identification).
 
 *   <a id="LLR-FSM-04"></a>**LLR-FSM-04** — `fsm_get_registers()` shall set the PC field (GDB register index 35, 4-byte little-endian at hex positions 70–77 of the 78-character g-packet buffer) to `thread->state_fn`. For non-active threads, R0–R31 (indices 0–31) and SREG (index 32) shall be zero-filled, and SPL (index 33) and SPH (index 34) shall be set to zero. For the active thread, SREG (index 32, hex positions 64–65), SPL (index 33, hex positions 66–67), and SPH (index 34, hex positions 68–69) shall be read from the target SRAM via `updi_mem_read()`.
@@ -177,27 +177,24 @@ Requirements for `fsm_build_thread_list()`, `fsm_invalidate()`, `fsm_get_active_
 
 ## 7. src/monitor.c — avrOS System Introspection
 
-Requirements for `monitor_dispatch()` and its static sub-command helpers `cmd_events()`, `cmd_queues()`, and `cmd_mempool()`.
+Requirements for `monitor_dispatch()` and its static sub-command helpers `cmd_events()` and `cmd_queues()`.
 
 *   <a id="LLR-MON-01"></a>**LLR-MON-01** — `monitor_dispatch()` shall hex-decode the ASCII-hex-encoded `cmd` string (pairs of hex digit characters) into a plain-text command string before any prefix or sub-command matching is attempted. An odd-length or invalid hex-digit sequence shall be treated as an unrecognised command.
     *Trace:* HLR-029 (Monitor Events Command).
 
 *   <a id="LLR-MON-02"></a>**LLR-MON-02** — `monitor_dispatch()` shall verify that the decoded command string begins with the prefix `"avros "` (case-sensitive, including the trailing space). If the prefix does not match, the function shall send a usage-hint O-packet to the GDB console and return -2.
-    *Trace:* HLR-029 (Monitor Events Command), HLR-030 (Monitor Queues Command), HLR-031 (Monitor Memory Pool Command).
+    *Trace:* HLR-029 (Monitor Events Command), HLR-030 (Monitor Queues Command).
 
-*   <a id="LLR-MON-03"></a>**LLR-MON-03** — `cmd_events()` shall call `updi_mem_read()` to read 2 bytes from `idx->event_mask_addr`. For each of the 16 bits (N=0 for the least-significant bit through N=15 for the most-significant bit), it shall test bit N of the 16-bit event mask word and append a line of the form `"  event<N>: SET\n"` if the bit is set, or `"  event<N>: clear\n"` if not, and send the complete buffer as RSP O-packets.
+*   <a id="LLR-MON-03"></a>**LLR-MON-03** — `cmd_events()` shall call `updi_mem_read()` to read `idx->event_count` consecutive 4-byte `evntDescriptor_t` records from FLASH at `idx->event_table_addr`. For each descriptor it shall dereference the `name` pointer (FLASH) to read the event's NUL-terminated display name (up to 31 chars) and the `status` pointer (SRAM) to read the 1-byte status flag, then append a line of the form `"  <name>: <status>\n"` and send the complete buffer as RSP O-packets.
     *Trace:* HLR-029 (Monitor Events Command).
 
-*   <a id="LLR-MON-04"></a>**LLR-MON-04** — `cmd_queues()` shall call `updi_mem_read()` to read `idx->queue_count` consecutive queue status structures from `idx->queue_table_addr`. For each structure, it shall extract and format the `head`, `tail`, and `count` fields as a one-line entry and send the complete table as RSP O-packets.
+*   <a id="LLR-MON-04"></a>**LLR-MON-04** — `cmd_queues()` shall call `updi_mem_read()` to read `idx->queue_count` consecutive 10-byte `queDescriptor_t` records from FLASH at `idx->queue_table_addr`. For each descriptor it shall extract and format the `capacity` and `sizeOfElement` fields as a one-line entry and send the complete table as RSP O-packets.
     *Trace:* HLR-030 (Monitor Queues Command).
 
-*   <a id="LLR-MON-05"></a>**LLR-MON-05** — `cmd_mempool()` shall call `updi_mem_read()` to read `idx->mempool_count` consecutive pool status structures from `idx->mempool_table_addr`. For each structure, it shall extract and format the `free_count` and `capacity` fields with a percentage utilisation figure and send the complete table as RSP O-packets.
-    *Trace:* HLR-031 (Monitor Memory Pool Command).
-
 *   <a id="LLR-MON-06"></a>**LLR-MON-06** — All monitor output shall be assembled into a temporary buffer of at most 512 bytes, hex-encoded (each ASCII byte converted to 2 hex characters per RSP O-packet spec), and transmitted to the GDB client as one or more RSP O-packets via `rsp_send_packet()`.
-    *Trace:* HLR-029 (Monitor Events Command), HLR-030 (Monitor Queues Command), HLR-031 (Monitor Memory Pool Command).
+    *Trace:* HLR-029 (Monitor Events Command), HLR-030 (Monitor Queues Command).
 
-*   <a id="LLR-MON-07"></a>**LLR-MON-07** — `monitor_dispatch()` and all of its static helpers (`cmd_events()`, `cmd_queues()`, `cmd_mempool()`) shall use `updi_mem_read()` exclusively for all target memory access. None of these functions shall call `updi_halt()`, ensuring that monitor commands never interrupt firmware execution.
+*   <a id="LLR-MON-07"></a>**LLR-MON-07** — `monitor_dispatch()` and all of its static helpers (`cmd_events()`, `cmd_queues()`) shall use `updi_mem_read()` exclusively for all target memory access. None of these functions shall call `updi_halt()`, ensuring that monitor commands never interrupt firmware execution.
     *Trace:* HLR-011 (Non-Intrusive Background Memory Read), HLR-032 (Introspection Reliability).
 
 ## 8. Makefile and Documentation

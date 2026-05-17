@@ -199,10 +199,14 @@ void elf_close(ElfContext *ctx)
 /* ── elf_find_avros_tables ───────────────────────────────────────────────── */
 int elf_find_avros_tables(ElfContext *ctx, AvrOsSymbolIndex *idx)
 {
-    /* Accumulate _start and _end VMAs in a single O(n) pass */
-    uint32_t fsm_start    = 0, fsm_end    = 0;
-    uint32_t queue_start  = 0, queue_end  = 0;
-    uint32_t mempool_start = 0, mempool_end = 0;
+    /* Accumulate _start and _end VMAs in a single O(n) pass.
+     * Symbol names match the real avrOS linker script
+     * (app/avrOS_example/avrOS.x): FSM_TABLE, QUE_TABLE, EVNT_TABLE
+     * sections with __start_<NAME> / __stop_<NAME> boundary symbols, plus
+     * the file-static `currStateMachine` (STB_LOCAL but still in .symtab). */
+    uint32_t fsm_start   = 0, fsm_end   = 0;
+    uint32_t queue_start = 0, queue_end = 0;
+    uint32_t event_start = 0, event_end = 0;
 
     /* Bitmask to track which sentinels were found */
     unsigned int found = 0U;
@@ -210,11 +214,10 @@ int elf_find_avros_tables(ElfContext *ctx, AvrOsSymbolIndex *idx)
 #define B_FSM_E  0x02U
 #define B_Q_S    0x04U
 #define B_Q_E    0x08U
-#define B_EVT    0x10U
-#define B_MEM_S  0x20U
-#define B_MEM_E  0x40U
-#define B_CURR   0x80U
-#define B_ALL    0xFFU
+#define B_EVT_S  0x10U
+#define B_EVT_E  0x20U
+#define B_CURR   0x40U
+#define B_ALL    0x7FU
 
     for (size_t i = 0; i < ctx->sym_count; i++) {
         const Elf32_Sym *sym = &ctx->symtab[i];
@@ -226,50 +229,52 @@ int elf_find_avros_tables(ElfContext *ctx, AvrOsSymbolIndex *idx)
 
         const char *name = ctx->strtab + sym->st_name;
 
-        if      (!strcmp(name, "__avros_fsm_table_start"))
-            { fsm_start    = sym->st_value; found |= B_FSM_S; }
-        else if (!strcmp(name, "__avros_fsm_table_end"))
-            { fsm_end      = sym->st_value; found |= B_FSM_E; }
-        else if (!strcmp(name, "__avros_queue_table_start"))
-            { queue_start  = sym->st_value; found |= B_Q_S;   }
-        else if (!strcmp(name, "__avros_queue_table_end"))
-            { queue_end    = sym->st_value; found |= B_Q_E;   }
-        else if (!strcmp(name, "__avros_event_mask"))
-            { idx->event_mask_addr  = sym->st_value; found |= B_EVT;  }
-        else if (!strcmp(name, "__avros_mempool_table_start"))
-            { mempool_start = sym->st_value; found |= B_MEM_S; }
-        else if (!strcmp(name, "__avros_mempool_table_end"))
-            { mempool_end   = sym->st_value; found |= B_MEM_E; }
-        else if (!strcmp(name, "__avros_current_fsm"))
+        if      (!strcmp(name, "__start_FSM_TABLE"))
+            { fsm_start   = sym->st_value; found |= B_FSM_S; }
+        else if (!strcmp(name, "__stop_FSM_TABLE"))
+            { fsm_end     = sym->st_value; found |= B_FSM_E; }
+        else if (!strcmp(name, "__start_QUE_TABLE"))
+            { queue_start = sym->st_value; found |= B_Q_S;   }
+        else if (!strcmp(name, "__stop_QUE_TABLE"))
+            { queue_end   = sym->st_value; found |= B_Q_E;   }
+        else if (!strcmp(name, "__start_EVNT_TABLE"))
+            { event_start = sym->st_value; found |= B_EVT_S; }
+        else if (!strcmp(name, "__stop_EVNT_TABLE"))
+            { event_end   = sym->st_value; found |= B_EVT_E; }
+        else if (!strcmp(name, "currStateMachine"))
             { idx->current_fsm_addr = sym->st_value; found |= B_CURR; }
     }
 
-    /* Compute word addresses and entry counts from gathered VMAs */
+    /* Compute word addresses and entry counts from gathered VMAs.
+     * Per-entry strides match the real avrOS struct layouts:
+     *   fsmStateMachineDescr_t  = 9 bytes
+     *   queDescriptor_t (no QUE_STATS) = 10 bytes
+     *   evntDescriptor_t        = 4 bytes
+     */
     if (found & B_FSM_S)
         idx->fsm_table_addr  = elf_flash_addr(ctx, fsm_start);
     if ((found & (B_FSM_S | B_FSM_E)) == (B_FSM_S | B_FSM_E))
-        idx->fsm_table_count = (uint8_t)((fsm_end - fsm_start) / 4U);
+        idx->fsm_table_count = (uint8_t)((fsm_end - fsm_start) / 9U);
 
     if (found & B_Q_S)
         idx->queue_table_addr = elf_flash_addr(ctx, queue_start);
     if ((found & (B_Q_S | B_Q_E)) == (B_Q_S | B_Q_E))
-        idx->queue_count = (uint8_t)((queue_end - queue_start) / 4U);
+        idx->queue_count = (uint8_t)((queue_end - queue_start) / 10U);
 
-    if (found & B_MEM_S)
-        idx->mempool_table_addr = elf_flash_addr(ctx, mempool_start);
-    if ((found & (B_MEM_S | B_MEM_E)) == (B_MEM_S | B_MEM_E))
-        idx->mempool_count = (uint8_t)((mempool_end - mempool_start) / 4U);
+    if (found & B_EVT_S)
+        idx->event_table_addr = elf_flash_addr(ctx, event_start);
+    if ((found & (B_EVT_S | B_EVT_E)) == (B_EVT_S | B_EVT_E))
+        idx->event_count = (uint8_t)((event_end - event_start) / 4U);
 
     /* Log any missing sentinels */
     if (found != B_ALL) {
-        if (!(found & B_FSM_S))  fprintf(stderr, "elf: missing __avros_fsm_table_start\n");
-        if (!(found & B_FSM_E))  fprintf(stderr, "elf: missing __avros_fsm_table_end\n");
-        if (!(found & B_Q_S))    fprintf(stderr, "elf: missing __avros_queue_table_start\n");
-        if (!(found & B_Q_E))    fprintf(stderr, "elf: missing __avros_queue_table_end\n");
-        if (!(found & B_EVT))    fprintf(stderr, "elf: missing __avros_event_mask\n");
-        if (!(found & B_MEM_S))  fprintf(stderr, "elf: missing __avros_mempool_table_start\n");
-        if (!(found & B_MEM_E))  fprintf(stderr, "elf: missing __avros_mempool_table_end\n");
-        if (!(found & B_CURR))   fprintf(stderr, "elf: missing __avros_current_fsm\n");
+        if (!(found & B_FSM_S))  fprintf(stderr, "elf: missing __start_FSM_TABLE\n");
+        if (!(found & B_FSM_E))  fprintf(stderr, "elf: missing __stop_FSM_TABLE\n");
+        if (!(found & B_Q_S))    fprintf(stderr, "elf: missing __start_QUE_TABLE\n");
+        if (!(found & B_Q_E))    fprintf(stderr, "elf: missing __stop_QUE_TABLE\n");
+        if (!(found & B_EVT_S))  fprintf(stderr, "elf: missing __start_EVNT_TABLE\n");
+        if (!(found & B_EVT_E))  fprintf(stderr, "elf: missing __stop_EVNT_TABLE\n");
+        if (!(found & B_CURR))   fprintf(stderr, "elf: missing currStateMachine\n");
     }
 
     return 0;

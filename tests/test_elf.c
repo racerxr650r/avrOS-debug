@@ -1,4 +1,4 @@
-/* tests/test_elf.c — Unit tests for src/elf_parser.c (Phase 1) */
+/* tests/test_elf.c — Unit tests for src/elf_parser.c (Phase 1, Phase 3 aligned) */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -142,64 +142,64 @@ void test_elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure(voi
 }
 
 /* ── Test 6: single linear scan with known in-memory symbol table ────── *
- * Hand-craft a minimal ctx with 9 symbols spread across the table and    *
- * verify that elf_find_avros_tables populates all 8 sentinel fields with *
- * the exact expected values. The implementation must examine every entry  *
- * exactly once (O(n)) to produce correct results here.                   *
+ * Hand-craft a minimal ctx with 8 symbols spread across the table and    *
+ * verify that elf_find_avros_tables populates all 7 sentinel fields with *
+ * the exact expected values. The implementation must examine every       *
+ * entry exactly once (O(n)) to produce correct results here.             *
  *                                                                         *
- * Strtab layout (offsets):                                                *
+ * Strtab layout (offsets, each entry includes its NUL terminator):       *
  *  [0]   '\0'                                                             *
- *  [1]   "__avros_fsm_table_start\0"    (24 bytes → next at  25)         *
- *  [25]  "__avros_fsm_table_end\0"      (22 bytes → next at  47)         *
- *  [47]  "__avros_queue_table_start\0"  (26 bytes → next at  73)         *
- *  [73]  "__avros_queue_table_end\0"    (24 bytes → next at  97)         *
- *  [97]  "__avros_event_mask\0"         (19 bytes → next at 116)         *
- *  [116] "__avros_mempool_table_start\0"(28 bytes → next at 144)         *
- *  [144] "__avros_mempool_table_end\0"  (26 bytes → next at 170)         *
- *  [170] "__avros_current_fsm\0"        (20 bytes → total   190)         *
+ *  [1]   "__start_FSM_TABLE\0"    (18 bytes → next at  19)               *
+ *  [19]  "__stop_FSM_TABLE\0"     (17 bytes → next at  36)               *
+ *  [36]  "__start_QUE_TABLE\0"    (18 bytes → next at  54)               *
+ *  [54]  "__stop_QUE_TABLE\0"     (17 bytes → next at  71)               *
+ *  [71]  "__start_EVNT_TABLE\0"   (19 bytes → next at  90)               *
+ *  [90]  "__stop_EVNT_TABLE\0"    (18 bytes → next at 108)               *
+ *  [108] "currStateMachine\0"     (17 bytes → total   125)               *
  * ─────────────────────────────────────────────────────────────────────── */
 void test_elf_find_avros_tables_performs_single_linear_scan(void)
 {
     static const char strtab[] =
         "\0"
-        "__avros_fsm_table_start\0"
-        "__avros_fsm_table_end\0"
-        "__avros_queue_table_start\0"
-        "__avros_queue_table_end\0"
-        "__avros_event_mask\0"
-        "__avros_mempool_table_start\0"
-        "__avros_mempool_table_end\0"
-        "__avros_current_fsm\0";
+        "__start_FSM_TABLE\0"
+        "__stop_FSM_TABLE\0"
+        "__start_QUE_TABLE\0"
+        "__stop_QUE_TABLE\0"
+        "__start_EVNT_TABLE\0"
+        "__stop_EVNT_TABLE\0"
+        "currStateMachine\0";
 
     /* Sym offsets into strtab (pre-computed from the layout above) */
     enum {
-        OFF_FSM_S    =   1, OFF_FSM_E    =  25,
-        OFF_Q_S      =  47, OFF_Q_E      =  73,
-        OFF_EVT      =  97,
-        OFF_MEM_S    = 116, OFF_MEM_E    = 144,
-        OFF_CURR     = 170
+        OFF_FSM_S    =   1, OFF_FSM_E    =  19,
+        OFF_Q_S      =  36, OFF_Q_E      =  54,
+        OFF_EVT_S    =  71, OFF_EVT_E    =  90,
+        OFF_CURR     = 108
     };
 
-    Elf32_Sym syms[9];
+    Elf32_Sym syms[8];
     memset(syms, 0, sizeof(syms));
     /* sym[0]: anonymous → skip */
     syms[0].st_name  = 0;
     syms[0].st_shndx = 1;
     syms[0].st_value = 0;
 
+    /* FSM:   stop - start = 0x12 = 18 → 18 / 9  = 2 entries */
     syms[1].st_name = OFF_FSM_S; syms[1].st_shndx = 1; syms[1].st_value = 0x1000U;
-    syms[2].st_name = OFF_FSM_E; syms[2].st_shndx = 1; syms[2].st_value = 0x1008U;
+    syms[2].st_name = OFF_FSM_E; syms[2].st_shndx = 1; syms[2].st_value = 0x1012U;
+    /* QUE:   stop - start = 0x14 = 20 → 20 / 10 = 2 entries */
     syms[3].st_name = OFF_Q_S;   syms[3].st_shndx = 1; syms[3].st_value = 0x2000U;
-    syms[4].st_name = OFF_Q_E;   syms[4].st_shndx = 1; syms[4].st_value = 0x2010U;
-    syms[5].st_name = OFF_EVT;   syms[5].st_shndx = 1; syms[5].st_value = 0x00802000U;
-    syms[6].st_name = OFF_MEM_S; syms[6].st_shndx = 1; syms[6].st_value = 0x3000U;
-    syms[7].st_name = OFF_MEM_E; syms[7].st_shndx = 1; syms[7].st_value = 0x3008U;
-    syms[8].st_name = OFF_CURR;  syms[8].st_shndx = 1; syms[8].st_value = 0x00802100U;
+    syms[4].st_name = OFF_Q_E;   syms[4].st_shndx = 1; syms[4].st_value = 0x2014U;
+    /* EVNT:  stop - start = 0x10 = 16 → 16 / 4  = 4 entries */
+    syms[5].st_name = OFF_EVT_S; syms[5].st_shndx = 1; syms[5].st_value = 0x3000U;
+    syms[6].st_name = OFF_EVT_E; syms[6].st_shndx = 1; syms[6].st_value = 0x3010U;
+    /* currStateMachine: SRAM raw VMA */
+    syms[7].st_name = OFF_CURR;  syms[7].st_shndx = 1; syms[7].st_value = 0x00802100U;
 
     ElfContext ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.symtab      = syms;
-    ctx.sym_count   = 9;
+    ctx.sym_count   = 8;
     ctx.strtab      = (char *)strtab;
     ctx.strtab_size = sizeof(strtab);
     ctx.flash_base  = 0;
@@ -215,10 +215,9 @@ void test_elf_find_avros_tables_performs_single_linear_scan(void)
     TEST_ASSERT_EQUAL_UINT32(0x0800U,     idx.fsm_table_addr);
     TEST_ASSERT_EQUAL_UINT8 (2U,          idx.fsm_table_count);
     TEST_ASSERT_EQUAL_UINT32(0x1000U,     idx.queue_table_addr);
-    TEST_ASSERT_EQUAL_UINT8 (4U,          idx.queue_count);
-    TEST_ASSERT_EQUAL_UINT32(0x00802000U, idx.event_mask_addr);
-    TEST_ASSERT_EQUAL_UINT32(0x1800U,     idx.mempool_table_addr);
-    TEST_ASSERT_EQUAL_UINT8 (2U,          idx.mempool_count);
+    TEST_ASSERT_EQUAL_UINT8 (2U,          idx.queue_count);
+    TEST_ASSERT_EQUAL_UINT32(0x1800U,     idx.event_table_addr);
+    TEST_ASSERT_EQUAL_UINT8 (4U,          idx.event_count);
     TEST_ASSERT_EQUAL_UINT32(0x00802100U, idx.current_fsm_addr);
 
     /* Do NOT call elf_close — symtab/strtab are stack/static, not heap */
@@ -226,8 +225,8 @@ void test_elf_find_avros_tables_performs_single_linear_scan(void)
     ctx.strtab  = NULL;
 }
 
-/* ── Test 7: all 8 sentinel fields non-zero with full fixture ────────── */
-void test_elf_find_avros_tables_populates_all_8_avros_sentinel_fields(void)
+/* ── Test 7: all 7 sentinel fields non-zero with full fixture ────────── */
+void test_elf_find_avros_tables_populates_all_7_avros_sentinel_fields(void)
 {
     ElfContext ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -241,9 +240,8 @@ void test_elf_find_avros_tables_populates_all_8_avros_sentinel_fields(void)
     TEST_ASSERT_NOT_EQUAL(0U, idx.fsm_table_count);
     TEST_ASSERT_NOT_EQUAL(0U, idx.queue_table_addr);
     TEST_ASSERT_NOT_EQUAL(0U, idx.queue_count);
-    TEST_ASSERT_NOT_EQUAL(0U, idx.event_mask_addr);
-    TEST_ASSERT_NOT_EQUAL(0U, idx.mempool_table_addr);
-    TEST_ASSERT_NOT_EQUAL(0U, idx.mempool_count);
+    TEST_ASSERT_NOT_EQUAL(0U, idx.event_table_addr);
+    TEST_ASSERT_NOT_EQUAL(0U, idx.event_count);
     TEST_ASSERT_NOT_EQUAL(0U, idx.current_fsm_addr);
 
     elf_close(&ctx);
@@ -274,29 +272,26 @@ void test_elf_flash_addr_all_avros_symbol_addresses_use_word_formula(void)
     TEST_ASSERT_EQUAL_INT(0, elf_find_avros_tables(&ctx, &idx));
 
     /* Scan the loaded symtab to find the raw _start VMAs */
-    uint32_t fsm_vma = 0, queue_vma = 0, mempool_vma = 0;
-    uint32_t event_vma = 0, curr_vma = 0;
+    uint32_t fsm_vma = 0, queue_vma = 0, event_vma = 0, curr_vma = 0;
     for (size_t i = 0; i < ctx.sym_count; i++) {
         const Elf32_Sym *s = &ctx.symtab[i];
         if (s->st_shndx == SHN_UNDEF || s->st_name == 0) continue;
         if ((size_t)s->st_name >= ctx.strtab_size)        continue;
         const char *nm = ctx.strtab + s->st_name;
-        if (!strcmp(nm, "__avros_fsm_table_start"))     fsm_vma    = s->st_value;
-        else if (!strcmp(nm, "__avros_queue_table_start"))   queue_vma  = s->st_value;
-        else if (!strcmp(nm, "__avros_mempool_table_start")) mempool_vma = s->st_value;
-        else if (!strcmp(nm, "__avros_event_mask"))          event_vma  = s->st_value;
-        else if (!strcmp(nm, "__avros_current_fsm"))         curr_vma   = s->st_value;
+        if      (!strcmp(nm, "__start_FSM_TABLE"))  fsm_vma   = s->st_value;
+        else if (!strcmp(nm, "__start_QUE_TABLE"))  queue_vma = s->st_value;
+        else if (!strcmp(nm, "__start_EVNT_TABLE")) event_vma = s->st_value;
+        else if (!strcmp(nm, "currStateMachine"))   curr_vma  = s->st_value;
     }
 
     /* FLASH-resident: must equal (vma - flash_base) / 2 */
     TEST_ASSERT_NOT_EQUAL(0U, fsm_vma);
-    TEST_ASSERT_EQUAL_UINT32(elf_flash_addr(&ctx, fsm_vma),    idx.fsm_table_addr);
-    TEST_ASSERT_EQUAL_UINT32(elf_flash_addr(&ctx, queue_vma),  idx.queue_table_addr);
-    TEST_ASSERT_EQUAL_UINT32(elf_flash_addr(&ctx, mempool_vma),idx.mempool_table_addr);
+    TEST_ASSERT_EQUAL_UINT32(elf_flash_addr(&ctx, fsm_vma),   idx.fsm_table_addr);
+    TEST_ASSERT_EQUAL_UINT32(elf_flash_addr(&ctx, queue_vma), idx.queue_table_addr);
+    TEST_ASSERT_EQUAL_UINT32(elf_flash_addr(&ctx, event_vma), idx.event_table_addr);
 
     /* SRAM-resident: must be the raw VMA, not a word address */
-    TEST_ASSERT_EQUAL_UINT32(event_vma, idx.event_mask_addr);
-    TEST_ASSERT_EQUAL_UINT32(curr_vma,  idx.current_fsm_addr);
+    TEST_ASSERT_EQUAL_UINT32(curr_vma, idx.current_fsm_addr);
 
     elf_close(&ctx);
 }
@@ -327,12 +322,12 @@ void test_elf_find_avros_tables_zero_initialises_absent_symbol_fields(void)
     memset(&idx, 0, sizeof(idx));
     TEST_ASSERT_EQUAL_INT(0, elf_find_avros_tables(&ctx, &idx));
 
-    /* Partial fixture has only FSM sentinels, event_mask, current_fsm */
-    /* Queue and mempool table fields must remain zero */
+    /* Partial fixture has only FSM_TABLE sentinels + currStateMachine. */
+    /* Queue and event table fields must remain zero-initialised.       */
     TEST_ASSERT_EQUAL_UINT32(0U, idx.queue_table_addr);
     TEST_ASSERT_EQUAL_UINT8 (0U, idx.queue_count);
-    TEST_ASSERT_EQUAL_UINT32(0U, idx.mempool_table_addr);
-    TEST_ASSERT_EQUAL_UINT8 (0U, idx.mempool_count);
+    TEST_ASSERT_EQUAL_UINT32(0U, idx.event_table_addr);
+    TEST_ASSERT_EQUAL_UINT8 (0U, idx.event_count);
 
     elf_close(&ctx);
 }
@@ -408,7 +403,7 @@ int main(void)
     RUN_TEST(test_elf_open_loads_symtab_and_strtab_into_heap_buffers);
     RUN_TEST(test_elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure);
     RUN_TEST(test_elf_find_avros_tables_performs_single_linear_scan);
-    RUN_TEST(test_elf_find_avros_tables_populates_all_8_avros_sentinel_fields);
+    RUN_TEST(test_elf_find_avros_tables_populates_all_7_avros_sentinel_fields);
     RUN_TEST(test_elf_flash_addr_applies_vma_minus_base_over_2_formula);
     RUN_TEST(test_elf_flash_addr_all_avros_symbol_addresses_use_word_formula);
     RUN_TEST(test_elf_find_avros_tables_returns_0_on_partial_symbol_match);
@@ -418,4 +413,3 @@ int main(void)
     RUN_TEST(test_elf_open_sets_flash_base_and_sram_base_from_pt_load_segments);
     return UNITY_END();
 }
-
