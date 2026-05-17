@@ -35,7 +35,7 @@ typedef struct {
     uint32_t current_fsm_addr;
 } AvrOsSymbolIndex;
 
-int      elf_open(ElfContext *ctx, const char *path);
+int      elf_open(const char *path, ElfContext *ctx);
 void     elf_close(ElfContext *ctx);
 int      elf_find_avros_tables(ElfContext *ctx, AvrOsSymbolIndex *idx);
 uint32_t elf_flash_addr(const ElfContext *ctx, uint32_t vma);

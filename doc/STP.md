@@ -66,7 +66,7 @@ Role: **unit**. **23 test(s).**
 
 ### 3.3. [tests/test_rsp.c](../tests/test_rsp.c)
 
-Role: **unit**. **28 test(s).**
+Role: **unit**. **29 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -166,7 +166,7 @@ Role: **integration**. **4 test(s).**
 | - | ---- | -------- | ------- |
 | 1 | <a id="integration_server_ready_within_2_seconds_of_client_connect"></a>`integration_server_ready_within_2_seconds_of_client_connect` | — | Launch `avr-updi-gdb` against a loopback UPDI stub and a fixture ELF, connect a GDB client, and measure the elapsed time from TCP accept to the first valid RSP response. Assert the elapsed time is less than 2.0 seconds. |
 | 2 | <a id="integration_server_emits_only_standard_rsp_no_ide_extensions"></a>`integration_server_emits_only_standard_rsp_no_ide_extensions` | — | Capture all TCP traffic from a full debug session (connect, register read, memory read, continue, breakpoint, detach) and verify that every server-originated packet conforms to the GDB RSP specification with no DAP, Cortex-Debug, or other IDE-specific packet types present. |
-| 3 | <a id="build_compiles_clean_on_linux_with_c99_and_posix"></a>`build_compiles_clean_on_linux_with_c99_and_posix` | — | Execute `make` with `CC=gcc CFLAGS="-std=c99 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L"` and assert that the build exits with status 0 and produces no compiler warnings or errors on a Linux x86-64 host. |
+| 3 | <a id="build_compiles_clean_on_linux_with_c99_and_posix"></a>`build_compiles_clean_on_linux_with_c99_and_posix` | `LLR-ELF-07` | Execute `make` with `CC=gcc CFLAGS="-std=c99 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L"` and assert that the build exits with status 0 and produces no compiler warnings or errors on a Linux x86-64 host. |
 | 4 | <a id="runtime_links_only_libc_no_heavyweight_deps"></a>`runtime_links_only_libc_no_heavyweight_deps` | — | Run `ldd avr-updi-gdb` on the linked binary and verify that the only shared-library dependency is `libc.so`. Assert that no Java runtime, Python interpreter, Electron libraries, or other non-POSIX dependencies appear. |
 
 ## 4. LLR Coverage Matrix
@@ -219,6 +219,7 @@ verified by code review — see
 | `LLR-ELF-04` | `elf` | `HLR-022` | `elf_flash_addr_applies_vma_minus_base_over_2_formula`, `elf_flash_addr_all_avros_symbol_addresses_use_word_formula` |
 | `LLR-ELF-05` | `elf` | `HLR-023` | `elf_find_avros_tables_returns_0_on_partial_symbol_match`, `elf_find_avros_tables_zero_initialises_absent_symbol_fields` |
 | `LLR-ELF-06` | `elf` | `HLR-040` | `elf_close_frees_symtab_strtab_and_closes_fd`, `elf_close_safe_on_partially_initialised_context` |
+| `LLR-ELF-07` | `elf` | `HLR-033` | `build_compiles_clean_on_linux_with_c99_and_posix` |
 | `LLR-FSM-01` | `fsm` | `HLR-024` | `fsm_build_thread_list_reads_fsm_table_from_flash_via_updi`, `fsm_build_thread_list_returns_minus1_on_updi_failure` |
 | `LLR-FSM-02` | `fsm` | `HLR-024` | `fsm_build_thread_list_assigns_1_based_thread_ids_in_order`, `fsm_build_thread_list_thread_ids_stable_across_calls` |
 | `LLR-FSM-03` | `fsm` | `HLR-025` | `fsm_build_thread_list_sets_active_thread_from_current_fsm_ptr`, `fsm_build_thread_list_sets_active_id_0_when_no_entry_matches` |

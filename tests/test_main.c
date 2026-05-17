@@ -25,8 +25,8 @@ int __wrap_rsp_recv_packet(int fd, char *buf, size_t sz)
 
 int __wrap_rsp_dispatch(int fd) { (void)fd; return -1; }
 
-int __wrap_elf_open(ElfContext *ctx, const char *path)
-{ (void)ctx;(void)path; return -1; }
+int __wrap_elf_open(const char *path, ElfContext *ctx)
+{ (void)path;(void)ctx; return -1; }
 
 int __wrap_elf_find_avros_tables(ElfContext *ctx, AvrOsSymbolIndex *idx)
 { (void)ctx;(void)idx; return -1; }

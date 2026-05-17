@@ -49,7 +49,7 @@ Requirements for all public functions in `src/updi.c`: link initialisation, memo
 *   <a id="LLR-UPDI-04"></a>**LLR-UPDI-04** — `updi_mem_read()` shall transfer up to `UPDI_MAX_BLOCK` (256) bytes per UPDI burst using the REPEAT+LD auto-increment sequence. If `len` exceeds `UPDI_MAX_BLOCK`, the function shall split the request into consecutive block reads automatically, with no size restriction imposed on the caller.
     *Trace:* HLR-007 (Target Memory Read).
 
-*   <a id="LLR-UPDI-05"></a>**LLR-UPDI-05** — `updi_mem_read()` shall apply a 100 ms per-byte read timeout to every `read()` call on the UART file descriptor. If no byte is received within 100 ms, the function shall abandon the current transaction and return -1.
+*   <a id="LLR-UPDI-05"></a>**LLR-UPDI-05** — `updi_mem_read()` shall use `select()` with a 100 ms timeout before each `read()` call on the UART file descriptor to enforce a per-byte inactivity deadline. If `select()` returns zero (timeout) before a byte is available, the function shall abandon the current transaction and return -1.
     *Trace:* HLR-007 (Target Memory Read), HLR-037 (UPDI Operation Timeout Bounds).
 
 *   <a id="LLR-UPDI-06"></a>**LLR-UPDI-06** — `updi_mem_write()` shall write arbitrary byte ranges to the SRAM address space of the target using UPDI ST commands and return 0 on success or -1 on UART framing error, timeout, or UPDI NAK.
@@ -83,7 +83,7 @@ Requirements for RSP packet framing, dispatch, GDB packet handlers, session life
 *   <a id="LLR-RSP-02"></a>**LLR-RSP-02** — `rsp_recv_packet()` shall scan incoming bytes discarding pre-packet ACK/NAK characters until a `$` delimiter is received. It shall accumulate the payload with a running XOR checksum until `#` is received, then compare the computed checksum against the two ASCII-hex checksum bytes that follow. On match it shall write `+` to the socket and return the payload length; on mismatch it shall write `-` and return -1.
     *Trace:* HLR-013 (RSP Server Accessibility).
 
-*   <a id="LLR-RSP-03"></a>**LLR-RSP-03** — The `on_read_regs` handler for the `g` packet shall read all 35 AVR CPU registers (R0–R31, SREG, SPL, SPH, and PC) from the target via `updi_mem_read()` and return them as a 70-character hex string in GDB g-packet register order.
+*   <a id="LLR-RSP-03"></a>**LLR-RSP-03** — The `on_read_regs` handler for the `g` packet shall read all 36 AVR CPU register values (R0–R31, SREG, SPL, SPH, and PC) from the target via `updi_mem_read()` and return them as a 78-character hex string in GDB g-packet register order (R0–R31 at hex positions 0–63, SREG at 64–65, SPL at 66–67, SPH at 68–69, PC as 4-byte little-endian at 70–77).
     *Trace:* HLR-014 (Register Read and Write).
 
 *   <a id="LLR-RSP-04"></a>**LLR-RSP-04** — The `on_write_regs` handler for the `G` packet and the single-register `P` handler shall write the supplied register values to the target's CPU register file via `updi_mem_write()` and return `OK` on success or an error reply on UPDI failure.
@@ -147,6 +147,9 @@ Requirements for `elf_open()`, `elf_close()`, `elf_find_avros_tables()`, and `el
 *   <a id="LLR-ELF-06"></a>**LLR-ELF-06** — `elf_close()` shall free `ctx->symtab`, free `ctx->strtab`, and close `ctx->fd`. After returning, `ctx->symtab` and `ctx->strtab` shall be set to NULL and `ctx->fd` to -1. `elf_close()` shall be safe to call on a partially initialised `ElfContext` (e.g., after a failed `elf_open()`).
     *Trace:* HLR-040 (Bounded Heap Allocation).
 
+*   <a id="LLR-ELF-07"></a>**LLR-ELF-07** — `src/elf_parser.c` shall obtain ELF32 type definitions via a platform-conditional include: on Linux (`#ifdef __linux__`) it shall use the system header `<elf.h>`; on all other platforms it shall include the bundled portability shim `src/elf.h`. The shim shall define at minimum: `Elf32_Half`, `Elf32_Word`, `Elf32_Off`, `Elf32_Addr`, `Elf32_Ehdr`, `Elf32_Phdr`, `Elf32_Shdr`, `Elf32_Sym`, the `ELFMAG`/`SELFMAG` magic constants, `EI_CLASS`, `ELFCLASS32`, `EM_AVR` (0x0053), `PT_LOAD`, `SHT_SYMTAB`, `SHT_STRTAB`, `SHN_UNDEF`, and the `ELF32_ST_BIND`/`ELF32_ST_TYPE` accessor macros.
+    *Trace:* HLR-033 (Native Linux and macOS Build).
+
 ## 6. src/fsm_mapper.c — FSM Virtual Thread Mapper
 
 Requirements for `fsm_build_thread_list()`, `fsm_invalidate()`, `fsm_get_active_thread()`, and `fsm_get_registers()`.
@@ -160,7 +163,7 @@ Requirements for `fsm_build_thread_list()`, `fsm_invalidate()`, `fsm_get_active_
 *   <a id="LLR-FSM-03"></a>**LLR-FSM-03** — `fsm_build_thread_list()` shall read the 2-byte SRAM value at `idx->current_fsm_addr` and compare it against each FSM entry's `state_var_sram_addr`. The matching entry shall have `thread->is_active = true` and its `gdb_id` stored in `ctx->active_id`. If no entry matches, `ctx->active_id` shall be set to 0.
     *Trace:* HLR-025 (Active Thread Identification).
 
-*   <a id="LLR-FSM-04"></a>**LLR-FSM-04** — `fsm_get_registers()` shall set the PC field (GDB register index 35, encoded as a 4-byte little-endian value at bytes 68–71 of the g-packet buffer) to `thread->state_fn`. For non-active threads, R0–R31 (indices 0–31) and SREG (index 32) shall be zero-filled. For the active thread, SPL (index 33) and SPH (index 34) shall be read from the target SRAM via `updi_mem_read()`.
+*   <a id="LLR-FSM-04"></a>**LLR-FSM-04** — `fsm_get_registers()` shall set the PC field (GDB register index 35, 4-byte little-endian at hex positions 70–77 of the 78-character g-packet buffer) to `thread->state_fn`. For non-active threads, R0–R31 (indices 0–31) and SREG (index 32) shall be zero-filled, and SPL (index 33) and SPH (index 34) shall be set to zero. For the active thread, SREG (index 32, hex positions 64–65), SPL (index 33, hex positions 66–67), and SPH (index 34, hex positions 68–69) shall be read from the target SRAM via `updi_mem_read()`.
     *Trace:* HLR-026 (Virtual Thread Register Frame).
 
 *   <a id="LLR-FSM-05"></a>**LLR-FSM-05** — `fsm_build_thread_list()` shall process at most `FSM_MAX_THREADS` (32) entries from the FSM registration table regardless of `idx->fsm_table_count`. If `idx->fsm_table_count` exceeds `FSM_MAX_THREADS`, the function shall log a diagnostic warning and return `FSM_MAX_THREADS` as the thread count without returning an error to the GDB client.
@@ -179,7 +182,7 @@ Requirements for `monitor_dispatch()` and its static sub-command helpers `cmd_ev
 *   <a id="LLR-MON-02"></a>**LLR-MON-02** — `monitor_dispatch()` shall verify that the decoded command string begins with the prefix `"avros "` (case-sensitive, including the trailing space). If the prefix does not match, the function shall send a usage-hint O-packet to the GDB console and return -2.
     *Trace:* HLR-029 (Monitor Events Command), HLR-030 (Monitor Queues Command), HLR-031 (Monitor Memory Pool Command).
 
-*   <a id="LLR-MON-03"></a>**LLR-MON-03** — `cmd_events()` shall call `updi_mem_read()` to read 2 bytes from `idx->event_mask_addr`. For each of the 16 bits (bit 0 through bit 15), it shall append a line of the form `"  event<N>: SET\n"` or `"  event<N>: clear\n"` to the output buffer and send the complete buffer as RSP O-packets.
+*   <a id="LLR-MON-03"></a>**LLR-MON-03** — `cmd_events()` shall call `updi_mem_read()` to read 2 bytes from `idx->event_mask_addr`. For each of the 16 bits (N=0 for the least-significant bit through N=15 for the most-significant bit), it shall test bit N of the 16-bit event mask word and append a line of the form `"  event<N>: SET\n"` if the bit is set, or `"  event<N>: clear\n"` if not, and send the complete buffer as RSP O-packets.
     *Trace:* HLR-029 (Monitor Events Command).
 
 *   <a id="LLR-MON-04"></a>**LLR-MON-04** — `cmd_queues()` shall call `updi_mem_read()` to read `idx->queue_count` consecutive queue status structures from `idx->queue_table_addr`. For each structure, it shall extract and format the `head`, `tail`, and `count` fields as a one-line entry and send the complete table as RSP O-packets.

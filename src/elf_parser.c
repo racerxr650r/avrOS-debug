@@ -7,9 +7,9 @@
 
 #include "elf_parser.h"
 
-int elf_open(ElfContext *ctx, const char *path)
+int elf_open(const char *path, ElfContext *ctx)
 {
-    (void)ctx; (void)path;
+    (void)path; (void)ctx;
     return -1;
 }
 
