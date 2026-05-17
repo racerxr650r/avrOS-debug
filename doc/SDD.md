@@ -666,7 +666,7 @@ void fsm_invalidate(FsmContext *ctx);
 int  fsm_get_active_thread(const FsmContext *ctx);
     /* Returns: GDB thread ID of active FSM; 0 if not identified. */
 int  fsm_get_registers(const FsmContext *ctx, int thread_id, uint8_t *reg_buf);
-    /* Fills reg_buf with 35-register AVR GDB g-packet hex string (70 bytes + NUL). */
+    /* Fills reg_buf with a 78-character hex string (39 bytes binary, hex-encoded: R0-R31, SREG, SPL, SPH, PC in g-packet order); buf must be >= 79 bytes. */
     /* Returns: 0 on success; -1 if thread_id out of range. */
 ```
 
@@ -705,13 +705,13 @@ The `FsmContext` struct is declared in `src/fsm_mapper.h` and must be zero-initi
 *   **`int fsm_get_active_thread(const FsmContext *ctx)`** — Return the GDB thread ID of the currently executing FSM.
 *   **`int fsm_get_registers(const FsmContext *ctx, int thread_id, uint8_t *reg_buf)`**
     *   Purpose: Synthesize a GDB g-packet register frame for the requested virtual thread and write it into reg_buf.
-    *   Pre-condition: `ctx->valid` is true; `thread_id` is in the range [1, ctx->thread_count]; `reg_buf` points to a caller-allocated buffer of at least 74 bytes (35 registers × 2 hex chars per byte).
-    *   Post-condition: `reg_buf` contains a 70-byte hex string representing the 35 AVR registers in GDB `g`-packet order.
+    *   Pre-condition: `ctx->valid` is true; `thread_id` is in the range [1, ctx->thread_count]; `reg_buf` points to a caller-allocated buffer of at least 79 bytes (39 binary bytes × 2 hex chars + NUL).
+    *   Post-condition: `reg_buf` contains a 78-character hex string representing the 36 AVR GDB register values (R0–R31, SREG, SPL, SPH, PC) in GDB `g`-packet order.
     *   Return Value: 0 on success; -1 if thread_id is out of range.
     *   Logic:
-        1.  Zero-initialise the register buffer (all 35 registers = 0x00).
-        2.  Set the program counter (register 34 in the AVR GDB register layout, encoded as a 4-byte little-endian value at bytes 68–71) to `thread->state_fn`.
-        3.  If `thread->is_active` is true, read the live SP (registers 32–33, the SPL/SPH pair) and SREG (register 32 per GDB AVR layout) from the target SRAM via `updi_mem_read()` and insert them into the buffer.
+        1.  Zero-initialise all 79 bytes of the register buffer.
+        2.  Set the PC field (GDB register index 35, 4-byte little-endian) at hex positions 70–77 of the buffer to `thread->state_fn`.
+        3.  If `thread->is_active` is true, read SREG (register 32), SPL (register 33), and SPH (register 34) from the target SRAM via `updi_mem_read()` and write them at hex positions 64–65, 66–67, and 68–69, respectively.
     *   Notes: Non-active threads return zeroed R0–R31 and SREG; only PC and SP are meaningful for suspended FSMs in the avrOS cooperative model.
 
 *   **`void fsm_invalidate(FsmContext *ctx)`** — Clear the cached thread list; called on every CPU resume.
@@ -743,7 +743,7 @@ typedef struct {
 | 34 | SPH | 1 byte | Stack pointer high byte; live value for active thread only. |
 | 35 | PC | 4 bytes LE | Set to `thread->state_fn` (FLASH word address) for all threads. |
 
-Total g-packet payload: 35 bytes x 2 hex chars = 70 hex characters + NUL.
+Total g-packet payload: 39 bytes × 2 hex chars = 78 hex characters + NUL. (Registers 0–34 each contribute 1 byte; register 35 (PC) contributes 4 bytes.)
 
 **UPDI read budget per `fsm_build_thread_list()` call (N threads):**
 

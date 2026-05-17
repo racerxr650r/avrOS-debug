@@ -1662,6 +1662,13 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="HLR" ref="HLR-040" name="Bounded Heap Allocation"/>
         </traces>
       </llr>
+
+      <llr id="LLR-ELF-07">
+        <text><![CDATA[`src/elf_parser.c` shall obtain ELF32 type definitions via a platform-conditional include: on Linux (`#ifdef __linux__`) it shall use the system header `<elf.h>`; on all other platforms it shall include the bundled portability shim `src/elf.h`. The shim shall define at minimum: `Elf32_Half`, `Elf32_Word`, `Elf32_Off`, `Elf32_Addr`, `Elf32_Ehdr`, `Elf32_Phdr`, `Elf32_Shdr`, `Elf32_Sym`, the `ELFMAG`/`SELFMAG` magic constants, `EI_CLASS`, `ELFCLASS32`, `EM_AVR` (0x0053), `PT_LOAD`, `SHT_SYMTAB`, `SHT_STRTAB`, `SHN_UNDEF`, and the `ELF32_ST_BIND`/`ELF32_ST_TYPE` accessor macros.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-033" name="Native Linux and macOS Build"/>
+        </traces>
+      </llr>
     </function>
 
     <function number="6" title="src/fsm_mapper.c — FSM Virtual Thread Mapper" name="fsm" source="src/fsm_mapper.c">
@@ -1974,7 +1981,7 @@ Errors are propagated upward through the module stack without retrying:
     <!-- ============================================================ -->
     <!-- src/gdb_rsp.c unit tests                                     -->
     <!-- ============================================================ -->
-    <file path="tests/test_rsp.c" role="unit" count="28">
+    <file path="tests/test_rsp.c" role="unit" count="29">
       <header><![CDATA[Unit tests for `src/gdb_rsp.c`: socket configuration, RSP packet framing, register and memory handlers, breakpoint management, session lifecycle packets, and monitor relay. Uses a `socketpair()` as a drop-in socket substitute so all tests run without a real GDB client.]]></header>
 
       <test name="rsp_listen_sets_so_reuseaddr_before_bind">
@@ -2347,7 +2354,10 @@ Errors are propagated upward through the module stack without retrying:
 
       <test name="build_compiles_clean_on_linux_with_c99_and_posix">
         <purpose><![CDATA[Execute `make` with `CC=gcc CFLAGS="-std=c99 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L"` and assert that the build exits with status 0 and produces no compiler warnings or errors on a Linux x86-64 host.]]></purpose>
-        <traces><trace target="HLR" ref="HLR-033"/></traces>
+        <traces>
+          <trace target="HLR" ref="HLR-033"/>
+          <trace target="LLR" ref="LLR-ELF-07"/>
+        </traces>
       </test>
 
       <test name="runtime_links_only_libc_no_heavyweight_deps">
