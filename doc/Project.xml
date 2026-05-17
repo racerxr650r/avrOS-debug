@@ -2365,29 +2365,24 @@ Errors are propagated upward through the module stack without retrying:
         <traces><trace target="LLR" ref="LLR-MON-03"/></traces>
       </test>
 
-      <test name="cmd_events_reports_set_bits_as_SET_clear_bits_as_clear">
-        <purpose><![CDATA[Inject an event mask of 0x0003 (bits 0 and 1 set, rest clear) and verify the output contains `"event0: SET"`, `"event1: SET"`, and `"event2: clear"`.]]></purpose>
+      <test name="cmd_events_reports_name_and_status_value_per_descriptor">
+        <purpose><![CDATA[Inject two `evntDescriptor_t` records pointing at FLASH names `"RX"`, `"TX"` and 1-byte SRAM status values `0x01`, `0x00` and verify the decoded O-packet text contains both names and both status bytes formatted as `0xXX`.]]></purpose>
         <traces><trace target="LLR" ref="LLR-MON-03"/></traces>
       </test>
 
-      <test name="cmd_events_bit0_is_lsb_event0_bit15_is_msb_event15">
-        <purpose><![CDATA[Inject a mask of 0x8001 and verify `"event0: SET"` (bit 0, LSB) and `"event15: SET"` (bit 15, MSB), with all intermediate bits reported as `"clear"`.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-MON-03"/></traces>
-      </test>
-
-      <test name="cmd_queues_reads_queue_count_structures_from_table">
-        <purpose><![CDATA[Dispatch `"avros queues"` and verify that `updi_mem_read()` is called with `idx->queue_table_addr` and a length equal to `idx->queue_count` times the size of the queue status structure.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-MON-04"/></traces>
-      </test>
-
-      <test name="cmd_queues_formats_head_tail_count_for_each_entry">
-        <purpose><![CDATA[Inject two queue structures with known `head`, `tail`, and `count` fields and verify that both entries appear in the O-packet output with the correct formatted values.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-MON-04"/></traces>
-      </test>
-
-      <test name="monitor_output_assembled_in_512_byte_buffer_sent_as_o_packets">
-        <purpose><![CDATA[Inject an event mask that produces near-maximum output and verify that the total assembled output does not exceed 512 bytes and is transmitted via `rsp_send_packet()` as RSP O-packets.]]></purpose>
+      <test name="cmd_events_output_is_hex_encoded_o_packet">
+        <purpose><![CDATA[Dispatch `"avros events"` and verify the single captured `rsp_send_packet()` payload begins with `'O'` and every subsequent character is an uppercase hex digit (`[0-9A-F]`), with an overall odd length.]]></purpose>
         <traces><trace target="LLR" ref="LLR-MON-06"/></traces>
+      </test>
+
+      <test name="cmd_queues_reads_queue_count_descriptors_from_que_table">
+        <purpose><![CDATA[Dispatch `"avros queues"` and verify that `updi_mem_read()` is called with `idx->queue_table_addr` and a length equal to `idx->queue_count` × 10 bytes (`queDescriptor_t` size).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-04"/></traces>
+      </test>
+
+      <test name="cmd_queues_formats_capacity_and_sizeofelement_for_each_entry">
+        <purpose><![CDATA[Inject two `queDescriptor_t` records with `(capacity, sizeOfElement)` of `(8, 1)` and `(16, 4)` respectively and verify the decoded O-packet text contains `"capacity=8 sizeOfElement=1"` and `"capacity=16 sizeOfElement=4"`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-04"/></traces>
       </test>
 
       <test name="monitor_dispatch_and_helpers_never_call_updi_halt">

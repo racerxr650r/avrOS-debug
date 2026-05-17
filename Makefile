@@ -124,9 +124,8 @@ TEST_EXTRA_LDFLAGS_test_fsm :=
 # test_monitor
 TEST_SRCS_test_monitor := $(TESTDIR)/test_monitor.c \
                            $(SRCDIR)/monitor.c \
-                           $(SRCDIR)/gdb_rsp.c \
                            $(SRCDIR)/elf_parser.c
-TEST_WRAP_test_monitor  := updi_mem_read
+TEST_WRAP_test_monitor  := updi_mem_read rsp_send_packet
 TEST_EXTRA_LDFLAGS_test_monitor :=
 
 # test_rsp
@@ -134,7 +133,7 @@ TEST_SRCS_test_rsp := $(TESTDIR)/test_rsp.c \
                        $(SRCDIR)/gdb_rsp.c \
                        $(SRCDIR)/fsm_mapper.c \
                        $(SRCDIR)/monitor.c
-TEST_WRAP_test_rsp  := updi_mem_read updi_halt updi_run updi_step \
+TEST_WRAP_test_rsp  := updi_mem_read updi_mem_write updi_halt updi_run updi_step \
                        updi_nvm_write_flash updi_console_poll \
                        fsm_build_thread_list fsm_get_registers \
                        fsm_get_active_thread fsm_invalidate \
