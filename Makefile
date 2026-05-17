@@ -124,9 +124,8 @@ TEST_EXTRA_LDFLAGS_test_fsm :=
 # test_monitor
 TEST_SRCS_test_monitor := $(TESTDIR)/test_monitor.c \
                            $(SRCDIR)/monitor.c \
-                           $(SRCDIR)/gdb_rsp.c \
                            $(SRCDIR)/elf_parser.c
-TEST_WRAP_test_monitor  := updi_mem_read
+TEST_WRAP_test_monitor  := updi_mem_read rsp_send_packet
 TEST_EXTRA_LDFLAGS_test_monitor :=
 
 # test_rsp
