@@ -17,10 +17,10 @@
     <document id="STP"          title="Software Test Plan"           source="doc/STP.md"          version="0.1" date="2026-05-16" author="John Anderson"/>
     <document id="Traceability" title="Traceability Matrix"          source="doc/Traceability.md" version="0.1" date="2026-05-16" author="John Anderson"/>
     <counts>
-      <count name="hlrs"       value="40"/>
-      <count name="llrs"       value="54"/>
-      <count name="tests"      value="106"/>
-      <count name="test_files" value="7"/>
+      <count name="hlrs"       value="42"/>
+      <count name="llrs"       value="60"/>
+      <count name="tests"      value="112"/>
+      <count name="test_files" value="8"/>
     </counts>
   </metadata>
 
@@ -37,6 +37,8 @@
       <file path="src/elf_parser.c">ELF parser: locates avrOS FLASH-resident system tables and produces the AvrOsSymbolIndex.</file>
       <file path="src/fsm_mapper.c">avrOS FSM-to-GDB virtual thread translator: maps FSM state tables to GDB thread objects and synthesizes per-thread register frames.</file>
       <file path="src/monitor.c">Custom monitor command handler: implements the avros events, queues, and mempool sub-commands via non-intrusive UPDI reads.</file>
+      <file path="Makefile">Build orchestration: compile, test, install, uninstall, and check-tools targets.</file>
+      <file path="doc/avr-updi-gdb.1">Unix man page: reference documentation for the avr-updi-gdb command.</file>
       <outro><![CDATA[It does not cover the build system, IDE adapter layers (Cortex-Debug, Zed DAP), or Windows support, all of which are out of scope for the initial release (see `doc/PVD.md §7.2`).]]></outro>
     </scope>
 
@@ -44,6 +46,7 @@
       <para><![CDATA[`avr-updi-gdb` is a POSIX C99 GDB stub that bridges the UPDI debug interface of modern AVR microcontrollers (DA/DB families) to standard IDEs over the GDB Remote Serial Protocol (RSP). A developer launches the stub, points it at a serial device and an ELF binary, and connects any GDB-compatible front-end — VS Code with Cortex-Debug, Zed with its DAP adapter, or bare `avr-gdb` — using the standard `target extended-remote` command.]]></para>
       <para><![CDATA[The server connects to the target via a TTL-level UART serial adapter with a 1 kΩ resistor on the UPDI line. No external JTAG programmer or proprietary debugger hardware is required — only a USB-to-serial adapter or direct Raspberry Pi UART pins.]]></para>
       <para><![CDATA[Unlike conventional GDB stubs that expose a flat memory model, `avr-updi-gdb` provides native avrOS state-machine awareness. At attach time it parses the supplied ELF binary to locate the avrOS FSM registration tables in FLASH, then presents each registered finite state machine as a standard GDB virtual thread. The currently executing FSM appears as the active thread; all suspended FSMs appear as additional threads, each with a synthetic register frame whose PC points to the FSM's current state function pointer.]]></para>
+      <para><![CDATA[The project ships with a `make install` target that installs the compiled binary to `$(PREFIX)/bin/` and the accompanying Unix man page to `$(PREFIX)/share/man/man1/`. A `make check-tools` target validates that all required build tools (`gcc`, `make`, `avr-gcc`, `avr-binutils`) are present on the host before any compilation is attempted. These targets ensure the project can be built, deployed, and documented by a developer from a single `make` command sequence with no manual file copying.]]></para>
     </overview>
 
     <definitions>
@@ -1341,12 +1344,30 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
     </section>
 
+    <section number="8" title="Installation and Documentation">
+      <intro><![CDATA[Requirements in this section govern the Makefile installation targets and the user-facing documentation deliverables that accompany the compiled binary.]]></intro>
+
+      <hlr id="HLR-041" name="Makefile Install and Uninstall Targets">
+        <text><![CDATA[The Makefile shall provide `install` and `uninstall` targets that accept a `PREFIX` variable (defaulting to `/usr/local`). The `install` target shall copy the compiled `avr-updi-gdb` binary to `$(PREFIX)/bin/` and the man page to `$(PREFIX)/share/man/man1/`. The `uninstall` target shall remove exactly those files. A `check-tools` target shall verify that all required host tools (`gcc`, `make`, `avr-gcc`, `avr-nm`) are available before any build step, printing a diagnostic and exiting non-zero if any required tool is absent.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-042" name="User Manual and Unix Man Page">
+        <text><![CDATA[The project shall provide a user manual (`doc/UserManual.md`) and a Unix man page (`doc/avr-updi-gdb.1`). The man page shall be parseable by the standard `man` utility and shall document the command synopsis, all options, operands, exit codes, and at least one usage example. The `doc/UserManual.md` shall document prerequisites, build instructions, usage, CLI options, and connection wiring for the UPDI adapter.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+        </traces>
+      </hlr>
+    </section>
+
   </hlrs>
 
   <!-- Low-Level Requirements (see tools/Developers_Guide.md §6). -->
   <llrs>
     <function number="1" title="Introduction" name="intro">
-      <intro><![CDATA[Each LLR ID follows the pattern `LLR-XXX-NN`, where `XXX` is a module code and `NN` is a zero-padded two-digit sequence number. Module codes: `MAIN` (`src/main.c`), `UPDI` (`src/updi.c`), `RSP` (`src/gdb_rsp.c`), `ELF` (`src/elf_parser.c`), `FSM` (`src/fsm_mapper.c`), `MON` (`src/monitor.c`). IDs are permanent contracts and may not be renumbered or reused once allocated.]]></intro>
+      <intro><![CDATA[Each LLR ID follows the pattern `LLR-XXX-NN`, where `XXX` is a module code and `NN` is a zero-padded two-digit sequence number. Module codes: `MAIN` (`src/main.c`), `UPDI` (`src/updi.c`), `RSP` (`src/gdb_rsp.c`), `ELF` (`src/elf_parser.c`), `FSM` (`src/fsm_mapper.c`), `MON` (`src/monitor.c`), `INST` (`Makefile`, `doc/avr-updi-gdb.1`, `doc/UserManual.md`). IDs are permanent contracts and may not be renumbered or reused once allocated.]]></intro>
     </function>
 
     <function number="2" title="src/main.c — Entry Point and Event Loop" name="main" source="src/main.c">
@@ -1669,6 +1690,14 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="HLR" ref="HLR-033" name="Native Linux and macOS Build"/>
         </traces>
       </llr>
+
+      <llr id="LLR-ELF-08">
+        <text><![CDATA[`elf_open()` shall iterate over all ELF program headers and identify `PT_LOAD` segments. The first `PT_LOAD` segment encountered shall be treated as the FLASH load segment: its `p_vaddr` and `p_filesz` shall be stored in `ctx->flash_base` and `ctx->flash_size` respectively. The second `PT_LOAD` segment shall be treated as the SRAM load segment: its `p_vaddr` and `p_memsz` shall be stored in `ctx->sram_base` and `ctx->sram_size` respectively. If fewer than two `PT_LOAD` segments are present the absent values shall remain zero. These fields are the sole inputs to `elf_flash_addr()`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-021" name="ELF Binary Parsing"/>
+          <trace target="HLR" ref="HLR-022" name="Harvard Architecture Address Mapping"/>
+        </traces>
+      </llr>
     </function>
 
     <function number="6" title="src/fsm_mapper.c — FSM Virtual Thread Mapper" name="fsm" source="src/fsm_mapper.c">
@@ -1771,6 +1800,45 @@ Errors are propagated upward through the module stack without retrying:
         <traces>
           <trace target="HLR" ref="HLR-011" name="Non-Intrusive Background Memory Read"/>
           <trace target="HLR" ref="HLR-032" name="Introspection Reliability"/>
+        </traces>
+      </llr>
+    </function>
+
+    <function number="8" title="Makefile and Documentation" name="inst">
+      <intro><![CDATA[Requirements for the Makefile installation targets (`install`, `uninstall`, `check-tools`) and the documentation deliverables (`doc/UserManual.md`, `doc/avr-updi-gdb.1`).]]></intro>
+
+      <llr id="LLR-INST-01">
+        <text><![CDATA[The Makefile shall provide a `check-tools` target that tests for the presence of every required host tool: `gcc` (or `cc`), `make`, `avr-gcc`, and `avr-nm`. For each absent tool the target shall print a diagnostic message to `stderr` naming the missing tool and then exit with status 1. The target shall exit with status 0 only when all required tools are found.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-041" name="Makefile Install and Uninstall Targets"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-INST-02">
+        <text><![CDATA[The Makefile `install` target shall accept a `PREFIX` variable (default `/usr/local`) and install: the compiled `avr-updi-gdb` binary to `$(PREFIX)/bin/avr-updi-gdb` and the man page `doc/avr-updi-gdb.1` to `$(PREFIX)/share/man/man1/avr-updi-gdb.1`. The target shall create any missing intermediate directories using `install -d`. The binary shall be installed with mode 0755 and the man page with mode 0644.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-041" name="Makefile Install and Uninstall Targets"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-INST-03">
+        <text><![CDATA[The Makefile `uninstall` target shall remove `$(PREFIX)/bin/avr-updi-gdb` and `$(PREFIX)/share/man/man1/avr-updi-gdb.1` using `rm -f`. The target shall be idempotent: running it when the files are already absent shall exit with status 0 without error.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-041" name="Makefile Install and Uninstall Targets"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-INST-04">
+        <text><![CDATA[The project shall include a user manual at `doc/UserManual.md` documenting: (1) prerequisites (required host tools and their minimum versions), (2) build instructions (`make`, `make test`), (3) connection wiring for the UPDI adapter (1 kΩ resistor on UPDI pin, serial adapter TX/RX orientation), (4) launch invocation and all CLI options, and (5) at least two complete usage examples (one with `--load`, one without).]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-042" name="User Manual and Unix Man Page"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-INST-05">
+        <text><![CDATA[The project shall include a Unix man page at `doc/avr-updi-gdb.1` in `groff`/`troff` format. The man page shall contain at minimum: NAME, SYNOPSIS, DESCRIPTION, OPTIONS (one entry per CLI flag), OPERANDS, EXIT STATUS, EXAMPLES, and SEE ALSO sections. The man page shall be parseable by `man -l doc/avr-updi-gdb.1` without error or warning on Linux.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-042" name="User Manual and Unix Man Page"/>
         </traces>
       </llr>
     </function>
@@ -2133,7 +2201,7 @@ Errors are propagated upward through the module stack without retrying:
     <!-- ============================================================ -->
     <!-- src/elf_parser.c unit tests                                  -->
     <!-- ============================================================ -->
-    <file path="tests/test_elf.c" role="unit" count="13">
+    <file path="tests/test_elf.c" role="unit" count="14">
       <header><![CDATA[Unit tests for `src/elf_parser.c`: ELF validation, symbol table loading, avrOS sentinel symbol discovery, Harvard address conversion, fail-safe degradation, and context cleanup. Fixture ELF binaries are generated by a helper script in `tests/fixtures/`.]]></header>
 
       <test name="elf_open_accepts_valid_avr_elf32_binary">
@@ -2199,6 +2267,11 @@ Errors are propagated upward through the module stack without retrying:
       <test name="elf_close_safe_on_partially_initialised_context">
         <purpose><![CDATA[Construct an `ElfContext` with `symtab = NULL`, `strtab` allocated, and `fd = -1`, call `elf_close()`, and verify no crash or double-free occurs.]]></purpose>
         <traces><trace target="LLR" ref="LLR-ELF-06"/></traces>
+      </test>
+
+      <test name="elf_open_sets_flash_base_and_sram_base_from_pt_load_segments">
+        <purpose><![CDATA[After a successful `elf_open()` on the full fixture, verify that `ctx.flash_base` equals the VMA of the first `PT_LOAD` segment (0x00000000 for the fixture) and `ctx.sram_base` equals the VMA of the second `PT_LOAD` segment (0x00802800 for the ATmega4809 fixture).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-08"/></traces>
       </test>
     </file>
 
@@ -2363,6 +2436,38 @@ Errors are propagated upward through the module stack without retrying:
       <test name="runtime_links_only_libc_no_heavyweight_deps">
         <purpose><![CDATA[Run `ldd avr-updi-gdb` on the linked binary and verify that the only shared-library dependency is `libc.so`. Assert that no Java runtime, Python interpreter, Electron libraries, or other non-POSIX dependencies appear.]]></purpose>
         <traces><trace target="HLR" ref="HLR-034"/></traces>
+      </test>
+    </file>
+
+    <!-- ============================================================ -->
+    <!-- Installation and documentation tests                         -->
+    <!-- ============================================================ -->
+    <file path="tests/test_install.c" role="integration" count="5">
+      <header><![CDATA[Verification tests for the Makefile install/uninstall targets, the `check-tools` pre-flight target, and the Unix man page. Tests fork a subprocess or invoke `make` directly and inspect the resulting file-system state or exit codes.]]></header>
+
+      <test name="check_tools_exits_nonzero_when_required_tool_is_absent">
+        <purpose><![CDATA[Temporarily shadow a required tool (e.g. `avr-gcc`) with a dummy wrapper that is not executable, then run `make check-tools` and verify it exits with a non-zero status and prints a diagnostic to stderr naming the missing tool.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-INST-01"/></traces>
+      </test>
+
+      <test name="make_install_places_binary_at_prefix_bin">
+        <purpose><![CDATA[Run `make install PREFIX=/tmp/aod_test_$$` (using a temporary directory as the prefix) and verify that the file `$(PREFIX)/bin/avr-updi-gdb` exists and is executable after the target completes.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-INST-02"/></traces>
+      </test>
+
+      <test name="make_install_places_man_page_at_prefix_man1">
+        <purpose><![CDATA[After `make install PREFIX=...`, verify that the file `$(PREFIX)/share/man/man1/avr-updi-gdb.1` exists and that `man -l` parses it without error.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-INST-02"/><trace target="LLR" ref="LLR-INST-05"/></traces>
+      </test>
+
+      <test name="make_uninstall_removes_all_installed_files">
+        <purpose><![CDATA[After `make install PREFIX=...`, run `make uninstall PREFIX=...` and verify that both `$(PREFIX)/bin/avr-updi-gdb` and `$(PREFIX)/share/man/man1/avr-updi-gdb.1` no longer exist.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-INST-03"/></traces>
+      </test>
+
+      <test name="user_manual_exists_and_contains_required_sections">
+        <purpose><![CDATA[Read `doc/UserManual.md` and verify the file exists and contains all required section headings: Prerequisites, Build, Connection Wiring, Usage (or Options), and at least one Example.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-INST-04"/></traces>
       </test>
     </file>
 

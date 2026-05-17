@@ -381,6 +381,23 @@ void test_elf_close_safe_on_partially_initialised_context(void)
     TEST_ASSERT_EQUAL_INT(-1, ctx.fd);
 }
 
+/* ── Test 14: flash_base and sram_base populated from PT_LOAD segments ─ */
+void test_elf_open_sets_flash_base_and_sram_base_from_pt_load_segments(void)
+{
+    ElfContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    TEST_ASSERT_EQUAL_INT(0, elf_open(FIXTURE_FULL, &ctx));
+
+    /* avros_full.elf is built for ATmega4809:
+     *   first  PT_LOAD → FLASH  VMA 0x00000000
+     *   second PT_LOAD → SRAM   VMA 0x00802800 */
+    TEST_ASSERT_EQUAL_UINT32(0x00000000UL, ctx.flash_base);
+    TEST_ASSERT_EQUAL_UINT32(0x00802800UL, ctx.sram_base);
+    TEST_ASSERT_GREATER_THAN(0, (int)ctx.flash_size);
+
+    elf_close(&ctx);
+}
+
 /* ── Test runner ─────────────────────────────────────────────────────── */
 int main(void)
 {
@@ -398,6 +415,7 @@ int main(void)
     RUN_TEST(test_elf_find_avros_tables_zero_initialises_absent_symbol_fields);
     RUN_TEST(test_elf_close_frees_symtab_strtab_and_closes_fd);
     RUN_TEST(test_elf_close_safe_on_partially_initialised_context);
+    RUN_TEST(test_elf_open_sets_flash_base_and_sram_base_from_pt_load_segments);
     return UNITY_END();
 }
 

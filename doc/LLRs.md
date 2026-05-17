@@ -6,7 +6,7 @@
 
 ## 1. Introduction
 
-Each LLR ID follows the pattern `LLR-XXX-NN`, where `XXX` is a module code and `NN` is a zero-padded two-digit sequence number. Module codes: `MAIN` (`src/main.c`), `UPDI` (`src/updi.c`), `RSP` (`src/gdb_rsp.c`), `ELF` (`src/elf_parser.c`), `FSM` (`src/fsm_mapper.c`), `MON` (`src/monitor.c`). IDs are permanent contracts and may not be renumbered or reused once allocated.
+Each LLR ID follows the pattern `LLR-XXX-NN`, where `XXX` is a module code and `NN` is a zero-padded two-digit sequence number. Module codes: `MAIN` (`src/main.c`), `UPDI` (`src/updi.c`), `RSP` (`src/gdb_rsp.c`), `ELF` (`src/elf_parser.c`), `FSM` (`src/fsm_mapper.c`), `MON` (`src/monitor.c`), `INST` (`Makefile`, `doc/avr-updi-gdb.1`, `doc/UserManual.md`). IDs are permanent contracts and may not be renumbered or reused once allocated.
 
 ## 2. src/main.c — Entry Point and Event Loop
 
@@ -150,6 +150,9 @@ Requirements for `elf_open()`, `elf_close()`, `elf_find_avros_tables()`, and `el
 *   <a id="LLR-ELF-07"></a>**LLR-ELF-07** — `src/elf_parser.c` shall obtain ELF32 type definitions via a platform-conditional include: on Linux (`#ifdef __linux__`) it shall use the system header `<elf.h>`; on all other platforms it shall include the bundled portability shim `src/elf.h`. The shim shall define at minimum: `Elf32_Half`, `Elf32_Word`, `Elf32_Off`, `Elf32_Addr`, `Elf32_Ehdr`, `Elf32_Phdr`, `Elf32_Shdr`, `Elf32_Sym`, the `ELFMAG`/`SELFMAG` magic constants, `EI_CLASS`, `ELFCLASS32`, `EM_AVR` (0x0053), `PT_LOAD`, `SHT_SYMTAB`, `SHT_STRTAB`, `SHN_UNDEF`, and the `ELF32_ST_BIND`/`ELF32_ST_TYPE` accessor macros.
     *Trace:* HLR-033 (Native Linux and macOS Build).
 
+*   <a id="LLR-ELF-08"></a>**LLR-ELF-08** — `elf_open()` shall iterate over all ELF program headers and identify `PT_LOAD` segments. The first `PT_LOAD` segment encountered shall be treated as the FLASH load segment: its `p_vaddr` and `p_filesz` shall be stored in `ctx->flash_base` and `ctx->flash_size` respectively. The second `PT_LOAD` segment shall be treated as the SRAM load segment: its `p_vaddr` and `p_memsz` shall be stored in `ctx->sram_base` and `ctx->sram_size` respectively. If fewer than two `PT_LOAD` segments are present the absent values shall remain zero. These fields are the sole inputs to `elf_flash_addr()`.
+    *Trace:* HLR-021 (ELF Binary Parsing), HLR-022 (Harvard Architecture Address Mapping).
+
 ## 6. src/fsm_mapper.c — FSM Virtual Thread Mapper
 
 Requirements for `fsm_build_thread_list()`, `fsm_invalidate()`, `fsm_get_active_thread()`, and `fsm_get_registers()`.
@@ -196,3 +199,22 @@ Requirements for `monitor_dispatch()` and its static sub-command helpers `cmd_ev
 
 *   <a id="LLR-MON-07"></a>**LLR-MON-07** — `monitor_dispatch()` and all of its static helpers (`cmd_events()`, `cmd_queues()`, `cmd_mempool()`) shall use `updi_mem_read()` exclusively for all target memory access. None of these functions shall call `updi_halt()`, ensuring that monitor commands never interrupt firmware execution.
     *Trace:* HLR-011 (Non-Intrusive Background Memory Read), HLR-032 (Introspection Reliability).
+
+## 8. Makefile and Documentation
+
+Requirements for the Makefile installation targets (`install`, `uninstall`, `check-tools`) and the documentation deliverables (`doc/UserManual.md`, `doc/avr-updi-gdb.1`).
+
+*   <a id="LLR-INST-01"></a>**LLR-INST-01** — The Makefile shall provide a `check-tools` target that tests for the presence of every required host tool: `gcc` (or `cc`), `make`, `avr-gcc`, and `avr-nm`. For each absent tool the target shall print a diagnostic message to `stderr` naming the missing tool and then exit with status 1. The target shall exit with status 0 only when all required tools are found.
+    *Trace:* HLR-041 (Makefile Install and Uninstall Targets).
+
+*   <a id="LLR-INST-02"></a>**LLR-INST-02** — The Makefile `install` target shall accept a `PREFIX` variable (default `/usr/local`) and install: the compiled `avr-updi-gdb` binary to `$(PREFIX)/bin/avr-updi-gdb` and the man page `doc/avr-updi-gdb.1` to `$(PREFIX)/share/man/man1/avr-updi-gdb.1`. The target shall create any missing intermediate directories using `install -d`. The binary shall be installed with mode 0755 and the man page with mode 0644.
+    *Trace:* HLR-041 (Makefile Install and Uninstall Targets).
+
+*   <a id="LLR-INST-03"></a>**LLR-INST-03** — The Makefile `uninstall` target shall remove `$(PREFIX)/bin/avr-updi-gdb` and `$(PREFIX)/share/man/man1/avr-updi-gdb.1` using `rm -f`. The target shall be idempotent: running it when the files are already absent shall exit with status 0 without error.
+    *Trace:* HLR-041 (Makefile Install and Uninstall Targets).
+
+*   <a id="LLR-INST-04"></a>**LLR-INST-04** — The project shall include a user manual at `doc/UserManual.md` documenting: (1) prerequisites (required host tools and their minimum versions), (2) build instructions (`make`, `make test`), (3) connection wiring for the UPDI adapter (1 kΩ resistor on UPDI pin, serial adapter TX/RX orientation), (4) launch invocation and all CLI options, and (5) at least two complete usage examples (one with `--load`, one without).
+    *Trace:* HLR-042 (User Manual and Unix Man Page).
+
+*   <a id="LLR-INST-05"></a>**LLR-INST-05** — The project shall include a Unix man page at `doc/avr-updi-gdb.1` in `groff`/`troff` format. The man page shall contain at minimum: NAME, SYNOPSIS, DESCRIPTION, OPTIONS (one entry per CLI flag), OPERANDS, EXIT STATUS, EXAMPLES, and SEE ALSO sections. The man page shall be parseable by `man -l doc/avr-updi-gdb.1` without error or warning on Linux.
+    *Trace:* HLR-042 (User Manual and Unix Man Page).

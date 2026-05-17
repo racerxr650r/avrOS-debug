@@ -13,18 +13,19 @@
 > Delivery section as work progresses. Link phase names in the Status
 > table to their detailed descriptions in §8.
 
-**Status:** Phase 0 complete (commit `92857a5`). Phases 1–5 not yet started.
+**Status:** Phase 1 complete (commit `6ef89d2`). Phases 2–5 not yet started.
 
 ## Status
 
 | Phase | Description | Status |
 | ----- | ----------- | ------ |
 | [0](#phase-0--project-scaffolding) | Directories, Unity test framework, Makefile, ELF portability shim | ✅ Complete (`92857a5`) |
-| [1](#phase-1--elf-parser) | `src/elf_parser.h/.c` + 13 unit tests | 🔲 Not started |
+| [1](#phase-1--elf-parser) | `src/elf_parser.h/.c` + 14 unit tests | ✅ Complete (`6ef89d2`) |
 | [2](#phase-2--updi-physical-layer) | `src/updi.h/.c` + 23 unit tests | 🔲 Not started |
 | [3](#phase-3--fsm-mapper) | `src/fsm_mapper.h/.c` + 11 unit tests | 🔲 Not started |
-| [4](#phase-4--monitor--rsp) | `src/monitor.h/.c` + `src/gdb_rsp.h/.c` + 41 unit tests | 🔲 Not started |
+| [4](#phase-4--monitor--rsp) | `src/monitor.h/.c` + `src/gdb_rsp.h/.c` + 42 unit tests | 🔲 Not started |
 | [5](#phase-5--application-entry-point--integration) | `src/main.c` + 18 tests (14 unit + 4 integration) | 🔲 Not started |
+| [6](#phase-6--installation-targets--documentation) | `make install/uninstall/check-tools` + user manual + man page + 5 install tests | 🔲 Not started |
 
 ## 0. Required Tools for Development
 
@@ -148,7 +149,7 @@ and reported in the [Software Test Plan](STP.md) and
 
 | Test binary | Source files linked (besides `tests/unity/unity.c`) | `--wrap` symbols | Extra link flags |
 | ----------- | --------------------------------------------------- | ---------------- | ---------------- |
-| `test_elf` | `src/elf_parser.c` | *(none)* | — |
+| `test_elf` | `src/elf_parser.c` | `malloc` | — |
 | `test_updi` | `src/updi.c` | `select` | `-lutil` (Linux only; not needed on macOS) |
 | `test_fsm` | `src/fsm_mapper.c` | `updi_mem_read` | — |
 | `test_monitor` | `src/monitor.c`, `src/gdb_rsp.c`, `src/elf_parser.c` | `updi_mem_read` | — |
@@ -180,6 +181,11 @@ and reported in the [Software Test Plan](STP.md) and
 
 ### Phase 1 — ELF Parser
 
+> **Status: ✅ Complete** — commit `6ef89d2` on branch `2-phase-1-elf-parser` (2026-05-16).
+> `make all`: 0 errors, 0 warnings. `make test`: test_elf reports 14/14 tests passing. `lint_project`: 0 errors, 0 warnings. `make ASAN=1 test`: no AddressSanitizer errors or memory leaks.
+
+> **Implementation note:** During Phase 1 the per-test linker `--wrap` symbol list for `test_elf` was updated from *(none)* to `malloc` to support the malloc-failure injection test (LLR-ELF-02). The `TEST_WRAP_test_elf` variable in the Makefile now carries `malloc`; this is reflected in the Phase 0 table above.
+
 1. `src/elf_parser.h` — define `ElfContext` and `AvrOsSymbolIndex` structs; declare `elf_open()`, `elf_close()`, `elf_find_avros_tables()`, `elf_flash_addr()`.
 2. `src/elf_parser.c` — validate ELF magic + `ELFCLASS32` + `EM_AVR`; scan `PT_LOAD` segments for `flash_base`/`sram_base`; `malloc` `.symtab` + `.strtab`; single O(sym\_count) scan for the 8 avrOS sentinel names; `elf_flash_addr(vma) = (vma − flash_base) / 2`; graceful return on partial symbol match; `elf_close()` frees all heap and sets pointers to NULL.
 3. `tests/fixtures/avros_full.c` — defines all 8 avrOS sentinel linker symbols via `__attribute__((section(...)))` or a linker script; compiled to `tests/fixtures/avros_full.elf` by the Makefile.
@@ -187,7 +193,7 @@ and reported in the [Software Test Plan](STP.md) and
 5. `tests/fixtures/not_avr.c` — compiled for a non-AVR target (e.g. `--target=elf32-i386`) to produce an ELF with `e_machine != EM_AVR`.
 6. `tests/test_elf.c` — 13 Unity tests covering: magic rejection, `EM_AVR` check, correct `flash_base`/`sram_base`, all 8 symbol names found with correct address conversions, partial symbol set, `malloc` failure injection, `elf_close()` resource-free correctness. Linked against `src/elf_parser.c tests/unity/unity.c` with no `--wrap` flags.
 
-**Acceptance:** `make test` runs `tests/test_elf` and reports 13/13 tests passing.
+**Acceptance:** `make test` runs `tests/test_elf` and reports 14/14 tests passing.
 
 **`ElfContext` struct (declared in `src/elf_parser.h`, zero-init before `elf_open()`):**
 
@@ -468,6 +474,54 @@ AVR BREAK opcode: `0x9598` (16-bit instruction, written as little-endian bytes `
 4. `updi_close(cfg.updi_fd)`
 5. `return exit_code` from `main()`
 
+---
+
+### Phase 6 — Installation Targets & Documentation
+
+1. **`make check-tools`** — pre-flight target that validates all required host tools are present (`gcc`/`cc`, `make`, `avr-gcc`, `avr-nm`). Prints a diagnostic naming each missing tool and exits non-zero if any are absent. This target must complete successfully before any build attempt.
+2. **`make install`** — installs the compiled `avr-updi-gdb` binary to `$(PREFIX)/bin/` (default `PREFIX=/usr/local`) and the man page to `$(PREFIX)/share/man/man1/`. Creates missing intermediate directories via `install -d`. Binary installed mode 0755; man page mode 0644.
+3. **`make uninstall`** — removes `$(PREFIX)/bin/avr-updi-gdb` and `$(PREFIX)/share/man/man1/avr-updi-gdb.1` with `rm -f`. Idempotent — exits 0 even if files are already absent.
+4. **`doc/UserManual.md`** — hand-authored user manual covering: prerequisites + minimum versions, build instructions (`make`, `make test`, `make install`), connection wiring for the UPDI serial adapter (1 kΩ resistor, TX/RX orientation), all CLI options, and at least two complete usage examples (one with `--load`, one without).
+5. **`doc/avr-updi-gdb.1`** — Unix man page in `groff` format. Required sections: NAME, SYNOPSIS, DESCRIPTION, OPTIONS, OPERANDS, EXIT STATUS, EXAMPLES, SEE ALSO. Must parse cleanly under `man -l doc/avr-updi-gdb.1` on Linux.
+6. **`tests/test_install.c`** — 5 integration-style tests: (a) `check-tools` exits non-zero on missing tool; (b) `make install` places binary at correct prefix path; (c) `make install` places man page and it renders without error; (d) `make uninstall` removes installed files; (e) user manual exists and contains all required section headings.
+
+**Acceptance:** `make check-tools` exits 0 when all tools are present. `make install PREFIX=/tmp/test` and `make uninstall PREFIX=/tmp/test` succeed. `man -l doc/avr-updi-gdb.1` exits 0. `make test` runs `tests/test_install` and reports 5/5 passing. `python3 tools/lint_project.py` reports 0 errors, 0 warnings.
+
+**`make install` implementation pattern:**
+
+```makefile
+PREFIX  ?= /usr/local
+BINDIR  := $(PREFIX)/bin
+MANDIR  := $(PREFIX)/share/man/man1
+
+install: all
+	install -d $(BINDIR) $(MANDIR)
+	install -m 0755 $(BINFILE) $(BINDIR)/avr-updi-gdb
+	install -m 0644 doc/avr-updi-gdb.1 $(MANDIR)/avr-updi-gdb.1
+
+uninstall:
+	rm -f $(BINDIR)/avr-updi-gdb $(MANDIR)/avr-updi-gdb.1
+
+check-tools:
+	@command -v $(CC)      >/dev/null 2>&1 || { echo "ERROR: C compiler not found ($(CC))"; exit 1; }
+	@command -v avr-gcc    >/dev/null 2>&1 || { echo "ERROR: avr-gcc not found"; exit 1; }
+	@command -v avr-nm     >/dev/null 2>&1 || { echo "ERROR: avr-nm not found"; exit 1; }
+	@echo "All required tools found."
+```
+
+**`doc/avr-updi-gdb.1` man page required sections:**
+
+| Section | Content |
+| ------- | ------- |
+| `NAME` | `avr-updi-gdb — UPDI-to-GDB stub with avrOS FSM awareness` |
+| `SYNOPSIS` | `avr-updi-gdb [--port port] [--baud baud] [--load] serial-device elf-file` |
+| `DESCRIPTION` | Overview of UPDI bridging and avrOS FSM virtual threads |
+| `OPTIONS` | `--port`, `--baud`, `--load` with types, defaults, and constraints |
+| `OPERANDS` | `serial-device` and `elf-file` positional arguments |
+| `EXIT STATUS` | Codes 0 and 1 with conditions |
+| `EXAMPLES` | `avr-updi-gdb /dev/ttyUSB0 firmware.elf` and `avr-updi-gdb --load --port 1234 /dev/ttyUSB0 firmware.elf` |
+| `SEE ALSO` | `avr-gdb(1)`, `avrdude(1)` |
+
 ## 9. Risks & Open Questions
 
 *   **Half-duplex echo cancellation in UPDI tests.** Every byte transmitted over the UPDI UART is echoed back on the RX line by the hardware. PTY pairs do not auto-echo, so the PTY test harness must explicitly write back the echo bytes before injecting each simulated AVR response. If this is omitted, UPDI functions will block waiting to drain echoes that never arrive, causing PTY tests to time out even though the production logic is correct.
@@ -488,8 +542,9 @@ T-shirt sizes relative to Phase 0.
 | 1 | ELF Parser | M — well-understood binary format; fixture generation adds one-time avr-gcc complexity |
 | 2 | UPDI Physical Layer | L — half-duplex echo cancellation, multi-opcode protocol, PTY harness with echo simulation |
 | 3 | FSM Mapper | M — clean mock boundary via `--wrap`; most complexity is in fixture byte sequence design |
-| 4 | Monitor + RSP | XL — 15 RSP handler table entries, 28 test cases, O-packet hex encoding, circular header dependency |
+| 4 | Monitor + RSP | XL — 15 RSP handler table entries, 29 test cases, O-packet hex encoding, circular header dependency |
 | 5 | Application Entry Point + Integration | L — `main.c` itself is thin; integration test harness (fork/PTY/TCP) is the dominant effort |
+| 6 | Installation Targets + Documentation | S — Makefile targets are 20 lines; most effort is in writing the user manual and man page prose |
 
 ## 11. Out-of-Scope Follow-ups
 
