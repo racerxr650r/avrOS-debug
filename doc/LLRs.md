@@ -83,7 +83,7 @@ Requirements for RSP packet framing, dispatch, GDB packet handlers, session life
 *   <a id="LLR-RSP-02"></a>**LLR-RSP-02** — `rsp_recv_packet()` shall scan incoming bytes discarding pre-packet ACK/NAK characters until a `$` delimiter is received. It shall accumulate the payload with a running XOR checksum until `#` is received, then compare the computed checksum against the two ASCII-hex checksum bytes that follow. On match it shall write `+` to the socket and return the payload length; on mismatch it shall write `-` and return -1.
     *Trace:* HLR-013 (RSP Server Accessibility).
 
-*   <a id="LLR-RSP-03"></a>**LLR-RSP-03** — The `on_read_regs` handler for the `g` packet shall read all 36 AVR CPU register values (R0–R31, SREG, SPL, SPH, and PC) from the target via `updi_mem_read()` and return them as a 78-character hex string in GDB g-packet register order (R0–R31 at hex positions 0–63, SREG at 64–65, SPL at 66–67, SPH at 68–69, PC as 4-byte little-endian at 70–77).
+*   <a id="LLR-RSP-03"></a>**LLR-RSP-03** — The `on_read_regs` handler for the `g` packet shall delegate to `fsm_get_registers()` for the currently selected virtual thread (stored in `RspContext.g_thread_p`, defaulting to the active FSM thread when zero or negative) and return the resulting 78-character hex string. The FSM mapper is responsible for placing R0-R31 at hex positions 0-63, SREG at 64-65, SPL at 66-67, SPH at 68-69, and PC as 4-byte little-endian at positions 70-77; live SREG/SP bytes for the active thread are read via `updi_mem_read()` from within `fsm_get_registers()`.
     *Trace:* HLR-014 (Register Read and Write).
 
 *   <a id="LLR-RSP-04"></a>**LLR-RSP-04** — The `on_write_regs` handler for the `G` packet and the single-register `P` handler shall write the supplied register values to the target's CPU register file via `updi_mem_write()` and return `OK` on success or an error reply on UPDI failure.
@@ -110,7 +110,7 @@ Requirements for RSP packet framing, dispatch, GDB packet handlers, session life
 *   <a id="LLR-RSP-11"></a>**LLR-RSP-11** — The `on_continue` handler for `c`/`vCont;c` shall call `updi_run()` followed by `fsm_invalidate()`, then poll by calling `updi_halt()` until the CPU stops. On halt, it shall call `fsm_build_thread_list()` to rebuild the thread list and send a stop-reason packet to the GDB client.
     *Trace:* HLR-018 (Continue Execution).
 
-*   <a id="LLR-RSP-12"></a>**LLR-RSP-12** — `rsp_dispatch()` shall handle `qSupported` inline, responding with a fixed string advertising the supported feature set. It shall handle `qAttached` inline, responding `1` (attached to an existing process). Neither packet requires target interaction or handler table dispatch.
+*   <a id="LLR-RSP-12"></a>**LLR-RSP-12** — `rsp_dispatch()` shall handle the following packets inline without invoking any `RspHandlers` slot, because each response is a fixed string requiring no target interaction: `qSupported` (responds with `PacketSize=800;QStartNoAckMode+;multiprocess-;vContSupported+`), `qAttached` (responds `1`), `QStartNoAckMode` (calls `rsp_set_noack(true)` and responds `OK`), and `vCont?` (responds `vCont;c;s`).
     *Trace:* HLR-019 (RSP Capability Negotiation and Lifecycle).
 
 *   <a id="LLR-RSP-13"></a>**LLR-RSP-13** — The `on_detach` handler for the `D` packet shall call `updi_run()` to resume the target, close the GDB client socket, reset `cfg->gdb_fd` to -1, and allow the event loop to re-enter the listening state. The server process shall not exit.
