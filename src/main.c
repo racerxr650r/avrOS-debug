@@ -32,6 +32,7 @@ typedef struct {
     uint16_t    gdb_port;
     int         baud_rate;
     bool        load_flash;
+    bool        device_info;   /* --device one-shot diagnostic (LLR-MAIN-08) */
     /* fds owned by main; -1 = closed/unset */
     int         listen_fd;
     int         gdb_fd;
@@ -56,13 +57,68 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
         "usage: %s [--port <port>] [--baud <baud>] [--load] "
-        "<serial-device> <elf-file>\n", prog);
+        "<serial-device> <elf-file>\n"
+        "       %s --device [--baud <baud>] <serial-device> [elf-file]\n",
+        prog, prog);
 }
 
 MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg);
 MAYBE_STATIC void event_loop(AppConfig *cfg, RspHandlers *h);
 MAYBE_STATIC int  load_flash_segments(AppConfig *cfg, ElfContext *ctx);
+MAYBE_STATIC int  run_device_mode(AppConfig *cfg);
 MAYBE_STATIC void sig_handler(int signo);
+
+/* ── Device family lookup (LLR-MAIN-09) ───────────────────────────────── *
+ * Signature → family name table for AVR DA/DB devices. Values are the
+ * canonical Microchip SIGROW DEVICEID0..2 triplets published in the
+ * AVR-Dx Device Family Pack ATDF files. Unknown signatures render as
+ * "unknown device" in the diagnostic report.                              */
+typedef struct {
+    uint8_t     id[3];
+    const char *name;
+} DeviceFamilyEntry;
+
+static const DeviceFamilyEntry device_family[] = {
+    /* AVR128DA */
+    { { 0x1E, 0x97, 0x0A }, "AVR128DA28" },
+    { { 0x1E, 0x97, 0x09 }, "AVR128DA32" },
+    { { 0x1E, 0x97, 0x08 }, "AVR128DA48" },
+    { { 0x1E, 0x97, 0x07 }, "AVR128DA64" },
+    /* AVR64DA */
+    { { 0x1E, 0x96, 0x15 }, "AVR64DA28"  },
+    { { 0x1E, 0x96, 0x14 }, "AVR64DA32"  },
+    { { 0x1E, 0x96, 0x13 }, "AVR64DA48"  },
+    { { 0x1E, 0x96, 0x12 }, "AVR64DA64"  },
+    /* AVR32DA */
+    { { 0x1E, 0x95, 0x36 }, "AVR32DA28"  },
+    { { 0x1E, 0x95, 0x35 }, "AVR32DA32"  },
+    { { 0x1E, 0x95, 0x34 }, "AVR32DA48"  },
+    /* AVR128DB */
+    { { 0x1E, 0x97, 0x0E }, "AVR128DB28" },
+    { { 0x1E, 0x97, 0x0D }, "AVR128DB32" },
+    { { 0x1E, 0x97, 0x0C }, "AVR128DB48" },
+    { { 0x1E, 0x97, 0x0B }, "AVR128DB64" },
+    /* AVR64DB */
+    { { 0x1E, 0x96, 0x19 }, "AVR64DB28"  },
+    { { 0x1E, 0x96, 0x18 }, "AVR64DB32"  },
+    { { 0x1E, 0x96, 0x17 }, "AVR64DB48"  },
+    { { 0x1E, 0x96, 0x16 }, "AVR64DB64"  },
+    /* AVR32DB */
+    { { 0x1E, 0x95, 0x3A }, "AVR32DB28"  },
+    { { 0x1E, 0x95, 0x39 }, "AVR32DB32"  },
+    { { 0x1E, 0x95, 0x38 }, "AVR32DB48"  },
+};
+
+static const char *lookup_device_family(const uint8_t id[3])
+{
+    for (size_t i = 0; i < sizeof(device_family)/sizeof(device_family[0]); i++) {
+        if (device_family[i].id[0] == id[0] &&
+            device_family[i].id[1] == id[1] &&
+            device_family[i].id[2] == id[2])
+            return device_family[i].name;
+    }
+    return "unknown device";
+}
 
 MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
 {
@@ -71,6 +127,7 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
     cfg->gdb_port      = 1234;
     cfg->baud_rate     = 115200;
     cfg->load_flash    = false;
+    cfg->device_info   = false;
     cfg->listen_fd     = -1;
     cfg->gdb_fd        = -1;
     cfg->updi_fd       = -1;
@@ -86,6 +143,8 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
             cfg->baud_rate = atoi(argv[i]);
         } else if (strcmp(a, "--load") == 0) {
             cfg->load_flash = true;
+        } else if (strcmp(a, "--device") == 0) {
+            cfg->device_info = true;
         } else if (a[0] == '-' && a[1] != '\0') {
             fprintf(stderr, "%s: unrecognised option '%s'\n", argv[0], a);
             usage(argv[0]);
@@ -102,7 +161,22 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
             exit(1);
         }
     }
-    if (cfg->serial_device == NULL || cfg->elf_path == NULL) {
+
+    /* LLR-MAIN-08: --device and --load are mutually exclusive. */
+    if (cfg->device_info && cfg->load_flash) {
+        fprintf(stderr,
+                "%s: error: --device is mutually exclusive with --load\n",
+                argv[0]);
+        usage(argv[0]);
+        exit(1);
+    }
+
+    if (cfg->serial_device == NULL) {
+        usage(argv[0]);
+        exit(1);
+    }
+    /* --device makes <elf-file> optional (LLR-MAIN-08). */
+    if (!cfg->device_info && cfg->elf_path == NULL) {
         usage(argv[0]);
         exit(1);
     }
@@ -175,6 +249,61 @@ MAYBE_STATIC void event_loop(AppConfig *cfg, RspHandlers *h)
 
 /* Iterate PT_LOAD segments and flash each non-SRAM segment.
  * Returns 0 on success, -1 on any read or flash error. */
+/* run_device_mode (LLR-MAIN-09): one-shot diagnostic that opens UPDI,
+ * reads SIGROW + ASI status via updi_read_device_info(), prints a
+ * human-readable report to stdout, and returns the process exit code.
+ * Does NOT call rsp_listen(), elf_*(), fsm_*(), or event_loop().      */
+MAYBE_STATIC int run_device_mode(AppConfig *cfg)
+{
+    UpdiDeviceInfo info;
+    int            fd;
+    int            rc;
+
+    memset(&info, 0, sizeof info);
+
+    fd = updi_open(cfg->serial_device, cfg->baud_rate);
+    if (fd < 0) {
+        fprintf(stderr,
+                "error: updi-open failed for '%s' \u2014 "
+                "check wiring, target power, UPDIDIS fuse\n",
+                cfg->serial_device);
+        return 1;
+    }
+    cfg->updi_fd = fd;
+
+    rc = updi_read_device_info(fd, &info);
+    if (rc < 0) {
+        fprintf(stderr,
+                "error: %s failed (rc=%d) \u2014 "
+                "check wiring, target power, UPDIDIS fuse\n",
+                info.fail_op ? info.fail_op : "updi",
+                info.fail_errno);
+        updi_close(fd);
+        cfg->updi_fd = -1;
+        return 1;
+    }
+
+    printf("Serial device:   %s\n", cfg->serial_device);
+    printf("Baud rate:       %d\n", cfg->baud_rate);
+    printf("Signature:       %02X %02X %02X\n",
+           info.device_id[0], info.device_id[1], info.device_id[2]);
+    printf("Family:          %s\n", lookup_device_family(info.device_id));
+    printf("Revision:        %c%u\n",
+           (char)('A' + ((info.revid >> 4) & 0x0Fu)),
+           (unsigned)(info.revid & 0x0Fu));
+    printf("Serial:          %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n",
+           info.serial[0], info.serial[1], info.serial[2], info.serial[3],
+           info.serial[4], info.serial[5], info.serial[6], info.serial[7],
+           info.serial[8], info.serial[9]);
+    printf("UPDI status:     SYS_STATUS=0x%02X  KEY_STATUS=0x%02X  STATUSB=0x%02X\n",
+           info.asi_sys_status, info.asi_key_status, info.asi_statusb);
+    fflush(stdout);
+
+    updi_close(fd);
+    cfg->updi_fd = -1;
+    return 0;
+}
+
 MAYBE_STATIC int load_flash_segments(AppConfig *cfg, ElfContext *ctx)
 {
     Elf32_Ehdr ehdr = ctx->ehdr;
@@ -217,6 +346,11 @@ int MAIN_NAME(int argc, char *argv[])
     elf_ctx.fd = -1;
 
     parse_args(argc, argv, &cfg);
+
+    /* LLR-MAIN-09: --device short-circuits the normal startup path. */
+    if (cfg.device_info) {
+        return run_device_mode(&cfg);
+    }
 
     /* Signal handlers (LLR-MAIN-06). */
     struct sigaction sa;

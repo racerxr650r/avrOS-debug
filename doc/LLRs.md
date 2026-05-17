@@ -33,6 +33,12 @@ Requirements for `main()`, `parse_args()`, and `event_loop()`. These functions o
 *   <a id="LLR-MAIN-07"></a>**LLR-MAIN-07** — On all exit paths, `main()` shall release resources in this exact order: (1) `rsp_close(cfg.gdb_fd)` if `gdb_fd >= 0`, (2) `rsp_close(cfg.listen_fd)`, (3) `elf_close(&ctx)`, (4) `updi_close(cfg.updi_fd)`. The process shall exit with code 0 on normal termination and code 1 on any fatal initialisation or flash-write failure.
     *Trace:* HLR-035 (Graceful Shutdown and Resource Release).
 
+*   <a id="LLR-MAIN-08"></a>**LLR-MAIN-08** — `parse_args()` shall recognise the `--device` long option, set `cfg->device_info = true`, and accept the absence of the `<elf-file>` operand without error. Specifying both `--device` and `--load` on the same command line shall cause `parse_args()` to print `"error: --device is mutually exclusive with --load"` to `stderr`, print the usage synopsis, and call `exit(1)`.
+    *Trace:* HLR-044 (Device-Signature Diagnostic Mode).
+
+*   <a id="LLR-MAIN-09"></a>**LLR-MAIN-09** — When `cfg.device_info` is true, `main()` shall: (1) call `updi_open()`; (2) on success call `updi_read_device_info()`; (3) on success format and print to `stdout` a multi-line report containing `Serial device:`, `Baud rate:`, `Signature:` (3 hex bytes), `Family:` (looked up via a static `device_family[]` table indexed by signature \u2014 unknown signatures shall print `unknown device`), `Revision:`, `Serial:` (10 hex bytes), and `UPDI status: SYS_STATUS=0x.. KEY_STATUS=0x.. STATUSB=0x..`; (4) call `updi_close()` and return. The function shall **not** call `rsp_listen()`, `elf_find_avros_tables()`, `fsm_build_thread_list()`, or `event_loop()`. On any UPDI failure the function shall print a verbose diagnostic to `stderr` that names the failed step (e.g. `"updi-open"`, `"sigrow"`, `"sys-status"`) and return exit code 1.
+    *Trace:* HLR-044 (Device-Signature Diagnostic Mode).
+
 ## 3. src/updi.c — UPDI Physical Layer
 
 Requirements for all public functions in `src/updi.c`: link initialisation, memory access, execution control, NVM programming, and console bridging.
@@ -72,6 +78,9 @@ Requirements for all public functions in `src/updi.c`: link initialisation, memo
 
 *   <a id="LLR-UPDI-12"></a>**LLR-UPDI-12** — `updi_console_poll()` shall perform a background `updi_mem_read()` of the avrOS software UART output buffer and return any pending bytes to the caller without halting the CPU. The function shall return the number of bytes read (0 if none pending) or -1 on UPDI error.
     *Trace:* HLR-012 (UPDI Console Bridge).
+
+*   <a id="LLR-UPDI-13"></a>**LLR-UPDI-13** — `updi_read_device_info(fd, info)` shall populate the caller-supplied `UpdiDeviceInfo` struct with: 3 SIGROW DEVICEID bytes from physical address `0x1100`-`0x1102`, the REVID byte at `0x1103`, 10 SERNUM bytes at `0x1110`-`0x1119`, and the three ASI registers `ASI_SYS_STATUS`, `ASI_KEY_STATUS`, `ASI_STATUSB` read via `LDCS`. The function shall be non-destructive (no halt, no NVM activity). On any UPDI read failure it shall set `info->fail_op` to a short ASCII tag (`"sigrow"`, `"revid"`, `"sernum"`, `"sys-status"`, `"key-status"`, `"asi-statusb"`) and return -1; on success it shall set `info->fail_op = NULL` and return 0.
+    *Trace:* HLR-044 (Device-Signature Diagnostic Mode).
 
 ## 4. src/gdb_rsp.c — GDB Remote Serial Protocol Server
 

@@ -30,4 +30,18 @@ int  updi_step(int fd);
 int  updi_nvm_write_flash(int fd, uint32_t word_addr, const uint8_t *data, size_t len);
 int  updi_console_poll(int fd, char *buf, size_t cap);
 
+/* ── Device-signature diagnostics (Phase 7) ──────────────────────────── */
+typedef struct {
+    uint8_t     device_id[3];   /* SIGROW DEVICEID0..2 @ 0x1100-0x1102 */
+    uint8_t     revid;          /* SIGROW REVID         @ 0x1103       */
+    uint8_t     serial[10];     /* SIGROW SERNUM0..9    @ 0x1110-0x1119 */
+    uint8_t     asi_sys_status;
+    uint8_t     asi_key_status;
+    uint8_t     asi_statusb;
+    const char *fail_op;        /* NULL on success                     */
+    int         fail_errno;     /* negative updi error on failure      */
+} UpdiDeviceInfo;
+
+int  updi_read_device_info(int fd, UpdiDeviceInfo *info);
+
 #endif /* AOD_UPDI_H */
