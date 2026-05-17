@@ -17,9 +17,9 @@
     <document id="STP"          title="Software Test Plan"           source="doc/STP.md"          version="0.1" date="2026-05-16" author="John Anderson"/>
     <document id="Traceability" title="Traceability Matrix"          source="doc/Traceability.md" version="0.1" date="2026-05-16" author="John Anderson"/>
     <counts>
-      <count name="hlrs"       value="42"/>
-      <count name="llrs"       value="60"/>
-      <count name="tests"      value="112"/>
+      <count name="hlrs"       value="43"/>
+      <count name="llrs"       value="63"/>
+      <count name="tests"      value="115"/>
       <count name="test_files" value="8"/>
     </counts>
   </metadata>
@@ -37,7 +37,7 @@
       <file path="src/elf_parser.c">ELF parser: locates avrOS FLASH-resident system tables and produces the AvrOsSymbolIndex.</file>
       <file path="src/fsm_mapper.c">avrOS FSM-to-GDB virtual thread translator: maps FSM state tables to GDB thread objects and synthesizes per-thread register frames.</file>
       <file path="src/monitor.c">Custom monitor command handler: implements the avros events, queues, and mempool sub-commands via non-intrusive UPDI reads.</file>
-      <file path="Makefile">Build orchestration: compile, test, install, uninstall, and check-tools targets.</file>
+      <file path="Makefile">Build orchestration: compile, test, install, uninstall, check-tools, and bundle (Debian .deb, Red Hat .rpm, Homebrew formula) targets.</file>
       <file path="doc/avr-updi-gdb.1">Unix man page: reference documentation for the avr-updi-gdb command.</file>
       <outro><![CDATA[It does not cover the build system, IDE adapter layers (Cortex-Debug, Zed DAP), or Windows support, all of which are out of scope for the initial release (see `doc/PVD.md §7.2`).]]></outro>
     </scope>
@@ -46,7 +46,7 @@
       <para><![CDATA[`avr-updi-gdb` is a POSIX C99 GDB stub that bridges the UPDI debug interface of modern AVR microcontrollers (DA/DB families) to standard IDEs over the GDB Remote Serial Protocol (RSP). A developer launches the stub, points it at a serial device and an ELF binary, and connects any GDB-compatible front-end — VS Code with Cortex-Debug, Zed with its DAP adapter, or bare `avr-gdb` — using the standard `target extended-remote` command.]]></para>
       <para><![CDATA[The server connects to the target via a TTL-level UART serial adapter with a 1 kΩ resistor on the UPDI line. No external JTAG programmer or proprietary debugger hardware is required — only a USB-to-serial adapter or direct Raspberry Pi UART pins.]]></para>
       <para><![CDATA[Unlike conventional GDB stubs that expose a flat memory model, `avr-updi-gdb` provides native avrOS state-machine awareness. At attach time it parses the supplied ELF binary to locate the avrOS FSM registration tables in FLASH, then presents each registered finite state machine as a standard GDB virtual thread. The currently executing FSM appears as the active thread; all suspended FSMs appear as additional threads, each with a synthetic register frame whose PC points to the FSM's current state function pointer.]]></para>
-      <para><![CDATA[The project ships with a `make install` target that installs the compiled binary to `$(PREFIX)/bin/` and the accompanying Unix man page to `$(PREFIX)/share/man/man1/`. A `make check-tools` target validates that all required build tools (`gcc`, `make`, `avr-gcc`, `avr-binutils`) are present on the host before any compilation is attempted. These targets ensure the project can be built, deployed, and documented by a developer from a single `make` command sequence with no manual file copying.]]></para>
+      <para><![CDATA[The project ships with a `make install` target that installs the compiled binary to `$(PREFIX)/bin/` and the accompanying Unix man page to `$(PREFIX)/share/man/man1/`. A `make check-tools` target validates that all required build tools (`gcc`, `make`, `avr-gcc`, `avr-binutils`) are present on the host before any compilation is attempted. A `make bundle` target produces native distribution packages for three platforms: a Debian binary package (`.deb`), a Red Hat RPM package (`.rpm`), and a Homebrew formula (`dist/avr-updi-gdb.rb`) for macOS. All output artefacts are written under the `dist/` directory. These targets ensure the project can be built, deployed, and distributed by a developer from a single `make` command sequence with no manual file copying.]]></para>
     </overview>
 
     <definitions>
@@ -1360,6 +1360,13 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="SDD" ref="2.2"/>
         </traces>
       </hlr>
+
+      <hlr id="HLR-043" name="Distribution Package Bundle">
+        <text><![CDATA[The Makefile shall provide a `bundle` target that produces native distribution packages for three target platforms: a Debian binary package (`dist/avr-updi-gdb_$(VERSION)_amd64.deb`) for Debian/Ubuntu Linux, an RPM binary package (`dist/avr-updi-gdb-$(VERSION)-1.x86_64.rpm`) for Red Hat/Fedora Linux, and a Homebrew formula (`dist/avr-updi-gdb.rb`) for macOS. Each package shall include the `avr-updi-gdb` binary and the man page. All output artefacts shall be written under the `dist/` directory. A `VERSION` variable (defaulting to the value extracted from `git describe`) shall parameterise every package version string.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+        </traces>
+      </hlr>
     </section>
 
   </hlrs>
@@ -1805,7 +1812,7 @@ Errors are propagated upward through the module stack without retrying:
     </function>
 
     <function number="8" title="Makefile and Documentation" name="inst">
-      <intro><![CDATA[Requirements for the Makefile installation targets (`install`, `uninstall`, `check-tools`) and the documentation deliverables (`doc/UserManual.md`, `doc/avr-updi-gdb.1`).]]></intro>
+      <intro><![CDATA[Requirements for the Makefile installation targets (`install`, `uninstall`, `check-tools`, `bundle`) and the documentation deliverables (`doc/UserManual.md`, `doc/avr-updi-gdb.1`). Bundle artefacts are written to `dist/`.]]></intro>
 
       <llr id="LLR-INST-01">
         <text><![CDATA[The Makefile shall provide a `check-tools` target that tests for the presence of every required host tool: `gcc` (or `cc`), `make`, `avr-gcc`, and `avr-nm`. For each absent tool the target shall print a diagnostic message to `stderr` naming the missing tool and then exit with status 1. The target shall exit with status 0 only when all required tools are found.]]></text>
@@ -1839,6 +1846,27 @@ Errors are propagated upward through the module stack without retrying:
         <text><![CDATA[The project shall include a Unix man page at `doc/avr-updi-gdb.1` in `groff`/`troff` format. The man page shall contain at minimum: NAME, SYNOPSIS, DESCRIPTION, OPTIONS (one entry per CLI flag), OPERANDS, EXIT STATUS, EXAMPLES, and SEE ALSO sections. The man page shall be parseable by `man -l doc/avr-updi-gdb.1` without error or warning on Linux.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-042" name="User Manual and Unix Man Page"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-INST-06">
+        <text><![CDATA[The Makefile `bundle` target shall produce a Debian binary package at `dist/avr-updi-gdb_$(VERSION)_amd64.deb` using `dpkg-deb --build`. The package staging tree shall install the binary to `usr/bin/avr-updi-gdb` (mode 0755) and the man page to `usr/share/man/man1/avr-updi-gdb.1` (mode 0644). The `DEBIAN/control` file shall declare at minimum: `Package: avr-updi-gdb`, `Version`, `Architecture: amd64`, `Maintainer`, and `Description` fields.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-043" name="Distribution Package Bundle"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-INST-07">
+        <text><![CDATA[The Makefile `bundle` target shall produce an RPM binary package at `dist/avr-updi-gdb-$(VERSION)-1.x86_64.rpm` using `rpmbuild`. A `.spec` file shall be generated in the build tree containing at minimum: `Name`, `Version`, `Release: 1`, `Summary`, `License`, `%description`, `%install`, and `%files` sections. The `%files` section shall list `/usr/bin/avr-updi-gdb` and `/usr/share/man/man1/avr-updi-gdb.1`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-043" name="Distribution Package Bundle"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-INST-08">
+        <text><![CDATA[The Makefile `bundle` target shall produce a Homebrew formula at `dist/avr-updi-gdb.rb`. The formula shall be a valid Ruby file usable with `brew install --formula dist/avr-updi-gdb.rb`. It shall define at minimum: `desc`, `homepage`, `url`, `sha256`, `version`, `license`, and an `install` block that places the binary using `bin.install` and the man page using `man1.install`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-043" name="Distribution Package Bundle"/>
         </traces>
       </llr>
     </function>
@@ -2442,7 +2470,7 @@ Errors are propagated upward through the module stack without retrying:
     <!-- ============================================================ -->
     <!-- Installation and documentation tests                         -->
     <!-- ============================================================ -->
-    <file path="tests/test_install.c" role="integration" count="5">
+    <file path="tests/test_install.c" role="integration" count="8">
       <header><![CDATA[Verification tests for the Makefile install/uninstall targets, the `check-tools` pre-flight target, and the Unix man page. Tests fork a subprocess or invoke `make` directly and inspect the resulting file-system state or exit codes.]]></header>
 
       <test name="check_tools_exits_nonzero_when_required_tool_is_absent">
@@ -2468,6 +2496,21 @@ Errors are propagated upward through the module stack without retrying:
       <test name="user_manual_exists_and_contains_required_sections">
         <purpose><![CDATA[Read `doc/UserManual.md` and verify the file exists and contains all required section headings: Prerequisites, Build, Connection Wiring, Usage (or Options), and at least one Example.]]></purpose>
         <traces><trace target="LLR" ref="LLR-INST-04"/></traces>
+      </test>
+
+      <test name="make_bundle_produces_deb_package">
+        <purpose><![CDATA[Run `make bundle VERSION=0.1.0` and verify that `dist/avr-updi-gdb_0.1.0_amd64.deb` exists, that `dpkg-deb --info` exits 0, and that `dpkg-deb --contents` lists both `./usr/bin/avr-updi-gdb` and `./usr/share/man/man1/avr-updi-gdb.1`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-INST-06"/></traces>
+      </test>
+
+      <test name="make_bundle_produces_rpm_package">
+        <purpose><![CDATA[Run `make bundle VERSION=0.1.0` and verify that `dist/avr-updi-gdb-0.1.0-1.x86_64.rpm` exists and that `rpm -qp --list` exits 0 and lists both `/usr/bin/avr-updi-gdb` and `/usr/share/man/man1/avr-updi-gdb.1`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-INST-07"/></traces>
+      </test>
+
+      <test name="make_bundle_produces_homebrew_formula">
+        <purpose><![CDATA[Run `make bundle VERSION=0.1.0` and verify that `dist/avr-updi-gdb.rb` exists, is valid Ruby syntax (parseable by `ruby -c`), and contains the required fields: `desc`, `url`, `sha256`, `version`, and an `install` block.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-INST-08"/></traces>
       </test>
     </file>
 

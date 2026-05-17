@@ -10,7 +10,7 @@
 
 ## 3. Test Catalogue
 
-Snapshot: **112 test(s)** across
+Snapshot: **115 test(s)** across
 **8 file(s)**.
 
 ### 3.1. [tests/test_main.c](../tests/test_main.c)
@@ -172,7 +172,7 @@ Role: **integration**. **4 test(s).**
 
 ### 3.8. [tests/test_install.c](../tests/test_install.c)
 
-Role: **integration**. **5 test(s).**
+Role: **integration**. **8 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -181,6 +181,9 @@ Role: **integration**. **5 test(s).**
 | 3 | <a id="make_install_places_man_page_at_prefix_man1"></a>`make_install_places_man_page_at_prefix_man1` | `LLR-INST-02`, `LLR-INST-05` | After `make install PREFIX=...`, verify that the file `$(PREFIX)/share/man/man1/avr-updi-gdb.1` exists and that `man -l` parses it without error. |
 | 4 | <a id="make_uninstall_removes_all_installed_files"></a>`make_uninstall_removes_all_installed_files` | `LLR-INST-03` | After `make install PREFIX=...`, run `make uninstall PREFIX=...` and verify that both `$(PREFIX)/bin/avr-updi-gdb` and `$(PREFIX)/share/man/man1/avr-updi-gdb.1` no longer exist. |
 | 5 | <a id="user_manual_exists_and_contains_required_sections"></a>`user_manual_exists_and_contains_required_sections` | `LLR-INST-04` | Read `doc/UserManual.md` and verify the file exists and contains all required section headings: Prerequisites, Build, Connection Wiring, Usage (or Options), and at least one Example. |
+| 6 | <a id="make_bundle_produces_deb_package"></a>`make_bundle_produces_deb_package` | `LLR-INST-06` | Run `make bundle VERSION=0.1.0` and verify that `dist/avr-updi-gdb_0.1.0_amd64.deb` exists, that `dpkg-deb --info` exits 0, and that `dpkg-deb --contents` lists both `./usr/bin/avr-updi-gdb` and `./usr/share/man/man1/avr-updi-gdb.1`. |
+| 7 | <a id="make_bundle_produces_rpm_package"></a>`make_bundle_produces_rpm_package` | `LLR-INST-07` | Run `make bundle VERSION=0.1.0` and verify that `dist/avr-updi-gdb-0.1.0-1.x86_64.rpm` exists and that `rpm -qp --list` exits 0 and lists both `/usr/bin/avr-updi-gdb` and `/usr/share/man/man1/avr-updi-gdb.1`. |
+| 8 | <a id="make_bundle_produces_homebrew_formula"></a>`make_bundle_produces_homebrew_formula` | `LLR-INST-08` | Run `make bundle VERSION=0.1.0` and verify that `dist/avr-updi-gdb.rb` exists, is valid Ruby syntax (parseable by `ruby -c`), and contains the required fields: `desc`, `url`, `sha256`, `version`, and an `install` block. |
 
 ## 4. LLR Coverage Matrix
 
@@ -252,3 +255,6 @@ verified by code review — see
 | `LLR-INST-03` | `inst` | `HLR-041` | `make_uninstall_removes_all_installed_files` |
 | `LLR-INST-04` | `inst` | `HLR-042` | `user_manual_exists_and_contains_required_sections` |
 | `LLR-INST-05` | `inst` | `HLR-042` | `make_install_places_man_page_at_prefix_man1` |
+| `LLR-INST-06` | `inst` | `HLR-043` | `make_bundle_produces_deb_package` |
+| `LLR-INST-07` | `inst` | `HLR-043` | `make_bundle_produces_rpm_package` |
+| `LLR-INST-08` | `inst` | `HLR-043` | `make_bundle_produces_homebrew_formula` |

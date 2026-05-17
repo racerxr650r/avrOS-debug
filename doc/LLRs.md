@@ -202,7 +202,7 @@ Requirements for `monitor_dispatch()` and its static sub-command helpers `cmd_ev
 
 ## 8. Makefile and Documentation
 
-Requirements for the Makefile installation targets (`install`, `uninstall`, `check-tools`) and the documentation deliverables (`doc/UserManual.md`, `doc/avr-updi-gdb.1`).
+Requirements for the Makefile installation targets (`install`, `uninstall`, `check-tools`, `bundle`) and the documentation deliverables (`doc/UserManual.md`, `doc/avr-updi-gdb.1`). Bundle artefacts are written to `dist/`.
 
 *   <a id="LLR-INST-01"></a>**LLR-INST-01** — The Makefile shall provide a `check-tools` target that tests for the presence of every required host tool: `gcc` (or `cc`), `make`, `avr-gcc`, and `avr-nm`. For each absent tool the target shall print a diagnostic message to `stderr` naming the missing tool and then exit with status 1. The target shall exit with status 0 only when all required tools are found.
     *Trace:* HLR-041 (Makefile Install and Uninstall Targets).
@@ -218,3 +218,12 @@ Requirements for the Makefile installation targets (`install`, `uninstall`, `che
 
 *   <a id="LLR-INST-05"></a>**LLR-INST-05** — The project shall include a Unix man page at `doc/avr-updi-gdb.1` in `groff`/`troff` format. The man page shall contain at minimum: NAME, SYNOPSIS, DESCRIPTION, OPTIONS (one entry per CLI flag), OPERANDS, EXIT STATUS, EXAMPLES, and SEE ALSO sections. The man page shall be parseable by `man -l doc/avr-updi-gdb.1` without error or warning on Linux.
     *Trace:* HLR-042 (User Manual and Unix Man Page).
+
+*   <a id="LLR-INST-06"></a>**LLR-INST-06** — The Makefile `bundle` target shall produce a Debian binary package at `dist/avr-updi-gdb_$(VERSION)_amd64.deb` using `dpkg-deb --build`. The package staging tree shall install the binary to `usr/bin/avr-updi-gdb` (mode 0755) and the man page to `usr/share/man/man1/avr-updi-gdb.1` (mode 0644). The `DEBIAN/control` file shall declare at minimum: `Package: avr-updi-gdb`, `Version`, `Architecture: amd64`, `Maintainer`, and `Description` fields.
+    *Trace:* HLR-043 (Distribution Package Bundle).
+
+*   <a id="LLR-INST-07"></a>**LLR-INST-07** — The Makefile `bundle` target shall produce an RPM binary package at `dist/avr-updi-gdb-$(VERSION)-1.x86_64.rpm` using `rpmbuild`. A `.spec` file shall be generated in the build tree containing at minimum: `Name`, `Version`, `Release: 1`, `Summary`, `License`, `%description`, `%install`, and `%files` sections. The `%files` section shall list `/usr/bin/avr-updi-gdb` and `/usr/share/man/man1/avr-updi-gdb.1`.
+    *Trace:* HLR-043 (Distribution Package Bundle).
+
+*   <a id="LLR-INST-08"></a>**LLR-INST-08** — The Makefile `bundle` target shall produce a Homebrew formula at `dist/avr-updi-gdb.rb`. The formula shall be a valid Ruby file usable with `brew install --formula dist/avr-updi-gdb.rb`. It shall define at minimum: `desc`, `homepage`, `url`, `sha256`, `version`, `license`, and an `install` block that places the binary using `bin.install` and the man page using `man1.install`.
+    *Trace:* HLR-043 (Distribution Package Bundle).
