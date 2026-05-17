@@ -140,11 +140,14 @@ TEST_WRAP_test_rsp  := updi_mem_read updi_mem_write updi_halt updi_run updi_step
                        monitor_dispatch
 TEST_EXTRA_LDFLAGS_test_rsp :=
 
-# test_main
-TEST_SRCS_test_main := $(TESTDIR)/test_main.c $(SRCDIR)/main.c
+# test_main — test_main.c #includes src/main.c so it can reach the
+# static parse_args() / event_loop() / load_flash_segments() helpers.
+TEST_SRCS_test_main := $(TESTDIR)/test_main.c
 TEST_WRAP_test_main  := updi_open updi_close updi_console_poll \
+                        updi_nvm_write_flash \
                         rsp_listen rsp_accept rsp_close \
                         rsp_recv_packet rsp_dispatch \
+                        rsp_default_handlers \
                         elf_open elf_find_avros_tables elf_close \
                         fsm_build_thread_list select
 TEST_EXTRA_LDFLAGS_test_main :=

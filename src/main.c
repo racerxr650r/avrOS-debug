@@ -1,15 +1,291 @@
-/* src/main.c — stub (Phase 5 will implement) */
+/* src/main.c — avr-updi-gdb entry point.
+ *
+ * Owns CLI parsing, top-level select()-based event loop, signal handling,
+ * and guaranteed resource teardown (LLR-MAIN-01 .. LLR-MAIN-07). */
+#define _POSIX_C_SOURCE 200809L
+
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <signal.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/select.h>
+
+#ifdef __linux__
+#include <elf.h>
+#else
+#include "elf.h"
+#endif
+
 #include "elf_parser.h"
 #include "updi.h"
 #include "fsm_mapper.h"
-#include "monitor.h"
 #include "gdb_rsp.h"
 
-#ifndef UNIT_TEST
-int main(int argc, char *argv[])
+/* ── AppConfig (SDD data_dictionary) ──────────────────────────────────── */
+typedef struct {
+    const char *serial_device;
+    const char *elf_path;
+    uint16_t    gdb_port;
+    int         baud_rate;
+    bool        load_flash;
+    /* fds owned by main; -1 = closed/unset */
+    int         listen_fd;
+    int         gdb_fd;
+    int         updi_fd;
+} AppConfig;
+
+/* Externally visible shutdown flag (LLR-MAIN-06). Set by SIGINT/SIGTERM
+ * handler and by the RSP "k" packet handler. */
+volatile sig_atomic_t g_quit = 0;
+
+/* In UNIT_TEST builds expose internals to test_main.c and rename main()
+ * out of the way so tests can supply their own. */
+#ifdef UNIT_TEST
+# define MAYBE_STATIC
+# define MAIN_NAME app_main
+#else
+# define MAYBE_STATIC static
+# define MAIN_NAME main
+#endif
+
+static void usage(const char *prog)
 {
-    (void)argc; (void)argv;
-    return EXIT_FAILURE;
+    fprintf(stderr,
+        "usage: %s [--port <port>] [--baud <baud>] [--load] "
+        "<serial-device> <elf-file>\n", prog);
 }
-#endif /* UNIT_TEST */
+
+MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg);
+MAYBE_STATIC void event_loop(AppConfig *cfg, RspHandlers *h);
+MAYBE_STATIC int  load_flash_segments(AppConfig *cfg, ElfContext *ctx);
+MAYBE_STATIC void sig_handler(int signo);
+
+MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
+{
+    cfg->serial_device = NULL;
+    cfg->elf_path      = NULL;
+    cfg->gdb_port      = 1234;
+    cfg->baud_rate     = 115200;
+    cfg->load_flash    = false;
+    cfg->listen_fd     = -1;
+    cfg->gdb_fd        = -1;
+    cfg->updi_fd       = -1;
+
+    int positional = 0;
+    for (int i = 1; i < argc; i++) {
+        const char *a = argv[i];
+        if (strcmp(a, "--port") == 0) {
+            if (++i >= argc) { usage(argv[0]); exit(1); }
+            cfg->gdb_port = (uint16_t)atoi(argv[i]);
+        } else if (strcmp(a, "--baud") == 0) {
+            if (++i >= argc) { usage(argv[0]); exit(1); }
+            cfg->baud_rate = atoi(argv[i]);
+        } else if (strcmp(a, "--load") == 0) {
+            cfg->load_flash = true;
+        } else if (a[0] == '-' && a[1] != '\0') {
+            fprintf(stderr, "%s: unrecognised option '%s'\n", argv[0], a);
+            usage(argv[0]);
+            exit(1);
+        } else if (positional == 0) {
+            cfg->serial_device = a;
+            positional++;
+        } else if (positional == 1) {
+            cfg->elf_path = a;
+            positional++;
+        } else {
+            fprintf(stderr, "%s: too many arguments\n", argv[0]);
+            usage(argv[0]);
+            exit(1);
+        }
+    }
+    if (cfg->serial_device == NULL || cfg->elf_path == NULL) {
+        usage(argv[0]);
+        exit(1);
+    }
+}
+
+MAYBE_STATIC void sig_handler(int signo)
+{
+    (void)signo;
+    g_quit = 1;
+}
+
+MAYBE_STATIC void event_loop(AppConfig *cfg, RspHandlers *h)
+{
+    char pkt[RSP_PACKET_MAX];
+
+    while (!g_quit) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        int maxfd = -1;
+        if (cfg->listen_fd >= 0) {
+            FD_SET(cfg->listen_fd, &rfds);
+            maxfd = cfg->listen_fd;
+        }
+        if (cfg->gdb_fd >= 0) {
+            FD_SET(cfg->gdb_fd, &rfds);
+            if (cfg->gdb_fd > maxfd) maxfd = cfg->gdb_fd;
+            if (cfg->updi_fd >= 0) {
+                FD_SET(cfg->updi_fd, &rfds);
+                if (cfg->updi_fd > maxfd) maxfd = cfg->updi_fd;
+            }
+        }
+
+        int n = select(maxfd + 1, &rfds, NULL, NULL, NULL);
+        if (g_quit) break;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        /* (1) accept new GDB client when none is connected */
+        if (cfg->listen_fd >= 0 && FD_ISSET(cfg->listen_fd, &rfds) &&
+            cfg->gdb_fd < 0) {
+            int fd = rsp_accept(cfg->listen_fd);
+            if (fd >= 0) cfg->gdb_fd = fd;
+        }
+
+        /* (2) forward UPDI console traffic to stdout */
+        if (cfg->gdb_fd >= 0 && cfg->updi_fd >= 0 &&
+            FD_ISSET(cfg->updi_fd, &rfds)) {
+            char ubuf[256];
+            int got = updi_console_poll(cfg->updi_fd, ubuf, sizeof ubuf);
+            if (got > 0) {
+                (void)fwrite(ubuf, 1, (size_t)got, stdout);
+                fflush(stdout);
+            }
+        }
+
+        /* (3) RSP packet from GDB → dispatch */
+        if (cfg->gdb_fd >= 0 && FD_ISSET(cfg->gdb_fd, &rfds)) {
+            int rc = rsp_recv_packet(cfg->gdb_fd, pkt, sizeof pkt);
+            if (rc <= 0) {
+                rsp_close(cfg->gdb_fd);
+                cfg->gdb_fd = -1;
+            } else {
+                (void)rsp_dispatch(cfg->gdb_fd, pkt, h);
+            }
+        }
+    }
+}
+
+/* Iterate PT_LOAD segments and flash each non-SRAM segment.
+ * Returns 0 on success, -1 on any read or flash error. */
+MAYBE_STATIC int load_flash_segments(AppConfig *cfg, ElfContext *ctx)
+{
+    Elf32_Ehdr ehdr = ctx->ehdr;
+    for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
+        Elf32_Phdr ph;
+        off_t off = (off_t)ehdr.e_phoff +
+                    (off_t)i * (off_t)sizeof(Elf32_Phdr);
+        if (lseek(ctx->fd, off, SEEK_SET) < 0) return -1;
+        if (read(ctx->fd, &ph, sizeof ph) != (ssize_t)sizeof ph) return -1;
+        if (ph.p_type != PT_LOAD || ph.p_filesz == 0) continue;
+        /* Skip SRAM-only segments (VMA inside SRAM region). */
+        if (ctx->sram_base != 0 && ph.p_vaddr >= ctx->sram_base) continue;
+
+        uint8_t *buf = malloc(ph.p_filesz);
+        if (!buf) return -1;
+        if (lseek(ctx->fd, (off_t)ph.p_offset, SEEK_SET) < 0 ||
+            read(ctx->fd, buf, ph.p_filesz) != (ssize_t)ph.p_filesz) {
+            free(buf);
+            return -1;
+        }
+        int rc = updi_nvm_write_flash(cfg->updi_fd, ph.p_vaddr,
+                                      buf, ph.p_filesz);
+        free(buf);
+        if (rc < 0) return -1;
+        printf("loaded %u bytes @ 0x%06x\n",
+               (unsigned)ph.p_filesz, (unsigned)ph.p_vaddr);
+    }
+    return 0;
+}
+
+int MAIN_NAME(int argc, char *argv[])
+{
+    AppConfig cfg;
+    ElfContext elf_ctx;
+    AvrOsSymbolIndex idx;
+    FsmContext fsm_ctx;
+    memset(&elf_ctx, 0, sizeof elf_ctx);
+    memset(&idx,     0, sizeof idx);
+    memset(&fsm_ctx, 0, sizeof fsm_ctx);
+    elf_ctx.fd = -1;
+
+    parse_args(argc, argv, &cfg);
+
+    /* Signal handlers (LLR-MAIN-06). */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = sig_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT,  &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    int exit_code = 0;
+    bool elf_opened = false;
+
+    if (elf_open(cfg.elf_path, &elf_ctx) < 0) {
+        fprintf(stderr, "error: cannot open ELF '%s'\n", cfg.elf_path);
+        exit_code = 1;
+        goto teardown;
+    }
+    elf_opened = true;
+
+    /* LLR-MAIN-03: open UPDI first; verify before listening. */
+    cfg.updi_fd = updi_open(cfg.serial_device, cfg.baud_rate);
+    if (cfg.updi_fd < 0) {
+        fprintf(stderr, "error: cannot open UPDI device '%s'\n",
+                cfg.serial_device);
+        exit_code = 1;
+        goto teardown;
+    }
+
+    /* LLR-MAIN-04: optional flash load before listener. */
+    if (cfg.load_flash) {
+        if (load_flash_segments(&cfg, &elf_ctx) < 0) {
+            fprintf(stderr, "error: flash load failed\n");
+            exit_code = 1;
+            goto teardown;
+        }
+    }
+
+    cfg.listen_fd = rsp_listen(cfg.gdb_port);
+    if (cfg.listen_fd < 0) {
+        fprintf(stderr, "error: cannot bind GDB listener on port %u\n",
+                (unsigned)cfg.gdb_port);
+        exit_code = 1;
+        goto teardown;
+    }
+
+    /* Best-effort session init; failures are tolerated. */
+    (void)elf_find_avros_tables(&elf_ctx, &idx);
+    (void)fsm_build_thread_list(&fsm_ctx, &idx, cfg.updi_fd);
+
+    int g_thread = -1, c_thread = -1;
+    RspContext rctx = {
+        .updi_fd    = cfg.updi_fd,
+        .gdb_fd_p   = &cfg.gdb_fd,
+        .fsm        = &fsm_ctx,
+        .idx        = &idx,
+        .g_thread_p = &g_thread,
+        .c_thread_p = &c_thread,
+        .quit_p     = &g_quit,
+    };
+    RspHandlers handlers;
+    rsp_default_handlers(&handlers, &rctx);
+
+    event_loop(&cfg, &handlers);
+
+teardown:
+    /* LLR-MAIN-07: gdb_fd → listen_fd → elf_close → updi_close. */
+    if (cfg.gdb_fd >= 0)    rsp_close(cfg.gdb_fd);
+    if (cfg.listen_fd >= 0) rsp_close(cfg.listen_fd);
+    if (elf_opened)         elf_close(&elf_ctx);
+    if (cfg.updi_fd >= 0)   updi_close(cfg.updi_fd);
+    return exit_code;
+}
