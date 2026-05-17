@@ -3,6 +3,8 @@
 # Targets:
 #   all        Build the avr-updi-gdb host binary
 #   test       Build ELF fixtures, build all test binaries, run them
+#   test-ci    Like test, but writes per-suite output to build/test-results/*.txt
+#              (used by CI to build a structured test summary)
 #   clean      Remove all build artefacts
 #   install    Install avr-updi-gdb to $(PREFIX)/bin  [default: /usr/local]
 #
@@ -223,6 +225,24 @@ test: fixtures $(addprefix $(TESTBINDIR)/,$(TEST_NAMES))
 # ── fixtures target ───────────────────────────────────────────────────────────
 .PHONY: fixtures
 fixtures: $(FIXTURE_ELFS) $(NOT_AVR_ELF)
+
+# ── test-ci target ────────────────────────────────────────────────────────────
+# Like 'test' but writes each suite's output to build/test-results/<name>.txt
+# so the CI workflow can parse Unity results and post a PR summary.
+# All suite output is also echoed to stdout for the Actions log.
+.PHONY: test-ci
+test-ci: fixtures $(addprefix $(TESTBINDIR)/,$(TEST_NAMES))
+	@mkdir -p $(BUILDDIR)/test-results
+	@FAIL=0; \
+	for t in $(TEST_NAMES); do \
+	    echo "── $$t ──────────────────────────────────────────────"; \
+	    $(TESTBINDIR)/$$t > $(BUILDDIR)/test-results/$$t.txt 2>&1; \
+	    RET=$$?; \
+	    cat $(BUILDDIR)/test-results/$$t.txt; \
+	    echo ""; \
+	    if [ $$RET -ne 0 ]; then FAIL=1; fi; \
+	done; \
+	exit $$FAIL
 
 # ── install target ────────────────────────────────────────────────────────────
 .PHONY: install
