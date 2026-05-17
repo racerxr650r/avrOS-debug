@@ -10,8 +10,8 @@
 
 ## 3. Test Catalogue
 
-Snapshot: **106 test(s)** across
-**7 file(s)**.
+Snapshot: **115 test(s)** across
+**8 file(s)**.
 
 ### 3.1. [tests/test_main.c](../tests/test_main.c)
 
@@ -102,7 +102,7 @@ Role: **unit**. **29 test(s).**
 
 ### 3.4. [tests/test_elf.c](../tests/test_elf.c)
 
-Role: **unit**. **13 test(s).**
+Role: **unit**. **14 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -119,6 +119,7 @@ Role: **unit**. **13 test(s).**
 | 11 | <a id="elf_find_avros_tables_zero_initialises_absent_symbol_fields"></a>`elf_find_avros_tables_zero_initialises_absent_symbol_fields` | `LLR-ELF-05` | After `elf_find_avros_tables()` on a partial-symbol ELF, verify that each field in `AvrOsSymbolIndex` that corresponds to a missing symbol is zero. |
 | 12 | <a id="elf_close_frees_symtab_strtab_and_closes_fd"></a>`elf_close_frees_symtab_strtab_and_closes_fd` | `LLR-ELF-06` | After a successful `elf_open()`, call `elf_close()` and verify that the file descriptor is closed and no memory is leaked (checked via Valgrind or AddressSanitizer). |
 | 13 | <a id="elf_close_safe_on_partially_initialised_context"></a>`elf_close_safe_on_partially_initialised_context` | `LLR-ELF-06` | Construct an `ElfContext` with `symtab = NULL`, `strtab` allocated, and `fd = -1`, call `elf_close()`, and verify no crash or double-free occurs. |
+| 14 | <a id="elf_open_sets_flash_base_and_sram_base_from_pt_load_segments"></a>`elf_open_sets_flash_base_and_sram_base_from_pt_load_segments` | `LLR-ELF-08` | After a successful `elf_open()` on the full fixture, verify that `ctx.flash_base` equals the VMA of the first `PT_LOAD` segment (0x00000000 for the fixture) and `ctx.sram_base` equals the VMA of the second `PT_LOAD` segment (0x00804000 for the AVR128DA28 fixture). |
 
 ### 3.5. [tests/test_fsm.c](../tests/test_fsm.c)
 
@@ -168,6 +169,21 @@ Role: **integration**. **4 test(s).**
 | 2 | <a id="integration_server_emits_only_standard_rsp_no_ide_extensions"></a>`integration_server_emits_only_standard_rsp_no_ide_extensions` | — | Capture all TCP traffic from a full debug session (connect, register read, memory read, continue, breakpoint, detach) and verify that every server-originated packet conforms to the GDB RSP specification with no DAP, Cortex-Debug, or other IDE-specific packet types present. |
 | 3 | <a id="build_compiles_clean_on_linux_with_c99_and_posix"></a>`build_compiles_clean_on_linux_with_c99_and_posix` | `LLR-ELF-07` | Execute `make` with `CC=gcc CFLAGS="-std=c99 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L"` and assert that the build exits with status 0 and produces no compiler warnings or errors on a Linux x86-64 host. |
 | 4 | <a id="runtime_links_only_libc_no_heavyweight_deps"></a>`runtime_links_only_libc_no_heavyweight_deps` | — | Run `ldd avr-updi-gdb` on the linked binary and verify that the only shared-library dependency is `libc.so`. Assert that no Java runtime, Python interpreter, Electron libraries, or other non-POSIX dependencies appear. |
+
+### 3.8. [tests/test_install.c](../tests/test_install.c)
+
+Role: **integration**. **8 test(s).**
+
+| # | Test | Verifies | Purpose |
+| - | ---- | -------- | ------- |
+| 1 | <a id="check_tools_exits_nonzero_when_required_tool_is_absent"></a>`check_tools_exits_nonzero_when_required_tool_is_absent` | `LLR-INST-01` | Temporarily shadow a required tool (e.g. `avr-gcc`) with a dummy wrapper that is not executable, then run `make check-tools` and verify it exits with a non-zero status and prints a diagnostic to stderr naming the missing tool. |
+| 2 | <a id="make_install_places_binary_at_prefix_bin"></a>`make_install_places_binary_at_prefix_bin` | `LLR-INST-02` | Run `make install PREFIX=/tmp/aod_test_$$` (using a temporary directory as the prefix) and verify that the file `$(PREFIX)/bin/avr-updi-gdb` exists and is executable after the target completes. |
+| 3 | <a id="make_install_places_man_page_at_prefix_man1"></a>`make_install_places_man_page_at_prefix_man1` | `LLR-INST-02`, `LLR-INST-05` | After `make install PREFIX=...`, verify that the file `$(PREFIX)/share/man/man1/avr-updi-gdb.1` exists and that `man -l` parses it without error. |
+| 4 | <a id="make_uninstall_removes_all_installed_files"></a>`make_uninstall_removes_all_installed_files` | `LLR-INST-03` | After `make install PREFIX=...`, run `make uninstall PREFIX=...` and verify that both `$(PREFIX)/bin/avr-updi-gdb` and `$(PREFIX)/share/man/man1/avr-updi-gdb.1` no longer exist. |
+| 5 | <a id="user_manual_exists_and_contains_required_sections"></a>`user_manual_exists_and_contains_required_sections` | `LLR-INST-04` | Read `doc/UserManual.md` and verify the file exists and contains all required section headings: Prerequisites, Build, Connection Wiring, Usage (or Options), and at least one Example. |
+| 6 | <a id="make_bundle_produces_deb_package"></a>`make_bundle_produces_deb_package` | `LLR-INST-06` | Run `make bundle VERSION=0.1.0` and verify that `dist/avr-updi-gdb_0.1.0_amd64.deb` exists, that `dpkg-deb --info` exits 0, and that `dpkg-deb --contents` lists both `./usr/bin/avr-updi-gdb` and `./usr/share/man/man1/avr-updi-gdb.1`. |
+| 7 | <a id="make_bundle_produces_rpm_package"></a>`make_bundle_produces_rpm_package` | `LLR-INST-07` | Run `make bundle VERSION=0.1.0` and verify that `dist/avr-updi-gdb-0.1.0-1.x86_64.rpm` exists and that `rpm -qp --list` exits 0 and lists both `/usr/bin/avr-updi-gdb` and `/usr/share/man/man1/avr-updi-gdb.1`. |
+| 8 | <a id="make_bundle_produces_homebrew_formula"></a>`make_bundle_produces_homebrew_formula` | `LLR-INST-08` | Run `make bundle VERSION=0.1.0` and verify that `dist/avr-updi-gdb.rb` exists, is valid Ruby syntax (parseable by `ruby -c`), and contains the required fields: `desc`, `url`, `sha256`, `version`, and an `install` block. |
 
 ## 4. LLR Coverage Matrix
 
@@ -220,6 +236,7 @@ verified by code review — see
 | `LLR-ELF-05` | `elf` | `HLR-023` | `elf_find_avros_tables_returns_0_on_partial_symbol_match`, `elf_find_avros_tables_zero_initialises_absent_symbol_fields` |
 | `LLR-ELF-06` | `elf` | `HLR-040` | `elf_close_frees_symtab_strtab_and_closes_fd`, `elf_close_safe_on_partially_initialised_context` |
 | `LLR-ELF-07` | `elf` | `HLR-033` | `build_compiles_clean_on_linux_with_c99_and_posix` |
+| `LLR-ELF-08` | `elf` | `HLR-021`, `HLR-022` | `elf_open_sets_flash_base_and_sram_base_from_pt_load_segments` |
 | `LLR-FSM-01` | `fsm` | `HLR-024` | `fsm_build_thread_list_reads_fsm_table_from_flash_via_updi`, `fsm_build_thread_list_returns_minus1_on_updi_failure` |
 | `LLR-FSM-02` | `fsm` | `HLR-024` | `fsm_build_thread_list_assigns_1_based_thread_ids_in_order`, `fsm_build_thread_list_thread_ids_stable_across_calls` |
 | `LLR-FSM-03` | `fsm` | `HLR-025` | `fsm_build_thread_list_sets_active_thread_from_current_fsm_ptr`, `fsm_build_thread_list_sets_active_id_0_when_no_entry_matches` |
@@ -233,3 +250,11 @@ verified by code review — see
 | `LLR-MON-05` | `monitor` | `HLR-031` | `cmd_mempool_reads_pool_count_structures_from_table`, `cmd_mempool_formats_free_count_capacity_and_utilisation` |
 | `LLR-MON-06` | `monitor` | `HLR-029`, `HLR-030`, `HLR-031` | `monitor_output_assembled_in_512_byte_buffer_sent_as_o_packets` |
 | `LLR-MON-07` | `monitor` | `HLR-011`, `HLR-032` | `monitor_dispatch_and_helpers_never_call_updi_halt` |
+| `LLR-INST-01` | `inst` | `HLR-041` | `check_tools_exits_nonzero_when_required_tool_is_absent` |
+| `LLR-INST-02` | `inst` | `HLR-041` | `make_install_places_binary_at_prefix_bin`, `make_install_places_man_page_at_prefix_man1` |
+| `LLR-INST-03` | `inst` | `HLR-041` | `make_uninstall_removes_all_installed_files` |
+| `LLR-INST-04` | `inst` | `HLR-042` | `user_manual_exists_and_contains_required_sections` |
+| `LLR-INST-05` | `inst` | `HLR-042` | `make_install_places_man_page_at_prefix_man1` |
+| `LLR-INST-06` | `inst` | `HLR-043` | `make_bundle_produces_deb_package` |
+| `LLR-INST-07` | `inst` | `HLR-043` | `make_bundle_produces_rpm_package` |
+| `LLR-INST-08` | `inst` | `HLR-043` | `make_bundle_produces_homebrew_formula` |

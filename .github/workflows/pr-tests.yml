@@ -1,0 +1,148 @@
+name: CI — Unit Tests
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write   # post / update the PR comment
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: make prereqs
+
+      # Run every test suite; write per-suite output to build/test-results/.
+      # continue-on-error keeps subsequent steps running so we always post a
+      # summary even when tests fail.
+      - name: Build and run tests
+        id: run_tests
+        run: make test-ci
+        continue-on-error: true
+
+      # Upload raw test-result files as a workflow artifact.
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: build/test-results/
+          retention-days: 7
+
+      # Parse Unity output, write the Actions step summary, and post (or
+      # update) a single sticky comment on the PR.
+      - name: Post test summary
+        uses: actions/github-script@v7
+        if: always()
+        env:
+          TESTS_OUTCOME: ${{ steps.run_tests.outcome }}
+        with:
+          script: |
+            const fs   = require('fs');
+            const path = require('path');
+
+            const resultsDir = 'build/test-results';
+            let files;
+            try {
+              files = fs.readdirSync(resultsDir)
+                        .filter(f => f.endsWith('.txt'))
+                        .sort();
+            } catch (_) {
+              files = [];
+            }
+
+            let totalTests = 0, totalFail = 0, totalIgnored = 0;
+            const rows        = [];
+            const failDetails = [];
+
+            for (const file of files) {
+              const suite = file.replace('.txt', '');
+              const raw   = fs.readFileSync(path.join(resultsDir, file), 'utf8');
+
+              // Unity summary line: "N Tests M Failures K Ignored"
+              const m = raw.match(/(\d+) Tests (\d+) Failures (\d+) Ignored/);
+              if (!m) {
+                rows.push(`| \`${suite}\` | ❓ | — | — | — |`);
+                continue;
+              }
+
+              const [t, f, i] = [m[1], m[2], m[3]].map(Number);
+              totalTests   += t;
+              totalFail    += f;
+              totalIgnored += i;
+
+              rows.push(
+                `| \`${suite}\` | ${f > 0 ? '❌' : '✅'} ` +
+                `| ${t - f - i} | ${f} | ${i} |`
+              );
+
+              if (f > 0) {
+                const lines = raw.split('\n')
+                  .filter(l => /:FAIL:/.test(l))
+                  .map(l => `  - \`${l.trim()}\``);
+                failDetails.push(`**\`${suite}\`**\n${lines.join('\n')}`);
+              }
+            }
+
+            const passed = totalTests - totalFail - totalIgnored;
+            const allOk  = process.env.TESTS_OUTCOME === 'success';
+            const badge  = allOk ? '✅ All tests passed' : '❌ Tests failed';
+            const sha    = context.payload.pull_request.head.sha.slice(0, 7);
+
+            let md = `## Test Results\n\n`;
+            if (files.length === 0) {
+              md += `⚠️ No test-result files found — the build may have failed before any suite ran.\n`;
+            } else {
+              md += `${badge} — **${passed} / ${totalTests}** passed`;
+              if (totalIgnored > 0) md += `, ${totalIgnored} ignored`;
+              md += ` (commit \`${sha}\`)\n\n`;
+              md += `| Suite | Status | Passed | Failed | Ignored |\n`;
+              md += `| --- | :---: | ---: | ---: | ---: |\n`;
+              md += rows.join('\n') + '\n';
+              if (failDetails.length > 0) {
+                md += `\n### Failures\n\n${failDetails.join('\n\n')}\n`;
+              }
+            }
+
+            // Write to the Actions job summary page
+            await core.summary.addRaw(md).write();
+
+            // Post or update a single sticky PR comment
+            const marker = '<!-- aod-ci-test-summary -->';
+            const body   = `${marker}\n${md}`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c => c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      # Propagate the test failure so the PR check is red when tests fail.
+      - name: Fail job if tests failed
+        if: steps.run_tests.outcome == 'failure'
+        run: |
+          echo "One or more test suites failed — see the PR comment for details."
+          exit 1

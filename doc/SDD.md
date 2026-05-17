@@ -20,6 +20,8 @@ This document describes the design of the source modules that implement the avr-
 *   [src/elf_parser.c](../src/elf_parser.c): ELF parser: locates avrOS FLASH-resident system tables and produces the AvrOsSymbolIndex.
 *   [src/fsm_mapper.c](../src/fsm_mapper.c): avrOS FSM-to-GDB virtual thread translator: maps FSM state tables to GDB thread objects and synthesizes per-thread register frames.
 *   [src/monitor.c](../src/monitor.c): Custom monitor command handler: implements the avros events, queues, and mempool sub-commands via non-intrusive UPDI reads.
+*   [Makefile](../Makefile): Build orchestration: compile, test, install, uninstall, check-tools, and bundle (Debian .deb, Red Hat .rpm, Homebrew formula) targets.
+*   [doc/avr-updi-gdb.1](../doc/avr-updi-gdb.1): Unix man page: reference documentation for the avr-updi-gdb command.
 
 It does not cover the build system, IDE adapter layers (Cortex-Debug, Zed DAP), or Windows support, all of which are out of scope for the initial release (see `doc/PVD.md §7.2`).
 
@@ -29,6 +31,8 @@ It does not cover the build system, IDE adapter layers (Cortex-Debug, Zed DAP), 
 The server connects to the target via a TTL-level UART serial adapter with a 1 kΩ resistor on the UPDI line. No external JTAG programmer or proprietary debugger hardware is required — only a USB-to-serial adapter or direct Raspberry Pi UART pins.
 
 Unlike conventional GDB stubs that expose a flat memory model, `avr-updi-gdb` provides native avrOS state-machine awareness. At attach time it parses the supplied ELF binary to locate the avrOS FSM registration tables in FLASH, then presents each registered finite state machine as a standard GDB virtual thread. The currently executing FSM appears as the active thread; all suspended FSMs appear as additional threads, each with a synthetic register frame whose PC points to the FSM's current state function pointer.
+
+The project ships with a `make install` target that installs the compiled binary to `$(PREFIX)/bin/` and the accompanying Unix man page to `$(PREFIX)/share/man/man1/`. A `make check-tools` target validates that all required build tools (`gcc`, `make`, `avr-gcc`, `avr-binutils`) are present on the host before any compilation is attempted. A `make bundle` target produces native distribution packages for three platforms: a Debian binary package (`.deb`), a Red Hat RPM package (`.rpm`), and a Homebrew formula (`dist/avr-updi-gdb.rb`) for macOS. All output artefacts are written under the `dist/` directory. These targets ensure the project can be built, deployed, and distributed by a developer from a single `make` command sequence with no manual file copying.
 
 ### 1.4 Definitions, Acronyms, and Abbreviations
 *   **UPDI:** Unified Program and Debug Interface — the single-wire debug protocol used by AVR DA/DB-family microcontrollers. Carried over a UART at the configured baud rate with a 1 kΩ isolation resistor on the UPDI pin.

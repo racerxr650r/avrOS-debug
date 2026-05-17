@@ -3,8 +3,13 @@
 # Targets:
 #   all        Build the avr-updi-gdb host binary
 #   test       Build ELF fixtures, build all test binaries, run them
+#   test-ci    Like test, but writes per-suite output to build/test-results/*.txt
+#              (used by CI to build a structured test summary)
 #   clean      Remove all build artefacts
 #   install    Install avr-updi-gdb to $(PREFIX)/bin  [default: /usr/local]
+#   prereqs    Install all dev prerequisites via apt and download the AVR-Dx DFP
+#              (Debian/Ubuntu only; requires sudo)
+#   help       Print this target list
 #
 # Variables:
 #   ASAN=1     Add -fsanitize=address,undefined to both host and test builds
@@ -80,8 +85,17 @@ UNITY_INC  := -I$(UNITYDIR)
 
 # ── AVR ELF fixtures ──────────────────────────────────────────────────────────
 # These are compiled with avr-gcc to produce genuine AVR ELF32 files.
-AVR_MCU        := atmega4809
-AVR_CFLAGS     := -mmcu=$(AVR_MCU) -Os -g
+# AVR-Dx devices require the Microchip Device Family Pack (DFP).
+# Run 'make prereqs' once to install the DFP.  When the DFP directory
+# does not exist avr-gcc 14+ has native AVR-Dx support and no -B is needed.
+AVR_MCU    := avr128da28
+DFP_VER    := 2.4.286
+DFP_PACK   := Atmel.AVR-Dx_DFP.$(DFP_VER).atpack
+DFP_URL    := http://packs.download.atmel.com/$(DFP_PACK)
+DFP        := /usr/lib/gcc/avr/5.4.0/Atmel.AVR-Dx_DFP.$(DFP_VER)
+DFP_FLAGS  := $(if $(wildcard $(DFP)/gcc/dev/$(AVR_MCU)),\
+                   -B $(DFP)/gcc/dev/$(AVR_MCU) -I$(DFP)/include,)
+AVR_CFLAGS := -mmcu=$(AVR_MCU) $(DFP_FLAGS) -Os -g
 FIXTURE_SRCS   := $(FIXTUREDIR)/avros_full.c \
                   $(FIXTUREDIR)/avros_partial.c
 FIXTURE_ELFS   := $(patsubst $(FIXTUREDIR)/%.c,$(FIXBINDIR)/%.elf,$(FIXTURE_SRCS))
@@ -94,7 +108,7 @@ NOT_AVR_ELF    := $(FIXBINDIR)/not_avr.elf
 #
 # test_elf
 TEST_SRCS_test_elf  := $(TESTDIR)/test_elf.c $(SRCDIR)/elf_parser.c
-TEST_WRAP_test_elf  :=
+TEST_WRAP_test_elf  := malloc
 TEST_EXTRA_LDFLAGS_test_elf :=
 
 # test_updi
@@ -224,15 +238,53 @@ test: fixtures $(addprefix $(TESTBINDIR)/,$(TEST_NAMES))
 .PHONY: fixtures
 fixtures: $(FIXTURE_ELFS) $(NOT_AVR_ELF)
 
+# ── test-ci target ────────────────────────────────────────────────────────────
+# Like 'test' but writes each suite's output to build/test-results/<name>.txt
+# so the CI workflow can parse Unity results and post a PR summary.
+# All suite output is also echoed to stdout for the Actions log.
+.PHONY: test-ci
+test-ci: fixtures $(addprefix $(TESTBINDIR)/,$(TEST_NAMES))
+	@mkdir -p $(BUILDDIR)/test-results
+	@FAIL=0; \
+	for t in $(TEST_NAMES); do \
+	    echo "── $$t ──────────────────────────────────────────────"; \
+	    $(TESTBINDIR)/$$t > $(BUILDDIR)/test-results/$$t.txt 2>&1; \
+	    RET=$$?; \
+	    cat $(BUILDDIR)/test-results/$$t.txt; \
+	    echo ""; \
+	    if [ $$RET -ne 0 ]; then FAIL=1; fi; \
+	done; \
+	exit $$FAIL
+
 # ── install target ────────────────────────────────────────────────────────────
 .PHONY: install
 install: all
 	install -d $(DESTDIR)$(PREFIX)/bin
 	install -m 755 $(BUILDDIR)/$(TARGET) $(DESTDIR)$(PREFIX)/bin/$(TARGET)
 	@echo "  INSTALL  $(PREFIX)/bin/$(TARGET)"
-
+# ── prereqs target ───────────────────────────────────────────────────────────
+# Install all development prerequisites (Debian/Ubuntu; requires sudo).
+# Installs host build tools via apt, then downloads and installs the
+# Microchip AVR-Dx Device Family Pack so avr-gcc can target AVR DA/DB parts.
+.PHONY: prereqs
+prereqs:
+	@echo "── Installing apt packages ──────────────────────────────────────"
+	sudo apt-get update -q
+	sudo apt-get install -y --no-install-recommends \
+	    make gcc binutils gcc-avr binutils-avr avr-libc wget unzip
+	@echo "── Installing AVR-Dx DFP $(DFP_VER) ──────────────────────────"
+	wget -q -O /tmp/$(DFP_PACK) $(DFP_URL)
+	unzip -q -o /tmp/$(DFP_PACK) -d /tmp/Atmel.AVR-Dx_DFP.$(DFP_VER)
+	sudo mkdir -p $(dir $(DFP))
+	sudo cp -R /tmp/Atmel.AVR-Dx_DFP.$(DFP_VER) $(DFP)
+	rm -rf /tmp/Atmel.AVR-Dx_DFP.$(DFP_VER) /tmp/$(DFP_PACK)
+	@echo "── Prerequisites installed successfully ──────────────────────"
 # ── clean target ──────────────────────────────────────────────────────────────
 .PHONY: clean
 clean:
 	$(Q)rm -rf $(BUILDDIR)
 	@echo "  CLEAN  $(BUILDDIR)/"
+# ── help target ───────────────────────────────────────────────────────────
+.PHONY: help
+help:
+	@awk '/^# Targets:/{found=1} found{if(/^[^#]/ || /^#$$/)exit; sub(/^# ?/,""); print}' $(MAKEFILE_LIST)

@@ -191,3 +191,19 @@ Requirements in this section govern the host platforms the server must support a
 *   <a id="HLR-040"></a>**HLR-040: Bounded Heap Allocation.**
     The server shall not allocate heap memory on any hot path (packet processing, UPDI reads, FSM enumeration, monitor commands). Heap allocation via `malloc` shall be used exclusively inside `elf_open()` to load the ELF symbol and string table sections; this allocation shall be bounded by the size of the ELF binary and shall occur at most once per GDB session. All heap memory shall be freed by `elf_close()` at session end or on error.
     *Trace:* [SDD Section 2.2](SDD.md), [SDD Section 9](SDD.md).
+
+## 8. Installation and Documentation
+
+Requirements in this section govern the Makefile installation targets and the user-facing documentation deliverables that accompany the compiled binary.
+
+*   <a id="HLR-041"></a>**HLR-041: Makefile Install and Uninstall Targets.**
+    The Makefile shall provide `install` and `uninstall` targets that accept a `PREFIX` variable (defaulting to `/usr/local`). The `install` target shall copy the compiled `avr-updi-gdb` binary to `$(PREFIX)/bin/` and the man page to `$(PREFIX)/share/man/man1/`. The `uninstall` target shall remove exactly those files. A `check-tools` target shall verify that all required host tools (`gcc`, `make`, `avr-gcc`, `avr-nm`) are available before any build step, printing a diagnostic and exiting non-zero if any required tool is absent.
+    *Trace:* [SDD Section 2.2](SDD.md).
+
+*   <a id="HLR-042"></a>**HLR-042: User Manual and Unix Man Page.**
+    The project shall provide a user manual (`doc/UserManual.md`) and a Unix man page (`doc/avr-updi-gdb.1`). The man page shall be parseable by the standard `man` utility and shall document the command synopsis, all options, operands, exit codes, and at least one usage example. The `doc/UserManual.md` shall document prerequisites, build instructions, usage, CLI options, and connection wiring for the UPDI adapter.
+    *Trace:* [SDD Section 2.2](SDD.md).
+
+*   <a id="HLR-043"></a>**HLR-043: Distribution Package Bundle.**
+    The Makefile shall provide a `bundle` target that produces native distribution packages for three target platforms: a Debian binary package (`dist/avr-updi-gdb_$(VERSION)_amd64.deb`) for Debian/Ubuntu Linux, an RPM binary package (`dist/avr-updi-gdb-$(VERSION)-1.x86_64.rpm`) for Red Hat/Fedora Linux, and a Homebrew formula (`dist/avr-updi-gdb.rb`) for macOS. Each package shall include the `avr-updi-gdb` binary and the man page. All output artefacts shall be written under the `dist/` directory. A `VERSION` variable (defaulting to the value extracted from `git describe`) shall parameterise every package version string.
+    *Trace:* [SDD Section 2.2](SDD.md).
