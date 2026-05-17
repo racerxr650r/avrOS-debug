@@ -35,13 +35,13 @@ Each row maps an SDD section to the HLRs that cite it in their
 
 | SDD Section | Title | HLRs |
 | ----------- | ----- | ---- |
-| [Section 2.1](SDD.md#21-system-architecture) | System Architecture | [`HLR-005`](HLRs.md#HLR-005), [`HLR-039`](HLRs.md#HLR-039) |
+| [Section 2.1](SDD.md#21-system-architecture) | System Architecture | [`HLR-005`](HLRs.md#HLR-005), [`HLR-039`](HLRs.md#HLR-039), [`HLR-044`](HLRs.md#HLR-044) |
 | [Section 2.2](SDD.md#22-design-goals-and-constraints) | Design Goals and Constraints | [`HLR-020`](HLRs.md#HLR-020), [`HLR-023`](HLRs.md#HLR-023), [`HLR-028`](HLRs.md#HLR-028), [`HLR-033`](HLRs.md#HLR-033), [`HLR-034`](HLRs.md#HLR-034), [`HLR-039`](HLRs.md#HLR-039), [`HLR-040`](HLRs.md#HLR-040), [`HLR-041`](HLRs.md#HLR-041), [`HLR-042`](HLRs.md#HLR-042), [`HLR-043`](HLRs.md#HLR-043) |
-| [Section 3.1](SDD.md#31-purpose-and-responsibilities-srcmainc) | Purpose and Responsibilities (src/main.c) | [`HLR-002`](HLRs.md#HLR-002), [`HLR-003`](HLRs.md#HLR-003) |
+| [Section 3.1](SDD.md#31-purpose-and-responsibilities-srcmainc) | Purpose and Responsibilities (src/main.c) | [`HLR-002`](HLRs.md#HLR-002), [`HLR-003`](HLRs.md#HLR-003), [`HLR-044`](HLRs.md#HLR-044) |
 | [Section 3.2.2](SDD.md#322-command-line-arguments) | Command-Line Arguments | [`HLR-001`](HLRs.md#HLR-001), [`HLR-004`](HLRs.md#HLR-004) |
 | [Section 3.3.2](SDD.md#332-key-functions-srcmainc) | Key Functions (src/main.c) | [`HLR-039`](HLRs.md#HLR-039) |
 | [Section 3.3.3](SDD.md#333-parsing-strategy-algorithm) | Parsing Strategy / Algorithm | [`HLR-035`](HLRs.md#HLR-035) |
-| [Section 4.1](SDD.md#41-purpose-and-responsibilities-srcupdic) | Purpose and Responsibilities (src/updi.c) | [`HLR-002`](HLRs.md#HLR-002), [`HLR-011`](HLRs.md#HLR-011), [`HLR-012`](HLRs.md#HLR-012) |
+| [Section 4.1](SDD.md#41-purpose-and-responsibilities-srcupdic) | Purpose and Responsibilities (src/updi.c) | [`HLR-002`](HLRs.md#HLR-002), [`HLR-011`](HLRs.md#HLR-011), [`HLR-012`](HLRs.md#HLR-012), [`HLR-044`](HLRs.md#HLR-044) |
 | [Section 4.2.2](SDD.md#422-hardware-connection) | Hardware Connection | [`HLR-006`](HLRs.md#HLR-006) |
 | [Section 4.3.1](SDD.md#431-key-data-structures) | Key Data Structures | [`HLR-004`](HLRs.md#HLR-004), [`HLR-007`](HLRs.md#HLR-007), [`HLR-008`](HLRs.md#HLR-008), [`HLR-009`](HLRs.md#HLR-009), [`HLR-010`](HLRs.md#HLR-010), [`HLR-011`](HLRs.md#HLR-011), [`HLR-012`](HLRs.md#HLR-012), [`HLR-016`](HLRs.md#HLR-016), [`HLR-017`](HLRs.md#HLR-017), [`HLR-018`](HLRs.md#HLR-018), [`HLR-032`](HLRs.md#HLR-032) |
 | [Section 4.3.3](SDD.md#433-parsing-strategy-algorithm) | Parsing Strategy / Algorithm | [`HLR-036`](HLRs.md#HLR-036), [`HLR-037`](HLRs.md#HLR-037) |
@@ -110,6 +110,7 @@ catalogue is in [STP.md §3](STP.md#3-test-catalogue).
 | [`HLR-041`](HLRs.md#HLR-041) | Makefile Install and Uninstall Targets | [`LLR-INST-01`](LLRs.md#LLR-INST-01), [`LLR-INST-02`](LLRs.md#LLR-INST-02), [`LLR-INST-03`](LLRs.md#LLR-INST-03) | [`check_tools_exits_nonzero_when_required_tool_is_absent`](STP.md#check_tools_exits_nonzero_when_required_tool_is_absent), [`make_install_places_binary_at_prefix_bin`](STP.md#make_install_places_binary_at_prefix_bin), [`make_install_places_man_page_at_prefix_man1`](STP.md#make_install_places_man_page_at_prefix_man1), [`make_uninstall_removes_all_installed_files`](STP.md#make_uninstall_removes_all_installed_files) |
 | [`HLR-042`](HLRs.md#HLR-042) | User Manual and Unix Man Page | [`LLR-INST-04`](LLRs.md#LLR-INST-04), [`LLR-INST-05`](LLRs.md#LLR-INST-05) | [`make_install_places_man_page_at_prefix_man1`](STP.md#make_install_places_man_page_at_prefix_man1), [`user_manual_exists_and_contains_required_sections`](STP.md#user_manual_exists_and_contains_required_sections) |
 | [`HLR-043`](HLRs.md#HLR-043) | Distribution Package Bundle | [`LLR-INST-06`](LLRs.md#LLR-INST-06), [`LLR-INST-07`](LLRs.md#LLR-INST-07), [`LLR-INST-08`](LLRs.md#LLR-INST-08) | [`make_bundle_produces_deb_package`](STP.md#make_bundle_produces_deb_package), [`make_bundle_produces_homebrew_formula`](STP.md#make_bundle_produces_homebrew_formula), [`make_bundle_produces_rpm_package`](STP.md#make_bundle_produces_rpm_package) |
+| [`HLR-044`](HLRs.md#HLR-044) | Device-Signature Diagnostic Mode | [`LLR-MAIN-08`](LLRs.md#LLR-MAIN-08), [`LLR-MAIN-09`](LLRs.md#LLR-MAIN-09), [`LLR-UPDI-13`](LLRs.md#LLR-UPDI-13) | [`device_mode_does_not_call_rsp_listen`](STP.md#device_mode_does_not_call_rsp_listen), [`parse_args_accepts_device_flag_without_elf_operand`](STP.md#parse_args_accepts_device_flag_without_elf_operand), [`parse_args_rejects_device_combined_with_load`](STP.md#parse_args_rejects_device_combined_with_load), [`run_device_mode_prints_report_to_stdout`](STP.md#run_device_mode_prints_report_to_stdout), [`updi_read_device_info_reports_failed_step_on_nak`](STP.md#updi_read_device_info_reports_failed_step_on_nak), [`updi_read_device_info_returns_sigrow_and_asi_bytes`](STP.md#updi_read_device_info_returns_sigrow_and_asi_bytes) |
 
 ## 3. HLR Section Coverage Summary
 
@@ -126,6 +127,7 @@ locating areas of the spec that may need additional tests.
 | §6 System Introspection | 3 | 7 | 13 | — |
 | §7 Platform and Build | 4 | 5 | 10 | — |
 | §8 Installation and Documentation | 3 | 8 | 8 | — |
+| §9 Diagnostics and Bring-up | 1 | 3 | 6 | — |
 
 ## 4. LLR Coverage
 
@@ -144,6 +146,8 @@ with **(no test)**; see
 | [`LLR-MAIN-05`](LLRs.md#LLR-MAIN-05) | `main` | [`HLR-003`](HLRs.md#HLR-003), [`HLR-039`](HLRs.md#HLR-039) | [`event_loop_accepts_gdb_client_when_gdb_fd_is_minus1`](STP.md#event_loop_accepts_gdb_client_when_gdb_fd_is_minus1), [`event_loop_uses_single_select_no_pthread_create`](STP.md#event_loop_uses_single_select_no_pthread_create) |
 | [`LLR-MAIN-06`](LLRs.md#LLR-MAIN-06) | `main` | [`HLR-035`](HLRs.md#HLR-035), [`HLR-039`](HLRs.md#HLR-039) | [`event_loop_exits_immediately_when_g_quit_is_1`](STP.md#event_loop_exits_immediately_when_g_quit_is_1), [`sigint_handler_sets_g_quit_to_1`](STP.md#sigint_handler_sets_g_quit_to_1) |
 | [`LLR-MAIN-07`](LLRs.md#LLR-MAIN-07) | `main` | [`HLR-035`](HLRs.md#HLR-035) | [`main_cleanup_closes_gdb_elf_updi_in_order`](STP.md#main_cleanup_closes_gdb_elf_updi_in_order) |
+| [`LLR-MAIN-08`](LLRs.md#LLR-MAIN-08) | `main` | [`HLR-044`](HLRs.md#HLR-044) | [`parse_args_accepts_device_flag_without_elf_operand`](STP.md#parse_args_accepts_device_flag_without_elf_operand), [`parse_args_rejects_device_combined_with_load`](STP.md#parse_args_rejects_device_combined_with_load) |
+| [`LLR-MAIN-09`](LLRs.md#LLR-MAIN-09) | `main` | [`HLR-044`](HLRs.md#HLR-044) | [`device_mode_does_not_call_rsp_listen`](STP.md#device_mode_does_not_call_rsp_listen), [`run_device_mode_prints_report_to_stdout`](STP.md#run_device_mode_prints_report_to_stdout) |
 | [`LLR-UPDI-01`](LLRs.md#LLR-UPDI-01) | `updi` | [`HLR-006`](HLRs.md#HLR-006) | [`updi_open_returns_minus1_on_device_open_failure`](STP.md#updi_open_returns_minus1_on_device_open_failure), [`updi_open_sets_8e2_raw_half_duplex_via_termios`](STP.md#updi_open_sets_8e2_raw_half_duplex_via_termios) |
 | [`LLR-UPDI-02`](LLRs.md#LLR-UPDI-02) | `updi` | [`HLR-006`](HLRs.md#HLR-006), [`HLR-036`](HLRs.md#HLR-036) | [`updi_open_asserts_two_breaks_then_synch`](STP.md#updi_open_asserts_two_breaks_then_synch), [`updi_open_restores_session_baud_after_break`](STP.md#updi_open_restores_session_baud_after_break) |
 | [`LLR-UPDI-03`](LLRs.md#LLR-UPDI-03) | `updi` | [`HLR-036`](HLRs.md#HLR-036) | [`updi_open_issues_ldcs_statusb_after_synch`](STP.md#updi_open_issues_ldcs_statusb_after_synch), [`updi_open_retries_break_synch_3_times_on_no_ack`](STP.md#updi_open_retries_break_synch_3_times_on_no_ack), [`updi_open_returns_minus1_after_3_consecutive_link_failures`](STP.md#updi_open_returns_minus1_after_3_consecutive_link_failures) |
@@ -156,6 +160,7 @@ with **(no test)**; see
 | [`LLR-UPDI-10`](LLRs.md#LLR-UPDI-10) | `updi` | [`HLR-010`](HLRs.md#HLR-010) | [`updi_run_returns_minus1_stub_until_ocd_layer`](STP.md#updi_run_returns_minus1_stub_until_ocd_layer) |
 | [`LLR-UPDI-11`](LLRs.md#LLR-UPDI-11) | `updi` | [`HLR-011`](HLRs.md#HLR-011) | [`updi_console_poll_returns_pending_bytes_without_halting`](STP.md#updi_console_poll_returns_pending_bytes_without_halting) |
 | [`LLR-UPDI-12`](LLRs.md#LLR-UPDI-12) | `updi` | [`HLR-012`](HLRs.md#HLR-012) | [`updi_console_poll_returns_0_when_output_buffer_empty`](STP.md#updi_console_poll_returns_0_when_output_buffer_empty), [`updi_console_poll_returns_pending_bytes_without_halting`](STP.md#updi_console_poll_returns_pending_bytes_without_halting) |
+| [`LLR-UPDI-13`](LLRs.md#LLR-UPDI-13) | `updi` | [`HLR-044`](HLRs.md#HLR-044) | [`updi_read_device_info_reports_failed_step_on_nak`](STP.md#updi_read_device_info_reports_failed_step_on_nak), [`updi_read_device_info_returns_sigrow_and_asi_bytes`](STP.md#updi_read_device_info_returns_sigrow_and_asi_bytes) |
 | [`LLR-RSP-01`](LLRs.md#LLR-RSP-01) | `rsp` | [`HLR-003`](HLRs.md#HLR-003), [`HLR-038`](HLRs.md#HLR-038) | [`rsp_accept_sets_tcp_nodelay_on_client_socket`](STP.md#rsp_accept_sets_tcp_nodelay_on_client_socket), [`rsp_listen_sets_so_reuseaddr_before_bind`](STP.md#rsp_listen_sets_so_reuseaddr_before_bind) |
 | [`LLR-RSP-02`](LLRs.md#LLR-RSP-02) | `rsp` | [`HLR-013`](HLRs.md#HLR-013) | [`rsp_recv_packet_discards_leading_ack_nak_bytes`](STP.md#rsp_recv_packet_discards_leading_ack_nak_bytes), [`rsp_recv_packet_sends_minus_and_returns_minus1_on_bad_checksum`](STP.md#rsp_recv_packet_sends_minus_and_returns_minus1_on_bad_checksum), [`rsp_recv_packet_sends_plus_on_valid_checksum`](STP.md#rsp_recv_packet_sends_plus_on_valid_checksum) |
 | [`LLR-RSP-03`](LLRs.md#LLR-RSP-03) | `rsp` | [`HLR-014`](HLRs.md#HLR-014) | [`on_read_regs_g_places_pc_little_endian_at_positions_70_77`](STP.md#on_read_regs_g_places_pc_little_endian_at_positions_70_77), [`on_read_regs_g_returns_78_char_hex_string`](STP.md#on_read_regs_g_returns_78_char_hex_string) |
@@ -210,6 +215,12 @@ the [Software Test Plan](STP.md) catalogue.
 
 | Test File | Test | LLRs | HLRs |
 | --------- | ---- | ---- | ---- |
+| [tests/test_device.c](../tests/test_device.c) | [`device_mode_does_not_call_rsp_listen`](STP.md#device_mode_does_not_call_rsp_listen) | [`LLR-MAIN-09`](LLRs.md#LLR-MAIN-09) | — |
+| [tests/test_device.c](../tests/test_device.c) | [`parse_args_accepts_device_flag_without_elf_operand`](STP.md#parse_args_accepts_device_flag_without_elf_operand) | [`LLR-MAIN-08`](LLRs.md#LLR-MAIN-08) | — |
+| [tests/test_device.c](../tests/test_device.c) | [`parse_args_rejects_device_combined_with_load`](STP.md#parse_args_rejects_device_combined_with_load) | [`LLR-MAIN-08`](LLRs.md#LLR-MAIN-08) | — |
+| [tests/test_device.c](../tests/test_device.c) | [`run_device_mode_prints_report_to_stdout`](STP.md#run_device_mode_prints_report_to_stdout) | [`LLR-MAIN-09`](LLRs.md#LLR-MAIN-09) | — |
+| [tests/test_device.c](../tests/test_device.c) | [`updi_read_device_info_reports_failed_step_on_nak`](STP.md#updi_read_device_info_reports_failed_step_on_nak) | [`LLR-UPDI-13`](LLRs.md#LLR-UPDI-13) | — |
+| [tests/test_device.c](../tests/test_device.c) | [`updi_read_device_info_returns_sigrow_and_asi_bytes`](STP.md#updi_read_device_info_returns_sigrow_and_asi_bytes) | [`LLR-UPDI-13`](LLRs.md#LLR-UPDI-13) | — |
 | [tests/test_elf.c](../tests/test_elf.c) | [`elf_close_frees_symtab_strtab_and_closes_fd`](STP.md#elf_close_frees_symtab_strtab_and_closes_fd) | [`LLR-ELF-06`](LLRs.md#LLR-ELF-06) | — |
 | [tests/test_elf.c](../tests/test_elf.c) | [`elf_close_safe_on_partially_initialised_context`](STP.md#elf_close_safe_on_partially_initialised_context) | [`LLR-ELF-06`](LLRs.md#LLR-ELF-06) | — |
 | [tests/test_elf.c](../tests/test_elf.c) | [`elf_find_avros_tables_performs_single_linear_scan`](STP.md#elf_find_avros_tables_performs_single_linear_scan) | [`LLR-ELF-03`](LLRs.md#LLR-ELF-03) | — |

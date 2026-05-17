@@ -444,3 +444,64 @@ int updi_console_poll(int fd, char *buf, size_t cap)
         return -1;
     return (int)n;
 }
+
+/* ── Device-signature diagnostics (Phase 7, LLR-UPDI-13) ──────────────── *
+ *
+ * updi_read_device_info() reads SIGROW (DEVICEID0..2 @ 0x1100-0x1102,
+ * REVID @ 0x1103, 10-byte SERNUM @ 0x1110-0x1119) and three ASI status
+ * registers via LDCS. The operation is non-destructive: it does not halt
+ * the CPU and does not initiate any NVM activity. On the first UPDI
+ * read failure it sets info->fail_op to a short ASCII tag identifying
+ * the failed step and returns -1.                                         */
+int updi_read_device_info(int fd, UpdiDeviceInfo *info)
+{
+    int v;
+
+    if (info == NULL)
+        return -1;
+
+    info->fail_op    = NULL;
+    info->fail_errno = 0;
+
+    if (updi_mem_read(fd, 0x1100u, info->device_id, 3u) < 0) {
+        info->fail_op    = "sigrow";
+        info->fail_errno = -1;
+        return -1;
+    }
+    if (updi_mem_read(fd, 0x1103u, &info->revid, 1u) < 0) {
+        info->fail_op    = "revid";
+        info->fail_errno = -1;
+        return -1;
+    }
+    if (updi_mem_read(fd, 0x1110u, info->serial, 10u) < 0) {
+        info->fail_op    = "sernum";
+        info->fail_errno = -1;
+        return -1;
+    }
+
+    v = updi_ldcs(fd, ASI_SYS_STATUS);
+    if (v < 0) {
+        info->fail_op    = "sys-status";
+        info->fail_errno = -1;
+        return -1;
+    }
+    info->asi_sys_status = (uint8_t)v;
+
+    v = updi_ldcs(fd, ASI_KEY_STATUS);
+    if (v < 0) {
+        info->fail_op    = "key-status";
+        info->fail_errno = -1;
+        return -1;
+    }
+    info->asi_key_status = (uint8_t)v;
+
+    v = updi_ldcs(fd, ASI_STATUSB);
+    if (v < 0) {
+        info->fail_op    = "asi-statusb";
+        info->fail_errno = -1;
+        return -1;
+    }
+    info->asi_statusb = (uint8_t)v;
+
+    return 0;
+}

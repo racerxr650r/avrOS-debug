@@ -203,3 +203,11 @@ Requirements in this section govern the Makefile installation targets and the us
 *   <a id="HLR-043"></a>**HLR-043: Distribution Package Bundle.**
     The Makefile shall provide a `bundle` target that produces native distribution packages for three target platforms: a Debian binary package (`dist/avr-updi-gdb_$(VERSION)_amd64.deb`) for Debian/Ubuntu Linux, an RPM binary package (`dist/avr-updi-gdb-$(VERSION)-1.x86_64.rpm`) for Red Hat/Fedora Linux, and a Homebrew formula (`dist/avr-updi-gdb.rb`) for macOS. Each package shall include the `avr-updi-gdb` binary and the man page. All output artefacts shall be written under the `dist/` directory. A `VERSION` variable (defaulting to the value extracted from `git describe`) shall parameterise every package version string.
     *Trace:* [SDD Section 2.2](SDD.md).
+
+## 9. Diagnostics and Bring-up
+
+Requirements in this section govern operator-facing diagnostic features intended for hardware bring-up and connection troubleshooting. They are activated by explicit CLI flags and never run on the GDB session hot path.
+
+*   <a id="HLR-044"></a>**HLR-044: Device-Signature Diagnostic Mode.**
+    The server shall provide a one-shot diagnostic mode, activated by the `--device` command-line flag, that opens the UPDI link, reads the target SIGROW (DEVICEID0..2, REVID, 10-byte SERNUM) and the UPDI ASI status registers (`ASI_SYS_STATUS`, `ASI_KEY_STATUS`, `ASI_STATUSB`), prints a verbose human-readable report to `stdout`, and exits with status 0 on success or status 1 on any failure. In this mode the `<elf-file>` operand shall be optional, the GDB TCP listener shall not be bound, and no event loop shall be entered. Every failure shall produce a diagnostic on `stderr` that names the failed UPDI step (BREAK, SYNCH, SIGROW read, ASI read) so an operator can distinguish wiring, power, and fuse problems without external instrumentation. `--device` shall be mutually exclusive with `--load`; specifying both shall trigger a usage error and exit status 1.
+    *Trace:* [SDD Section 2.1](SDD.md), [SDD Section 3.1](SDD.md), [SDD Section 4.1](SDD.md).
