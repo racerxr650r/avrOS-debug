@@ -114,7 +114,7 @@ TEST_EXTRA_LDFLAGS_test_elf :=
 # test_updi
 TEST_SRCS_test_updi  := $(TESTDIR)/test_updi.c $(SRCDIR)/updi.c
 TEST_WRAP_test_updi  := select
-TEST_EXTRA_LDFLAGS_test_updi := $(LUTIL)
+TEST_EXTRA_LDFLAGS_test_updi := $(LUTIL) -lpthread
 
 # test_fsm
 TEST_SRCS_test_fsm  := $(TESTDIR)/test_fsm.c $(SRCDIR)/fsm_mapper.c

@@ -11,11 +11,14 @@
 #define UPDI_BREAK_BAUD  300
 #define UPDI_ERR_WP      (-2)
 
-/* ASI register offsets */
-#define ASI_CTRLA       0x02
-#define ASI_RESET_REQ   0x08
-#define ASI_SYS_STATUS  0x0B
-#define ASI_SYS_CTRL    0x0C
+/* UPDI CS-space register offsets (datasheet §35.4) */
+#define ASI_STATUSB     0x01     /* RO: PESIG error signature                */
+#define ASI_CTRLA       0x02     /* RW: IBDLY, PARD, DTD, RSD, GTVAL         */
+#define ASI_CTRLB       0x03     /* RW: NACKDIS, CCDETDIS, UPDIDIS           */
+#define ASI_KEY_STATUS  0x07     /* RO: UROWWRITE, NVMPROG, CHIPER           */
+#define ASI_RESET_REQ   0x08     /* RW: RSTREQ[7:0]  (0x59 = reset, 0 = run) */
+#define ASI_SYS_CTRLA   0x0A     /* RW: UROWDONE (b1), CLKREQ (b0)           */
+#define ASI_SYS_STATUS  0x0B     /* RO: ERASEFAIL/SYSRST/INSLEEP/NVMPROG/... */
 
 int  updi_open(const char *device, int baud);
 void updi_close(int fd);

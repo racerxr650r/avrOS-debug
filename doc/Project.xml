@@ -208,12 +208,12 @@ If the `--load` flag is set, `main()` invokes `updi_nvm_write_flash()` for each 
 
       <module path="src/updi.c">
         <purpose><![CDATA[implements the UPDI physical layer, managing the UART serial port and encoding/decoding UPDI protocol frames for memory access, execution control, NVM flash programming, and UPDI-based console bridging.]]></purpose>
-        <responsibility>Open, configure (8N2, half-duplex), and close the UART serial device.</responsibility>
-        <responsibility><![CDATA[Encode and transmit UPDI commands (`STCS`, `LDCS`, `ST`, `LD`, `KEY`, `REPEAT`) over the UART.]]></responsibility>
+        <responsibility>Open, configure (8E2, half-duplex), and close the UART serial device. On hosts where the underlying device cannot honour even parity (notably Linux PTY slaves used by the unit-test harness), fall back to 8N2 so the link still works in test environments.</responsibility>
+        <responsibility><![CDATA[Encode and transmit UPDI commands (`STCS`, `LDCS`, `ST`, `LD`, `KEY`, `REPEAT`, `ST_PTR_WORD`) over the UART.]]></responsibility>
         <responsibility>Receive UPDI response frames and validate ACK/NAK bytes.</responsibility>
         <responsibility>Provide non-intrusive background memory reads while the CPU is running.</responsibility>
         <responsibility>Implement NVM write sequences for FLASH page erase and program.</responsibility>
-        <responsibility>Export execution-control primitives: halt, run, and single-step.</responsibility>
+        <responsibility><![CDATA[Expose execution-control entry points (`updi_halt`, `updi_run`, `updi_step`) as -1 stubs; the full halt/run/step implementation is deferred to the Phase 3 OCD layer, which carries its own Microchip specification independent of the §35 UPDI document.]]></responsibility>
         <responsibility>Bridge the avrOS software UART console channel to host stdout for CLI and automated test use.</responsibility>
         <interfaces>
           <interface title="Public C API (src/updi.h)"><![CDATA[All functions exported from `src/updi.c` and declared in `src/updi.h`:
@@ -241,7 +241,7 @@ int  updi_console_poll(int fd, char *buf, size_t cap);
 ```
 
 Error return convention: all functions return 0 on success and -1 on error (errno not set); `updi_nvm_write_flash()` additionally returns `UPDI_ERR_WP` (-2) when FLASH write-protection is active.]]></interface>
-          <interface title="Hardware Connection"><![CDATA[Half-duplex UART at the configured baud rate (default 115200). The AVR UPDI pin is connected to both TX and RX on the host adapter through a 1 kΩ isolation resistor. The UPDI protocol requires 8N2 framing (8 data bits, no parity, 2 stop bits).]]></interface>
+          <interface title="Hardware Connection"><![CDATA[Half-duplex UART at the configured baud rate (default 115200). The AVR UPDI pin is connected to both TX and RX on the host adapter through a 1 kΩ isolation resistor. The UPDI protocol requires 8E2 framing (8 data bits, even parity, 2 stop bits) per AVR128DA datasheet §35.3.1.]]></interface>
         </interfaces>
         <data_structures><![CDATA[UPDI protocol constants used throughout the module:
 
@@ -250,16 +250,18 @@ Error return convention: all functions return 0 on success and -1 on error (errn
 | `UPDI_SYNCH`       | `0x55` | UPDI synchronisation character sent after BREAK. |
 | `UPDI_ACK`         | `0x40` | Acknowledgement byte returned by the target after each data byte. |
 | `UPDI_MAX_BLOCK`   | `256`  | Maximum bytes transferred in a single REPEAT+LD/ST burst. |
-| `UPDI_BREAK_BAUD`  | `300`  | Temporary baud rate used to generate the BREAK condition. |
 
-UPDI ASI (Application System Interface) registers used for execution control:
+UPDI ASI (Application System Interface) Control/Status register map (AVR128DA §35.4):
 
 | Register | Offset | Description |
 | -------- | ------ | ----------- |
-| `ASI_SYS_STATUS` | `0x0B` | System status; bit 3 = STOPPED (CPU halted). |
-| `ASI_SYS_CTRL`   | `0x0C` | System control; bit 5 = CLKREQ. |
-| `ASI_RESET_REQ`  | `0x08` | Write `0x59` to request CPU reset; write `0x00` to release. |
-| `ASI_CTRLA`      | `0x02` | UPDI control register A; bit 2 = IBD (inter-byte delay enable). |
+| `ASI_STATUSB`     | `0x01` | Status B; reading clears the PESIG bit set on every BREAK. |
+| `ASI_CTRLA`       | `0x02` | UPDI control register A; bit 2 = IBD (inter-byte delay enable). |
+| `ASI_CTRLB`       | `0x03` | UPDI control register B. |
+| `ASI_KEY_STATUS`  | `0x07` | NVM-key acceptance status. |
+| `ASI_RESET_REQ`   | `0x08` | Write `0x59` to assert CPU reset; write `0x00` to release. |
+| `ASI_SYS_CTRLA`   | `0x0A` | System control A. |
+| `ASI_SYS_STATUS`  | `0x0B` | System status; bit 3 (`0x08`) = NVMPROG (NVM programming mode active). |
 
 NVM controller registers (accessed via UPDI ST/LD at base address `0x1000`):
 
@@ -279,38 +281,33 @@ NVM controller registers (accessed via UPDI ST/LD at base address `0x1000`):
             <returns>0 on success; -1 on UART framing error, timeout, or UPDI NAK.</returns>
             <logic>
               <step><![CDATA[If `len` is greater than `UPDI_MAX_BLOCK`, split the read into consecutive transactions each transferring up to `UPDI_MAX_BLOCK` bytes.]]></step>
-              <step><![CDATA[For each block: transmit SYNCH byte (`0x55`), the REPEAT opcode with count `(block_len - 1)`, then the LD (pointer auto-increment) opcode and the 16-bit address in little-endian order.]]></step>
-              <step>Read `block_len` response bytes from the UART into the destination buffer, accumulating ACK bytes between data bytes as required by the UPDI framing spec.</step>
-              <step><![CDATA[Return -1 immediately on any `read()` timeout (no byte received within 100 ms) or on a framing error (unexpected byte in place of ACK).]]></step>
+              <step><![CDATA[For each block, transmit three separate UPDI frames (datasheet §35.3.3.4): (a) `ST_PTR_WORD` (`0x69`) followed by the 16-bit target address in little-endian order, then read the single ACK (`0x40`); (b) `REPEAT` (`0xA0`) followed by `(block_len - 1)`; (c) `LD ptr++` (`0x24`).]]></step>
+              <step><![CDATA[Use `select()` with a 100 ms timeout before each `read()`; accumulate `block_len` data bytes into the destination buffer.]]></step>
+              <step><![CDATA[Return -1 immediately on any `select()` timeout or framing error (unexpected byte in place of ACK).]]></step>
             </logic>
           </function>
           <function signature="int updi_mem_write(int fd, uint32_t addr, const uint8_t *buf, size_t len)"
                     summary="Write len bytes to target address addr via UPDI ST; return 0 or -1."/>
           <function signature="int updi_halt(int fd)">
-            <purpose>Halt the CPU core by asserting the UPDI ASI halt request and polling until STOPPED.</purpose>
-            <returns>0 when the CPU reports STOPPED within 50 ms; -1 on timeout or UPDI error.</returns>
-            <logic>
-              <step>Write `0x01` to `ASI_SYS_CTRL` to request a halt via the STCS opcode.</step>
-              <step><![CDATA[Poll `ASI_SYS_STATUS` via LDCS at 1 ms intervals until bit 3 (STOPPED) is set or 50 ms elapses.]]></step>
-              <step>Return 0 on success; return -1 on timeout.</step>
-            </logic>
+            <purpose><![CDATA[Halt the CPU core. **Phase 2 stub**: returns -1 unconditionally; the full halt sequence (OCD register manipulation, STOPPED-bit polling) belongs to the AVR On-Chip Debug specification and is implemented in Phase 3 alongside the OCD layer.]]></purpose>
+            <returns>-1 (stub, until OCD layer is implemented).</returns>
           </function>
           <function signature="int updi_run(int fd)"
-                    summary="Resume CPU execution; return 0 or -1."/>
+                    summary="Resume CPU execution. Phase 2 stub: returns -1 until the OCD layer is implemented."/>
           <function signature="int updi_step(int fd)"
-                    summary="Single-step one instruction and halt; return 0 or -1."/>
+                    summary="Single-step one instruction and halt. Phase 2 stub: returns -1 until the OCD layer is implemented."/>
           <function signature="int updi_nvm_write_flash(int fd, uint32_t word_addr, const uint8_t *data, size_t len)">
             <purpose>Erase and program one or more FLASH pages starting at word_addr using the UPDI NVM controller write-page sequence.</purpose>
             <pre><![CDATA[Target CPU is halted (`updi_halt()` has been called); `word_addr` is aligned to a FLASH page boundary; `len` is a non-zero multiple of the target FLASH page size (512 bytes for AVR DA/DB).]]></pre>
             <returns><![CDATA[0 on success; -1 on NVM timeout or UPDI communication error; `UPDI_ERR_WP` (a distinct negative constant) if FLASH write protection is detected in `NVMCTRL_STATUS`.]]></returns>
             <logic>
-              <step><![CDATA[Enter NVM programming mode: transmit the UPDI KEY command with the 8-byte NVM key string `"NVMProg "`.]]></step>
-              <step><![CDATA[Poll `ASI_SYS_STATUS` until bit 4 (NVMPROG) is set; timeout after 100 ms.]]></step>
-              <step><![CDATA[For each FLASH page: write the page-sized data block via `updi_mem_write()` using a REPEAT+ST burst to the target page buffer address.]]></step>
-              <step>Issue the NVMCTRL ERWP (Erase + Write Page) command: write the command code `0x03` to `NVMCTRL_CTRLA`.</step>
-              <step><![CDATA[Poll `NVMCTRL_STATUS` bit 0 (BUSY) until clear; timeout after 20 ms per page.]]></step>
-              <step><![CDATA[Check `NVMCTRL_STATUS` bit 2 (WRERROR); if set, return `UPDI_ERR_WP`.]]></step>
-              <step>After all pages are written, exit NVM mode by writing the UPDI LDCS/STCS sequence to clear NVMPROG.</step>
+              <step><![CDATA[Transmit the UPDI `KEY` opcode (`0xE0`) followed by the 8-byte NVM key string `"NVMProg "`.]]></step>
+              <step><![CDATA[`STCS ASI_RESET_REQ = 0x59` to assert reset, then `STCS ASI_RESET_REQ = 0x00` to release reset (per AVR128DA §35.3.7.2).]]></step>
+              <step><![CDATA[Poll `ASI_SYS_STATUS` via LDCS until bit 3 (NVMPROG, mask `0x08`) is set; timeout after 100 polling iterations (1 ms each).]]></step>
+              <step><![CDATA[For each FLASH page: write the page-sized data block via `updi_mem_write()` (which itself uses the 3-frame `ST_PTR_WORD` + `REPEAT` + `ST ptr++` burst); then issue the NVMCTRL ERWP (Erase + Write Page) command by writing `0x03` to `NVMCTRL_CTRLA` (`0x1000`).]]></step>
+              <step><![CDATA[Poll `NVMCTRL_STATUS` (`0x1002`) bit 0 (BUSY) via `updi_mem_read()` until clear; timeout after 20 iterations per page.]]></step>
+              <step><![CDATA[Check `NVMCTRL_STATUS` bit 2 (WRERR); if set, return `UPDI_ERR_WP`.]]></step>
+              <step><![CDATA[After all pages are written, exit NVM mode with `STCS ASI_RESET_REQ = 0x59` followed by `STCS ASI_RESET_REQ = 0x00`.]]></step>
             </logic>
           </function>
           <function signature="int updi_console_poll(int fd, char *buf, size_t cap)"
@@ -318,11 +315,12 @@ NVM controller registers (accessed via UPDI ST/LD at base address `0x1000`):
         </functions>
         <algorithm><![CDATA[**UPDI link initialisation sequence (performed inside `updi_open()`):**
 
-1.  Open the serial port with `O_RDWR | O_NOCTTY | O_NONBLOCK`; apply `fcntl()` to restore blocking mode with a 100 ms read timeout via `VTIME`.
-2.  Configure `termios` for raw 8N2 mode: `cfmakeraw()`, set 2 stop bits (`CSTOPB`), disable parity, disable flow control, and apply `cfsetispeed()` / `cfsetospeed()` for the operating baud rate.
-3.  Generate a BREAK condition: temporarily lower the baud rate to 300 baud, write a single `0x00` byte (which occupies the line for ≥ 24.6 µs — the UPDI minimum break duration), then flush and restore the operating baud rate.
-4.  Transmit the SYNCH byte (`0x55`) and discard the half-duplex loopback echo.
-5.  Transmit an `LDCS ASI_SYS_STATUS` command and read the response byte; verify the target is reachable. Retry the BREAK+SYNCH sequence up to three times before returning -1.
+1.  Open the serial port with `O_RDWR | O_NOCTTY | O_NONBLOCK`, then restore blocking mode via `fcntl()`.
+2.  Configure `termios` for raw 8E2 mode: `cfmakeraw()`, set `CS8`, `CSTOPB`, `PARENB` (with `PARODD` cleared = even parity), disable flow control, and apply `cfsetispeed()` / `cfsetospeed()` for the operating baud rate.
+3.  If the kernel rejects `PARENB` with `EINVAL` (Linux PTY slaves silently strip parity from virtual terminals), retry the `tcsetattr()` call with `PARENB` cleared. Real serial hardware accepts 8E2; the fallback only affects PTY-backed unit tests.
+4.  Assert the BREAK condition by writing two consecutive `0x00` bytes at the session baud rate, then `tcdrain()` the output queue. At 115200 baud each zero byte holds TX low for ≈70 µs, so two bytes together cover ≥ 140 µs — well above the ≥ 24.6 µs UPDI minimum break duration of §35.3.1.2. The kernel `tcsetattr()` baud-switch trick recommended in earlier UPDI literature is unsafe on Linux PTYs (a baud change flushes the master RX queue), so the implementation deliberately avoids it.
+5.  Transmit the SYNCH byte (`0x55`) and discard the half-duplex loopback echo.
+6.  Send `LDCS ASI_STATUSB` (opcode `0x80 | 0x01` = `0x81`). Reading `ASI_STATUSB` clears the PESIG bit that the BREAK sets, confirming the link is alive and ready for opcodes. Retry the BREAK+SYNCH sequence up to three times before returning -1.
 
 **Half-duplex echo cancellation:** Because TX and RX share the same physical wire, every transmitted byte is echoed back on the RX line. All UPDI transmit helpers skip one echo byte per transmitted byte before reading response data.
 
@@ -330,25 +328,26 @@ NVM controller registers (accessed via UPDI ST/LD at base address `0x1000`):
 
 | Operation | Timeout | Notes |
 | --------- | ------- | ----- |
-| `read()` per byte | 100 ms (`VTIME=1`) | Applied via `termios` `VTIME`; any idle gap triggers a framing error. |
-| `updi_halt()` poll interval | 1 ms | `nanosleep(1 ms)` between `LDCS ASI_SYS_STATUS` reads. |
-| `updi_halt()` total timeout | 50 ms | Returns -1 if CPU does not enter STOPPED state within 50 polls. |
-| `updi_nvm_write_flash()` NVMPROG wait | 100 ms | Timeout on `ASI_SYS_STATUS` bit 4 (NVMPROG). |
-| `updi_nvm_write_flash()` page BUSY poll | 20 ms per page | Timeout on `NVMCTRL_STATUS` bit 0 (BUSY). |
-| BREAK condition duration | ≥ 24.6 µs | One `0x00` byte at 300 baud = 33.3 µs; safely exceeds UPDI minimum. |
+| `updi_mem_read()` per-byte | 100 ms (`select()`) | A `select()` with `timeval { 0, 100000 }` guards every `read()`. |
+| `updi_nvm_write_flash()` NVMPROG wait | ≈ 100 ms | 100 LDCS polls of `ASI_SYS_STATUS` at 1 ms intervals. |
+| `updi_nvm_write_flash()` page BUSY poll | ≈ 20 ms per page | 20 reads of `NVMCTRL_STATUS` (bit 0 = BUSY). |
+| BREAK condition duration | ≥ ≈ 140 µs | Two `0x00` bytes at 115200 baud easily exceed the §35.3.1.2 minimum of 24.6 µs. |
 
-**UPDI command opcode encoding:** Each command frame begins with the SYNCH byte `0x55` followed by a command byte. Key opcodes:
+Note: `updi_halt()`, `updi_run()`, and `updi_step()` are deferred stubs in Phase 2 and contribute no entries to the timing table.
+
+**UPDI command opcode encoding:** Each command frame begins with a single command byte followed by its operands. Key opcodes (AVR128DA §35.3.3):
 
 | Opcode mnemonic | Byte value | Purpose |
 | --------------- | ---------- | ------- |
 | `LDCS rd, cs`   | `0x80\|cs` | Load Control/Status register `cs`. |
 | `STCS cs, rr`   | `0xC0\|cs` | Store to Control/Status register `cs`. |
+| `ST_PTR_WORD`   | `0x69`     | Set the burst pointer with a 16-bit address operand (precedes REPEAT/LD/ST bursts). |
 | `ST ptr++, rr`  | `0x64`     | Store with pointer post-increment (burst write). |
 | `LD rd, ptr++`  | `0x24`     | Load with pointer post-increment (burst read). |
-| `REPEAT`        | `0xA0`     | Set repeat count for next bulk transfer (n-1 in operand). |
+| `REPEAT`        | `0xA0`     | Set repeat count for the next bulk transfer (n-1 in operand). |
 | `KEY`           | `0xE0`     | Transmit 8-byte key to unlock a privileged mode. |
 
-**Test approach for `src/updi.c`:** Unit-testable using a POSIX pseudo-terminal pair (`openpty()`): one end is passed to `updi_open()`, the other is driven by the test harness. Test cases cover: correct SYNCH/ACK exchange, BREAK regeneration, echo-cancellation correctness, block-split boundary at `UPDI_MAX_BLOCK`, halt-timeout expiry, NVM ERWP sequence byte order, and `UPDI_ERR_WP` detection.]]></algorithm>
+**Test approach for `src/updi.c`:** Unit-testable using a POSIX pseudo-terminal pair (`openpty()`): one end is passed to `updi_open()`, the other is driven by the test harness. Test cases cover: termios 8E2 configuration (with PARENB-fallback under PTYs), the BREAK+SYNCH+LDCS-STATUSB probe and its 3-retry policy, the 3-frame `ST_PTR_WORD`/`REPEAT`/`LD-or-ST` burst, the 100 ms `select()` deadline, NVM precondition checks, NVMPROG and per-page BUSY timeouts, and that `updi_halt`/`updi_run`/`updi_step` return -1 stubs until the OCD layer lands.]]></algorithm>
         <dependencies>
           <dep><![CDATA[POSIX `termios` serial API (`tcgetattr`, `tcsetattr`, `cfsetspeed`, `cfmakeraw`).]]></dep>
           <dep><![CDATA[Standard POSIX file I/O (`open`, `read`, `write`, `close`, `fcntl`, `tcdrain`).]]></dep>
@@ -1094,7 +1093,7 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-010" name="Execution Control">
-        <text><![CDATA[The application shall halt, resume, and single-step the AVR CPU core via the UPDI Application System Interface (ASI), mapping directly to GDB continue, step, and stop operations.]]></text>
+        <text><![CDATA[The application shall halt, resume, and single-step the AVR CPU core via the AVR On-Chip Debug (OCD) interface layered on top of UPDI, mapping directly to GDB continue, step, and stop operations. The Phase 2 UPDI module exposes `updi_halt`/`updi_run`/`updi_step` entry points as -1 stubs; full implementation is performed by the Phase 3 OCD layer using its own Microchip specification.]]></text>
         <traces>
           <trace target="SDD" ref="4.3.1"/>
         </traces>
@@ -1117,14 +1116,14 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-036" name="UPDI Link Initialisation Timing and Retry">
-        <text><![CDATA[The UPDI initialisation sequence shall assert a BREAK condition by holding the TX line low for at least 24.6 µs before transmitting the SYNCH character (0x55). If the target does not acknowledge the SYNCH within the expected window, the server shall retry the BREAK+SYNCH sequence up to three times before declaring a link failure and exiting with a fatal error.]]></text>
+        <text><![CDATA[The UPDI initialisation sequence shall assert a BREAK condition by transmitting two consecutive zero (0x00) bytes at the session baud rate, holding the TX line low for well over the 24.6 µs UPDI minimum (datasheet §35.3.1.2), before transmitting the SYNCH character (0x55) and probing the link with `LDCS ASI_STATUSB`. If the target does not acknowledge the probe, the server shall retry the BREAK+SYNCH+LDCS sequence up to three times before declaring a link failure and returning -1 from `updi_open()`.]]></text>
         <traces>
           <trace target="SDD" ref="4.3.3"/>
         </traces>
       </hlr>
 
       <hlr id="HLR-037" name="UPDI Operation Timeout Bounds">
-        <text><![CDATA[All UPDI polling loops shall implement explicit timeouts to prevent indefinite blocking: the halt-acknowledgement poll shall time out after 50 milliseconds; the NVMPROG mode entry poll shall time out after 100 milliseconds; the per-page NVM BUSY poll shall time out after 20 milliseconds per page. On any timeout the failing UPDI function shall return an error code rather than blocking or spinning.]]></text>
+        <text><![CDATA[All UPDI polling loops shall implement explicit timeouts to prevent indefinite blocking: each `updi_mem_read()` `read()` call shall be guarded by a `select()` with a 100 ms deadline; the NVMPROG mode entry poll shall time out after 100 iterations (≈ 100 ms); the per-page NVM BUSY poll shall time out after 20 iterations (≈ 20 ms) per page. On any timeout the failing UPDI function shall return -1 rather than blocking or spinning.]]></text>
         <traces>
           <trace target="SDD" ref="4.3.3"/>
         </traces>
@@ -1437,14 +1436,14 @@ Errors are propagated upward through the module stack without retrying:
       <intro><![CDATA[Requirements for all public functions in `src/updi.c`: link initialisation, memory access, execution control, NVM programming, and console bridging.]]></intro>
 
       <llr id="LLR-UPDI-01">
-        <text><![CDATA[`updi_open()` shall open the UART device and configure it for 8N2 framing (8 data bits, no parity, 2 stop bits) in raw half-duplex mode using `termios`. `cfmakeraw()`, `CSTOPB`, and explicit baud setting via `cfsetispeed()`/`cfsetospeed()` shall be applied. The function shall return the open file descriptor on success or -1 on failure.]]></text>
+        <text><![CDATA[`updi_open()` shall open the UART device and configure it for 8E2 framing (8 data bits, even parity, 2 stop bits) in raw half-duplex mode using `termios`. `cfmakeraw()`, `CS8`, `CSTOPB`, `PARENB` (with `PARODD` cleared), and explicit baud setting via `cfsetispeed()`/`cfsetospeed()` shall be applied. If `tcsetattr()` returns `EINVAL` when setting `PARENB` (Linux PTY slaves strip parity from virtual terminals), the function shall retry with `PARENB` cleared so the link still works against PTY-backed test harnesses. The function shall return the open file descriptor on success or -1 on failure.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-006" name="UPDI Hardware Connection"/>
         </traces>
       </llr>
 
       <llr id="LLR-UPDI-02">
-        <text><![CDATA[`updi_open()` shall generate the UPDI BREAK condition by temporarily switching the UART baud rate to `UPDI_BREAK_BAUD` (300 baud), transmitting a 0x00 framing byte (which holds TX low for at least 24.6 µs at 300 baud, satisfying the UPDI BREAK timing requirement), then restoring the session baud rate before transmitting the SYNCH character (0x55).]]></text>
+        <text><![CDATA[`updi_open()` shall generate the UPDI BREAK condition by transmitting two consecutive 0x00 framing bytes at the configured session baud rate followed by `tcdrain()`. At 115200 baud each zero byte holds TX low for ≈ 70 µs, so two bytes together exceed the 24.6 µs minimum BREAK duration of datasheet §35.3.1.2 by a wide margin. The function shall not switch the kernel baud rate to generate the BREAK — a kernel baud change flushes the master RX queue on Linux PTYs and is unnecessary at modern UART speeds. After the BREAK the SYNCH character (0x55) shall be transmitted to establish frame alignment.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-006" name="UPDI Hardware Connection"/>
           <trace target="HLR" ref="HLR-036" name="UPDI Link Initialisation Timing and Retry"/>
@@ -1452,16 +1451,17 @@ Errors are propagated upward through the module stack without retrying:
       </llr>
 
       <llr id="LLR-UPDI-03">
-        <text><![CDATA[If the target does not respond to the BREAK+SYNCH sequence with a UPDI ACK (0x40) within the expected window, `updi_open()` shall retry the entire BREAK+SYNCH sequence. After 3 consecutive failures, `updi_open()` shall return -1 and the caller shall treat the link as unavailable.]]></text>
+        <text><![CDATA[Immediately after SYNCH, `updi_open()` shall probe the link by issuing `LDCS ASI_STATUSB` (opcode `0x80 | 0x01 = 0x81`). Reading `ASI_STATUSB` clears the PESIG bit that the BREAK sets and confirms the target is responsive. If the probe fails, `updi_open()` shall retry the entire BREAK+BREAK+SYNCH+LDCS sequence. After 3 consecutive failed attempts the function shall return -1 and the caller shall treat the link as unavailable.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-036" name="UPDI Link Initialisation Timing and Retry"/>
         </traces>
       </llr>
 
       <llr id="LLR-UPDI-04">
-        <text><![CDATA[`updi_mem_read()` shall transfer up to `UPDI_MAX_BLOCK` (256) bytes per UPDI burst using the REPEAT+LD auto-increment sequence. If `len` exceeds `UPDI_MAX_BLOCK`, the function shall split the request into consecutive block reads automatically, with no size restriction imposed on the caller.]]></text>
+        <text><![CDATA[`updi_mem_read()` and `updi_mem_write()` shall transfer up to `UPDI_MAX_BLOCK` (256) bytes per UPDI burst using a three-frame sequence per datasheet §35.3.3.4: (1) `ST_PTR_WORD` (`0x69`) followed by the 16-bit target address in little-endian order and a single ACK readback; (2) `REPEAT` (`0xA0`) followed by `(block_len - 1)`; (3) `LD ptr++` (`0x24`) for reads or `ST ptr++` (`0x64`) for writes. If `len` exceeds `UPDI_MAX_BLOCK`, the function shall split the request into consecutive bursts automatically, with no size restriction imposed on the caller.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-007" name="Target Memory Read"/>
+          <trace target="HLR" ref="HLR-008" name="Target Memory Write"/>
         </traces>
       </llr>
 
@@ -1481,7 +1481,7 @@ Errors are propagated upward through the module stack without retrying:
       </llr>
 
       <llr id="LLR-UPDI-07">
-        <text><![CDATA[`updi_nvm_write_flash()` shall require `word_addr` to be aligned to a 512-byte FLASH page boundary and `len` to be a non-zero multiple of 512. The function shall poll `NVMCTRL_STATUS` BUSY for up to 100 ms before issuing the NVM write command, and poll the BUSY bit for up to 20 ms after each page write. Timeout of either poll shall cause the function to return -1. FLASH write-protection detection shall return `UPDI_ERR_WP`.]]></text>
+        <text><![CDATA[`updi_nvm_write_flash()` shall require `word_addr` to be aligned to a 512-byte FLASH page boundary and `len` to be a non-zero multiple of 512. It shall enter NVM programming mode by transmitting the `KEY` opcode (`0xE0`) with the 8-byte string `"NVMProg "`, asserting reset with `STCS ASI_RESET_REQ = 0x59`, releasing reset with `STCS ASI_RESET_REQ = 0x00`, then polling `ASI_SYS_STATUS` via LDCS for bit 3 (NVMPROG, mask `0x08`) up to 100 iterations (≈ 100 ms). For each page it shall write the page data via `updi_mem_write()`, write `0x03` (ERWP) to `NVMCTRL_CTRLA`, and poll `NVMCTRL_STATUS` bit 0 (BUSY) clear up to 20 iterations (≈ 20 ms). On exit it shall toggle `ASI_RESET_REQ` `0x59` then `0x00` to release the target. Timeout of either poll shall return -1; a `NVMCTRL_STATUS` WRERR (bit 2) shall return `UPDI_ERR_WP`.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-009" name="FLASH Programming"/>
           <trace target="HLR" ref="HLR-037" name="UPDI Operation Timeout Bounds"/>
@@ -1489,22 +1489,21 @@ Errors are propagated upward through the module stack without retrying:
       </llr>
 
       <llr id="LLR-UPDI-08">
-        <text><![CDATA[`updi_halt()` shall write 0x01 to `ASI_SYS_CTRL` to request a halt, then poll `ASI_SYS_STATUS` at 1 ms intervals for bit 3 (STOPPED). The function shall return 0 when STOPPED is observed within 50 ms, or -1 if the bit has not been set after 50 polling intervals.]]></text>
+        <text><![CDATA[`updi_halt()` is a Phase 2 stub. It shall return -1 unconditionally with no UART traffic. The full halt sequence (OCD register manipulation, STOPPED-bit polling) is part of the AVR On-Chip Debug specification and is implemented by the Phase 3 OCD layer.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-010" name="Execution Control"/>
-          <trace target="HLR" ref="HLR-037" name="UPDI Operation Timeout Bounds"/>
         </traces>
       </llr>
 
       <llr id="LLR-UPDI-09">
-        <text><![CDATA[`updi_step()` shall issue the UPDI ASI single-instruction-step command, then verify that the STOPPED bit is set in `ASI_SYS_STATUS` before returning. It shall return 0 on success or -1 on timeout or UPDI error.]]></text>
+        <text><![CDATA[`updi_step()` is a Phase 2 stub. It shall return -1 unconditionally with no UART traffic. Single-step is implemented by the Phase 3 OCD layer.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-010" name="Execution Control"/>
         </traces>
       </llr>
 
       <llr id="LLR-UPDI-10">
-        <text><![CDATA[`updi_run()` shall clear the UPDI ASI halt request and verify that the STOPPED bit in `ASI_SYS_STATUS` is no longer set before returning. It shall return 0 on success or -1 on UPDI error.]]></text>
+        <text><![CDATA[`updi_run()` is a Phase 2 stub. It shall return -1 unconditionally with no UART traffic. CPU resume is implemented by the Phase 3 OCD layer.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-010" name="Execution Control"/>
         </traces>
@@ -1955,11 +1954,11 @@ Errors are propagated upward through the module stack without retrying:
     <!-- ============================================================ -->
     <!-- src/updi.c unit tests                                        -->
     <!-- ============================================================ -->
-    <file path="tests/test_updi.c" role="unit" count="23">
-      <header><![CDATA[Unit tests for `src/updi.c`: UART configuration, BREAK/SYNCH link initialisation, block memory read/write, NVM flash programming, execution control, and console polling. A loopback PTY pair substitutes for real UART hardware.]]></header>
+    <file path="tests/test_updi.c" role="unit" count="22">
+      <header><![CDATA[Unit tests for `src/updi.c`: UART configuration, BREAK/SYNCH/LDCS link initialisation, three-frame block memory read/write, NVM flash programming, execution-control stubs, and console polling. A loopback PTY pair substitutes for real UART hardware; a `--wrap=select` linker shim lets tests inject `select()` timeouts.]]></header>
 
-      <test name="updi_open_sets_8n2_raw_half_duplex_via_termios">
-        <purpose><![CDATA[Open a PTY pair, call `updi_open()` on the slave side, and inspect the resulting `termios` structure to confirm 8 data bits, no parity, 2 stop bits (`CSTOPB`), and raw mode (`cfmakeraw()`).]]></purpose>
+      <test name="updi_open_sets_8e2_raw_half_duplex_via_termios">
+        <purpose><![CDATA[Open a PTY pair, call `updi_open()` on the slave side, and inspect the resulting `termios` structure to confirm `CS8`, `CSTOPB` (2 stop bits), even-parity intent (`PARODD` clear), and raw mode (no `ICANON`/`ECHO`/`ISIG`/`OPOST`). PARENB itself is not asserted because Linux PTYs strip parity on slave reopen; parity is verified on real serial hardware in Phase 3 integration.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-01"/></traces>
       </test>
 
@@ -1968,53 +1967,58 @@ Errors are propagated upward through the module stack without retrying:
         <traces><trace target="LLR" ref="LLR-UPDI-01"/></traces>
       </test>
 
-      <test name="updi_open_asserts_break_at_300_baud_before_synch">
-        <purpose><![CDATA[Verify that `updi_open()` temporarily sets the baud rate to `UPDI_BREAK_BAUD` (300) and transmits a 0x00 byte before transmitting 0x55, confirming the BREAK-before-SYNCH ordering.]]></purpose>
+      <test name="updi_open_asserts_two_breaks_then_synch">
+        <purpose><![CDATA[Verify that `updi_open()` transmits two consecutive 0x00 bytes (the UPDI BREAK pattern) followed by the SYNCH character 0x55 at the session baud rate, with no intervening kernel baud-rate switch.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-02"/></traces>
       </test>
 
+      <test name="updi_open_issues_ldcs_statusb_after_synch">
+        <purpose><![CDATA[Capture the bytes written by `updi_open()` after SYNCH and verify the link-probe opcode is `LDCS ASI_STATUSB` (`0x80 | 0x01 = 0x81`), which clears the PESIG bit set by BREAK and confirms target responsiveness.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-03"/></traces>
+      </test>
+
       <test name="updi_open_restores_session_baud_after_break">
-        <purpose><![CDATA[Verify that `updi_open()` restores the configured session baud rate after the BREAK condition and before transmitting the SYNCH character (0x55).]]></purpose>
+        <purpose><![CDATA[Verify that `updi_open()` leaves the configured session baud rate (B115200) in effect after a successful BREAK+SYNCH sequence — i.e. it does not corrupt the termios baud setting.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-02"/></traces>
       </test>
 
       <test name="updi_open_retries_break_synch_3_times_on_no_ack">
-        <purpose><![CDATA[Simulate a target that never returns ACK (0x40) and verify that `updi_open()` repeats the BREAK+SYNCH sequence exactly 3 times before giving up.]]></purpose>
+        <purpose><![CDATA[Simulate a target that never responds to LDCS and verify that `updi_open()` transmits the BREAK+BREAK+SYNCH+LDCS sequence exactly 3 times (six 0x00 BREAK bytes total) before giving up.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-03"/></traces>
       </test>
 
       <test name="updi_open_returns_minus1_after_3_consecutive_link_failures">
-        <purpose><![CDATA[After 3 failed BREAK+SYNCH attempts with no ACK, verify that `updi_open()` returns -1.]]></purpose>
+        <purpose><![CDATA[After 3 failed BREAK+SYNCH+LDCS attempts with no response, verify that `updi_open()` returns -1.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-03"/></traces>
       </test>
 
       <test name="updi_mem_read_splits_request_larger_than_256_bytes">
-        <purpose><![CDATA[Request a read of 512 bytes and verify that `updi_mem_read()` issues two consecutive 256-byte REPEAT+LD bursts rather than a single oversized transfer.]]></purpose>
+        <purpose><![CDATA[Request a read of 512 bytes and verify that `updi_mem_read()` issues two consecutive 256-byte three-frame bursts rather than a single oversized transfer.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-04"/></traces>
       </test>
 
       <test name="updi_mem_read_uses_repeat_ld_auto_increment_sequence">
-        <purpose><![CDATA[Capture the bytes written to the UART and verify that each block begins with the UPDI REPEAT opcode followed by a LD-auto-increment command, confirming the correct UPDI framing.]]></purpose>
+        <purpose><![CDATA[Capture the bytes written to the UART and verify the three-frame burst: byte 0 = `ST_PTR_WORD` (`0x69`), bytes 1–2 = address little-endian, frame 2 = `REPEAT` (`0xA0`) + count, frame 3 = `LD ptr++` (`0x24`).]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-04"/></traces>
       </test>
 
       <test name="updi_mem_read_calls_select_with_100ms_timeout_before_read">
-        <purpose><![CDATA[Using a mock `select()` that records its timeout argument, verify that `updi_mem_read()` passes a `timeval` of 0 seconds and 100,000 microseconds before every `read()` call.]]></purpose>
+        <purpose><![CDATA[Using a `--wrap=select` shim that records the `timeval` argument, verify that `updi_mem_read()` passes a `timeval` of 0 seconds and 100,000 microseconds before every `read()` call.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-05"/></traces>
       </test>
 
       <test name="updi_mem_read_returns_minus1_on_select_timeout">
-        <purpose><![CDATA[Inject a mock `select()` that returns 0 (timeout) and verify that `updi_mem_read()` immediately returns -1 without calling `read()`.]]></purpose>
+        <purpose><![CDATA[Inject a wrapped `select()` that returns 0 (timeout) and verify that `updi_mem_read()` immediately returns -1 without calling `read()`.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-05"/></traces>
       </test>
 
       <test name="updi_mem_write_returns_0_on_success">
-        <purpose><![CDATA[Call `updi_mem_write()` targeting a SRAM address with a loopback PTY that echoes the expected ACK and verify the return value is 0.]]></purpose>
+        <purpose><![CDATA[Call `updi_mem_write()` targeting an SRAM address with a loopback PTY that echoes the expected ACK and verify the return value is 0.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-06"/></traces>
       </test>
 
       <test name="updi_mem_write_returns_minus1_on_updi_nak">
-        <purpose><![CDATA[Inject a mock that returns a UPDI NAK instead of ACK and verify that `updi_mem_write()` returns -1.]]></purpose>
+        <purpose><![CDATA[Inject a responder that returns a non-ACK byte instead of `UPDI_ACK` (0x40) and verify that `updi_mem_write()` returns -1.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-06"/></traces>
       </test>
 
@@ -2029,47 +2033,37 @@ Errors are propagated upward through the module stack without retrying:
       </test>
 
       <test name="updi_nvm_write_flash_nvmprog_poll_timeout_returns_minus1">
-        <purpose><![CDATA[Inject a mock target that never clears the NVMPROG BUSY bit and verify that `updi_nvm_write_flash()` returns -1 after 100 ms.]]></purpose>
+        <purpose><![CDATA[Inject a mock target that never sets the NVMPROG bit (`ASI_SYS_STATUS` bit 3) and verify that `updi_nvm_write_flash()` returns -1 after 100 polling iterations.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-07"/></traces>
       </test>
 
       <test name="updi_nvm_write_flash_per_page_busy_timeout_returns_minus1">
-        <purpose><![CDATA[Inject a mock target that never clears the NVM BUSY bit after a page write and verify that `updi_nvm_write_flash()` returns -1 after 20 ms.]]></purpose>
+        <purpose><![CDATA[Inject a mock target that never clears `NVMCTRL_STATUS` BUSY (bit 0) after a page write and verify that `updi_nvm_write_flash()` returns -1 after 20 polling iterations.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-07"/></traces>
       </test>
 
-      <test name="updi_halt_returns_0_when_stopped_bit_set_within_50ms">
-        <purpose><![CDATA[Inject a mock `ASI_SYS_STATUS` that sets the STOPPED bit (bit 3) on the first poll and verify that `updi_halt()` returns 0.]]></purpose>
+      <test name="updi_halt_returns_minus1_stub_until_ocd_layer">
+        <purpose><![CDATA[Verify that `updi_halt()` returns -1 with no UART traffic in Phase 2 — it is a stub pending the Phase 3 OCD layer.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-08"/></traces>
       </test>
 
-      <test name="updi_halt_returns_minus1_after_50ms_timeout">
-        <purpose><![CDATA[Inject a mock `ASI_SYS_STATUS` that never sets the STOPPED bit and verify that `updi_halt()` returns -1 after 50 polling intervals.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-UPDI-08"/></traces>
-      </test>
-
-      <test name="updi_step_issues_asi_step_command_and_confirms_stopped_bit">
-        <purpose><![CDATA[Verify that `updi_step()` writes the ASI single-step command and then reads `ASI_SYS_STATUS` to confirm the STOPPED bit is set before returning 0.]]></purpose>
+      <test name="updi_step_returns_minus1_stub_until_ocd_layer">
+        <purpose><![CDATA[Verify that `updi_step()` returns -1 with no UART traffic in Phase 2 — it is a stub pending the Phase 3 OCD layer.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-09"/></traces>
       </test>
 
-      <test name="updi_run_clears_halt_request_and_verifies_stopped_cleared">
-        <purpose><![CDATA[Verify that `updi_run()` clears the ASI halt request and confirms the STOPPED bit is no longer set in `ASI_SYS_STATUS` before returning 0.]]></purpose>
+      <test name="updi_run_returns_minus1_stub_until_ocd_layer">
+        <purpose><![CDATA[Verify that `updi_run()` returns -1 with no UART traffic in Phase 2 — it is a stub pending the Phase 3 OCD layer.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-10"/></traces>
       </test>
 
-      <test name="updi_mem_read_callable_while_cpu_running_no_halt_issued">
-        <purpose><![CDATA[With the mock target in RUNNING state (STOPPED bit clear), call `updi_mem_read()` and verify that no halt request is written to `ASI_SYS_CTRL`.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-UPDI-11"/></traces>
-      </test>
-
       <test name="updi_console_poll_returns_pending_bytes_without_halting">
-        <purpose><![CDATA[Inject a mock avrOS software UART buffer containing 4 bytes and verify that `updi_console_poll()` returns 4 and copies the bytes to the output buffer without calling `updi_halt()`.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-UPDI-12"/></traces>
+        <purpose><![CDATA[Pre-stuff the master end of the PTY with 4 bytes and verify that `updi_console_poll()` returns 4 and copies the bytes to the output buffer without calling `updi_halt()`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-11"/><trace target="LLR" ref="LLR-UPDI-12"/></traces>
       </test>
 
       <test name="updi_console_poll_returns_0_when_output_buffer_empty">
-        <purpose><![CDATA[With the mock avrOS software UART buffer empty, verify that `updi_console_poll()` returns 0.]]></purpose>
+        <purpose><![CDATA[With no data pending on the master end, verify that `updi_console_poll()` returns 0 in a non-blocking manner.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-12"/></traces>
       </test>
     </file>

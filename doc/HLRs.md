@@ -53,7 +53,7 @@ Requirements in this section govern the hardware connection to the AVR target an
     *Trace:* [SDD Section 4.3.1](SDD.md).
 
 *   <a id="HLR-010"></a>**HLR-010: Execution Control.**
-    The application shall halt, resume, and single-step the AVR CPU core via the UPDI Application System Interface (ASI), mapping directly to GDB continue, step, and stop operations.
+    The application shall halt, resume, and single-step the AVR CPU core via the AVR On-Chip Debug (OCD) interface layered on top of UPDI, mapping directly to GDB continue, step, and stop operations. The Phase 2 UPDI module exposes `updi_halt`/`updi_run`/`updi_step` entry points as -1 stubs; full implementation is performed by the Phase 3 OCD layer using its own Microchip specification.
     *Trace:* [SDD Section 4.3.1](SDD.md).
 
 *   <a id="HLR-011"></a>**HLR-011: Non-Intrusive Background Memory Read.**
@@ -65,11 +65,11 @@ Requirements in this section govern the hardware connection to the AVR target an
     *Trace:* [SDD Section 4.1](SDD.md), [SDD Section 4.3.1](SDD.md).
 
 *   <a id="HLR-036"></a>**HLR-036: UPDI Link Initialisation Timing and Retry.**
-    The UPDI initialisation sequence shall assert a BREAK condition by holding the TX line low for at least 24.6 µs before transmitting the SYNCH character (0x55). If the target does not acknowledge the SYNCH within the expected window, the server shall retry the BREAK+SYNCH sequence up to three times before declaring a link failure and exiting with a fatal error.
+    The UPDI initialisation sequence shall assert a BREAK condition by transmitting two consecutive zero (0x00) bytes at the session baud rate, holding the TX line low for well over the 24.6 µs UPDI minimum (datasheet §35.3.1.2), before transmitting the SYNCH character (0x55) and probing the link with `LDCS ASI_STATUSB`. If the target does not acknowledge the probe, the server shall retry the BREAK+SYNCH+LDCS sequence up to three times before declaring a link failure and returning -1 from `updi_open()`.
     *Trace:* [SDD Section 4.3.3](SDD.md).
 
 *   <a id="HLR-037"></a>**HLR-037: UPDI Operation Timeout Bounds.**
-    All UPDI polling loops shall implement explicit timeouts to prevent indefinite blocking: the halt-acknowledgement poll shall time out after 50 milliseconds; the NVMPROG mode entry poll shall time out after 100 milliseconds; the per-page NVM BUSY poll shall time out after 20 milliseconds per page. On any timeout the failing UPDI function shall return an error code rather than blocking or spinning.
+    All UPDI polling loops shall implement explicit timeouts to prevent indefinite blocking: each `updi_mem_read()` `read()` call shall be guarded by a `select()` with a 100 ms deadline; the NVMPROG mode entry poll shall time out after 100 iterations (≈ 100 ms); the per-page NVM BUSY poll shall time out after 20 iterations (≈ 20 ms) per page. On any timeout the failing UPDI function shall return -1 rather than blocking or spinning.
     *Trace:* [SDD Section 4.3.3](SDD.md).
 
 ## 3. GDB Remote Serial Protocol Server
