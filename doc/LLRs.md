@@ -15,13 +15,13 @@ Requirements for `main()`, `parse_args()`, and `event_loop()`. These functions o
 *   <a id="LLR-MAIN-01"></a>**LLR-MAIN-01** — `parse_args()` shall populate an `AppConfig` struct from `argc`/`argv`. If any unrecognised argument is encountered, it shall print a usage message to `stderr` and call `exit(1)`.
     *Trace:* HLR-001 (CLI Argument Parsing).
 
-*   <a id="LLR-MAIN-02"></a>**LLR-MAIN-02** — When not supplied on the command line, `parse_args()` shall apply the following default values: `--port` = 1234, `--baud` = 115200, `--load` = false. The `<serial-device>` and `<elf-file>` positional arguments are mandatory; absence of either shall trigger the usage error path.
+*   <a id="LLR-MAIN-02"></a>**LLR-MAIN-02** — When not supplied on the command line, `parse_args()` shall apply the following defaults to the `AppConfig` fields: `gdb_port` = 1234, `baud_rate` = 115200, `load_flash` = false. The `<serial-device>` and `<elf-file>` positional arguments are mandatory; absence of either shall trigger the usage error path.
     *Trace:* HLR-001 (CLI Argument Parsing).
 
 *   <a id="LLR-MAIN-03"></a>**LLR-MAIN-03** — `main()` shall call `updi_open()` and validate the returned file descriptor before calling `rsp_listen()`. A failure from either shall cause `main()` to release any already-open resources and return exit code 1.
     *Trace:* HLR-002 (Serial Device Initialisation), HLR-003 (GDB Listener Startup).
 
-*   <a id="LLR-MAIN-04"></a>**LLR-MAIN-04** — When the `--load` flag is set, `main()` shall iterate over all `PT_LOAD` ELF segments and call `updi_nvm_write_flash()` for each segment before entering `event_loop()`. A flash write failure shall cause `main()` to print an error to `stderr` and return exit code 1.
+*   <a id="LLR-MAIN-04"></a>**LLR-MAIN-04** — When the `--load` flag is set, `main()` shall iterate over all `PT_LOAD` ELF program headers and call `updi_nvm_write_flash()` for each segment whose `p_filesz > 0` and whose virtual address lies below the SRAM base (i.e. flash-resident segments only). Segments with `p_vaddr >= ctx.sram_base` shall be skipped. All qualifying segments shall be written before entering `event_loop()`. A flash write failure shall cause `main()` to print an error to `stderr` and return exit code 1.
     *Trace:* HLR-004 (ELF Flash Load Option).
 
 *   <a id="LLR-MAIN-05"></a>**LLR-MAIN-05** — `event_loop()` shall multiplex `listen_fd`, `gdb_fd`, and `updi_fd` using a single POSIX `select()` call with no timeout. On each iteration it shall: accept a GDB client on `listen_fd` if `gdb_fd` is -1; forward console bytes from `updi_fd` to `stdout` via `updi_console_poll()`; dispatch RSP packets from `gdb_fd` via `rsp_recv_packet()` and `rsp_dispatch()`. No POSIX threads shall be created.

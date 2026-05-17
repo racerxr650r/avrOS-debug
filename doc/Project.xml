@@ -1388,7 +1388,7 @@ Errors are propagated upward through the module stack without retrying:
       </llr>
 
       <llr id="LLR-MAIN-02">
-        <text><![CDATA[When not supplied on the command line, `parse_args()` shall apply the following default values: `--port` = 1234, `--baud` = 115200, `--load` = false. The `<serial-device>` and `<elf-file>` positional arguments are mandatory; absence of either shall trigger the usage error path.]]></text>
+        <text><![CDATA[When not supplied on the command line, `parse_args()` shall apply the following defaults to the `AppConfig` fields: `gdb_port` = 1234, `baud_rate` = 115200, `load_flash` = false. The `<serial-device>` and `<elf-file>` positional arguments are mandatory; absence of either shall trigger the usage error path.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-001" name="CLI Argument Parsing"/>
         </traces>
@@ -1403,7 +1403,7 @@ Errors are propagated upward through the module stack without retrying:
       </llr>
 
       <llr id="LLR-MAIN-04">
-        <text><![CDATA[When the `--load` flag is set, `main()` shall iterate over all `PT_LOAD` ELF segments and call `updi_nvm_write_flash()` for each segment before entering `event_loop()`. A flash write failure shall cause `main()` to print an error to `stderr` and return exit code 1.]]></text>
+        <text><![CDATA[When the `--load` flag is set, `main()` shall iterate over all `PT_LOAD` ELF program headers and call `updi_nvm_write_flash()` for each segment whose `p_filesz > 0` and whose virtual address lies below the SRAM base (i.e. flash-resident segments only). Segments with `p_vaddr >= ctx.sram_base` shall be skipped. All qualifying segments shall be written before entering `event_loop()`. A flash write failure shall cause `main()` to print an error to `stderr` and return exit code 1.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-004" name="ELF Flash Load Option"/>
         </traces>
@@ -1882,7 +1882,7 @@ Errors are propagated upward through the module stack without retrying:
       </test>
 
       <test name="parse_args_default_port_baud_load_when_not_supplied">
-        <purpose><![CDATA[Call `parse_args()` with only the two mandatory positional arguments and verify that `cfg.port == 1234`, `cfg.baud == 115200`, and `cfg.load == false`.]]></purpose>
+        <purpose><![CDATA[Call `parse_args()` with only the two mandatory positional arguments and verify that `cfg.gdb_port == 1234`, `cfg.baud_rate == 115200`, and `cfg.load_flash == false`.]]></purpose>
         <traces><trace target="LLR" ref="LLR-MAIN-02"/></traces>
       </test>
 
