@@ -94,7 +94,7 @@ NOT_AVR_ELF    := $(FIXBINDIR)/not_avr.elf
 #
 # test_elf
 TEST_SRCS_test_elf  := $(TESTDIR)/test_elf.c $(SRCDIR)/elf_parser.c
-TEST_WRAP_test_elf  :=
+TEST_WRAP_test_elf  := malloc
 TEST_EXTRA_LDFLAGS_test_elf :=
 
 # test_updi
