@@ -37,17 +37,17 @@ Requirements for `main()`, `parse_args()`, and `event_loop()`. These functions o
 
 Requirements for all public functions in `src/updi.c`: link initialisation, memory access, execution control, NVM programming, and console bridging.
 
-*   <a id="LLR-UPDI-01"></a>**LLR-UPDI-01** — `updi_open()` shall open the UART device and configure it for 8N2 framing (8 data bits, no parity, 2 stop bits) in raw half-duplex mode using `termios`. `cfmakeraw()`, `CSTOPB`, and explicit baud setting via `cfsetispeed()`/`cfsetospeed()` shall be applied. The function shall return the open file descriptor on success or -1 on failure.
+*   <a id="LLR-UPDI-01"></a>**LLR-UPDI-01** — `updi_open()` shall open the UART device and configure it for 8E2 framing (8 data bits, even parity, 2 stop bits) in raw half-duplex mode using `termios`. `cfmakeraw()`, `CS8`, `CSTOPB`, `PARENB` (with `PARODD` cleared), and explicit baud setting via `cfsetispeed()`/`cfsetospeed()` shall be applied. If `tcsetattr()` returns `EINVAL` when setting `PARENB` (Linux PTY slaves strip parity from virtual terminals), the function shall retry with `PARENB` cleared so the link still works against PTY-backed test harnesses. The function shall return the open file descriptor on success or -1 on failure.
     *Trace:* HLR-006 (UPDI Hardware Connection).
 
-*   <a id="LLR-UPDI-02"></a>**LLR-UPDI-02** — `updi_open()` shall generate the UPDI BREAK condition by temporarily switching the UART baud rate to `UPDI_BREAK_BAUD` (300 baud), transmitting a 0x00 framing byte (which holds TX low for at least 24.6 µs at 300 baud, satisfying the UPDI BREAK timing requirement), then restoring the session baud rate before transmitting the SYNCH character (0x55).
+*   <a id="LLR-UPDI-02"></a>**LLR-UPDI-02** — `updi_open()` shall generate the UPDI BREAK condition by transmitting two consecutive 0x00 framing bytes at the configured session baud rate followed by `tcdrain()`. At 115200 baud each zero byte holds TX low for ≈ 70 µs, so two bytes together exceed the 24.6 µs minimum BREAK duration of datasheet §35.3.1.2 by a wide margin. The function shall not switch the kernel baud rate to generate the BREAK — a kernel baud change flushes the master RX queue on Linux PTYs and is unnecessary at modern UART speeds. After the BREAK the SYNCH character (0x55) shall be transmitted to establish frame alignment.
     *Trace:* HLR-006 (UPDI Hardware Connection), HLR-036 (UPDI Link Initialisation Timing and Retry).
 
-*   <a id="LLR-UPDI-03"></a>**LLR-UPDI-03** — If the target does not respond to the BREAK+SYNCH sequence with a UPDI ACK (0x40) within the expected window, `updi_open()` shall retry the entire BREAK+SYNCH sequence. After 3 consecutive failures, `updi_open()` shall return -1 and the caller shall treat the link as unavailable.
+*   <a id="LLR-UPDI-03"></a>**LLR-UPDI-03** — Immediately after SYNCH, `updi_open()` shall probe the link by issuing `LDCS ASI_STATUSB` (opcode `0x80 | 0x01 = 0x81`). Reading `ASI_STATUSB` clears the PESIG bit that the BREAK sets and confirms the target is responsive. If the probe fails, `updi_open()` shall retry the entire BREAK+BREAK+SYNCH+LDCS sequence. After 3 consecutive failed attempts the function shall return -1 and the caller shall treat the link as unavailable.
     *Trace:* HLR-036 (UPDI Link Initialisation Timing and Retry).
 
-*   <a id="LLR-UPDI-04"></a>**LLR-UPDI-04** — `updi_mem_read()` shall transfer up to `UPDI_MAX_BLOCK` (256) bytes per UPDI burst using the REPEAT+LD auto-increment sequence. If `len` exceeds `UPDI_MAX_BLOCK`, the function shall split the request into consecutive block reads automatically, with no size restriction imposed on the caller.
-    *Trace:* HLR-007 (Target Memory Read).
+*   <a id="LLR-UPDI-04"></a>**LLR-UPDI-04** — `updi_mem_read()` and `updi_mem_write()` shall transfer up to `UPDI_MAX_BLOCK` (256) bytes per UPDI burst using a three-frame sequence per datasheet §35.3.3.4: (1) `ST_PTR_WORD` (`0x69`) followed by the 16-bit target address in little-endian order and a single ACK readback; (2) `REPEAT` (`0xA0`) followed by `(block_len - 1)`; (3) `LD ptr++` (`0x24`) for reads or `ST ptr++` (`0x64`) for writes. If `len` exceeds `UPDI_MAX_BLOCK`, the function shall split the request into consecutive bursts automatically, with no size restriction imposed on the caller.
+    *Trace:* HLR-007 (Target Memory Read), HLR-008 (Target Memory Write).
 
 *   <a id="LLR-UPDI-05"></a>**LLR-UPDI-05** — `updi_mem_read()` shall use `select()` with a 100 ms timeout before each `read()` call on the UART file descriptor to enforce a per-byte inactivity deadline. If `select()` returns zero (timeout) before a byte is available, the function shall abandon the current transaction and return -1.
     *Trace:* HLR-007 (Target Memory Read), HLR-037 (UPDI Operation Timeout Bounds).
@@ -55,16 +55,16 @@ Requirements for all public functions in `src/updi.c`: link initialisation, memo
 *   <a id="LLR-UPDI-06"></a>**LLR-UPDI-06** — `updi_mem_write()` shall write arbitrary byte ranges to the SRAM address space of the target using UPDI ST commands and return 0 on success or -1 on UART framing error, timeout, or UPDI NAK.
     *Trace:* HLR-008 (Target Memory Write).
 
-*   <a id="LLR-UPDI-07"></a>**LLR-UPDI-07** — `updi_nvm_write_flash()` shall require `word_addr` to be aligned to a 512-byte FLASH page boundary and `len` to be a non-zero multiple of 512. The function shall poll `NVMCTRL_STATUS` BUSY for up to 100 ms before issuing the NVM write command, and poll the BUSY bit for up to 20 ms after each page write. Timeout of either poll shall cause the function to return -1. FLASH write-protection detection shall return `UPDI_ERR_WP`.
+*   <a id="LLR-UPDI-07"></a>**LLR-UPDI-07** — `updi_nvm_write_flash()` shall require `word_addr` to be aligned to a 512-byte FLASH page boundary and `len` to be a non-zero multiple of 512. It shall enter NVM programming mode by transmitting the `KEY` opcode (`0xE0`) with the 8-byte string `"NVMProg "`, asserting reset with `STCS ASI_RESET_REQ = 0x59`, releasing reset with `STCS ASI_RESET_REQ = 0x00`, then polling `ASI_SYS_STATUS` via LDCS for bit 3 (NVMPROG, mask `0x08`) up to 100 iterations (≈ 100 ms). For each page it shall write the page data via `updi_mem_write()`, write `0x03` (ERWP) to `NVMCTRL_CTRLA`, and poll `NVMCTRL_STATUS` bit 0 (BUSY) clear up to 20 iterations (≈ 20 ms). On exit it shall toggle `ASI_RESET_REQ` `0x59` then `0x00` to release the target. Timeout of either poll shall return -1; a `NVMCTRL_STATUS` WRERR (bit 2) shall return `UPDI_ERR_WP`.
     *Trace:* HLR-009 (FLASH Programming), HLR-037 (UPDI Operation Timeout Bounds).
 
-*   <a id="LLR-UPDI-08"></a>**LLR-UPDI-08** — `updi_halt()` shall write 0x01 to `ASI_SYS_CTRL` to request a halt, then poll `ASI_SYS_STATUS` at 1 ms intervals for bit 3 (STOPPED). The function shall return 0 when STOPPED is observed within 50 ms, or -1 if the bit has not been set after 50 polling intervals.
-    *Trace:* HLR-010 (Execution Control), HLR-037 (UPDI Operation Timeout Bounds).
-
-*   <a id="LLR-UPDI-09"></a>**LLR-UPDI-09** — `updi_step()` shall issue the UPDI ASI single-instruction-step command, then verify that the STOPPED bit is set in `ASI_SYS_STATUS` before returning. It shall return 0 on success or -1 on timeout or UPDI error.
+*   <a id="LLR-UPDI-08"></a>**LLR-UPDI-08** — `updi_halt()` is a Phase 2 stub. It shall return -1 unconditionally with no UART traffic. The full halt sequence (OCD register manipulation, STOPPED-bit polling) is part of the AVR On-Chip Debug specification and is implemented by the Phase 3 OCD layer.
     *Trace:* HLR-010 (Execution Control).
 
-*   <a id="LLR-UPDI-10"></a>**LLR-UPDI-10** — `updi_run()` shall clear the UPDI ASI halt request and verify that the STOPPED bit in `ASI_SYS_STATUS` is no longer set before returning. It shall return 0 on success or -1 on UPDI error.
+*   <a id="LLR-UPDI-09"></a>**LLR-UPDI-09** — `updi_step()` is a Phase 2 stub. It shall return -1 unconditionally with no UART traffic. Single-step is implemented by the Phase 3 OCD layer.
+    *Trace:* HLR-010 (Execution Control).
+
+*   <a id="LLR-UPDI-10"></a>**LLR-UPDI-10** — `updi_run()` is a Phase 2 stub. It shall return -1 unconditionally with no UART traffic. CPU resume is implemented by the Phase 3 OCD layer.
     *Trace:* HLR-010 (Execution Control).
 
 *   <a id="LLR-UPDI-11"></a>**LLR-UPDI-11** — `updi_mem_read()` shall be callable while the target CPU is in the RUNNING state (not halted). The function shall not call `updi_halt()` internally, permitting non-intrusive SRAM sampling for the monitor sub-commands and console polling without interrupting firmware execution.
