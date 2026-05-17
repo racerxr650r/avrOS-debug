@@ -13,13 +13,13 @@
 > Delivery section as work progresses. Link phase names in the Status
 > table to their detailed descriptions in §8.
 
-**Status:** Specification complete (SDD, HLRs, LLRs, STP, Traceability — 0 lint errors). Implementation not yet started.
+**Status:** Phase 0 complete (commit `92857a5`). Phases 1–5 not yet started.
 
 ## Status
 
 | Phase | Description | Status |
 | ----- | ----------- | ------ |
-| [0](#phase-0--project-scaffolding) | Directories, Unity test framework, Makefile, ELF portability shim | 🔲 Not started |
+| [0](#phase-0--project-scaffolding) | Directories, Unity test framework, Makefile, ELF portability shim | ✅ Complete (`92857a5`) |
 | [1](#phase-1--elf-parser) | `src/elf_parser.h/.c` + 13 unit tests | 🔲 Not started |
 | [2](#phase-2--updi-physical-layer) | `src/updi.h/.c` + 23 unit tests | 🔲 Not started |
 | [3](#phase-3--fsm-mapper) | `src/fsm_mapper.h/.c` + 11 unit tests | 🔲 Not started |
@@ -133,6 +133,9 @@ and reported in the [Software Test Plan](STP.md) and
 ## 8. Phased Delivery
 
 ### Phase 0 — Project Scaffolding
+
+> **Status: ✅ Complete** — commit `92857a5` on branch `1-phase-0-project-scaffolding` (2026-05-16).
+> `make all`: 0 errors, 0 warnings. `make test`: 7/7 binaries run, 0 failures. `lint_project`: 0 errors, 0 warnings.
 
 1. Create directories: `src/`, `tests/`, `tests/fixtures/`, `tests/unity/`.
 2. Vendor Unity test framework: download `unity.c`, `unity.h`, `unity_internals.h` from ThrowTheSwitch/Unity into `tests/unity/`.
