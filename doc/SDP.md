@@ -47,13 +47,9 @@
 
 ## 1. Motivation
 
-## 1. Motivation
-
 `avr-updi-gdb` fills the gap between the AVR UPDI debug interface and standard GDB-based IDEs while adding first-class avrOS FSM task visibility. Without this stub, developers must choose between low-level UPDI tools with no source-level debugging, or generic GDB stubs that have no awareness of the avrOS cooperative task model. The result is that avrOS application developers cannot set breakpoints, inspect task state, or understand which FSM is running — the core debugging workflows that every RTOS user expects.
 
 This implementation follows the complete specification stack authored in this repository (PVD → SDD → HLRs → LLRs → STP), which reached lint-clean status (0 errors, 0 warnings) before any source code was written. See [doc/PVD.md](PVD.md) for the full product vision.
-
-## 2. Goals
 
 ## 2. Goals
 
@@ -67,15 +63,11 @@ This implementation follows the complete specification stack authored in this re
 
 ## 3. Non-Goals
 
-## 3. Non-Goals
-
 *   **Windows native build.** WSL2 may work but is untested and unsupported (see [doc/PVD.md](PVD.md) §7.2).
 *   **IDE adapter layers.** Cortex-Debug and Zed DAP integration are out of scope for the initial implementation.
 *   **Multi-client GDB support.** The server accepts a single GDB connection at a time; concurrent clients are not addressed.
 *   **UPDI retry/recovery.** Physical-layer errors return −1 to the caller; no automatic retry or reconnect logic is implemented at this layer.
 *   **AVR XMEGA or ATtiny targets.** Only the AVR DA/DB family (128 KiB FLASH, 16 KiB SRAM) is in scope.
-
-## 4. Design — see the SDD
 
 ## 4. Design — see the SDD
 
@@ -87,8 +79,6 @@ The detailed software architecture is documented in the [Software Design Documen
 *   `src/monitor.c` — custom `monitor avros events|queues|mempool` sub-command handler; reads avrOS runtime data via non-intrusive UPDI background reads and delivers formatted output as GDB O-packets.
 *   `src/gdb_rsp.c` — GDB Remote Serial Protocol server; TCP socket lifecycle, RSP packet codec, and a 15-entry command dispatch table covering all standard debug operations.
 *   `src/main.c` — application entry point; CLI argument parsing (`AppConfig`), single-threaded `select()`-based event loop, SIGINT/SIGTERM handler (`g_quit`), and ordered teardown.
-
-## 5. Development Process
 
 ## 5. Development Process
 
@@ -115,8 +105,6 @@ Source-only releases. Tag `vX.Y.Z` on `main` once all 106 tests pass and the bin
 
 ## 6. Testing Strategy
 
-## 6. Testing Strategy
-
 | Level | Scope | Tools | Coverage Target |
 | ----- | ----- | ----- | --------------- |
 | Unit | Per-module isolation — each source module tested independently against mock/stub dependencies | [Unity](https://github.com/ThrowTheSwitch/Unity) (vendored as `tests/unity/unity.c`) + `gcc`/`ld` `--wrap` linker mocking for POSIX symbols and inter-module calls | 100% LLR coverage (54 LLRs, 102 unit tests) |
@@ -132,8 +120,6 @@ and reported in the [Software Test Plan](STP.md) and
 
 ## 7. Dependencies & Prerequisites
 
-## 7. Dependencies & Prerequisites
-
 | Dependency | Required By | Notes |
 | ---------- | ----------- | ----- |
 | `avr-gcc` ≥ 12.0 | Phase 1 test fixtures | Compiles `tests/fixtures/*.c` to `.elf` binaries consumed by `tests/test_elf.c`; not needed for the main binary |
@@ -146,8 +132,6 @@ and reported in the [Software Test Plan](STP.md) and
 
 ## 8. Phased Delivery
 
-## 8. Phased Delivery
-
 ### Phase 0 — Project Scaffolding
 
 1. Create directories: `src/`, `tests/`, `tests/fixtures/`, `tests/unity/`.
@@ -156,6 +140,38 @@ and reported in the [Software Test Plan](STP.md) and
 4. Create `src/elf.h` — minimal bundled ELF type definitions (`Elf32_Ehdr`, `Elf32_Shdr`, `Elf32_Phdr`, `Elf32_Sym`, `ELFMAG`, `ELFCLASS32`, `EM_AVR 0x0053`, `SHT_SYMTAB`, `SHN_UNDEF`, `PT_LOAD`). Used by `src/elf_parser.c` on macOS; Linux uses the system `<elf.h>` via `#ifdef __linux__` guard.
 
 **Acceptance:** `make all` succeeds (even with empty `.c` stub files); `make clean` removes all build artefacts; `make test` compiles and runs (stubs may fail; the infrastructure must work).
+
+**Per-test linker `--wrap` symbol lists** — each test binary must link exactly these symbols:
+
+| Test binary | Source files linked (besides `tests/unity/unity.c`) | `--wrap` symbols | Extra link flags |
+| ----------- | --------------------------------------------------- | ---------------- | ---------------- |
+| `test_elf` | `src/elf_parser.c` | *(none)* | — |
+| `test_updi` | `src/updi.c` | `select` | `-lutil` (Linux only; not needed on macOS) |
+| `test_fsm` | `src/fsm_mapper.c` | `updi_mem_read` | — |
+| `test_monitor` | `src/monitor.c`, `src/gdb_rsp.c`, `src/elf_parser.c` | `updi_mem_read` | — |
+| `test_rsp` | `src/gdb_rsp.c`, `src/fsm_mapper.c`, `src/monitor.c` | `updi_mem_read`, `updi_halt`, `updi_run`, `updi_step`, `updi_nvm_write_flash`, `updi_console_poll`, `fsm_build_thread_list`, `fsm_get_registers`, `fsm_get_active_thread`, `fsm_invalidate`, `monitor_dispatch` | — |
+| `test_main` | `src/main.c` | `updi_open`, `updi_close`, `updi_console_poll`, `rsp_listen`, `rsp_accept`, `rsp_close`, `rsp_recv_packet`, `rsp_dispatch`, `elf_open`, `elf_find_avros_tables`, `elf_close`, `fsm_build_thread_list`, `select` | — |
+| `test_integration` | *(launches compiled `avr-updi-gdb` binary via `execv()`)* | *(none)* | — |
+
+**`src/elf.h` portability shim — complete required content** (guarded by `#ifndef AOD_ELF_H`):
+
+*Typedefs:* `Elf32_Half` (`uint16_t`), `Elf32_Word` (`uint32_t`), `Elf32_Off` (`uint32_t`), `Elf32_Addr` (`uint32_t`).
+
+*Identification macros:* `ELFMAG "\177ELF"`, `SELFMAG 4`, `EI_CLASS 4`, `ELFCLASS32 1`, `EM_AVR 0x0053`, `ET_EXEC 2`.
+
+*Program header:* `PT_LOAD 1`.
+
+*Section header:* `SHT_SYMTAB 2`, `SHT_STRTAB 3`, `SHN_UNDEF 0`.
+
+*Symbol macros:* `ELF32_ST_BIND(i) ((i)>>4)`, `ELF32_ST_TYPE(i) ((i)&0xf)`, `STT_OBJECT 1`, `STT_FUNC 2`, `STB_GLOBAL 1`.
+
+*Structs (packed order matters — match the ELF spec byte layout exactly):*
+- `Elf32_Ehdr` — `e_ident[16]`, `e_type`, `e_machine`, `e_version`, `e_entry`, `e_phoff`, `e_shoff`, `e_flags`, `e_ehsize`, `e_phentsize`, `e_phnum`, `e_shentsize`, `e_shnum`, `e_shstrndx` (total 52 bytes).
+- `Elf32_Phdr` — `p_type`, `p_offset`, `p_vaddr`, `p_paddr`, `p_filesz`, `p_memsz`, `p_flags`, `p_align` (total 32 bytes).
+- `Elf32_Shdr` — `sh_name`, `sh_type`, `sh_flags`, `sh_addr`, `sh_offset`, `sh_size`, `sh_link`, `sh_info`, `sh_addralign`, `sh_entsize` (total 40 bytes).
+- `Elf32_Sym` — `st_name`, `st_value`, `st_size`, `st_info`, `st_other`, `st_shndx` (total 16 bytes).
+
+*Platform guard in `src/elf_parser.c`:* `#ifdef __linux__\n#include <elf.h>\n#else\n#include "elf.h"\n#endif`
 
 ---
 
@@ -169,6 +185,46 @@ and reported in the [Software Test Plan](STP.md) and
 6. `tests/test_elf.c` — 13 Unity tests covering: magic rejection, `EM_AVR` check, correct `flash_base`/`sram_base`, all 8 symbol names found with correct address conversions, partial symbol set, `malloc` failure injection, `elf_close()` resource-free correctness. Linked against `src/elf_parser.c tests/unity/unity.c` with no `--wrap` flags.
 
 **Acceptance:** `make test` runs `tests/test_elf` and reports 13/13 tests passing.
+
+**`ElfContext` struct (declared in `src/elf_parser.h`, zero-init before `elf_open()`):**
+
+| Field | Type | Set by |
+| ----- | ---- | ------ |
+| `fd` | `int` | `elf_open()` |
+| `ehdr` | `Elf32_Ehdr` | `elf_open()` — full header cached |
+| `symtab` | `Elf32_Sym *` | `elf_open()` — heap alloc |
+| `sym_count` | `size_t` | `elf_open()` |
+| `strtab` | `char *` | `elf_open()` — heap alloc |
+| `strtab_size` | `size_t` | `elf_open()` |
+| `flash_base` | `uint32_t` | `elf_open()` — VMA of first `PT_LOAD` segment |
+| `flash_size` | `uint32_t` | `elf_open()` |
+| `sram_base` | `uint32_t` | `elf_open()` — VMA of second `PT_LOAD` segment |
+| `sram_size` | `uint32_t` | `elf_open()` |
+
+**`AvrOsSymbolIndex` struct (declared in `src/elf_parser.h`, zero-init before `elf_find_avros_tables()`):**
+
+| Field | Type | Populated by symbol |
+| ----- | ---- | ------------------- |
+| `fsm_table_addr` | `uint32_t` | `__avros_fsm_table_start` — FLASH word address |
+| `fsm_table_count` | `uint8_t` | `(__avros_fsm_table_end_vma - __avros_fsm_table_start_vma) / 4` |
+| `queue_table_addr` | `uint32_t` | `__avros_queue_table_start` — FLASH word address |
+| `queue_count` | `uint8_t` | `(__avros_queue_table_end_vma - __avros_queue_table_start_vma) / 4` |
+| `event_mask_addr` | `uint32_t` | `__avros_event_mask` — SRAM byte address (no Harvard offset) |
+| `mempool_table_addr` | `uint32_t` | `__avros_mempool_table_start` — FLASH word address |
+| `mempool_count` | `uint8_t` | `(__avros_mempool_table_end_vma - __avros_mempool_table_start_vma) / 4` |
+| `current_fsm_addr` | `uint32_t` | `__avros_current_fsm` — SRAM byte address (no Harvard offset) |
+
+**Exact sentinel symbol strings scanned in `elf_find_avros_tables()`** — these are the verbatim C string literals to `strcmp()` against `&ctx->strtab[sym->st_name]`:
+
+```
+"__avros_fsm_table_start"      "__avros_fsm_table_end"
+"__avros_queue_table_start"    "__avros_queue_table_end"
+"__avros_event_mask"
+"__avros_mempool_table_start"  "__avros_mempool_table_end"
+"__avros_current_fsm"
+```
+
+Entry count formula: the `_end` VMA minus `_start` VMA divided by `4` (size of `avros_fsm_entry_t` on AVR: two 2-byte pointers). Skip symbols with `sym->st_shndx == SHN_UNDEF` or `sym->st_name == 0` to avoid false matches.
 
 ---
 
@@ -187,6 +243,71 @@ and reported in the [Software Test Plan](STP.md) and
 
 **Acceptance:** `make test` runs `tests/test_updi` and reports 23/23 tests passing.
 
+**`updi_open()` `termios` initialisation sequence (all steps required; order matters):**
+
+1. `open(device, O_RDWR | O_NOCTTY | O_NONBLOCK)` to get the fd, then `fcntl(fd, F_SETFL, 0)` to clear `O_NONBLOCK` and restore blocking mode.
+2. `tcgetattr(fd, &tty)` to read current terminal settings.
+3. `cfmakeraw(&tty)` — disables all line-processing, echo, and canonical mode.
+4. 8N2 framing: `tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8 | CSTOPB`; `tty.c_cflag &= ~PARENB`.
+5. Enable receiver: `tty.c_cflag |= CLOCAL | CREAD`.
+6. 100 ms inter-byte timeout: `tty.c_cc[VMIN] = 0; tty.c_cc[VTIME] = 1` (tenths of seconds — any idle gap ≥ 100 ms triggers a framing error in callers).
+7. Baud: `cfsetispeed(&tty, Bxxx); cfsetospeed(&tty, Bxxx)` using the `Bxxx` constant for the requested rate.
+8. `tcsetattr(fd, TCSANOW, &tty)`.
+
+**BREAK condition generation** (step 3 of the UPDI init sequence in `updi_open()`):
+
+1. Lower to `B300`: `cfsetispeed/cfsetospeed(&tty, B300)` + `tcsetattr(TCSANOW)`.
+2. `write(fd, "\x00", 1)` — one `0x00` byte at 300 baud occupies the line for ~33 ms (well above the 24.6 µs UPDI minimum BREAK).
+3. `tcdrain(fd)` — block until the byte is fully transmitted before raising baud again.
+4. Restore operating baud: `cfsetispeed/cfsetospeed(&tty, Bxxx)` + `tcsetattr(TCSANOW)`.
+5. Transmit `UPDI_SYNCH` (`0x55`) and read + discard the one echo byte via `updi_write_bytes()`.
+
+**Private helper (must NOT appear in `src/updi.h`):**
+
+```c
+static int updi_write_bytes(int fd, const uint8_t *buf, size_t n);
+```
+
+Writes `n` bytes then reads and discards exactly `n` echo bytes from the half-duplex RX line (every transmitted byte is looped back on RX by the hardware). If fewer than `n` echo bytes arrive within the 100 ms `VTIME` timeout, return -1. Every UPDI command encoder calls this helper instead of `write()` directly.
+
+**UPDI command opcode encoding** (frame = `SYNCH 0x55` then one or more command bytes):
+
+| Mnemonic | Byte value | Purpose in this module |
+| -------- | ---------- | ---------------------- |
+| `LDCS rd, cs` | `0x80 \| cs` | Read ASI control/status register `cs` |
+| `STCS cs, rr` | `0xC0 \| cs` | Write value `rr` to ASI register `cs` |
+| `LD rd, ptr++` | `0x24` | Burst read with pointer auto-increment |
+| `ST ptr++, rr` | `0x64` | Burst write with pointer post-increment |
+| `REPEAT n` | `0xA0`, `n-1` | Set burst count; next LD/ST repeats `n` times |
+| `KEY` | `0xE0` | Transmit 8-byte unlock key (e.g. `"NVMProg "`) |
+| `STS addr, rr` | `0x44` | Store single byte to 16-bit address (NVM CTRLA) |
+
+**ASI register map** (accessed via `LDCS`/`STCS`; used by `updi_halt`, `updi_run`, `updi_step`, `updi_nvm_write_flash`):
+
+| Name | Offset | Key bits |
+| ---- | ------ | -------- |
+| `ASI_CTRLA` | `0x02` | bit 2 = IBD (inter-byte delay) — set at UPDI init |
+| `ASI_RESET_REQ` | `0x08` | write `0x59` = request reset; write `0x00` = release |
+| `ASI_SYS_STATUS` | `0x0B` | bit 3 = STOPPED (CPU halted); bit 4 = NVMPROG |
+| `ASI_SYS_CTRL` | `0x0C` | bit 0 = RSTSYS (reset request); write `0x01` to halt |
+
+**NVM controller registers** (accessed via `updi_mem_write`/`updi_mem_read` at these absolute addresses):
+
+| Name | Address | Purpose |
+| ---- | ------- | ------- |
+| `NVMCTRL_CTRLA` | `0x1000` | Write command: `0x03` = ERWP (Erase + Write Page) |
+| `NVMCTRL_STATUS` | `0x1002` | bit 0 = BUSY; bit 2 = WRERROR (write-protect active) |
+
+**Timing budget:**
+
+| Operation | Timeout | Mechanism |
+| --------- | ------- | --------- |
+| Per-byte read | 100 ms | `termios VTIME=1` |
+| `updi_halt()` poll interval | 1 ms | `nanosleep({0, 1000000})` |
+| `updi_halt()` total | 50 ms | 50 polls × 1 ms; return -1 on expiry |
+| NVM NVMPROG wait | 100 ms | Poll `ASI_SYS_STATUS` bit 4 |
+| NVM page BUSY poll | 20 ms per page | Poll `NVMCTRL_STATUS` bit 0 |
+
 ---
 
 ### Phase 3 — FSM Mapper
@@ -200,6 +321,33 @@ and reported in the [Software Test Plan](STP.md) and
 3. `tests/test_fsm.c` — 11 Unity tests. `__wrap_updi_mem_read()` drains a pre-filled `g_updi_queue[]` byte array; tests verify: GDB thread ID assignment (1-based), FLASH word-address conversion from SRAM state pointer, active thread identification, cap at 32 entries with warning, PC encoding at exact hex positions 70–77, cache invalidation round-trip. Linked with `-Wl,--wrap,updi_mem_read`.
 
 **Acceptance:** `make test` runs `tests/test_fsm` and reports 11/11 tests passing; a test explicitly asserts that `fsm_get_registers()` places the PC at buffer bytes 70–77.
+
+**avrOS FSM FLASH table entry layout** (`avros_fsm_entry_t` — 4 bytes on AVR, two 2-byte pointers):
+
+```c
+typedef struct {
+    uint16_t *state;    /* SRAM addr of the current-state fn-ptr variable (2 bytes) */
+    const char *name;   /* FLASH addr of null-terminated name string (2 bytes) */
+} avros_fsm_entry_t;
+```
+
+`fsm_build_thread_list()` reads `idx->fsm_table_count * 4` bytes starting at `idx->fsm_table_addr` in one `updi_mem_read()` call to get all entries. Each `state` field is then dereferenced via a separate 2-byte `updi_mem_read()` to obtain the current state function pointer (a FLASH word address), and each `name` pointer is dereferenced via a `updi_mem_read()` of up to 31+1 bytes.
+
+**g-packet register buffer specification (critical — buffer must be exactly 79 bytes):**
+
+The AVR GDB register frame contains 39 bytes encoded as 78 ASCII hex characters plus a NUL terminator. `reg_buf` must be at least 79 bytes.
+
+| GDB reg index | Register | Bytes in buffer | Hex char positions | Notes |
+| ------------- | -------- | --------------- | ------------------ | ----- |
+| 0–31 | R0–R31 | 0–31 | `[0..63]` | Zeroed for all threads |
+| 32 | SREG | 32 | `[64..65]` | Live for active thread; zero otherwise |
+| 33 | SPL | 33 | `[66..67]` | Live for active thread; zero otherwise |
+| 34 | SPH | 34 | `[68..69]` | Live for active thread; zero otherwise |
+| 35 | PC | 35–38 | **`[70..77]`** | `thread->state_fn`, 4-byte **little-endian** |
+
+PC encoding example: if `state_fn = 0x0000021A`, the 8 hex chars at positions 70–77 are `"1A020000"` (byte 0 = `0x1A` → `"1A"`, byte 1 = `0x02` → `"02"`, bytes 2–3 = `0x00` → `"0000"`).
+
+The `reg_buf` is a plain `char` array (not `uint8_t *`) — `fsm_get_registers()` writes ASCII hex directly using `snprintf` or equivalent. The caller in `gdb_rsp.c` passes it straight to `rsp_send_packet()`.
 
 ---
 
@@ -216,6 +364,47 @@ Both modules have a circular header dependency (`monitor.c` calls `rsp_send_pack
 
 **Acceptance:** `make test` runs `tests/test_monitor` (13/13) and `tests/test_rsp` (28/28) passing.
 
+**Complete `RspHandlers` dispatch table — all 15 entries:**
+
+| Handler field | Packet prefix(es) | Action summary |
+| ------------- | ----------------- | -------------- |
+| `on_halt_reason` | `?` | Return `T05thread:<active_id>;` |
+| `on_read_regs` | `g` | `fsm_get_registers(g_thread)` → 78-char hex string |
+| `on_write_regs` | `G<hex>` | Parse 78 hex chars; update live SREG/SP via `updi_mem_write()` |
+| `on_read_mem` | `m <addr>,<len>` | `updi_mem_read()` → hex-encoded bytes |
+| `on_write_mem` | `M <addr>,<len>:<data>` | Hex-decode `<data>` → `updi_mem_write()` |
+| `on_continue` | `c`, `vCont;c[:<tid>]` | `updi_run()` + `fsm_invalidate()` → wait for halt → `T05...` |
+| `on_step` | `s`, `vCont;s[:<tid>]` | `updi_step()` + `fsm_invalidate()` → `T05thread:<id>;` |
+| `on_insert_bp` | `Z0,<addr>,<kind>` | Read + save 2-byte word at `addr`; write `0x9598` via `updi_nvm_write_flash()` |
+| `on_remove_bp` | `z0,<addr>,<kind>` | Restore saved word via `updi_nvm_write_flash()`; clear table slot |
+| `on_thread_info` | `qfThreadInfo`, `qsThreadInfo` | Enumerate thread IDs from `FsmContext`; `m<id>,<id>,...` then `l` |
+| `on_thread_extra` | `qThreadExtraInfo,<id>` | Return `FsmThread.name` hex-encoded (O-packet ASCII encoding) |
+| `on_set_thread_g` | `H g <id>` | Store `g_thread = id` → `OK` |
+| `on_set_thread_c` | `H c <id>` | Store `c_thread = id` → `OK` |
+| `on_monitor` | `qRcmd,<hex>` | Hex-decode `<hex>` payload → `monitor_dispatch()` |
+| `on_detach` | `D`, `k` | `updi_run()`; clear breakpoint table; close `gdb_fd`; reset `g_thread`/`c_thread` to 0 |
+
+**Inline-handled packets** (fixed responses, not in `RspHandlers`):
+
+| Packet | Response |
+| ------ | -------- |
+| `qSupported` | `"PacketSize=800;QStartNoAckMode+;multiprocess-;vContSupported+"` |
+| `qAttached` | `"1"` |
+| `QStartNoAckMode` | `"OK"` then set internal no-ack flag (stop sending `+`/`-`) |
+| Unknown packet | `""` (empty response — mandatory per RSP spec) |
+
+**Breakpoint table entry struct and AVR BREAK opcode:**
+
+```c
+struct { uint32_t addr; uint16_t saved_word; } bp_table[RSP_MAX_BREAKPOINTS]; /* 96 bytes BSS */
+```
+
+AVR BREAK opcode: `0x9598` (16-bit instruction, written as little-endian bytes `{0x98, 0x95}` to FLASH). Insertion requires the CPU to be halted (`updi_halt()` is called before `Z0` handler runs if not already stopped). Breakpoint table full → return error packet `E08`.
+
+**O-packet encoding** for `monitor_dispatch()` and `on_thread_extra`: each ASCII byte → two uppercase hex chars. Example: `"OK\n"` → `"4F4B0A"`. Build plain text into a 512-byte staging buffer first, then hex-encode the whole buffer in one pass before calling `rsp_send_packet(rsp_fd, "O" + encoded)`.
+
+**`qRcmd` hex-decode procedure** in `monitor_dispatch()`: the payload after `qRcmd,` is a hex-encoded ASCII command string. Decode pairs of hex chars → bytes to recover the plain text command. Verify it starts with `"avros "` (6 chars, case-sensitive) before dispatching.
+
 ---
 
 ### Phase 5 — Application Entry Point + Integration
@@ -226,7 +415,55 @@ Both modules have a circular header dependency (`monitor.c` calls `rsp_send_pack
 
 **Acceptance:** `make test` runs all 7 test binaries; all 106 tests pass (14 + 23 + 11 + 13 + 28 + 14 + 4). `make` builds the final `avr-updi-gdb` binary without warnings. `ldd avr-updi-gdb` shows only libc. `python3 tools/lint_project.py` reports 0 errors, 0 warnings.
 
-## 9. Risks & Open Questions
+**CLI argument specification:**
+
+`avr-updi-gdb [--port <port>] [--baud <baud>] [--load] <serial-device> <elf-file>`
+
+| Argument | Type | Default | Validation in `parse_args()` |
+| -------- | ---- | ------- | ---------------------------- |
+| `--port <port>` | `uint16_t` | `1234` | `1 ≤ port ≤ 65535`; print usage + `exit(1)` on error |
+| `--baud <baud>` | `int` | `115200` | Must be a positive integer; baud-to-`Bxxx` mapping validated at `updi_open()` time |
+| `--load` | flag | `false` | No argument; enables `updi_nvm_write_flash()` before entering event loop |
+| `<serial-device>` | `const char *` | (required) | Positional; missing → usage + `exit(1)` |
+| `<elf-file>` | `const char *` | (required) | Positional; missing → usage + `exit(1)` |
+
+**Exit code table:**
+
+| Code | Condition |
+| ---- | --------- |
+| `0` | Normal exit after SIGINT/SIGTERM or `k` (kill) packet |
+| `1` | Bad arguments, serial device open failure, or TCP socket bind failure |
+| `1` | `--load` flash write failure (UPDI error or write-protect) |
+
+**`AppConfig` struct fields:**
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `serial_device` | `const char *` | Path to UART device (argv pointer; not copied) |
+| `elf_path` | `const char *` | Path to AVR ELF binary (argv pointer; not copied) |
+| `gdb_port` | `uint16_t` | TCP port for GDB listener |
+| `baud_rate` | `int` | UART baud rate |
+| `load_flash` | `bool` | When true, flash the ELF before attaching |
+| `listen_fd` | `int` | Passive TCP listener socket fd |
+| `gdb_fd` | `int` | Active GDB client fd; `-1` when no client connected |
+| `updi_fd` | `int` | UART serial device fd |
+
+**`event_loop()` decision tree (6 steps per iteration):**
+
+1. **Check `g_quit`** at top of loop — if set by SIGINT/SIGTERM handler, `return` immediately.
+2. **Build `fd_set`**: always add `listen_fd`; add `gdb_fd` and `updi_fd` only when `gdb_fd >= 0`. Recompute `maxfd = max(listen_fd, gdb_fd, updi_fd)` before each call.
+3. **`select(maxfd+1, &rds, NULL, NULL, NULL)`** — no timeout; block until at least one fd is readable.
+4. **`listen_fd` ready** and `gdb_fd == -1`: call `rsp_accept()` → `elf_open()` → `elf_find_avros_tables()` → `fsm_build_thread_list()` → store result in `cfg->gdb_fd`.
+5. **`updi_fd` ready**: call `updi_console_poll()` → `write(STDOUT_FILENO, buf, n)`.
+6. **`gdb_fd` ready**: call `rsp_recv_packet()`; on 0 bytes (disconnect) close + set `gdb_fd = -1`; otherwise `rsp_dispatch()`.
+
+**Teardown sequence** (guaranteed order on all exit paths including `exit(1)` from `parse_args()`):
+
+1. `rsp_close(cfg.gdb_fd)` if `gdb_fd >= 0`
+2. `rsp_close(cfg.listen_fd)`
+3. `elf_close(&elf_ctx)`
+4. `updi_close(cfg.updi_fd)`
+5. `return exit_code` from `main()`
 
 ## 9. Risks & Open Questions
 
@@ -240,8 +477,6 @@ Both modules have a circular header dependency (`monitor.c` calls `rsp_send_pack
 
 ## 10. Estimated Effort
 
-## 10. Estimated Effort
-
 T-shirt sizes relative to Phase 0.
 
 | Phase | Description | Effort |
@@ -252,8 +487,6 @@ T-shirt sizes relative to Phase 0.
 | 3 | FSM Mapper | M — clean mock boundary via `--wrap`; most complexity is in fixture byte sequence design |
 | 4 | Monitor + RSP | XL — 15 RSP handler table entries, 28 test cases, O-packet hex encoding, circular header dependency |
 | 5 | Application Entry Point + Integration | L — `main.c` itself is thin; integration test harness (fork/PTY/TCP) is the dominant effort |
-
-## 11. Out-of-Scope Follow-ups
 
 ## 11. Out-of-Scope Follow-ups
 
