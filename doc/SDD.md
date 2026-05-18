@@ -21,6 +21,7 @@ This document describes the design of the source modules that implement the avr-
 *   [src/fsm_mapper.c](../src/fsm_mapper.c): avrOS FSM-to-GDB virtual thread translator: maps FSM state tables to GDB thread objects and synthesizes per-thread register frames.
 *   [src/monitor.c](../src/monitor.c): Custom monitor command handler: implements the `avros events` and `avros queues` sub-commands via non-intrusive UPDI reads.
 *   [Makefile](../Makefile): Build orchestration: compile, test, install, uninstall, check-tools, and bundle (Debian .deb, Red Hat .rpm, Homebrew formula) targets.
+*   [tests/hw/hw_test.c](../tests/hw/hw_test.c): On-target hardware integration test harness: links against `src/updi.c` and exercises the live UPDI silicon, device-info report, SRAM round-trips, NVM page programming, and the RSP server's TCP path. Manual-only — never wired into `make test`.
 *   [doc/avr-updi-gdb.1](../doc/avr-updi-gdb.1): Unix man page: reference documentation for the avr-updi-gdb command.
 
 It does not cover the build system, IDE adapter layers (Cortex-Debug, Zed DAP), or Windows support, all of which are out of scope for the initial release (see `doc/PVD.md §7.2`).
@@ -117,6 +118,8 @@ The startup and attach sequence proceeds as follows:
 *   **Deterministic Memory Allocation:** Static and stack allocation are used for all hot-path data structures (`AppConfig`, `FsmContext`, RSP packet buffers, breakpoint table). The only heap (`malloc`) usage is in `elf_open()` to load the ELF symbol and string tables; this allocation is bounded by the size of the ELF binary and occurs once per session at attach time. `elf_close()` frees all heap memory on detach.
 *   **POSIX C99 Build:** The stub is compiled with a host C99 compiler (gcc ≥ 4.8 or clang ≥ 3.4) against the POSIX.1-2008 API. No compiler-specific extensions, no C11 atomics, and no dynamic libraries beyond libc are required. The Makefile produces a standalone executable with no runtime package dependencies.
 *   **Modular Test Isolation:** Each module exposes a public C API declared in a matching `.h` header. The UPDI layer can be exercised against a loopback serial device or pre-recorded byte stream. The ELF parser and FSM mapper can be driven against any AVR ELF binary without live hardware. The RSP layer can be tested over a loopback TCP socket. No module requires a live AVR target to run its unit tests.
+
+    A companion **on-target hardware integration harness** (`tests/hw/hw_test.c`) supplements the PTY-based unit tests by exercising the same UPDI public API against a real AVR-Dx target connected via a serial device. The harness is manual-only and is never invoked by `make test` (which must remain hardware-independent for CI). It is driven by the dedicated Makefile targets `hw-test`, `hw-test-nvm`, `hw-test-rsp`, and `hw-test-all`; destructive operations (FLASH erase/write, RSP-server spawn) are gated behind explicit opt-in variables.
 
 ## 3. Detailed Design for [src/main.c](../src/main.c)
 
@@ -241,7 +244,7 @@ If the `--load` flag is set, `main()` invokes `updi_nvm_write_flash()` for each 
 [src/updi.c](../src/updi.c) implements the UPDI physical layer, managing the UART serial port and encoding/decoding UPDI protocol frames for memory access, execution control, NVM flash programming, and UPDI-based console bridging.
 
 *   Open, configure (8E2, half-duplex), and close the UART serial device. On hosts where the underlying device cannot honour even parity (notably Linux PTY slaves used by the unit-test harness), fall back to 8N2 so the link still works in test environments.
-*   Encode and transmit UPDI commands (`STCS`, `LDCS`, `ST`, `LD`, `KEY`, `REPEAT`, `ST_PTR_WORD`) over the UART.
+*   Encode and transmit UPDI commands (`STCS`, `LDCS`, `ST`, `LD`, `KEY`, `REPEAT`, `ST_PTR_WORD`, `ST_PTR_LONG`) over the UART.
 *   Receive UPDI response frames and validate ACK/NAK bytes.
 *   Provide non-intrusive background memory reads while the CPU is running.
 *   Implement NVM write sequences for FLASH page erase and program.
@@ -276,9 +279,9 @@ int  updi_console_poll(int fd, char *buf, size_t cap);
 
 /* Device-signature diagnostics (Phase 7) */
 typedef struct {
-    uint8_t  device_id[3];     /* SIGROW DEVICEID0..2 @ 0x1100-0x1102 */
-    uint8_t  revid;            /* SIGROW REVID         @ 0x1103       */
-    uint8_t  serial[10];       /* SIGROW SERNUM0..9    @ 0x1110-0x1119 */
+    uint8_t  device_id[3];     /* SIGROW DEVICEID0..2 @ 0x1100-0x1102 (DS §7.6.1)  */
+    uint8_t  revid;            /* SYSCFG.REVID        @ 0x0F01        (DS §8.3.2.1) */
+    uint8_t  serial[16];       /* SIGROW SERNUM0..15  @ 0x1110-0x111F (DS §7.6.2.3) */
     uint8_t  asi_sys_status;
     uint8_t  asi_key_status;
     uint8_t  asi_statusb;
@@ -338,7 +341,7 @@ NVM controller registers (accessed via UPDI ST/LD at base address `0x1000`):
     *   Return Value: 0 on success; -1 on UART framing error, timeout, or UPDI NAK.
     *   Logic:
         1.  If `len` is greater than `UPDI_MAX_BLOCK`, split the read into consecutive transactions each transferring up to `UPDI_MAX_BLOCK` bytes.
-        2.  For each block, transmit three separate UPDI frames (datasheet §35.3.3.4): (a) `ST_PTR_WORD` (`0x69`) followed by the 16-bit target address in little-endian order, then read the single ACK (`0x40`); (b) `REPEAT` (`0xA0`) followed by `(block_len - 1)`; (c) `LD ptr++` (`0x24`).
+        2.  For each block, transmit three separate UPDI frames (datasheet §35.3.3.4): (a) the pointer-set frame — `ST_PTR_WORD` (`0x69`) followed by the 16-bit target address in little-endian order when `addr ≤ 0xFFFF`, or `ST_PTR_LONG` (`0x6A`) followed by the 24-bit address in little-endian order when `addr > 0xFFFF` (required for the AVR128DA/DB mapped-Flash region above 64 KiB) — then read the single ACK (`0x40`); (b) `REPEAT` (`0xA0`) followed by `(block_len - 1)`; (c) `LD ptr++` (`0x24`).
         3.  Use `select()` with a 100 ms timeout before each `read()`; accumulate `block_len` data bytes into the destination buffer.
         4.  Return -1 immediately on any `select()` timeout or framing error (unexpected byte in place of ACK).
 
@@ -364,14 +367,14 @@ NVM controller registers (accessed via UPDI ST/LD at base address `0x1000`):
 
 *   **`int updi_console_poll(int fd, char *buf, size_t cap)`** — Poll the UPDI console channel and copy any pending bytes to buf; return byte count or -1.
 *   **`int updi_read_device_info(int fd, UpdiDeviceInfo *info)`**
-    *   Purpose: Read the AVR-Dx SIGROW (DEVICEID0..2 at `0x1100`–`0x1102`, REVID at `0x1103`, 10-byte SERNUM at `0x1110`–`0x1119`) and the UPDI ASI status registers (`ASI_SYS_STATUS`, `ASI_KEY_STATUS`, `ASI_STATUSB`), populating the caller-supplied `UpdiDeviceInfo` struct. The operation is non-destructive — the CPU is **not** halted and no NVM activity is initiated.
+    *   Purpose: Read the AVR-Dx SIGROW.DEVICEID0..2 at `0x1100`–`0x1102` (datasheet §7.6.1, Table 7-4), the SYSCFG.REVID byte at `0x0F01` (datasheet §8.3.2.1; SYSCFG base `0x0F00`), the 16-byte SIGROW.SERNUM0..15 at `0x1110`–`0x111F` (datasheet §7.6.2.3), and the UPDI ASI status registers (`ASI_SYS_STATUS`, `ASI_KEY_STATUS`, `ASI_STATUSB`), populating the caller-supplied `UpdiDeviceInfo` struct. The operation is non-destructive — the CPU is **not** halted and no NVM activity is initiated.
     *   Pre-condition: `fd` is a valid UPDI serial file descriptor; `info` points to a caller-allocated `UpdiDeviceInfo` struct; the UPDI link has been initialised by `updi_open()`.
     *   Post-condition: On success, every field of `*info` carries verbatim bytes from the target; on failure, `info->fail_op` carries a short identifier of the failed UPDI step (one of `"break"`, `"synch"`, `"asi-statusb"`, `"sigrow"`, `"revid"`, `"sernum"`, `"sys-status"`, `"key-status"`) and `info->fail_errno` carries either the negative `updi_mem_read` return or 0.
     *   Return Value: 0 on success; -1 on any UPDI read failure.
     *   Logic:
         1.  Read three bytes at `0x1100` via `updi_mem_read()` into `info->device_id[0..2]`; on failure record `"sigrow"` and return -1.
-        2.  Read one byte at `0x1103` (REVID) into `info->revid`; on failure record `"revid"` and return -1.
-        3.  Read ten bytes at `0x1110` into `info->serial[0..9]`; on failure record `"sernum"` and return -1.
+        2.  Read one byte at `0x0F01` (SYSCFG.REVID, datasheet §8.3.2.1) into `info->revid`; on failure record `"revid"` and return -1.
+        3.  Read sixteen bytes at `0x1110` (SIGROW.SERNUM0..15, datasheet §7.6.2.3) into `info->serial[0..15]`; on failure record `"sernum"` and return -1.
         4.  Read `ASI_SYS_STATUS`, `ASI_KEY_STATUS`, and `ASI_STATUSB` via three `LDCS` opcodes; record `"sys-status"` / `"key-status"` / `"asi-statusb"` on failure.
         5.  On success, clear `info->fail_op` to `NULL` and return 0.
 
@@ -412,7 +415,8 @@ Note: `updi_halt()`, `updi_run()`, and `updi_step()` are deferred stubs in Phase
 | --------------- | ---------- | ------- |
 | `LDCS rd, cs`   | `0x80\|cs` | Load Control/Status register `cs`. |
 | `STCS cs, rr`   | `0xC0\|cs` | Store to Control/Status register `cs`. |
-| `ST_PTR_WORD`   | `0x69`     | Set the burst pointer with a 16-bit address operand (precedes REPEAT/LD/ST bursts). |
+| `ST_PTR_WORD`   | `0x69`     | Set the burst pointer with a 16-bit address operand (precedes REPEAT/LD/ST bursts for addresses ≤ 0xFFFF). |
+| `ST_PTR_LONG`   | `0x6A`     | Set the burst pointer with a 24-bit address operand (used for addresses > 0xFFFF, e.g. AVR128DA/DB mapped Flash). |
 | `ST ptr++, rr`  | `0x64`     | Store with pointer post-increment (burst write). |
 | `LD rd, ptr++`  | `0x24`     | Load with pointer post-increment (burst read). |
 | `REPEAT`        | `0xA0`     | Set repeat count for the next bulk transfer (n-1 in operand). |

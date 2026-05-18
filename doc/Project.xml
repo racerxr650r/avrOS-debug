@@ -38,6 +38,7 @@
       <file path="src/fsm_mapper.c">avrOS FSM-to-GDB virtual thread translator: maps FSM state tables to GDB thread objects and synthesizes per-thread register frames.</file>
       <file path="src/monitor.c">Custom monitor command handler: implements the `avros events` and `avros queues` sub-commands via non-intrusive UPDI reads.</file>
       <file path="Makefile">Build orchestration: compile, test, install, uninstall, check-tools, and bundle (Debian .deb, Red Hat .rpm, Homebrew formula) targets.</file>
+      <file path="tests/hw/hw_test.c">On-target hardware integration test harness: links against `src/updi.c` and exercises the live UPDI silicon, device-info report, SRAM round-trips, NVM page programming, and the RSP server's TCP path. Manual-only — never wired into `make test`.</file>
       <file path="doc/avr-updi-gdb.1">Unix man page: reference documentation for the avr-updi-gdb command.</file>
       <outro><![CDATA[It does not cover the build system, IDE adapter layers (Cortex-Debug, Zed DAP), or Windows support, all of which are out of scope for the initial release (see `doc/PVD.md §7.2`).]]></outro>
     </scope>
@@ -119,7 +120,9 @@
       <goal name="Single-Threaded Concurrency Model"><![CDATA[The server uses a single POSIX `select()` event loop with no POSIX threads. All module entry points are synchronous and return to the event loop promptly. Long-blocking operations (NVM programming, UPDI link initialisation) are permitted only at startup or in direct response to an explicit GDB command, never during the event-loop hot path.]]></goal>
       <goal name="Deterministic Memory Allocation"><![CDATA[Static and stack allocation are used for all hot-path data structures (`AppConfig`, `FsmContext`, RSP packet buffers, breakpoint table). The only heap (`malloc`) usage is in `elf_open()` to load the ELF symbol and string tables; this allocation is bounded by the size of the ELF binary and occurs once per session at attach time. `elf_close()` frees all heap memory on detach.]]></goal>
       <goal name="POSIX C99 Build"><![CDATA[The stub is compiled with a host C99 compiler (gcc ≥ 4.8 or clang ≥ 3.4) against the POSIX.1-2008 API. No compiler-specific extensions, no C11 atomics, and no dynamic libraries beyond libc are required. The Makefile produces a standalone executable with no runtime package dependencies.]]></goal>
-      <goal name="Modular Test Isolation"><![CDATA[Each module exposes a public C API declared in a matching `.h` header. The UPDI layer can be exercised against a loopback serial device or pre-recorded byte stream. The ELF parser and FSM mapper can be driven against any AVR ELF binary without live hardware. The RSP layer can be tested over a loopback TCP socket. No module requires a live AVR target to run its unit tests.]]></goal>
+      <goal name="Modular Test Isolation"><![CDATA[Each module exposes a public C API declared in a matching `.h` header. The UPDI layer can be exercised against a loopback serial device or pre-recorded byte stream. The ELF parser and FSM mapper can be driven against any AVR ELF binary without live hardware. The RSP layer can be tested over a loopback TCP socket. No module requires a live AVR target to run its unit tests.
+
+A companion **on-target hardware integration harness** (`tests/hw/hw_test.c`) supplements the PTY-based unit tests by exercising the same UPDI public API against a real AVR-Dx target connected via a serial device. The harness is manual-only and is never invoked by `make test` (which must remain hardware-independent for CI). It is driven by the dedicated Makefile targets `hw-test`, `hw-test-nvm`, `hw-test-rsp`, and `hw-test-all`; destructive operations (FLASH erase/write, RSP-server spawn) are gated behind explicit opt-in variables.]]></goal>
     </design_goals>
 
     <modules>
@@ -228,7 +231,7 @@ If the `--load` flag is set, `main()` invokes `updi_nvm_write_flash()` for each 
       <module path="src/updi.c">
         <purpose><![CDATA[implements the UPDI physical layer, managing the UART serial port and encoding/decoding UPDI protocol frames for memory access, execution control, NVM flash programming, and UPDI-based console bridging.]]></purpose>
         <responsibility>Open, configure (8E2, half-duplex), and close the UART serial device. On hosts where the underlying device cannot honour even parity (notably Linux PTY slaves used by the unit-test harness), fall back to 8N2 so the link still works in test environments.</responsibility>
-        <responsibility><![CDATA[Encode and transmit UPDI commands (`STCS`, `LDCS`, `ST`, `LD`, `KEY`, `REPEAT`, `ST_PTR_WORD`) over the UART.]]></responsibility>
+        <responsibility><![CDATA[Encode and transmit UPDI commands (`STCS`, `LDCS`, `ST`, `LD`, `KEY`, `REPEAT`, `ST_PTR_WORD`, `ST_PTR_LONG`) over the UART.]]></responsibility>
         <responsibility>Receive UPDI response frames and validate ACK/NAK bytes.</responsibility>
         <responsibility>Provide non-intrusive background memory reads while the CPU is running.</responsibility>
         <responsibility>Implement NVM write sequences for FLASH page erase and program.</responsibility>
@@ -260,9 +263,9 @@ int  updi_console_poll(int fd, char *buf, size_t cap);
 
 /* Device-signature diagnostics (Phase 7) */
 typedef struct {
-    uint8_t  device_id[3];     /* SIGROW DEVICEID0..2 @ 0x1100-0x1102 */
-    uint8_t  revid;            /* SIGROW REVID         @ 0x1103       */
-    uint8_t  serial[10];       /* SIGROW SERNUM0..9    @ 0x1110-0x1119 */
+    uint8_t  device_id[3];     /* SIGROW DEVICEID0..2 @ 0x1100-0x1102 (DS §7.6.1)  */
+    uint8_t  revid;            /* SYSCFG.REVID        @ 0x0F01        (DS §8.3.2.1) */
+    uint8_t  serial[16];       /* SIGROW SERNUM0..15  @ 0x1110-0x111F (DS §7.6.2.3) */
     uint8_t  asi_sys_status;
     uint8_t  asi_key_status;
     uint8_t  asi_statusb;
@@ -314,7 +317,7 @@ NVM controller registers (accessed via UPDI ST/LD at base address `0x1000`):
             <returns>0 on success; -1 on UART framing error, timeout, or UPDI NAK.</returns>
             <logic>
               <step><![CDATA[If `len` is greater than `UPDI_MAX_BLOCK`, split the read into consecutive transactions each transferring up to `UPDI_MAX_BLOCK` bytes.]]></step>
-              <step><![CDATA[For each block, transmit three separate UPDI frames (datasheet §35.3.3.4): (a) `ST_PTR_WORD` (`0x69`) followed by the 16-bit target address in little-endian order, then read the single ACK (`0x40`); (b) `REPEAT` (`0xA0`) followed by `(block_len - 1)`; (c) `LD ptr++` (`0x24`).]]></step>
+              <step><![CDATA[For each block, transmit three separate UPDI frames (datasheet §35.3.3.4): (a) the pointer-set frame — `ST_PTR_WORD` (`0x69`) followed by the 16-bit target address in little-endian order when `addr ≤ 0xFFFF`, or `ST_PTR_LONG` (`0x6A`) followed by the 24-bit address in little-endian order when `addr > 0xFFFF` (required for the AVR128DA/DB mapped-Flash region above 64 KiB) — then read the single ACK (`0x40`); (b) `REPEAT` (`0xA0`) followed by `(block_len - 1)`; (c) `LD ptr++` (`0x24`).]]></step>
               <step><![CDATA[Use `select()` with a 100 ms timeout before each `read()`; accumulate `block_len` data bytes into the destination buffer.]]></step>
               <step><![CDATA[Return -1 immediately on any `select()` timeout or framing error (unexpected byte in place of ACK).]]></step>
             </logic>
@@ -346,14 +349,14 @@ NVM controller registers (accessed via UPDI ST/LD at base address `0x1000`):
           <function signature="int updi_console_poll(int fd, char *buf, size_t cap)"
                     summary="Poll the UPDI console channel and copy any pending bytes to buf; return byte count or -1."/>
           <function signature="int updi_read_device_info(int fd, UpdiDeviceInfo *info)">
-            <purpose><![CDATA[Read the AVR-Dx SIGROW (DEVICEID0..2 at `0x1100`–`0x1102`, REVID at `0x1103`, 10-byte SERNUM at `0x1110`–`0x1119`) and the UPDI ASI status registers (`ASI_SYS_STATUS`, `ASI_KEY_STATUS`, `ASI_STATUSB`), populating the caller-supplied `UpdiDeviceInfo` struct. The operation is non-destructive — the CPU is **not** halted and no NVM activity is initiated.]]></purpose>
+            <purpose><![CDATA[Read the AVR-Dx SIGROW.DEVICEID0..2 at `0x1100`–`0x1102` (datasheet §7.6.1, Table 7-4), the SYSCFG.REVID byte at `0x0F01` (datasheet §8.3.2.1; SYSCFG base `0x0F00`), the 16-byte SIGROW.SERNUM0..15 at `0x1110`–`0x111F` (datasheet §7.6.2.3), and the UPDI ASI status registers (`ASI_SYS_STATUS`, `ASI_KEY_STATUS`, `ASI_STATUSB`), populating the caller-supplied `UpdiDeviceInfo` struct. The operation is non-destructive — the CPU is **not** halted and no NVM activity is initiated.]]></purpose>
             <pre><![CDATA[`fd` is a valid UPDI serial file descriptor; `info` points to a caller-allocated `UpdiDeviceInfo` struct; the UPDI link has been initialised by `updi_open()`.]]></pre>
             <post><![CDATA[On success, every field of `*info` carries verbatim bytes from the target; on failure, `info->fail_op` carries a short identifier of the failed UPDI step (one of `"break"`, `"synch"`, `"asi-statusb"`, `"sigrow"`, `"revid"`, `"sernum"`, `"sys-status"`, `"key-status"`) and `info->fail_errno` carries either the negative `updi_mem_read` return or 0.]]></post>
             <returns>0 on success; -1 on any UPDI read failure.</returns>
             <logic>
               <step><![CDATA[Read three bytes at `0x1100` via `updi_mem_read()` into `info->device_id[0..2]`; on failure record `"sigrow"` and return -1.]]></step>
-              <step><![CDATA[Read one byte at `0x1103` (REVID) into `info->revid`; on failure record `"revid"` and return -1.]]></step>
-              <step><![CDATA[Read ten bytes at `0x1110` into `info->serial[0..9]`; on failure record `"sernum"` and return -1.]]></step>
+              <step><![CDATA[Read one byte at `0x0F01` (SYSCFG.REVID, datasheet §8.3.2.1) into `info->revid`; on failure record `"revid"` and return -1.]]></step>
+              <step><![CDATA[Read sixteen bytes at `0x1110` (SIGROW.SERNUM0..15, datasheet §7.6.2.3) into `info->serial[0..15]`; on failure record `"sernum"` and return -1.]]></step>
               <step><![CDATA[Read `ASI_SYS_STATUS`, `ASI_KEY_STATUS`, and `ASI_STATUSB` via three `LDCS` opcodes; record `"sys-status"` / `"key-status"` / `"asi-statusb"` on failure.]]></step>
               <step><![CDATA[On success, clear `info->fail_op` to `NULL` and return 0.]]></step>
             </logic>
@@ -393,7 +396,8 @@ Note: `updi_halt()`, `updi_run()`, and `updi_step()` are deferred stubs in Phase
 | --------------- | ---------- | ------- |
 | `LDCS rd, cs`   | `0x80\|cs` | Load Control/Status register `cs`. |
 | `STCS cs, rr`   | `0xC0\|cs` | Store to Control/Status register `cs`. |
-| `ST_PTR_WORD`   | `0x69`     | Set the burst pointer with a 16-bit address operand (precedes REPEAT/LD/ST bursts). |
+| `ST_PTR_WORD`   | `0x69`     | Set the burst pointer with a 16-bit address operand (precedes REPEAT/LD/ST bursts for addresses ≤ 0xFFFF). |
+| `ST_PTR_LONG`   | `0x6A`     | Set the burst pointer with a 24-bit address operand (used for addresses > 0xFFFF, e.g. AVR128DA/DB mapped Flash). |
 | `ST ptr++, rr`  | `0x64`     | Store with pointer post-increment (burst write). |
 | `LD rd, ptr++`  | `0x24`     | Load with pointer post-increment (burst read). |
 | `REPEAT`        | `0xA0`     | Set repeat count for the next bulk transfer (n-1 in operand). |
@@ -1425,11 +1429,24 @@ Errors are propagated upward through the module stack without retrying:
       <intro><![CDATA[Requirements in this section govern operator-facing diagnostic features intended for hardware bring-up and connection troubleshooting. They are activated by explicit CLI flags and never run on the GDB session hot path.]]></intro>
 
       <hlr id="HLR-044" name="Device-Signature Diagnostic Mode">
-        <text><![CDATA[The server shall provide a one-shot diagnostic mode, activated by the `--device` command-line flag, that opens the UPDI link, reads the target SIGROW (DEVICEID0..2, REVID, 10-byte SERNUM) and the UPDI ASI status registers (`ASI_SYS_STATUS`, `ASI_KEY_STATUS`, `ASI_STATUSB`), prints a verbose human-readable report to `stdout`, and exits with status 0 on success or status 1 on any failure. In this mode the `<elf-file>` operand shall be optional, the GDB TCP listener shall not be bound, and no event loop shall be entered. Every failure shall produce a diagnostic on `stderr` that names the failed UPDI step (BREAK, SYNCH, SIGROW read, ASI read) so an operator can distinguish wiring, power, and fuse problems without external instrumentation. `--device` shall be mutually exclusive with `--load`; specifying both shall trigger a usage error and exit status 1.]]></text>
+        <text><![CDATA[The server shall provide a one-shot diagnostic mode, activated by the `--device` command-line flag, that opens the UPDI link, reads the target SIGROW (`DEVICEID0..2`, 16-byte `SERNUM`), the SYSCFG.REVID byte, and the UPDI ASI status registers (`ASI_SYS_STATUS`, `ASI_KEY_STATUS`, `ASI_STATUSB`), prints a verbose human-readable report to `stdout`, and exits with status 0 on success or status 1 on any failure. In this mode the `<elf-file>` operand shall be optional, the GDB TCP listener shall not be bound, and no event loop shall be entered. Every failure shall produce a diagnostic on `stderr` that names the failed UPDI step (BREAK, SYNCH, SIGROW read, ASI read) so an operator can distinguish wiring, power, and fuse problems without external instrumentation. `--device` shall be mutually exclusive with `--load`; specifying both shall trigger a usage error and exit status 1.]]></text>
         <traces>
           <trace target="SDD" ref="2.1"/>
           <trace target="SDD" ref="3.1"/>
           <trace target="SDD" ref="4.1"/>
+        </traces>
+      </hlr>
+    </section>
+
+    <section number="10" title="Hardware Integration Testing">
+      <intro><![CDATA[Requirements in this section govern the on-target hardware integration test harness (`tests/hw/hw_test.c`). These tests link against the project's UPDI driver and exercise live AVR-Dx silicon over a serial UPDI link. They are manual-only and are explicitly excluded from `make test` so that unit-test execution remains hardware-independent and CI-safe.]]></intro>
+
+      <hlr id="HLR-045" name="On-Target Hardware Integration Test Harness">
+        <text><![CDATA[The project shall provide a standalone, manual-only on-target hardware integration test harness, separate from the unit-test suite, that validates the UPDI driver, device-info report, SRAM and FLASH memory access, and the GDB RSP server against live AVR-Dx silicon. The harness shall be organised into four opt-in groups: Group A (read-only link and device-info probes), Group B (non-destructive SRAM round-trips with size and address-mode variants), Group C (destructive FLASH erase/write/verify, gated by an explicit confirmation variable), and Group D (RSP server spawn-and-probe over TCP, gated by an opt-in variable). The harness shall be configurable via environment variables and command-line flags (serial port, expected device ID, SRAM probe address, FLASH page address, RSP TCP port, verbosity), and shall accept an explicit `--addr-24bit` switch to validate 24-bit UPDI addressing on parts whose FLASH lies above 64 KiB. The Makefile shall expose dedicated targets `hw-test` (Groups A+B), `hw-test-nvm` (Groups A+B+C), `hw-test-rsp` (Groups A+B+D), and `hw-test-all` (all groups); none of these targets shall ever be invoked by `make test`.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+          <trace target="SDD" ref="4.1"/>
+          <trace target="SDD" ref="4.2.1"/>
         </traces>
       </hlr>
     </section>
@@ -1439,7 +1456,7 @@ Errors are propagated upward through the module stack without retrying:
   <!-- Low-Level Requirements (see tools/Developers_Guide.md §6). -->
   <llrs>
     <function number="1" title="Introduction" name="intro">
-      <intro><![CDATA[Each LLR ID follows the pattern `LLR-XXX-NN`, where `XXX` is a module code and `NN` is a zero-padded two-digit sequence number. Module codes: `MAIN` (`src/main.c`), `UPDI` (`src/updi.c`), `RSP` (`src/gdb_rsp.c`), `ELF` (`src/elf_parser.c`), `FSM` (`src/fsm_mapper.c`), `MON` (`src/monitor.c`), `INST` (`Makefile`, `doc/avr-updi-gdb.1`, `doc/UserManual.md`). IDs are permanent contracts and may not be renumbered or reused once allocated.]]></intro>
+      <intro><![CDATA[Each LLR ID follows the pattern `LLR-XXX-NN`, where `XXX` is a module code and `NN` is a zero-padded two-digit sequence number. Module codes: `MAIN` (`src/main.c`), `UPDI` (`src/updi.c`), `RSP` (`src/gdb_rsp.c`), `ELF` (`src/elf_parser.c`), `FSM` (`src/fsm_mapper.c`), `MON` (`src/monitor.c`), `INST` (`Makefile`, `doc/avr-updi-gdb.1`, `doc/UserManual.md`), `HWTEST` (`tests/hw/hw_test.c`). IDs are permanent contracts and may not be renumbered or reused once allocated.]]></intro>
     </function>
 
     <function number="2" title="src/main.c — Entry Point and Event Loop" name="main" source="src/main.c">
@@ -1538,7 +1555,7 @@ Errors are propagated upward through the module stack without retrying:
       </llr>
 
       <llr id="LLR-UPDI-04">
-        <text><![CDATA[`updi_mem_read()` and `updi_mem_write()` shall transfer up to `UPDI_MAX_BLOCK` (256) bytes per UPDI burst using a three-frame sequence per datasheet §35.3.3.4: (1) `ST_PTR_WORD` (`0x69`) followed by the 16-bit target address in little-endian order and a single ACK readback; (2) `REPEAT` (`0xA0`) followed by `(block_len - 1)`; (3) `LD ptr++` (`0x24`) for reads or `ST ptr++` (`0x64`) for writes. If `len` exceeds `UPDI_MAX_BLOCK`, the function shall split the request into consecutive bursts automatically, with no size restriction imposed on the caller.]]></text>
+        <text><![CDATA[`updi_mem_read()` and `updi_mem_write()` shall transfer up to `UPDI_MAX_BLOCK` (256) bytes per UPDI burst using a three-frame sequence per datasheet §35.3.3.4: (1) a pointer-set frame — `ST_PTR_WORD` (`0x69`) followed by the 16-bit target address in little-endian order when `addr ≤ 0xFFFF`, or `ST_PTR_LONG` (`0x6A`) followed by the 24-bit address in little-endian order when `addr > 0xFFFF` — with a single ACK readback; (2) `REPEAT` (`0xA0`) followed by `(block_len - 1)`; (3) `LD ptr++` (`0x24`) for reads or `ST ptr++` (`0x64`) for writes. The selection between the 16-bit and 24-bit pointer-set forms shall be automatic based on the requested address, with the 24-bit form required for access to the AVR128DA/DB mapped-Flash region above 64 KiB. If `len` exceeds `UPDI_MAX_BLOCK`, the function shall split the request into consecutive bursts automatically, with no size restriction imposed on the caller.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-007" name="Target Memory Read"/>
           <trace target="HLR" ref="HLR-008" name="Target Memory Write"/>
@@ -1604,7 +1621,7 @@ Errors are propagated upward through the module stack without retrying:
       </llr>
 
       <llr id="LLR-UPDI-13">
-        <text><![CDATA[`updi_read_device_info(fd, info)` shall populate the caller-supplied `UpdiDeviceInfo` struct with: 3 SIGROW DEVICEID bytes from physical address `0x1100`-`0x1102`, the REVID byte at `0x1103`, 10 SERNUM bytes at `0x1110`-`0x1119`, and the three ASI registers `ASI_SYS_STATUS`, `ASI_KEY_STATUS`, `ASI_STATUSB` read via `LDCS`. The function shall be non-destructive (no halt, no NVM activity). On any UPDI read failure it shall set `info->fail_op` to a short ASCII tag (`"sigrow"`, `"revid"`, `"sernum"`, `"sys-status"`, `"key-status"`, `"asi-statusb"`) and return -1; on success it shall set `info->fail_op = NULL` and return 0.]]></text>
+        <text><![CDATA[`updi_read_device_info(fd, info)` shall populate the caller-supplied `UpdiDeviceInfo` struct with: 3 SIGROW DEVICEID bytes from physical address `0x1100`-`0x1102` (datasheet §7.6.1, Table 7-4), the SYSCFG.REVID byte at `0x0F01` (datasheet §8.3.2.1; SYSCFG base `0x0F00`), 16 SERNUM bytes at `0x1110`-`0x111F` (datasheet §7.6.2.3), and the three ASI registers `ASI_SYS_STATUS`, `ASI_KEY_STATUS`, `ASI_STATUSB` read via `LDCS`. The function shall be non-destructive (no halt, no NVM activity). On any UPDI read failure it shall set `info->fail_op` to a short ASCII tag (`"sigrow"`, `"revid"`, `"sernum"`, `"sys-status"`, `"key-status"`, `"asi-statusb"`) and return -1; on success it shall set `info->fail_op = NULL` and return 0.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-044" name="Device-Signature Diagnostic Mode"/>
         </traces>
@@ -1954,6 +1971,56 @@ Errors are propagated upward through the module stack without retrying:
         </traces>
       </llr>
     </function>
+
+    <function number="9" title="tests/hw/hw_test.c — On-Target Hardware Integration Test Harness" name="hwtest" source="tests/hw/hw_test.c">
+      <intro><![CDATA[Requirements for the manual-only on-target hardware integration test program. The harness links against `src/updi.c` (and, for Group D, spawns the production `build/avr-updi-gdb` binary via `fork`/`execl`) and runs against live AVR-Dx silicon connected via a UART/UPDI adapter.]]></intro>
+
+      <llr id="LLR-HWTEST-01">
+        <text><![CDATA[`tests/hw/hw_test.c` shall accept its configuration from environment variables and from long-form command-line options. Recognised settings: `HW_PORT` / `--port` (serial device path; default `/dev/ttyUSB0`), `HW_DEVICE_ID` / `--device-id` (expected 24-bit SIGROW signature as a hex literal; default `0x1E970A` for AVR128DA48), `HW_SRAM_ADDR` / `--sram-addr` (16-bit SRAM probe address; default `0x7000`), `HW_FLASH_PAGE_ADDR` / `--flash-page` (FLASH page-aligned address used by Group C; default `0x1FE00`), `HW_RSP_PORT` / `--rsp-port` (TCP port for Group D; default `1234`), `HW_TEST_ELF` / `--elf` (optional ELF binary passed to the spawned RSP server in Group D), `HW_ADDR_24BIT` / `--addr-24bit` (boolean; when true, FLASH access uses the 24-bit UPDI addressing path), and `HW_VERBOSE` / `--verbose` (boolean; enables per-byte tracing). CLI flags shall override the corresponding environment values.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-045" name="On-Target Hardware Integration Test Harness"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-HWTEST-02">
+        <text><![CDATA[Group A (read-only link probes) shall execute the following ordered checks against the live target: **A1** open the serial port and perform the UPDI cold-start handshake (BREAK + SYNCH); **A2** call `updi_read_device_info()` and capture the result for downstream assertions; **A3** verify that the captured `DEVICEID0..2` bytes match the configured `HW_DEVICE_ID`; **A4** verify that the SIGROW signature is not all-zero and not all-`0xFF`; **A5** verify that `SYSCFG.REVID` is non-zero; **A6** verify that the 10-byte `SERNUM` field is not all-zero and not all-`0xFF`; **A7** verify that `ASI_SYS_STATUS.NVMPROG` is clear (target is not stuck in a programming session). Each individual check shall be reported as a separate `[PASS]`/`[FAIL]` line.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-045" name="On-Target Hardware Integration Test Harness"/>
+          <trace target="HLR" ref="HLR-044" name="Device-Signature Diagnostic Mode"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-HWTEST-03">
+        <text><![CDATA[Group B (non-destructive SRAM round-trips) shall execute the following ordered checks at `HW_SRAM_ADDR`: **B0** single-byte write/read; **B1** 64-byte buffer write/read; **B1a** SIGROW read repeated twice and compared (isolates the read path from the write path); **B1b** write 64 bytes of constant `0xAA` then read back (value-independence check); **B1c** write a known pattern once then read it back twice and compare both reads (detects live CPU writes to the probed region — on failure the harness shall hint that the operator pick a different `--sram-addr` / `HW_SRAM_ADDR`); **B2** 600-byte buffer write/read (exercises multi-chunk transfer); **B3** when `HW_ADDR_24BIT` is true, a small write/read at the configured FLASH page address using the 24-bit UPDI addressing path. None of the Group B steps shall modify FLASH.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-045" name="On-Target Hardware Integration Test Harness"/>
+          <trace target="HLR" ref="HLR-011" name="Non-Intrusive Background Memory Read"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-HWTEST-04">
+        <text><![CDATA[Group C (destructive FLASH write/verify) shall execute only when the environment variable `HW_TEST_NVM_CONFIRM=YES` is set; otherwise the group shall be reported as skipped. When confirmed, Group C shall perform: **C1** erase the FLASH page at `HW_FLASH_PAGE_ADDR`, then write a deterministic pattern via the NVM controller; **C2** read the page back and verify a byte-for-byte match against the written pattern. The harness shall enter and leave the NVM programming session cleanly (NVMPROG key in, NVMPROG key cleared on exit) so that subsequent Group A/B checks find the target in a non-programming state.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-045" name="On-Target Hardware Integration Test Harness"/>
+          <trace target="HLR" ref="HLR-008" name="Flash Write"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-HWTEST-05">
+        <text><![CDATA[Group D (RSP server spawn-and-probe) shall execute only when the environment variable `HW_TEST_RSP=YES` is set; otherwise the group shall be reported as skipped. When enabled, Group D shall `fork` and `execl` the production `build/avr-updi-gdb` binary with the configured serial port and optional `HW_TEST_ELF`, wait briefly for the server's TCP listener to bind on `HW_RSP_PORT`, then perform: **D1** connect a TCP client to `127.0.0.1:HW_RSP_PORT` and verify the connection is accepted; **D2** send an RSP `qSupported` packet (`$qSupported#37`) and verify a non-empty, properly-framed RSP reply is received. The harness shall terminate the spawned server cleanly (SIGTERM + `waitpid`) on completion or on test failure.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-045" name="On-Target Hardware Integration Test Harness"/>
+          <trace target="HLR" ref="HLR-014" name="GDB RSP TCP Listener"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-HWTEST-06">
+        <text><![CDATA[The Makefile shall expose four targets that drive `tests/hw/hw_test.c`: `hw-test` runs Groups A+B (read-only); `hw-test-nvm` runs Groups A+B+C and forwards `HW_TEST_NVM_CONFIRM=YES`; `hw-test-rsp` runs Groups A+B+D and forwards `HW_TEST_RSP=YES`; `hw-test-all` runs all four groups. Every hw-test variable (`HW_PORT`, `HW_DEVICE_ID`, `HW_SRAM_ADDR`, `HW_FLASH_PAGE_ADDR`, `HW_RSP_PORT`, `HW_TEST_ELF`, `HW_ADDR_24BIT`, `HW_VERBOSE`) shall be passed through to the child process via the target recipes. None of these targets shall be a dependency of the default `make test` target or be built by `make all`. The `make help` output shall document each variable, its default, and a brief description.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-045" name="On-Target Hardware Integration Test Harness"/>
+        </traces>
+      </llr>
+    </function>
   </llrs>
 
   <!-- Test sources (see tools/Developers_Guide.md §7). -->
@@ -2084,6 +2151,11 @@ Errors are propagated upward through the module stack without retrying:
 
       <test name="updi_mem_read_uses_repeat_ld_auto_increment_sequence">
         <purpose><![CDATA[Capture the bytes written to the UART and verify the three-frame burst: byte 0 = `ST_PTR_WORD` (`0x69`), bytes 1–2 = address little-endian, frame 2 = `REPEAT` (`0xA0`) + count, frame 3 = `LD ptr++` (`0x24`).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-04"/></traces>
+      </test>
+
+      <test name="updi_mem_read_uses_24bit_addressing_above_64kib">
+        <purpose><![CDATA[Request a read at address `0x012345` (above the 64 KiB boundary) and verify that `updi_mem_read()` emits the 24-bit pointer-set frame: `SYNCH`, `ST_PTR_LONG` (`0x6A`), then the address bytes in little-endian order (`0x45`, `0x23`, `0x01`), followed by the standard `REPEAT` + `LD ptr++` frames. Confirms automatic selection of the 24-bit form for AVR128DA/DB mapped-Flash access above 64 KiB.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-04"/></traces>
       </test>
 
@@ -2595,7 +2667,7 @@ Errors are propagated upward through the module stack without retrying:
       </test>
 
       <test name="updi_read_device_info_returns_sigrow_and_asi_bytes">
-        <purpose><![CDATA[Open a PTY pair; in a helper thread script the slave end to echo half-duplex bytes and respond to a SIGROW read at `0x1100`-`0x1119` with canned signature `0x1E 0x97 0x0A`, REVID `0xA6`, and a 10-byte serial number, and to LDCS reads of SYS_STATUS / KEY_STATUS / STATUSB. Call `updi_read_device_info()` and assert all struct fields match the canned values and that the function returns 0 with `info.fail_op == NULL`.]]></purpose>
+        <purpose><![CDATA[Open a PTY pair; in a helper thread script the slave end to echo half-duplex bytes and respond to a SIGROW DEVICEID read at `0x1100`-`0x1102` with canned signature `0x1E 0x97 0x0A`, a SYSCFG.REVID read at `0x0F01` returning `0xA6`, a SIGROW.SERNUM read at `0x1110`-`0x111F` returning a canned 16-byte serial number, and to LDCS reads of SYS_STATUS / KEY_STATUS / STATUSB. Call `updi_read_device_info()` and assert all struct fields match the canned values and that the function returns 0 with `info.fail_op == NULL`.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-13"/></traces>
       </test>
 
@@ -2612,6 +2684,103 @@ Errors are propagated upward through the module stack without retrying:
       <test name="device_mode_does_not_call_rsp_listen">
         <purpose><![CDATA[Link the test binary with a stub `rsp_listen()` that flags a global. Invoke `run_device_mode()` to completion and assert the flag remains clear, proving the diagnostic path bypasses GDB listener startup.]]></purpose>
         <traces><trace target="LLR" ref="LLR-MAIN-09"/></traces>
+      </test>
+    </file>
+
+    <!-- ============================================================ -->
+    <!-- On-target hardware integration tests (manual; not in CI)     -->
+    <!-- ============================================================ -->
+    <file path="tests/hw/hw_test.c" role="hardware" count="18">
+      <header><![CDATA[On-target hardware integration test harness for the AVR-Dx UPDI driver, device-info report, SRAM/FLASH memory access, and the GDB RSP server. Manual-only: never invoked by `make test`. Driven by the Makefile targets `hw-test`, `hw-test-nvm`, `hw-test-rsp`, and `hw-test-all`. Configurable via `HW_PORT`, `HW_DEVICE_ID`, `HW_SRAM_ADDR`, `HW_FLASH_PAGE_ADDR`, `HW_RSP_PORT`, `HW_TEST_ELF`, `HW_ADDR_24BIT`, `HW_VERBOSE` (env or CLI). Destructive groups gated by `HW_TEST_NVM_CONFIRM=YES` (FLASH) and `HW_TEST_RSP=YES` (RSP).]]></header>
+
+      <test name="A1_port_open_and_cold_start_handshake">
+        <purpose><![CDATA[Open the configured serial device and execute the UPDI cold-start handshake (BREAK + SYNCH). Assert that `updi_open()` returns a valid file descriptor and that the handshake completes without error. Implicitly verifies that `HW_PORT` / `--port` resolution and CLI-overrides-environment precedence work end-to-end.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-01"/><trace target="LLR" ref="LLR-HWTEST-02"/></traces>
+      </test>
+
+      <test name="A2_read_device_info">
+        <purpose><![CDATA[Call `updi_read_device_info()` against the live target and capture the returned struct. Assert the call returns 0 and `info.fail_op == NULL`; the captured fields are reused by A3..A7.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-02"/></traces>
+      </test>
+
+      <test name="A3_deviceid_matches_expected">
+        <purpose><![CDATA[Compare the SIGROW `DEVICEID0..2` bytes against the configured `HW_DEVICE_ID` (default `0x1E970A`). Assert exact byte-for-byte match.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-02"/></traces>
+      </test>
+
+      <test name="A4_signature_non_zero_non_ff">
+        <purpose><![CDATA[Assert that the captured SIGROW signature is neither all `0x00` nor all `0xFF` (catches dead-bus / pull-up-only conditions that A3 might miss if `HW_DEVICE_ID` were misconfigured).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-02"/></traces>
+      </test>
+
+      <test name="A5_revid_non_zero">
+        <purpose><![CDATA[Assert that the captured `SYSCFG.REVID` byte is non-zero.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-02"/></traces>
+      </test>
+
+      <test name="A6_sernum_non_zero_non_ff">
+        <purpose><![CDATA[Assert that the 10-byte SIGROW `SERNUM` field is neither all `0x00` nor all `0xFF`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-02"/></traces>
+      </test>
+
+      <test name="A7_nvmprog_bit_clear">
+        <purpose><![CDATA[Assert that the `ASI_SYS_STATUS.NVMPROG` bit is clear, proving the target is not stuck in a programming session at harness start-up.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-02"/></traces>
+      </test>
+
+      <test name="B0_sram_single_byte_round_trip">
+        <purpose><![CDATA[Write one byte to `HW_SRAM_ADDR` via `updi_mem_write()`, read it back via `updi_mem_read()`, and assert byte-equality. Reaching this test through any of the four `hw-test*` Makefile targets implicitly verifies that the recipes forward `HW_PORT`, `HW_SRAM_ADDR`, and related variables to the child process.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-03"/><trace target="LLR" ref="LLR-HWTEST-06"/></traces>
+      </test>
+
+      <test name="B1_sram_64_byte_round_trip">
+        <purpose><![CDATA[Write a 64-byte deterministic pattern to `HW_SRAM_ADDR`, read it back, and assert byte-for-byte match.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-03"/></traces>
+      </test>
+
+      <test name="B1a_sigrow_read_repeatability">
+        <purpose><![CDATA[Read SIGROW twice via `updi_mem_read()` and assert both reads return identical bytes. Isolates the read path from the write path; a failure indicates a bus or framing problem rather than RAM corruption.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-03"/></traces>
+      </test>
+
+      <test name="B1b_sram_constant_0xAA_round_trip">
+        <purpose><![CDATA[Write 64 bytes of constant `0xAA` to `HW_SRAM_ADDR` and read back. Asserts that data fidelity does not depend on byte value (rules out value-dependent framing or escape-byte bugs).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-03"/></traces>
+      </test>
+
+      <test name="B1c_sram_write_once_read_twice">
+        <purpose><![CDATA[Write a known pattern to `HW_SRAM_ADDR` once, then read the region back twice; assert both reads are identical. On failure, the harness shall print a hint instructing the operator to choose a different `--sram-addr` / `HW_SRAM_ADDR`, because the live target CPU is writing to the probed region.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-03"/></traces>
+      </test>
+
+      <test name="B2_sram_600_byte_round_trip">
+        <purpose><![CDATA[Write a 600-byte buffer to `HW_SRAM_ADDR`, read it back, and assert byte-equality. Exercises multi-chunk transfer and any internal block-size boundary handling in the UPDI driver.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-03"/></traces>
+      </test>
+
+      <test name="B3_flash_24bit_addressing_smoke">
+        <purpose><![CDATA[When `HW_ADDR_24BIT` is true, perform a small read at `HW_FLASH_PAGE_ADDR` using the UPDI 24-bit addressing path; assert the call returns the expected number of bytes. Skipped when `HW_ADDR_24BIT` is false.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-03"/></traces>
+      </test>
+
+      <test name="C1_flash_erase_and_write">
+        <purpose><![CDATA[When `HW_TEST_NVM_CONFIRM=YES`, erase the FLASH page at `HW_FLASH_PAGE_ADDR` and write a deterministic pattern via the NVM controller; assert all NVM controller status checks succeed. Skipped otherwise.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-04"/></traces>
+      </test>
+
+      <test name="C2_flash_read_back_verify">
+        <purpose><![CDATA[Read the FLASH page written by C1 and assert a byte-for-byte match against the written pattern. Skipped unless `HW_TEST_NVM_CONFIRM=YES`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-04"/></traces>
+      </test>
+
+      <test name="D1_rsp_server_accepts_tcp_connection">
+        <purpose><![CDATA[When `HW_TEST_RSP=YES`, `fork`+`execl` the production `build/avr-updi-gdb` against the configured serial port; open a TCP client to `127.0.0.1:HW_RSP_PORT` and assert the connect succeeds within a bounded timeout. Skipped otherwise.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-05"/></traces>
+      </test>
+
+      <test name="D2_rsp_qsupported_round_trip">
+        <purpose><![CDATA[Send an RSP `$qSupported#37` packet to the spawned server and assert a non-empty, properly-framed RSP reply is received. Skipped unless `HW_TEST_RSP=YES`. On completion the harness shall terminate the spawned server cleanly via SIGTERM + `waitpid`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-05"/></traces>
       </test>
     </file>
 

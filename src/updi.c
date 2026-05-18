@@ -10,7 +10,8 @@
 #include <unistd.h>
 
 /* ── UPDI opcode constants (datasheet §35.3.3, Fig. 35-6) ─────────────── */
-#define UPDI_OP_ST_PTR_WORD  0x69u   /* ST  pointer-reg, addr size = word    */
+#define UPDI_OP_ST_PTR_WORD  0x69u   /* ST  pointer-reg, addr size = word (16b) */
+#define UPDI_OP_ST_PTR_LONG  0x6Au   /* ST  pointer-reg, addr size = long (24b) */
 #define UPDI_OP_LD_PTR_INC   0x24u   /* LD  rd, *(ptr++)  size B = byte      */
 #define UPDI_OP_ST_PTR_INC   0x64u   /* ST  *(ptr++), rr  size B = byte      */
 #define UPDI_OP_REPEAT       0xA0u   /* REPEAT count      size B = byte      */
@@ -116,21 +117,39 @@ static int updi_stcs(int fd, uint8_t cs, uint8_t val)
 }
 
 /*
- * Set the UPDI pointer register to a 16-bit address via
- *   SYNCH, ST_PTR_WORD, addr_lo, addr_hi
- * Expects one ACK back from the UPDI (datasheet §35.3.3.4).
+ * Set the UPDI pointer register via
+ *   16-bit form: SYNCH, ST_PTR_WORD (0x69), addr_lo, addr_hi
+ *   24-bit form: SYNCH, ST_PTR_LONG (0x6A), addr_lo, addr_mid, addr_hi
+ *
+ * The 24-bit form is required for the AVR-Dx mapped-Flash region above
+ * 0x0000FFFF on parts with > 64 KiB Flash (AVR128DA/DB) and is selected
+ * automatically when `addr > 0xFFFF`. Sub-64-KiB targets (SIGROW, NVMCTRL,
+ * SRAM, ASI registers, etc.) keep the 16-bit form for byte-for-byte
+ * compatibility with avrdude's serialupdi cold-path captures.
+ *
+ * Both forms expect one ACK back from the UPDI (datasheet §35.3.3.4).
  */
 static int updi_set_ptr(int fd, uint32_t addr)
 {
-    uint8_t frame[4] = {
-        UPDI_SYNCH,
-        UPDI_OP_ST_PTR_WORD,
-        (uint8_t)(addr & 0xFFu),
-        (uint8_t)((addr >> 8) & 0xFFu)
-    };
+    uint8_t frame[5];
+    size_t  frame_len;
     uint8_t ack;
 
-    if (updi_write_bytes(fd, frame, sizeof(frame)) < 0)
+    frame[0] = UPDI_SYNCH;
+    if (addr > 0xFFFFu) {
+        frame[1] = UPDI_OP_ST_PTR_LONG;
+        frame[2] = (uint8_t)( addr        & 0xFFu);
+        frame[3] = (uint8_t)((addr >>  8) & 0xFFu);
+        frame[4] = (uint8_t)((addr >> 16) & 0xFFu);
+        frame_len = 5u;
+    } else {
+        frame[1] = UPDI_OP_ST_PTR_WORD;
+        frame[2] = (uint8_t)( addr       & 0xFFu);
+        frame[3] = (uint8_t)((addr >> 8) & 0xFFu);
+        frame_len = 4u;
+    }
+
+    if (updi_write_bytes(fd, frame, frame_len) < 0)
         return -1;
     if (read(fd, &ack, 1) != (ssize_t)1)
         return -1;
@@ -373,10 +392,13 @@ void updi_close(int fd)
 /*
  * mem_read: split into three frames per block (datasheet §35.3.3.3,
  * §35.3.3.4, §35.3.3.7):
- *     A) SYNCH, ST_PTR_WORD, addr_lo, addr_hi  → ACK
- *     B) SYNCH, REPEAT, count-1                (no ACK)
- *     C) SYNCH, LD ptr++                       (no ACK)
+ *     A) SYNCH, ST_PTR_{WORD,LONG}, addr bytes (LE) → ACK
+ *     B) SYNCH, REPEAT, count-1                     (no ACK)
+ *     C) SYNCH, LD ptr++                            (no ACK)
  * The UPDI then streams `count` data bytes after the guard time.
+ * `updi_set_ptr()` selects ST_PTR_WORD (16-bit) for addr ≤ 0xFFFF and
+ * ST_PTR_LONG (24-bit) above, enabling access to mapped Flash on
+ * AVR128DA/DB parts.
  */
 int updi_mem_read(int fd, uint32_t addr, uint8_t *buf, size_t len)
 {
@@ -573,12 +595,17 @@ int updi_console_poll(int fd, char *buf, size_t cap)
 
 /* ── Device-signature diagnostics (Phase 7, LLR-UPDI-13) ──────────────── *
  *
- * updi_read_device_info() reads SIGROW (DEVICEID0..2 @ 0x1100-0x1102,
- * REVID @ 0x1103, 10-byte SERNUM @ 0x1110-0x1119) and three ASI status
- * registers via LDCS. The operation is non-destructive: it does not halt
- * the CPU and does not initiate any NVM activity. On the first UPDI
- * read failure it sets info->fail_op to a short ASCII tag identifying
- * the failed step and returns -1.                                         */
+ * updi_read_device_info() reads:
+ *   - SIGROW.DEVICEID0..2 @ 0x1100-0x1102   (datasheet §7.6.1, Table 7-4)
+ *   - SYSCFG.REVID        @ 0x0F01          (datasheet §8.3.2.1; SYSCFG
+ *                                            base 0x0F00 per memory map)
+ *   - SIGROW.SERNUM0..15  @ 0x1110-0x111F   (datasheet §7.6.2.3: 16 bytes)
+ *   - ASI_SYS_STATUS, ASI_KEY_STATUS, ASI_STATUSB via LDCS
+ *
+ * The operation is non-destructive: it does not halt the CPU and does
+ * not initiate any NVM activity. On the first UPDI read failure it sets
+ * info->fail_op to a short ASCII tag identifying the failed step and
+ * returns -1.                                                             */
 int updi_read_device_info(int fd, UpdiDeviceInfo *info)
 {
     int v;
@@ -594,12 +621,12 @@ int updi_read_device_info(int fd, UpdiDeviceInfo *info)
         info->fail_errno = -1;
         return -1;
     }
-    if (updi_mem_read(fd, 0x1103u, &info->revid, 1u) < 0) {
+    if (updi_mem_read(fd, 0x0F01u, &info->revid, 1u) < 0) {
         info->fail_op    = "revid";
         info->fail_errno = -1;
         return -1;
     }
-    if (updi_mem_read(fd, 0x1110u, info->serial, 10u) < 0) {
+    if (updi_mem_read(fd, 0x1110u, info->serial, 16u) < 0) {
         info->fail_op    = "sernum";
         info->fail_errno = -1;
         return -1;
