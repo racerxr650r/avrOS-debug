@@ -106,6 +106,7 @@ Standard UPDI `LDS`/`STS` instructions can read SRAM and Peripherals, but **they
 3. **Execution:** The debugger toggles a specific bit in the `OCD_CTRLA` register, forcing the halted CPU to execute *only* the injected instruction offline, without advancing the Program Counter.
 4. **Extraction:** The CPU dumps `r16` into an SRAM scratchpad address. The debugger then uses a standard UPDI `LDS` command to read that SRAM address and forward the register value to GDB.
 
+-------------------------------------------------------------------------------------------------------
 
 Here is the reference mapping of the addresses, offsets, and bit positions for the registers involved in AVR UPDI debugging.
 
@@ -222,3 +223,104 @@ There is no dedicated memory-mapped register that holds the current Program Coun
 3. Inject instructions to read the SPL (Stack Pointer Low) and SPH (Stack Pointer High) I/O registers.
 4. Use standard UPDI `LDS` to read the SRAM addresses currently pointed to by the SP to retrieve the PC.
 5. Inject an `POP` instruction or an `ADIW` to repair the Stack Pointer back to its original state.
+
+---------------------------------------------------------------------------------
+
+To build a functional GDB server for modern AVR microcontrollers, your software must act as a translator. It receives high-level, ASCII-based **GDB Remote Serial Protocol (RSP)** packets over a TCP socket and translates them into low-level, half-duplex **UPDI** byte sequences targeting specific ASI and OCD registers.
+
+Below is the architectural mapping between standard GDB RSP commands and the underlying AVR UPDI/OCD memory-mapped registers.
+
+---
+
+### 1. Execution Control & State Polling
+
+These commands control the starting, stopping, and status reporting of the target CPU. They primarily interact with the out-of-band Application Status Interface (ASI).
+
+| GDB RSP Packet | RSP Description | UPDI Target Register(s) | Translation Action / Bit Manipulation |
+| --- | --- | --- | --- |
+| **`?`** | Target Halt Reason / Status | `ASI_SYS_STATUS` (`0x0B`)<br>
+
+<br>`OCD_STATUS` (`0x0F81`) | Poll `ASI_SYS_STATUS`. If `HALTED` (Bit 5) is 1, read `OCD_STATUS`. If `HWBREAK` (Bit 0) or `SWBREAK` (Bit 1) is set, reply with `$S05#` (SIGTRAP). |
+| **`\x03`** (Ctrl-C) <br>
+
+<br> or **`vCtrlC`** | Interrupt / Halt CPU | `ASI_CPU_REQ` (`0x08`) | Write `0x02` to set the `HALT_REQ` bit. Wait for `ASI_SYS_STATUS` to confirm `HALTED`. Reply with `$S02#` (SIGINT). |
+| **`c`** <br>
+
+<br> or **`vCont;c`** | Continue Execution | `ASI_CPU_REQ` (`0x08`) | Write `0x00` to clear the `HALT_REQ` bit. The CPU will immediately resume execution. |
+| **`s`** <br>
+
+<br> or **`vCont;s`** | Single Step | `OCD_CTRLA` (`0x0F80`)<br>
+
+<br>`ASI_CPU_REQ` (`0x08`) | 1. Write `0x01` (`STEP`) to `OCD_CTRLA`.<br>
+
+<br>2. Write `0x00` to `ASI_CPU_REQ` to clear `HALT_REQ`.<br>
+
+<br>3. The CPU will execute one opcode and halt again. |
+
+---
+
+### 2. Register Access (Instruction Injection)
+
+GDB assumes it can read the CPU's internal registers (like `r0-r31`, `SP`, `PC`, and `SREG`) at any time. Because these are **not** directly memory-mapped while the CPU is running or halted, the GDB server must use the Instruction Injection mechanism.
+
+| GDB RSP Packet | RSP Description | UPDI Target Register(s) | Translation Action / Bit Manipulation |
+| --- | --- | --- | --- |
+| **`g`** | Read all CPU registers | `OCD_INSTR_L/H` (`0x0F88`)<br>
+
+<br>Standard SRAM | 1. Inject the `STS` (Store Direct) opcode into `OCD_INSTR` to force the CPU to push `r0` through `r31` to a safe SRAM scratchpad.<br>
+
+<br>2. Use standard UPDI `LDS` (Load) commands to read those SRAM addresses back to the host.<br>
+
+<br>3. Format the block as a hex string and reply to GDB. |
+| **`p`** *`[n]`* | Read single register *n* | `OCD_INSTR_L/H` (`0x0F88`)<br>
+
+<br>Standard SRAM | Same as `g`, but inject a single `STS` instruction specifically targeting register *n*, then fetch that single byte from SRAM. |
+| **`G`** | Write all CPU registers | `OCD_INSTR_L/H` (`0x0F88`)<br>
+
+<br>Standard SRAM | 1. Use UPDI `STS` to write the new register values from GDB into the SRAM scratchpad.<br>
+
+<br>2. Inject `LDS` (Load Direct) opcodes into `OCD_INSTR` to force the CPU to pull the values from SRAM back into `r0-r31`. |
+| **`P`** *`[n=v]`* | Write single register *n* | `OCD_INSTR_L/H` (`0x0F88`)<br>
+
+<br>Standard SRAM | Same as `G`, but write a single value to SRAM and inject one `LDS` instruction for register *n*. |
+
+---
+
+### 3. Program Counter (PC) Extraction & Modification
+
+Extracting the PC is the most complex mapping because it is a multi-step macro that the GDB server must execute whenever GDB asks for the target state. GDB typically expects the PC to be included in the general register dump (`g`), appended at the end.
+
+| Internal GDB Server Goal | UPDI Target Register(s) | Translation Action / Sequence |
+| --- | --- | --- |
+| **Read PC** | `OCD_INSTR` (`0x0F88`)<br>
+
+<br>SRAM (via UPDI) | 1. Inject `RCALL +0` into `OCD_INSTR` (Pushes PC to stack, decrements SP).<br>
+
+<br>2. Inject instructions to read the Stack Pointer (SP) into SRAM.<br>
+
+<br>3. Use UPDI to read the SP value, then read the SRAM address the SP points to (This is the PC).<br>
+
+<br>4. Inject `POP` instructions to restore the SP to its original state. |
+| **Write PC** | `OCD_INSTR` (`0x0F88`) | 1. Inject instructions to load the target PC address into the `Z` pointer registers (`r30/r31` or `r24/r25` depending on architecture).<br>
+
+<br>2. Inject an `IJMP` (Indirect Jump) instruction to force the halted CPU's PC to snap to the new address. |
+
+---
+
+### 4. Memory & Breakpoint Management
+
+These commands handle reading/writing Flash, SRAM, and setting breakpoints.
+
+| GDB RSP Packet | RSP Description | UPDI Target Register(s) | Translation Action / Bit Manipulation |
+| --- | --- | --- | --- |
+| **`m`** *`[addr,length]`* | Read Memory | Target Memory Address | Translates directly to UPDI `LDS` (Load from Data Space) commands. If reading a large block, the server should optimize by utilizing the UPDI `REPEAT` instruction to stream the data. |
+| **`M`** *`[addr,length]`* | Write Memory | Target Memory Address | Translates to UPDI `STS` (Store to Data Space). If the address falls in the Flash memory map, the GDB server must silently execute the NVM (Non-Volatile Memory) unlock and page-erase/page-write sequence before writing. |
+| **`Z0`** *`[addr]`* | Insert Software Breakpoint | Flash Memory Address (via NVM Controller) | 1. Read the original 16-bit opcode at the target Flash address.<br>
+
+<br>2. Save the original opcode in the GDB server's host memory.<br>
+
+<br>3. Overwrite the address with the AVR `BREAK` opcode (`0x9598`). |
+| **`z0`** *`[addr]`* | Remove Software Breakpoint | Flash Memory Address (via NVM Controller) | Overwrite the `0x9598` `BREAK` opcode with the original instruction saved by the GDB server in the previous step. |
+| **`Z1`** *`[addr]`* | Insert Hardware Breakpoint | `OCD_PSB0_L/H` (`0x0F90`)<br>
+
+<br>`OCD_PSB1_L/H` (`0x0F94`) | Write the target address into an available Program Space Breakpoint register pair. Enable the specific PSB in the hidden debug control bits (implementation varies slightly by chip family). |
