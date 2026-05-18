@@ -518,13 +518,16 @@ static void updi_nvm_write_flash_per_page_busy_timeout_returns_minus1(void)
 /* ══════════════════════════════════════════════════════════════════════ */
 
 /*
- * Per-attempt SUT byte stream (5 bytes):
- *   0: 0x00         BREAK 1  (tcflush'd — inject doesn't matter)
- *   1: 0x00         BREAK 2  (ditto)
- *   2: 0x55         bare SYNCH      → SUT expects 1 echo
- *   3: 0x55         LDCS frame SYNCH
- *   4: 0x81         LDCS STATUSB    → SUT expects 1 echo + 1 status byte
- *                                     (echo for byte 3 plus echo+status here)
+ * Per-attempt SUT byte stream (9 bytes) — cold-start handshake (issue #19):
+ *   0: 0x00         wake byte (tcflush absorbs the echo, so inject nothing)
+ *   1: 0x55         STCS CTRLB frame SYNCH        → 1 echo byte
+ *   2: 0xC3         STCS CTRLB opcode             → 1 echo byte
+ *   3: 0x08         STCS CTRLB value (CCDETDIS)   → 1 echo byte
+ *   4: 0x55         STCS CTRLA frame SYNCH        → 1 echo byte
+ *   5: 0xC2         STCS CTRLA opcode             → 1 echo byte
+ *   6: 0x80         STCS CTRLA value (IBDLY)      → 1 echo byte
+ *   7: 0x55         LDCS STATUSA frame SYNCH      → 1 echo byte
+ *   8: 0x80         LDCS STATUSA opcode           → 1 echo byte + 1 STATUSA byte
  */
 typedef struct {
     int             master_fd;
@@ -537,8 +540,16 @@ typedef struct {
 static void *responder_thread(void *arg)
 {
     responder_t *r = (responder_t *)arg;
-    static const uint8_t one_echo       = 0xAA;
-    static const uint8_t three_resp[3]  = { 0xBB, 0xCC, 0x00 };
+    static const uint8_t echo_byte    = 0xAA;
+    static const uint8_t ldcs_resp[2] = { 0xAA, 0x30 };  /* echo + UPDIREV */
+    /* SIB response: 1 echo byte for the 0xE6 opcode + 32 bytes of SIB. */
+    static const uint8_t sib_resp[1 + 32] = {
+        0xAA,
+        ' ', ' ', ' ', ' ', 'A', 'V', 'R', ' ',
+        'P', ':', '2', 'D', ':', '1', '-', '3',
+        'M', '2', ' ', '(', 'A', '7', '.', 'K',
+        'V', '0', '0', '1', '.', '0', ')', '\0'
+    };
 
     while (1) {
         fd_set         rfds;
@@ -571,12 +582,24 @@ static void *responder_thread(void *arg)
         pos = r->n_captured;
         pthread_mutex_unlock(&r->mtx);
 
-        switch ((pos - 1u) % 5u) {
-            case 0u: /* BREAK 1                  */                 break;
-            case 1u: /* BREAK 2                  */                 break;
-            case 2u: (void)write(r->master_fd, &one_echo,   1);     break;
-            case 3u: /* LDCS-SYNCH               */                 break;
-            case 4u: (void)write(r->master_fd, three_resp,  3);     break;
+        switch ((pos - 1u) % 11u) {
+            case 0u: /* wake byte — tcflush absorbs anything we send */    break;
+            case 1u: /* STCS CTRLB SYNCH echo */
+            case 2u: /* STCS CTRLB opcode echo */
+            case 3u: /* STCS CTRLB value echo */
+            case 4u: /* STCS CTRLA SYNCH echo */
+            case 5u: /* STCS CTRLA opcode echo */
+            case 6u: /* STCS CTRLA value echo */
+            case 7u: /* LDCS STATUSA SYNCH echo */
+            case 9u: /* SIB SYNCH echo */
+                (void)write(r->master_fd, &echo_byte, 1);
+                break;
+            case 8u: /* LDCS STATUSA opcode echo + UPDIREV response */
+                (void)write(r->master_fd, ldcs_resp, sizeof(ldcs_resp));
+                break;
+            case 10u: /* SIB opcode echo + 16-byte SIB payload */
+                (void)write(r->master_fd, sib_resp, sizeof(sib_resp));
+                break;
         }
     }
     return NULL;
@@ -639,13 +662,13 @@ static void updi_open_sets_8e2_raw_half_duplex_via_termios(void)
     close(sut_fd);
 }
 
-/* Test 3: two consecutive BREAK bytes precede the SYNCH (§35.3.1.2). */
-static void updi_open_asserts_two_breaks_then_synch(void)
+/* Test 3: wake byte precedes the STCS CTRLB frame (cold-start, issue #19). */
+static void updi_open_asserts_wake_byte_then_stcs_ctrlb(void)
 {
     responder_t rsp;
     pthread_t   tid;
     int         sut_fd;
-    uint8_t     cap0, cap1, cap2;
+    uint8_t     cap0, cap1, cap2, cap3;
 
     open_pty_fixture();
     tid    = responder_start(&rsp, g_master_fd);
@@ -654,26 +677,29 @@ static void updi_open_asserts_two_breaks_then_synch(void)
 
     TEST_ASSERT_GREATER_OR_EQUAL_INT(0, sut_fd);
     pthread_mutex_lock(&rsp.mtx);
-    TEST_ASSERT_GREATER_OR_EQUAL_size_t(3u, rsp.n_captured);
+    TEST_ASSERT_GREATER_OR_EQUAL_size_t(4u, rsp.n_captured);
     cap0 = rsp.capture[0];
     cap1 = rsp.capture[1];
     cap2 = rsp.capture[2];
+    cap3 = rsp.capture[3];
     pthread_mutex_unlock(&rsp.mtx);
 
-    TEST_ASSERT_EQUAL_HEX8(0x00u,      cap0);
-    TEST_ASSERT_EQUAL_HEX8(0x00u,      cap1);
-    TEST_ASSERT_EQUAL_HEX8(UPDI_SYNCH, cap2);
+    TEST_ASSERT_EQUAL_HEX8(0x00u,                              cap0);
+    TEST_ASSERT_EQUAL_HEX8(UPDI_SYNCH,                         cap1);
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)(0xC0u | ASI_CTRLB),       cap2);
+    TEST_ASSERT_EQUAL_HEX8(ASI_CTRLB_CCDETDIS,                 cap3);
 
     close(sut_fd);
 }
 
-/* Test 3b: SUT also issues LDCS STATUSB (0x81) after the SYNCH (§35.3.2.3) */
-static void updi_open_issues_ldcs_statusb_after_synch(void)
+/* Test 3b: SUT then writes STCS CTRLA=IBDLY and probes LDCS STATUSA. */
+static void updi_open_issues_stcs_ctrla_and_ldcs_statusa(void)
 {
     responder_t rsp;
     pthread_t   tid;
     int         sut_fd;
-    uint8_t     cmd_byte;
+    uint8_t     stcs_a_sync, stcs_a_op, stcs_a_val;
+    uint8_t     ldcs_sync,   ldcs_op;
 
     open_pty_fixture();
     tid    = responder_start(&rsp, g_master_fd);
@@ -682,16 +708,24 @@ static void updi_open_issues_ldcs_statusb_after_synch(void)
 
     TEST_ASSERT_GREATER_OR_EQUAL_INT(0, sut_fd);
     pthread_mutex_lock(&rsp.mtx);
-    TEST_ASSERT_GREATER_OR_EQUAL_size_t(5u, rsp.n_captured);
-    cmd_byte = rsp.capture[4];
+    TEST_ASSERT_GREATER_OR_EQUAL_size_t(9u, rsp.n_captured);
+    stcs_a_sync = rsp.capture[4];
+    stcs_a_op   = rsp.capture[5];
+    stcs_a_val  = rsp.capture[6];
+    ldcs_sync   = rsp.capture[7];
+    ldcs_op     = rsp.capture[8];
     pthread_mutex_unlock(&rsp.mtx);
 
-    TEST_ASSERT_EQUAL_HEX8((uint8_t)(0x80u | ASI_STATUSB), cmd_byte);
+    TEST_ASSERT_EQUAL_HEX8(UPDI_SYNCH,                        stcs_a_sync);
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)(0xC0u | ASI_CTRLA),      stcs_a_op);
+    TEST_ASSERT_EQUAL_HEX8(ASI_CTRLA_IBDLY,                   stcs_a_val);
+    TEST_ASSERT_EQUAL_HEX8(UPDI_SYNCH,                        ldcs_sync);
+    TEST_ASSERT_EQUAL_HEX8((uint8_t)(0x80u | ASI_STATUSA),    ldcs_op);
 
     close(sut_fd);
 }
 
-/* Test 4: after the BREAK, baud is restored to the session rate. */
+/* Test 4: after the cold-start, baud remains the configured session rate. */
 static void updi_open_restores_session_baud_after_break(void)
 {
     responder_t    rsp;
@@ -712,11 +746,11 @@ static void updi_open_restores_session_baud_after_break(void)
     close(sut_fd);
 }
 
-/* Test 5: with no responder, BREAK+SYNCH is retried 3 times → 6 BREAKs. */
-static void updi_open_retries_break_synch_3_times_on_no_ack(void)
+/* Test 5: with no responder, the cold-start sequence is retried 3 times. */
+static void updi_open_retries_cold_start_3_times_on_no_ack(void)
 {
-    uint8_t cap[32];
-    size_t  n, i, breaks;
+    uint8_t cap[64];
+    size_t  n, i, wake_bytes;
     int     sut_fd;
 
     open_pty_fixture();
@@ -725,11 +759,16 @@ static void updi_open_retries_break_synch_3_times_on_no_ack(void)
     TEST_ASSERT_EQUAL_INT(-1, sut_fd);
 
     n = drain_master(g_master_fd, cap, sizeof(cap));
-    breaks = 0;
+    /* Cold-start attempt counting (matches avrdude's serialupdi):
+     *   attempt 0 (fast path): 1× 0x00 wake byte, then STCS+STCS+LDCS
+     *   attempt 1 (slow path): 2× 0x00 break bytes at 300 baud, then STCS+STCS+LDCS
+     *   attempt 2 (slow path): 2× 0x00 break bytes at 300 baud, then STCS+STCS+LDCS
+     * No other byte in any frame is 0x00, so counting zeros gives 1+2+2 = 5. */
+    wake_bytes = 0;
     for (i = 0; i < n; i++)
         if (cap[i] == 0x00u)
-            breaks++;
-    TEST_ASSERT_EQUAL_size_t(6u, breaks);   /* 3 attempts × 2 BREAKs each */
+            wake_bytes++;
+    TEST_ASSERT_EQUAL_size_t(5u, wake_bytes);
 }
 
 /* Test 6: after 3 failed BREAK+SYNCH attempts, updi_open returns -1. */
@@ -772,10 +811,10 @@ int main(void)
 
     /* Phase E */
     RUN_TEST(updi_open_sets_8e2_raw_half_duplex_via_termios);
-    RUN_TEST(updi_open_asserts_two_breaks_then_synch);
-    RUN_TEST(updi_open_issues_ldcs_statusb_after_synch);
+    RUN_TEST(updi_open_asserts_wake_byte_then_stcs_ctrlb);
+    RUN_TEST(updi_open_issues_stcs_ctrla_and_ldcs_statusa);
     RUN_TEST(updi_open_restores_session_baud_after_break);
-    RUN_TEST(updi_open_retries_break_synch_3_times_on_no_ack);
+    RUN_TEST(updi_open_retries_cold_start_3_times_on_no_ack);
     RUN_TEST(updi_open_returns_minus1_after_3_consecutive_link_failures);
 
     return UNITY_END();
