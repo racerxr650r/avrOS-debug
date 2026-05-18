@@ -383,9 +383,15 @@ NVM controller registers (accessed via UPDI ST/LD at base address `0x1000`):
 1.  Open the serial port with `O_RDWR | O_NOCTTY | O_NONBLOCK`, then restore blocking mode via `fcntl()`.
 2.  Configure `termios` for raw 8E2 mode: `cfmakeraw()`, set `CS8`, `CSTOPB`, `PARENB` (with `PARODD` cleared = even parity), disable flow control, and apply `cfsetispeed()` / `cfsetospeed()` for the operating baud rate.
 3.  If the kernel rejects `PARENB` with `EINVAL` (Linux PTY slaves silently strip parity from virtual terminals), retry the `tcsetattr()` call with `PARENB` cleared. Real serial hardware accepts 8E2; the fallback only affects PTY-backed unit tests.
-4.  Assert the BREAK condition by writing two consecutive `0x00` bytes at the session baud rate, then `tcdrain()` the output queue. At 115200 baud each zero byte holds TX low for ≈70 µs, so two bytes together cover ≥ 140 µs — well above the ≥ 24.6 µs UPDI minimum break duration of §35.3.1.2. The kernel `tcsetattr()` baud-switch trick recommended in earlier UPDI literature is unsafe on Linux PTYs (a baud change flushes the master RX queue), so the implementation deliberately avoids it.
-5.  Transmit the SYNCH byte (`0x55`) and discard the half-duplex loopback echo.
-6.  Send `LDCS ASI_STATUSB` (opcode `0x80 | 0x01` = `0x81`). Reading `ASI_STATUSB` clears the PESIG bit that the BREAK sets, confirming the link is alive and ready for opcodes. Retry the BREAK+SYNCH sequence up to three times before returning -1.
+4.  Run up to three cold-start attempts that mirror avrdude's `serialupdi` programmer (verified bit-for-bit by `strace`-ing avrdude against the same target):
+    - **Attempt 0 — fast path** (succeeds against an already-prepped target, e.g. immediately after a previous successful session): write one `0x00` wake byte at session baud, then `tcdrain()` + `tcflush(TCIFLUSH)`.
+    - **Attempts 1, 2 — slow path** (required on cold power-on with passive single-wire combiners such as the RPi PL011): switch the kernel baud to 300 with `CSTOPB` cleared (1 stop bit) via `tcsetattr(TCSADRAIN)`, write two `0x00` bytes — each immediately followed by `tcdrain()` (mandatory: without it the queued byte is flushed or re-clocked by the subsequent baud switch, destroying the BREAK pulse) — and read-and-discard their half-duplex echoes at 300 baud (each byte holds TX low ≈ 33 ms = ≥ 60 ms total). Wait ≈ 50 ms (`nanosleep`) so any line-bus echoes still in flight reach the kernel RX queue at 300-baud framing, then `tcflush(TCIFLUSH)` to discard them, then restore session baud (`tcsetattr(TCSADRAIN)` + a second `tcflush(TCIFLUSH)`).
+    - For every attempt, follow the wake / BREAK with three frames: `STCS ASI_CTRLB = ASI_CTRLB_CCDETDIS (0x08)` (disable contention detection), `STCS ASI_CTRLA = ASI_CTRLA_IBDLY (0x80)` (enable inter-byte delay on responses), and `LDCS ASI_STATUSA` (link probe — `ASI_STATUSA` carries UPDIREV and is always readable while UPDI is enabled). If all three succeed, read the 32-byte System Information Block (`SYNCH` + `UPDI_OP_KEY_SIB` `0xE6`, followed by `UPDI_SIB_LEN = 32` response bytes) to wake any target left in UPDI SLEEP from a prior session and to confirm the link end-to-end; on success the function returns the open fd. Otherwise it advances to the next attempt.
+5.  After three failed attempts the function returns -1.
+
+**Why the 300-baud BREAK trick is necessary:** No portable POSIX API generates a multi-millisecond line-low BREAK on demand. `tcsendbreak()` is too short (and on the RPi PL011 driver is silently ignored). Switching the kernel baud rate is the only mechanism that reliably stretches a single `0x00` byte to ≥ 30 ms of line-low time, which is what cold-power AVR-Dx UPDI requires to clear its contention-detect latch.
+
+**Why the SIB-read SLEEP wake is necessary:** A target left in UPDI SLEEP from a prior debug session will accept every link-layer probe (STCS, LDCS) — those frames merely echo on the half-duplex line — yet reject every memory access, manifesting as `updi_mem_read()` returning -1 immediately after a successful-looking `updi_open()`. avrdude reads the 32-byte SIB unconditionally on every connect; the act of issuing a key-opcode-class frame (`0xE6`) is what wakes the target. The 32-byte payload itself (e.g. `"    AVR P:2D:1-3M2 (A7.KV001.0)\0"`) is discarded.
 
 **Half-duplex echo cancellation:** Because TX and RX share the same physical wire, every transmitted byte is echoed back on the RX line. All UPDI transmit helpers skip one echo byte per transmitted byte before reading response data.
 
@@ -396,7 +402,7 @@ NVM controller registers (accessed via UPDI ST/LD at base address `0x1000`):
 | `updi_mem_read()` per-byte | 100 ms (`select()`) | A `select()` with `timeval { 0, 100000 }` guards every `read()`. |
 | `updi_nvm_write_flash()` NVMPROG wait | ≈ 100 ms | 100 LDCS polls of `ASI_SYS_STATUS` at 1 ms intervals. |
 | `updi_nvm_write_flash()` page BUSY poll | ≈ 20 ms per page | 20 reads of `NVMCTRL_STATUS` (bit 0 = BUSY). |
-| BREAK condition duration | ≥ ≈ 140 µs | Two `0x00` bytes at 115200 baud easily exceed the §35.3.1.2 minimum of 24.6 µs. |
+| Cold-start slow-path BREAK | ≥ ≈ 60 ms per attempt | Two `0x00` bytes at 300 baud, mirroring avrdude's serialupdi. |
 
 Note: `updi_halt()`, `updi_run()`, and `updi_step()` are deferred stubs in Phase 2 and contribute no entries to the timing table.
 
@@ -412,7 +418,7 @@ Note: `updi_halt()`, `updi_run()`, and `updi_step()` are deferred stubs in Phase
 | `REPEAT`        | `0xA0`     | Set repeat count for the next bulk transfer (n-1 in operand). |
 | `KEY`           | `0xE0`     | Transmit 8-byte key to unlock a privileged mode. |
 
-**Test approach for `src/updi.c`:** Unit-testable using a POSIX pseudo-terminal pair (`openpty()`): one end is passed to `updi_open()`, the other is driven by the test harness. Test cases cover: termios 8E2 configuration (with PARENB-fallback under PTYs), the BREAK+SYNCH+LDCS-STATUSB probe and its 3-retry policy, the 3-frame `ST_PTR_WORD`/`REPEAT`/`LD-or-ST` burst, the 100 ms `select()` deadline, NVM precondition checks, NVMPROG and per-page BUSY timeouts, and that `updi_halt`/`updi_run`/`updi_step` return -1 stubs until the OCD layer lands.
+**Test approach for `src/updi.c`:** Unit-testable using a POSIX pseudo-terminal pair (`openpty()`): one end is passed to `updi_open()`, the other is driven by the test harness. Test cases cover: termios 8E2 configuration (with PARENB-fallback under PTYs), the cold-start wake-byte/STCS-CCDETDIS/STCS-IBDLY/LDCS-STATUSA probe and its 3-retry policy, the 3-frame `ST_PTR_WORD`/`REPEAT`/`LD-or-ST` burst, the 100 ms `select()` deadline, NVM precondition checks, NVMPROG and per-page BUSY timeouts, and that `updi_halt`/`updi_run`/`updi_step` return -1 stubs until the OCD layer lands.
 
 ### 4.4 Dependencies
 

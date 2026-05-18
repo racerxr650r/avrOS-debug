@@ -364,9 +364,15 @@ NVM controller registers (accessed via UPDI ST/LD at base address `0x1000`):
 1.  Open the serial port with `O_RDWR | O_NOCTTY | O_NONBLOCK`, then restore blocking mode via `fcntl()`.
 2.  Configure `termios` for raw 8E2 mode: `cfmakeraw()`, set `CS8`, `CSTOPB`, `PARENB` (with `PARODD` cleared = even parity), disable flow control, and apply `cfsetispeed()` / `cfsetospeed()` for the operating baud rate.
 3.  If the kernel rejects `PARENB` with `EINVAL` (Linux PTY slaves silently strip parity from virtual terminals), retry the `tcsetattr()` call with `PARENB` cleared. Real serial hardware accepts 8E2; the fallback only affects PTY-backed unit tests.
-4.  Assert the BREAK condition by writing two consecutive `0x00` bytes at the session baud rate, then `tcdrain()` the output queue. At 115200 baud each zero byte holds TX low for ≈70 µs, so two bytes together cover ≥ 140 µs — well above the ≥ 24.6 µs UPDI minimum break duration of §35.3.1.2. The kernel `tcsetattr()` baud-switch trick recommended in earlier UPDI literature is unsafe on Linux PTYs (a baud change flushes the master RX queue), so the implementation deliberately avoids it.
-5.  Transmit the SYNCH byte (`0x55`) and discard the half-duplex loopback echo.
-6.  Send `LDCS ASI_STATUSB` (opcode `0x80 | 0x01` = `0x81`). Reading `ASI_STATUSB` clears the PESIG bit that the BREAK sets, confirming the link is alive and ready for opcodes. Retry the BREAK+SYNCH sequence up to three times before returning -1.
+4.  Run up to three cold-start attempts that mirror avrdude's `serialupdi` programmer (verified bit-for-bit by `strace`-ing avrdude against the same target):
+    - **Attempt 0 — fast path** (succeeds against an already-prepped target, e.g. immediately after a previous successful session): write one `0x00` wake byte at session baud, then `tcdrain()` + `tcflush(TCIFLUSH)`.
+    - **Attempts 1, 2 — slow path** (required on cold power-on with passive single-wire combiners such as the RPi PL011): switch the kernel baud to 300 with `CSTOPB` cleared (1 stop bit) via `tcsetattr(TCSADRAIN)`, write two `0x00` bytes — each immediately followed by `tcdrain()` (mandatory: without it the queued byte is flushed or re-clocked by the subsequent baud switch, destroying the BREAK pulse) — and read-and-discard their half-duplex echoes at 300 baud (each byte holds TX low ≈ 33 ms = ≥ 60 ms total). Wait ≈ 50 ms (`nanosleep`) so any line-bus echoes still in flight reach the kernel RX queue at 300-baud framing, then `tcflush(TCIFLUSH)` to discard them, then restore session baud (`tcsetattr(TCSADRAIN)` + a second `tcflush(TCIFLUSH)`).
+    - For every attempt, follow the wake / BREAK with three frames: `STCS ASI_CTRLB = ASI_CTRLB_CCDETDIS (0x08)` (disable contention detection), `STCS ASI_CTRLA = ASI_CTRLA_IBDLY (0x80)` (enable inter-byte delay on responses), and `LDCS ASI_STATUSA` (link probe — `ASI_STATUSA` carries UPDIREV and is always readable while UPDI is enabled). If all three succeed, read the 32-byte System Information Block (`SYNCH` + `UPDI_OP_KEY_SIB` `0xE6`, followed by `UPDI_SIB_LEN = 32` response bytes) to wake any target left in UPDI SLEEP from a prior session and to confirm the link end-to-end; on success the function returns the open fd. Otherwise it advances to the next attempt.
+5.  After three failed attempts the function returns -1.
+
+**Why the 300-baud BREAK trick is necessary:** No portable POSIX API generates a multi-millisecond line-low BREAK on demand. `tcsendbreak()` is too short (and on the RPi PL011 driver is silently ignored). Switching the kernel baud rate is the only mechanism that reliably stretches a single `0x00` byte to ≥ 30 ms of line-low time, which is what cold-power AVR-Dx UPDI requires to clear its contention-detect latch.
+
+**Why the SIB-read SLEEP wake is necessary:** A target left in UPDI SLEEP from a prior debug session will accept every link-layer probe (STCS, LDCS) — those frames merely echo on the half-duplex line — yet reject every memory access, manifesting as `updi_mem_read()` returning -1 immediately after a successful-looking `updi_open()`. avrdude reads the 32-byte SIB unconditionally on every connect; the act of issuing a key-opcode-class frame (`0xE6`) is what wakes the target. The 32-byte payload itself (e.g. `"    AVR P:2D:1-3M2 (A7.KV001.0)\0"`) is discarded.
 
 **Half-duplex echo cancellation:** Because TX and RX share the same physical wire, every transmitted byte is echoed back on the RX line. All UPDI transmit helpers skip one echo byte per transmitted byte before reading response data.
 
@@ -377,7 +383,7 @@ NVM controller registers (accessed via UPDI ST/LD at base address `0x1000`):
 | `updi_mem_read()` per-byte | 100 ms (`select()`) | A `select()` with `timeval { 0, 100000 }` guards every `read()`. |
 | `updi_nvm_write_flash()` NVMPROG wait | ≈ 100 ms | 100 LDCS polls of `ASI_SYS_STATUS` at 1 ms intervals. |
 | `updi_nvm_write_flash()` page BUSY poll | ≈ 20 ms per page | 20 reads of `NVMCTRL_STATUS` (bit 0 = BUSY). |
-| BREAK condition duration | ≥ ≈ 140 µs | Two `0x00` bytes at 115200 baud easily exceed the §35.3.1.2 minimum of 24.6 µs. |
+| Cold-start slow-path BREAK | ≥ ≈ 60 ms per attempt | Two `0x00` bytes at 300 baud, mirroring avrdude's serialupdi. |
 
 Note: `updi_halt()`, `updi_run()`, and `updi_step()` are deferred stubs in Phase 2 and contribute no entries to the timing table.
 
@@ -393,7 +399,7 @@ Note: `updi_halt()`, `updi_run()`, and `updi_step()` are deferred stubs in Phase
 | `REPEAT`        | `0xA0`     | Set repeat count for the next bulk transfer (n-1 in operand). |
 | `KEY`           | `0xE0`     | Transmit 8-byte key to unlock a privileged mode. |
 
-**Test approach for `src/updi.c`:** Unit-testable using a POSIX pseudo-terminal pair (`openpty()`): one end is passed to `updi_open()`, the other is driven by the test harness. Test cases cover: termios 8E2 configuration (with PARENB-fallback under PTYs), the BREAK+SYNCH+LDCS-STATUSB probe and its 3-retry policy, the 3-frame `ST_PTR_WORD`/`REPEAT`/`LD-or-ST` burst, the 100 ms `select()` deadline, NVM precondition checks, NVMPROG and per-page BUSY timeouts, and that `updi_halt`/`updi_run`/`updi_step` return -1 stubs until the OCD layer lands.]]></algorithm>
+**Test approach for `src/updi.c`:** Unit-testable using a POSIX pseudo-terminal pair (`openpty()`): one end is passed to `updi_open()`, the other is driven by the test harness. Test cases cover: termios 8E2 configuration (with PARENB-fallback under PTYs), the cold-start wake-byte/STCS-CCDETDIS/STCS-IBDLY/LDCS-STATUSA probe and its 3-retry policy, the 3-frame `ST_PTR_WORD`/`REPEAT`/`LD-or-ST` burst, the 100 ms `select()` deadline, NVM precondition checks, NVMPROG and per-page BUSY timeouts, and that `updi_halt`/`updi_run`/`updi_step` return -1 stubs until the OCD layer lands.]]></algorithm>
         <dependencies>
           <dep><![CDATA[POSIX `termios` serial API (`tcgetattr`, `tcsetattr`, `cfsetspeed`, `cfmakeraw`).]]></dep>
           <dep><![CDATA[Standard POSIX file I/O (`open`, `read`, `write`, `close`, `fcntl`, `tcdrain`).]]></dep>
@@ -1170,8 +1176,8 @@ Errors are propagated upward through the module stack without retrying:
         </traces>
       </hlr>
 
-      <hlr id="HLR-036" name="UPDI Link Initialisation Timing and Retry">
-        <text><![CDATA[The UPDI initialisation sequence shall assert a BREAK condition by transmitting two consecutive zero (0x00) bytes at the session baud rate, holding the TX line low for well over the 24.6 µs UPDI minimum (datasheet §35.3.1.2), before transmitting the SYNCH character (0x55) and probing the link with `LDCS ASI_STATUSB`. If the target does not acknowledge the probe, the server shall retry the BREAK+SYNCH+LDCS sequence up to three times before declaring a link failure and returning -1 from `updi_open()`.]]></text>
+      <hlr id="HLR-036" name="UPDI Cold-Start Contention Handshake">
+        <text><![CDATA[The UPDI link initialisation sequence shall make a fresh power-on AVR-Dx target reachable on host wirings that combine TX and RX onto the single UPDI line via a passive resistor (notably Raspberry Pi PL011 and FTDI-based serial adapters), where the host's push-pull idle-high TX otherwise drives the target's UPDI collision detector and silences responses. `updi_open()` shall execute up to three cold-start attempts that mirror avrdude's `serialupdi` programmer (the reference implementation against which behaviour has been verified by `strace`): attempt 0 (fast path, succeeds against an already-prepped target) shall transmit one 0x00 wake byte at session baud followed by `tcdrain()` + `tcflush(TCIFLUSH)`, then `STCS ASI_CTRLB=CCDETDIS`, `STCS ASI_CTRLA=IBDLY`, and `LDCS ASI_STATUSA`; attempts 1 and 2 (slow path, required on cold power-on) shall instead generate a multi-millisecond line-low BREAK by switching the kernel baud to 300 with one stop bit (`CSTOPB` cleared), writing two 0x00 bytes each followed by `tcdrain()` (each byte ≈33 ms line-low = ≥60 ms total — enough to reset the target's UPDI clock and contention detector) and consuming their half-duplex echoes, then waiting ≈50 ms for any in-flight line bytes to settle, performing `tcflush(TCIFLUSH)`, restoring session baud (`tcsetattr(TCSADRAIN)` + `tcflush(TCIFLUSH)`), and repeating the STCS+STCS+LDCS sequence. After a successful `LDCS ASI_STATUSA` the link probe is followed by a 32-byte System Information Block read (`SYNCH` + `0xE6`) which both confirms the link end-to-end and wakes any target left in UPDI SLEEP from a prior session — without this step a sleeping target accepts link-layer probes but rejects every memory access. After three consecutive failed attempts `updi_open()` shall return -1.]]></text>
         <traces>
           <trace target="SDD" ref="4.3.3"/>
         </traces>
@@ -1517,17 +1523,17 @@ Errors are propagated upward through the module stack without retrying:
       </llr>
 
       <llr id="LLR-UPDI-02">
-        <text><![CDATA[`updi_open()` shall generate the UPDI BREAK condition by transmitting two consecutive 0x00 framing bytes at the configured session baud rate followed by `tcdrain()`. At 115200 baud each zero byte holds TX low for ≈ 70 µs, so two bytes together exceed the 24.6 µs minimum BREAK duration of datasheet §35.3.1.2 by a wide margin. The function shall not switch the kernel baud rate to generate the BREAK — a kernel baud change flushes the master RX queue on Linux PTYs and is unnecessary at modern UART speeds. After the BREAK the SYNCH character (0x55) shall be transmitted to establish frame alignment.]]></text>
+        <text><![CDATA[`updi_open()` shall execute up to three cold-start attempts. Attempt 0 (fast path) shall write a single 0x00 wake byte at the configured session baud rate, followed by `tcdrain()` and `tcflush(fd, TCIFLUSH)` to discard the half-duplex echo. Attempts 1 and 2 (slow path) shall instead generate a multi-millisecond line-low pulse by temporarily switching the kernel baud rate to 300 baud with `CSTOPB` cleared (1 stop bit) via `tcsetattr(TCSADRAIN)`, then writing two 0x00 bytes each followed immediately by `tcdrain()` to guarantee the byte is actually clocked out of the UART FIFO before the next operation. Each byte at 300 baud holds the TX line low for ≈33 ms (≥60 ms total — sufficient to reset the target's UPDI clock and contention detector on a cold power-on with passive single-wire combiners), and the half-duplex echoes are read-and-discarded at 300 baud. After both BREAK bytes, `updi_open()` shall sleep ≈50 ms (`nanosleep()`) so that any echo bytes still in flight on the line bus reach the kernel RX queue at 300-baud framing, then `tcflush(TCIFLUSH)` discards them. Only then shall the session baud rate be restored (`tcsetattr(TCSADRAIN)` followed by a second `tcflush(TCIFLUSH)`). Without `tcdrain()` after each write, the subsequent baud switch flushes or re-clocks the queued BREAK byte, destroying the line-low pulse; without the 50 ms settle, late echo bytes arrive AFTER the baud restore, get framed at 115200 baud, and desynchronise every subsequent frame echo. This mirrors avrdude's `serialupdi` programmer exactly (verified by `strace`) and is necessary because no portable POSIX API generates a multi-ms BREAK on demand — `tcsendbreak()` is too short and not honoured by all kernel UART drivers (notably the RPi PL011).]]></text>
         <traces>
           <trace target="HLR" ref="HLR-006" name="UPDI Hardware Connection"/>
-          <trace target="HLR" ref="HLR-036" name="UPDI Link Initialisation Timing and Retry"/>
+          <trace target="HLR" ref="HLR-036" name="UPDI Cold-Start Contention Handshake"/>
         </traces>
       </llr>
 
       <llr id="LLR-UPDI-03">
-        <text><![CDATA[Immediately after SYNCH, `updi_open()` shall probe the link by issuing `LDCS ASI_STATUSB` (opcode `0x80 | 0x01 = 0x81`). Reading `ASI_STATUSB` clears the PESIG bit that the BREAK sets and confirms the target is responsive. If the probe fails, `updi_open()` shall retry the entire BREAK+BREAK+SYNCH+LDCS sequence. After 3 consecutive failed attempts the function shall return -1 and the caller shall treat the link as unavailable.]]></text>
+        <text><![CDATA[After the wake byte (attempt 0) or 300-baud double-break (attempts 1–2), `updi_open()` shall transmit `STCS ASI_CTRLB = ASI_CTRLB_CCDETDIS` (0x08) to disable the target's collision/contention detector, then `STCS ASI_CTRLA = ASI_CTRLA_IBDLY` (0x80) to enable inter-byte delay on the target's responses, then probe the link with `LDCS ASI_STATUSA` (opcode `0x80 | 0x00 = 0x80`). `ASI_STATUSA` carries UPDIREV in its upper nibble and is always readable while UPDI is enabled, including before any reset. If any STCS write or the LDCS probe fails, `updi_open()` shall advance to the next attempt. After 3 consecutive failed attempts the function shall return -1 and the caller shall treat the link as unavailable.]]></text>
         <traces>
-          <trace target="HLR" ref="HLR-036" name="UPDI Link Initialisation Timing and Retry"/>
+          <trace target="HLR" ref="HLR-036" name="UPDI Cold-Start Contention Handshake"/>
         </traces>
       </llr>
 
@@ -1601,6 +1607,14 @@ Errors are propagated upward through the module stack without retrying:
         <text><![CDATA[`updi_read_device_info(fd, info)` shall populate the caller-supplied `UpdiDeviceInfo` struct with: 3 SIGROW DEVICEID bytes from physical address `0x1100`-`0x1102`, the REVID byte at `0x1103`, 10 SERNUM bytes at `0x1110`-`0x1119`, and the three ASI registers `ASI_SYS_STATUS`, `ASI_KEY_STATUS`, `ASI_STATUSB` read via `LDCS`. The function shall be non-destructive (no halt, no NVM activity). On any UPDI read failure it shall set `info->fail_op` to a short ASCII tag (`"sigrow"`, `"revid"`, `"sernum"`, `"sys-status"`, `"key-status"`, `"asi-statusb"`) and return -1; on success it shall set `info->fail_op = NULL` and return 0.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-044" name="Device-Signature Diagnostic Mode"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-UPDI-14">
+        <text><![CDATA[After each successful `LDCS ASI_STATUSA` link probe inside `updi_open()`, the function shall read the target's 32-byte System Information Block by transmitting `SYNCH` (`0x55`) followed by opcode `UPDI_OP_KEY_SIB` (`0xE6`) and reading exactly `UPDI_SIB_LEN` (32) bytes of response — looped over `read()` until the full block is collected. The SIB read serves two purposes: (1) it confirms the link end-to-end (target must be actively responding to return non-echo bytes), and (2) it wakes a target that was left in UPDI SLEEP from a prior debug session. Without this step a sleeping target will appear to accept every link-layer probe (STCS, LDCS) — those frames merely echo on the half-duplex line — yet reject every memory access, manifesting as `updi_mem_read()` returning -1 immediately after a successful `updi_open()`. avrdude's `serialupdi` issues this exact 32-byte SIB read on every connect; the response payload (e.g. `"    AVR P:2D:1-3M2 (A7.KV001.0)\0"`) is discarded by `updi_open()` since the caller currently only needs the wake side-effect. If the SIB read times out or returns fewer than 32 bytes the attempt shall be abandoned and the next cold-start attempt shall begin.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-006" name="UPDI Hardware Connection"/>
+          <trace target="HLR" ref="HLR-036" name="UPDI Cold-Start Contention Handshake"/>
         </traces>
       </llr>
     </function>
@@ -2038,28 +2052,28 @@ Errors are propagated upward through the module stack without retrying:
         <traces><trace target="LLR" ref="LLR-UPDI-01"/></traces>
       </test>
 
-      <test name="updi_open_asserts_two_breaks_then_synch">
-        <purpose><![CDATA[Verify that `updi_open()` transmits two consecutive 0x00 bytes (the UPDI BREAK pattern) followed by the SYNCH character 0x55 at the session baud rate, with no intervening kernel baud-rate switch.]]></purpose>
+      <test name="updi_open_asserts_wake_byte_then_stcs_ctrlb">
+        <purpose><![CDATA[Verify that `updi_open()` transmits a single 0x00 wake byte first, then the STCS CTRLB frame (SYNCH `0x55`, opcode `0xC0|ASI_CTRLB = 0xC3`, value `ASI_CTRLB_CCDETDIS = 0x08`) — the first half of the avrdude-matching cold-start sequence (issue #19).]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-02"/></traces>
       </test>
 
-      <test name="updi_open_issues_ldcs_statusb_after_synch">
-        <purpose><![CDATA[Capture the bytes written by `updi_open()` after SYNCH and verify the link-probe opcode is `LDCS ASI_STATUSB` (`0x80 | 0x01 = 0x81`), which clears the PESIG bit set by BREAK and confirms target responsiveness.]]></purpose>
+      <test name="updi_open_issues_stcs_ctrla_and_ldcs_statusa">
+        <purpose><![CDATA[Verify that after STCS CTRLB the SUT writes STCS CTRLA (`0xC2`, value `ASI_CTRLA_IBDLY = 0x80`) and then probes the link with LDCS STATUSA (`0x80|ASI_STATUSA = 0x80`) — the second half of the cold-start sequence (issue #19).]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-03"/></traces>
       </test>
 
       <test name="updi_open_restores_session_baud_after_break">
-        <purpose><![CDATA[Verify that `updi_open()` leaves the configured session baud rate (B115200) in effect after a successful BREAK+SYNCH sequence — i.e. it does not corrupt the termios baud setting.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-UPDI-02"/></traces>
+        <purpose><![CDATA[Verify that `updi_open()` leaves the configured session baud rate (B115200) in effect after a successful cold-start sequence — i.e. it does not corrupt the termios baud setting. The PTY responder also feeds the 32-byte SIB payload (`SYNCH`+`0xE6` → `"    AVR P:2D:1-3M2 (A7.KV001.0)\0"`), so a successful run additionally exercises the SIB-read SLEEP-wake step that `updi_open()` issues after the LDCS ASI_STATUSA link probe.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-02"/><trace target="LLR" ref="LLR-UPDI-14"/></traces>
       </test>
 
-      <test name="updi_open_retries_break_synch_3_times_on_no_ack">
-        <purpose><![CDATA[Simulate a target that never responds to LDCS and verify that `updi_open()` transmits the BREAK+BREAK+SYNCH+LDCS sequence exactly 3 times (six 0x00 BREAK bytes total) before giving up.]]></purpose>
+      <test name="updi_open_retries_cold_start_3_times_on_no_ack">
+        <purpose><![CDATA[Simulate a target that never responds and verify that `updi_open()` runs all three cold-start attempts before giving up: attempt 0 emits 1× 0x00 wake byte then STCS+STCS+LDCS at session baud; attempts 1 and 2 each emit 2× 0x00 BREAK bytes (at 300 baud via `tcsetattr`) then STCS+STCS+LDCS at session baud. With no 0x00 byte present anywhere else in the frames, this yields 1 + 2 + 2 = 5 zero bytes on the wire.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-03"/></traces>
       </test>
 
       <test name="updi_open_returns_minus1_after_3_consecutive_link_failures">
-        <purpose><![CDATA[After 3 failed BREAK+SYNCH+LDCS attempts with no response, verify that `updi_open()` returns -1.]]></purpose>
+        <purpose><![CDATA[After 3 failed cold-start attempts (wake + STCS CTRLB + STCS CTRLA + LDCS STATUSA) with no response, verify that `updi_open()` returns -1.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-03"/></traces>
       </test>
 

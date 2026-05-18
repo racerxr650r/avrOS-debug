@@ -205,40 +205,157 @@ int updi_open(const char *device, int baud)
     }
 
     /*
-     * Recovery handshake (datasheet §35.3.1.2 + §35.3.2.3):
-     *   1. Send two consecutive BREAK characters.  The spec recommends
-     *      dropping to a very low baud (≤ 300 Bd) so the low period easily
-     *      exceeds 12 UPDI-clock bit-times in worst-case low-power modes,
-     *      but at session baud (115200, 8E2) a 0x00 frame already holds
-     *      the line low for ≈104 µs — well above the 12-bit-time minimum
-     *      at the UPDI clock rates (4–32 MHz) used in this debugger.  We
-     *      stay at session baud because Linux PTYs flush the master's
-     *      RX queue on tcsetattr-baud-change, breaking the unit tests.
-     *   2. Send SYNCH (0x55).
-     *   3. Read PESIG via LDCS STATUSB to clear any error condition.
+     * Cold-start handshake (datasheet §35.3.1.2 + §35.3.2.3, matching
+     * avrdude's `serialupdi` programmer; see issue #19):
+     *
+     *   1. Write one 0x00 wake byte.  Its low frame doubles as a soft
+     *      BREAK at session baud — ≈87 µs of line-low, well above the
+     *      UPDI 12-bit-time minimum at any UPDI-clock rate in use.
+     *   2. tcdrain to flush TX, then tcflush(TCIFLUSH) to drop the
+     *      half-duplex echo of the wake byte.  Without the flush the
+     *      stale echo shifts the echo-byte accounting in every later
+     *      `updi_write_bytes()` call by one byte, which makes the
+     *      first `updi_set_ptr()` read an echo byte where it expects
+     *      the ACK and abort.
+     *   3. `STCS ASI_CTRLB = CCDETDIS` so the target ignores the
+     *      contention between its open-drain UPDI TX and the host
+     *      UART's push-pull idle-high TX.  Passive single-wire
+     *      combiners (the typical wiring on Raspberry Pi PL011 / FTDI
+     *      hosts) make the target see every TX attempt as a collision
+     *      and stay silent forever unless CCDETDIS is set.
+     *   4. `STCS ASI_CTRLA = IBDLY` so the target inserts inter-byte
+     *      guard time on its responses, which the host UART RX needs
+     *      to deframe reliably at session baud.
+     *   5. `LDCS ASI_STATUSA` to verify the link is alive.  STATUSA
+     *      carries UPDIREV in its upper nibble and is always readable
+     *      once UPDI is enabled, even before any reset has occurred.
+     *
+     * Retries: the entire 5-step sequence is attempted up to 3 times
+     * before declaring a link failure and returning -1.
+     */
+    /*
+     * Cold-start handshake (matching avrdude's `serialupdi` programmer
+     * exactly; see issue #19).  Empirically verified by `strace`-ing
+     * avrdude against the same target as this debugger:
+     *
+     *   Attempt 0 (fast path, succeeds against an already-prepped target):
+     *     1. Write one 0x00 wake byte at session baud, then
+     *        tcdrain() + tcflush(TCIFLUSH) to discard the half-duplex
+     *        echo of the wake byte.
+     *     2. STCS ASI_CTRLB = CCDETDIS  (disable contention detection)
+     *     3. STCS ASI_CTRLA = IBDLY     (inter-byte delay on responses)
+     *     4. LDCS ASI_STATUSA          (link probe)
+     *
+     *   Attempts 1, 2 (slow path, required on cold power-on with passive
+     *   single-wire combiners — RPi PL011, FTDI):
+     *     1a. Switch the kernel baud rate to 300 baud.
+     *     1b. Write two 0x00 bytes — each holds the TX line low for
+     *         ≈ 33 ms at 300 baud, giving the target's UPDI clock and
+     *         contention detector a clean ≥ 60 ms reset window that
+     *         dwarfs anything achievable at session baud.
+     *     1c. Restore session baud and tcflush(TCIFLUSH).
+     *     2-4. STCS CTRLB / STCS CTRLA / LDCS STATUSA as above.
+     *
+     * The 300-baud trick is unusual but Microchip-blessed — pymcuprog
+     * and avrdude both use it because no portable POSIX API generates
+     * a multi-ms BREAK on demand.  tcsendbreak() is too short and
+     * not honoured by all kernel UART drivers.
      */
     for (attempt = 0; attempt < 3; attempt++) {
-        uint8_t brk_pat[2] = { 0x00u, 0x00u };
-        uint8_t synch      = UPDI_SYNCH;
+        int rc;
 
-        if (write(fd, brk_pat, sizeof(brk_pat)) != (ssize_t)sizeof(brk_pat)) {
-            continue;
+        if (attempt == 0) {
+            uint8_t wake = 0x00u;
+
+            if (write(fd, &wake, 1) != (ssize_t)1)
+                continue;
+            tcdrain(fd);
+            tcflush(fd, TCIFLUSH);
+        } else {
+            struct termios slow = tty;
+            uint8_t        brk  = 0x00u;
+            uint8_t        echo;
+
+            /* B300, 8 data bits, even parity, 1 stop bit (NOT 2) — exactly
+             * matching avrdude's serialupdi.  The 1-stop-bit cell makes the
+             * byte ≈ 33 ms long, which is the line-low BREAK duration we
+             * want.  CSTOPB is restored when we revert to session baud. */
+            cfsetispeed(&slow, B300);
+            cfsetospeed(&slow, B300);
+            slow.c_cflag &= ~(tcflag_t)CSTOPB;
+            if (tcsetattr(fd, TCSADRAIN, &slow) < 0)
+                continue;
+            tcflush(fd, TCIFLUSH);
+
+            /* Two 0x00 bytes at 300 baud = two ~33 ms line-low pulses.
+             * `tcdrain()` after each write is critical: it blocks until the
+             * UART has actually clocked the byte out of the FIFO.  Without
+             * it, the subsequent `tcsetattr(B115200)` either flushes the
+             * queued byte or re-clocks it at 115200 baud, in either case
+             * destroying the BREAK pulse.  After each write+drain we
+             * read-and-discard the half-duplex echo at 300 baud; if it
+             * fails to arrive within VTIME we still proceed (the BREAK
+             * pulse itself is what the target needs, not the echo).      */
+            if (write(fd, &brk, 1) == (ssize_t)1) {
+                tcdrain(fd);
+                { ssize_t r = read(fd, &echo, 1); (void)r; }
+            }
+            if (write(fd, &brk, 1) == (ssize_t)1) {
+                tcdrain(fd);
+                { ssize_t r = read(fd, &echo, 1); (void)r; }
+            }
+
+            /* Allow any in-flight echo bytes from the line bus to reach
+             * the kernel RX queue before we switch baud — otherwise they
+             * arrive AFTER the tcflush below, get clocked at 115200 baud
+             * (corrupt framing), and desynchronise every subsequent
+             * frame echo.                                                */
+            {
+                struct timespec ts = { 0, 50 * 1000 * 1000L };  /* 50 ms */
+                (void)nanosleep(&ts, NULL);
+            }
+            tcflush(fd, TCIFLUSH);
+
+            if (tcsetattr(fd, TCSADRAIN, &tty) < 0)
+                continue;
+            tcflush(fd, TCIFLUSH);
         }
-        tcdrain(fd);
-        /* Discard the half-duplex echo of the BREAK pattern (and any
-         * spurious bytes the kernel queued while the line settled).
-         * Without this flush the leftover BREAK echo bytes shift the
-         * echo-byte accounting in every subsequent updi_write_bytes()
-         * call by one byte, which causes the first updi_mem_read() to
-         * mistake an echo byte for the ACK and abort.  Real UARTs
-         * (e.g. Raspberry Pi PL011) reproduce this in any session that
-         * runs back-to-back with the SIGROW read.                     */
-        tcflush(fd, TCIFLUSH);
 
-        if (updi_write_bytes(fd, &synch, 1) < 0)
-            continue;
-        if (updi_ldcs(fd, ASI_STATUSB) >= 0)
-            return fd;
+        rc = updi_stcs(fd, ASI_CTRLB, ASI_CTRLB_CCDETDIS);
+        if (rc < 0) continue;
+        rc = updi_stcs(fd, ASI_CTRLA, ASI_CTRLA_IBDLY);
+        if (rc < 0) continue;
+        rc = updi_ldcs(fd, ASI_STATUSA);
+        if (rc < 0) continue;
+
+        /*
+         * Wake the target from UPDI SLEEP if necessary.  Reading the
+         * 16-byte System Information Block (SYNCH + 0xE6, then 16
+         * response bytes) is harmless on an awake target and reliably
+         * wakes a sleeping one — avrdude's serialupdi issues exactly
+         * this transaction whenever ASI_SYS_STATUS reports INSLEEP.
+         * Without this step a target left in SLEEP from a prior session
+         * will accept the link-layer probes (LDCS STATUSA) but reject
+         * every memory access (sigrow read returns -1).
+         */
+        {
+            uint8_t sib_cmd[2] = { UPDI_SYNCH, UPDI_OP_KEY_SIB };
+            uint8_t sib_buf[UPDI_SIB_LEN];
+            size_t  total;
+            int     ok = 1;
+
+            if (updi_write_bytes(fd, sib_cmd, sizeof(sib_cmd)) < 0)
+                continue;
+            total = 0;
+            while (total < sizeof(sib_buf)) {
+                ssize_t got = read(fd, sib_buf + total, sizeof(sib_buf) - total);
+                if (got <= 0) { ok = 0; break; }
+                total += (size_t)got;
+            }
+            if (!ok) continue;
+        }
+
+        return fd;
     }
 
     close(fd);

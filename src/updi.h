@@ -11,7 +11,14 @@
 #define UPDI_BREAK_BAUD  300
 #define UPDI_ERR_WP      (-2)
 
+/* SIB (System Information Block) read opcode: KEY family with SIB-direction
+ * bit set and size selector = 32 bytes.  Issuing this opcode also wakes a
+ * UPDI target from sleep (matching avrdude's serialupdi behaviour). */
+#define UPDI_OP_KEY_SIB     0xE6
+#define UPDI_SIB_LEN        32
+
 /* UPDI CS-space register offsets (datasheet §35.4) */
+#define ASI_STATUSA     0x00     /* RO: UPDIREV[7:4]                         */
 #define ASI_STATUSB     0x01     /* RO: PESIG error signature                */
 #define ASI_CTRLA       0x02     /* RW: IBDLY, PARD, DTD, RSD, GTVAL         */
 #define ASI_CTRLB       0x03     /* RW: NACKDIS, CCDETDIS, UPDIDIS           */
@@ -19,6 +26,12 @@
 #define ASI_RESET_REQ   0x08     /* RW: RSTREQ[7:0]  (0x59 = reset, 0 = run) */
 #define ASI_SYS_CTRLA   0x0A     /* RW: UROWDONE (b1), CLKREQ (b0)           */
 #define ASI_SYS_STATUS  0x0B     /* RO: ERASEFAIL/SYSRST/INSLEEP/NVMPROG/... */
+
+/* ASI_CTRLA bits (datasheet §35.4.2) */
+#define ASI_CTRLA_IBDLY     0x80    /* Inter-Byte Delay enable                */
+
+/* ASI_CTRLB bits (datasheet §35.4.3) */
+#define ASI_CTRLB_CCDETDIS  0x08    /* Collision/Contention Detection Disable */
 
 int  updi_open(const char *device, int baud);
 void updi_close(int fd);
