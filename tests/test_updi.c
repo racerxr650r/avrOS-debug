@@ -592,13 +592,13 @@ static void *responder_thread(void *arg)
             case 6u: /* STCS CTRLA value echo */
             case 7u: /* LDCS STATUSA SYNCH echo */
             case 9u: /* SIB SYNCH echo */
-                (void)write(r->master_fd, &echo_byte, 1);
+                { ssize_t w = write(r->master_fd, &echo_byte, 1); (void)w; }
                 break;
             case 8u: /* LDCS STATUSA opcode echo + UPDIREV response */
-                (void)write(r->master_fd, ldcs_resp, sizeof(ldcs_resp));
+                { ssize_t w = write(r->master_fd, ldcs_resp, sizeof(ldcs_resp)); (void)w; }
                 break;
             case 10u: /* SIB opcode echo + 16-byte SIB payload */
-                (void)write(r->master_fd, sib_resp, sizeof(sib_resp));
+                { ssize_t w = write(r->master_fd, sib_resp, sizeof(sib_resp)); (void)w; }
                 break;
         }
     }

@@ -298,11 +298,11 @@ int updi_open(const char *device, int baud)
              * pulse itself is what the target needs, not the echo).      */
             if (write(fd, &brk, 1) == (ssize_t)1) {
                 tcdrain(fd);
-                (void)read(fd, &echo, 1);
+                { ssize_t r = read(fd, &echo, 1); (void)r; }
             }
             if (write(fd, &brk, 1) == (ssize_t)1) {
                 tcdrain(fd);
-                (void)read(fd, &echo, 1);
+                { ssize_t r = read(fd, &echo, 1); (void)r; }
             }
 
             /* Allow any in-flight echo bytes from the line bus to reach
