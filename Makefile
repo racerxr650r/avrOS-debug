@@ -5,6 +5,10 @@
 #   test         Build ELF fixtures, build all test binaries, run them
 #   test-ci      Like test, but writes per-suite output to build/test-results/*.txt
 #                (used by CI to build a structured test summary)
+#   coverage     Rebuild with --coverage, run all unit tests, and emit a
+#                line + branch coverage report under build/coverage/
+#                (txt, Cobertura XML, JSON summary, drill-down HTML).
+#                Requires `gcovr` (pip install gcovr).
 #   hw-test      Run on-target hardware integration tests (Groups A + B, safe)
 #                Manual only — never wired into `make test`.
 #                Override port: make hw-test HW_PORT=/dev/ttyUSB0
@@ -26,6 +30,8 @@
 #
 # Variables:
 #   ASAN=1     Add -fsanitize=address,undefined to both host and test builds
+#   COVERAGE=1 Add gcov instrumentation (--coverage -O0) to host and test builds
+#              (normally set automatically by the `coverage` target)
 #   PREFIX     Install prefix (default: /usr/local)
 #   VERSION    Package version string (default: `git describe` or 0.0.0)
 #   V=1        Verbose build (show full commands)
@@ -80,6 +86,18 @@ else
   SAN_FLAGS :=
 endif
 
+# ── Coverage flag ────────────────────────────────────────────────────────────
+# COVERAGE=1 instruments host + test builds with gcov line/branch counters.
+# -O0 keeps the gcov line/branch map accurate; we override the optimisation
+# level only inside the coverage step so normal builds stay at -O2.
+ifeq ($(COVERAGE),1)
+  COV_CFLAGS  := --coverage -O0 -fprofile-arcs -ftest-coverage -fno-inline -fno-inline-small-functions -fno-default-inline
+  COV_LDFLAGS := --coverage
+else
+  COV_CFLAGS  :=
+  COV_LDFLAGS :=
+endif
+
 # ── Verbose flag ─────────────────────────────────────────────────────────────
 ifeq ($(V),1)
   Q :=
@@ -93,7 +111,7 @@ CFLAGS := -std=c99 -D_POSIX_C_SOURCE=200809L \
            -Wstrict-prototypes -Wmissing-prototypes \
            -Wshadow \
            -O2 -g \
-           $(SAN_FLAGS)
+           $(SAN_FLAGS) $(COV_CFLAGS)
 
 # Test builds: suppress warnings on __wrap_* stubs (no header declares them),
 # and pass -DUNIT_TEST so src/main.c can exclude its main() entry point.
@@ -318,6 +336,61 @@ test-ci: fixtures $(addprefix $(TESTBINDIR)/,$(TEST_NAMES))
 	    if [ $$RET -ne 0 ]; then FAIL=1; fi; \
 	done; \
 	exit $$FAIL
+
+# ── coverage target ──────────────────────────────────────────────────────────
+# Build the host sources + every Unity test suite with gcov instrumentation,
+# run them, then drive `gcovr` to produce a line + branch coverage report.
+#
+# Outputs (under build/coverage/):
+#   summary.txt        plain-text gcovr --print-summary
+#   coverage.txt       per-file gcovr report (lines + branches)
+#   coverage.xml       Cobertura XML (for CI ingestion)
+#   coverage.json      gcovr JSON summary (for programmatic parsing)
+#   html/index.html    drill-down HTML report (uploaded as a CI artifact)
+#
+# Usage:
+#   make coverage              # full clean build + tests + report
+#   make coverage GCOVR_FILTER='^src/updi\.c'   # restrict to one file
+#
+# Notes:
+#   * Forces a clean build because gcov data files are tied to the exact
+#     compilation flags.
+#   * COVERAGE=1 also disables inlining so branch counters stay aligned
+#     with the source.
+#   * ASAN and COVERAGE are mutually compatible but ASAN slows test runs;
+#     CI runs coverage with ASAN off.
+GCOVR_FILTER ?= ^src/
+GCOVR        ?= gcovr
+
+.PHONY: coverage
+coverage:
+	@echo "── coverage: rebuilding with --coverage ─────────────────"
+	$(Q)$(MAKE) --no-print-directory clean
+	$(Q)$(MAKE) --no-print-directory test-ci COVERAGE=1 ASAN=
+	@mkdir -p $(BUILDDIR)/coverage/html
+	@echo "── coverage: generating report (lines + branches) ───────"
+	$(Q)$(GCOVR) --root . \
+	    --filter '$(GCOVR_FILTER)' \
+	    --exclude '^tests/' \
+	    --exclude '^tools/' \
+	    --print-summary \
+	    --txt              $(BUILDDIR)/coverage/coverage.txt \
+	    --cobertura        $(BUILDDIR)/coverage/coverage.xml \
+	    --json-summary     $(BUILDDIR)/coverage/coverage.json \
+	    --json-summary-pretty \
+	    --html-details     $(BUILDDIR)/coverage/html/index.html \
+	    --html-title       "avr-updi-gdb coverage" \
+	    | tee $(BUILDDIR)/coverage/summary.txt
+	@echo ""
+	@echo "── coverage: per-file (lines + branches) ────────────────"
+	@cat $(BUILDDIR)/coverage/coverage.txt
+	@echo ""
+	@echo "Report artefacts:"
+	@echo "  $(BUILDDIR)/coverage/summary.txt"
+	@echo "  $(BUILDDIR)/coverage/coverage.txt"
+	@echo "  $(BUILDDIR)/coverage/coverage.xml   (Cobertura)"
+	@echo "  $(BUILDDIR)/coverage/coverage.json  (gcovr JSON summary)"
+	@echo "  $(BUILDDIR)/coverage/html/index.html"
 
 # ── hw-test target ────────────────────────────────────────────────────────────
 # On-target hardware integration tests. MANUAL ONLY — never wired into `make
