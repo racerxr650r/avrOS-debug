@@ -10,6 +10,12 @@
 #define UPDI_MAX_BLOCK   256
 #define UPDI_BREAK_BAUD  300
 #define UPDI_ERR_WP      (-2)
+#define UPDI_FLASH_PAGE_SIZE 512u
+/* AVR-Dx unified-UPDI memory map: FLASH section base.  Add to a
+ * program-memory byte offset (avr-gcc .text VMA) to obtain the UPDI
+ * physical address used by ST_PTR_LONG.  Section selection within FLASH
+ * (>32 KiB parts) is done via NVMCTRL.CTRLB.FLMAP. */
+#define UPDI_FLASH_BASE      0x800000u
 
 /* SIB (System Information Block) read opcode: KEY family with SIB-direction
  * bit set and size selector = 32 bytes.  Issuing this opcode also wakes a
@@ -41,6 +47,8 @@ int  updi_halt(int fd);
 int  updi_run(int fd);
 int  updi_step(int fd);
 int  updi_nvm_write_flash(int fd, uint32_t word_addr, const uint8_t *data, size_t len);
+int  updi_nvm_flash_patch(int fd, uint32_t addr, const uint8_t *data, size_t len);
+int  updi_chip_erase(int fd);
 int  updi_console_poll(int fd, char *buf, size_t cap);
 
 /* ── Device-signature diagnostics (Phase 7) ──────────────────────────── */

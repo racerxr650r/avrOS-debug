@@ -32,6 +32,7 @@ typedef struct {
     uint16_t    gdb_port;
     int         baud_rate;
     bool        load_flash;
+    bool        erase_chip;    /* --erase: DESTRUCTIVE chip erase before load */
     bool        device_info;   /* --device one-shot diagnostic (LLR-MAIN-08) */
     /* fds owned by main; -1 = closed/unset */
     int         listen_fd;
@@ -56,9 +57,12 @@ volatile sig_atomic_t g_quit = 0;
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "usage: %s [--port <port>] [--baud <baud>] [--load] "
+        "usage: %s [--port <port>] [--baud <baud>] [--erase] [--load] "
         "<serial-device> <elf-file>\n"
-        "       %s --device [--baud <baud>] <serial-device> [elf-file]\n",
+        "       %s --device [--baud <baud>] <serial-device> [elf-file]\n"
+        "\n"
+        "  --erase   DESTRUCTIVE: chip-erase + unlock before --load.\n"
+        "            Required on a locked AVR-Dx target before NVMPROG.\n",
         prog, prog);
 }
 
@@ -127,6 +131,7 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
     cfg->gdb_port      = 1234;
     cfg->baud_rate     = 115200;
     cfg->load_flash    = false;
+    cfg->erase_chip    = false;
     cfg->device_info   = false;
     cfg->listen_fd     = -1;
     cfg->gdb_fd        = -1;
@@ -143,6 +148,8 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
             cfg->baud_rate = atoi(argv[i]);
         } else if (strcmp(a, "--load") == 0) {
             cfg->load_flash = true;
+        } else if (strcmp(a, "--erase") == 0) {
+            cfg->erase_chip = true;
         } else if (strcmp(a, "--device") == 0) {
             cfg->device_info = true;
         } else if (a[0] == '-' && a[1] != '\0') {
@@ -329,19 +336,37 @@ MAYBE_STATIC int load_flash_segments(AppConfig *cfg, ElfContext *ctx)
         /* Skip SRAM-only segments (VMA inside SRAM region). */
         if (ctx->sram_base != 0 && ph.p_vaddr >= ctx->sram_base) continue;
 
-        uint8_t *buf = malloc(ph.p_filesz);
+        /* updi_nvm_write_flash() requires page-aligned address and length;
+         * pad the tail of the segment with 0xFF (erased-flash value) so a
+         * non-aligned p_filesz can still be programmed page-by-page. */
+        if ((ph.p_vaddr % UPDI_FLASH_PAGE_SIZE) != 0u) {
+            fprintf(stderr,
+                    "error: segment vaddr 0x%06x not page-aligned\n",
+                    (unsigned)ph.p_vaddr);
+            return -1;
+        }
+        uint32_t padded = (ph.p_filesz + UPDI_FLASH_PAGE_SIZE - 1u) &
+                          ~(UPDI_FLASH_PAGE_SIZE - 1u);
+
+        uint8_t *buf = malloc(padded);
         if (!buf) return -1;
+        memset(buf, 0xFF, padded);
         if (lseek(ctx->fd, (off_t)ph.p_offset, SEEK_SET) < 0 ||
             read(ctx->fd, buf, ph.p_filesz) != (ssize_t)ph.p_filesz) {
             free(buf);
             return -1;
         }
-        int rc = updi_nvm_write_flash(cfg->updi_fd, ph.p_vaddr,
-                                      buf, ph.p_filesz);
+        /* AVR-Dx UPDI memory map: FLASH lives at 0x800000 + flash_offset
+         * in the 24-bit unified address space.  avr-gcc links .text at
+         * p_vaddr = 0x000000 (program-memory view), so OR in the UPDI
+         * FLASH base before driving the NVM controller. */
+        uint32_t updi_addr = ph.p_vaddr | UPDI_FLASH_BASE;
+        int rc = updi_nvm_write_flash(cfg->updi_fd, updi_addr, buf, padded);
         free(buf);
         if (rc < 0) return -1;
-        printf("loaded %u bytes @ 0x%06x\n",
-               (unsigned)ph.p_filesz, (unsigned)ph.p_vaddr);
+        printf("loaded %u bytes @ 0x%06x → UPDI 0x%06x (padded to %u)\n",
+               (unsigned)ph.p_filesz, (unsigned)ph.p_vaddr,
+               (unsigned)updi_addr, (unsigned)padded);
     }
     return 0;
 }
@@ -392,6 +417,15 @@ int MAIN_NAME(int argc, char *argv[])
     }
 
     /* LLR-MAIN-04: optional flash load before listener. */
+    if (cfg.erase_chip) {
+        printf("chip-erase (DESTRUCTIVE) requested\n");
+        if (updi_chip_erase(cfg.updi_fd) < 0) {
+            fprintf(stderr, "error: chip erase failed\n");
+            exit_code = 1;
+            goto teardown;
+        }
+        printf("chip-erase complete; device unlocked\n");
+    }
     if (cfg.load_flash) {
         if (load_flash_segments(&cfg, &elf_ctx) < 0) {
             fprintf(stderr, "error: flash load failed\n");

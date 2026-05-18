@@ -19,6 +19,7 @@
 #include <ctype.h>
 
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <sys/types.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -179,7 +180,7 @@ int rsp_recv_packet(int fd, char *buf, size_t cap)
         if (c == '#') break;
         if (plen + 1 >= cap) return -1;
         buf[plen++] = c;
-        csum ^= (uint8_t)c;
+        csum = (uint8_t)(csum + (uint8_t)c);
     }
     buf[plen] = '\0';
 
@@ -204,7 +205,7 @@ int rsp_send_packet(int fd, const char *payload)
     size_t plen = strlen(payload);
     if (plen + 4u > sizeof rsp_buf) return -1;
     uint8_t csum = 0;
-    for (size_t i = 0; i < plen; ++i) csum ^= (uint8_t)payload[i];
+    for (size_t i = 0; i < plen; ++i) csum = (uint8_t)(csum + (uint8_t)payload[i]);
     rsp_buf[0] = '$';
     memcpy(rsp_buf + 1, payload, plen);
     rsp_buf[1 + plen] = '#';
@@ -327,8 +328,14 @@ static int dh_read_mem(int fd, const char *pkt, void *vctx)
     if (parse_hex_u32(&p, &len) < 0) return reply_err(fd, "E01");
     if (len == 0 || len > 512u) return reply_err(fd, "E01");
 
+    /* GDB AVR memory map: 0x000000-0x7FFFFF = FLASH (program memory),
+     * 0x800000+ = SRAM/IO (data memory).  AVR-Dx UPDI memory map: FLASH at
+     * UPDI 0x800000+, SRAM/IO at UPDI 0x000000+.  Swap the bit-23 sense to
+     * translate between the two spaces. */
+    uint32_t updi_addr = (addr >= 0x800000u) ? (addr & 0x7FFFFFu)
+                                             : (addr | UPDI_FLASH_BASE);
     uint8_t buf[512];
-    if (updi_mem_read(ctx->updi_fd, addr, buf, len) < 0) {
+    if (updi_mem_read(ctx->updi_fd, updi_addr, buf, len) < 0) {
         return reply_err(fd, "E01");
     }
     char reply[1025];
@@ -363,13 +370,16 @@ static int dh_write_mem(int fd, const char *pkt, void *vctx)
         memcpy(data, p, len);
     }
 
-    /* Heuristic: FLASH addresses are below SRAM (the host program-counter
-     * space). avr8 SRAM begins at 0x800000 in GDB's unified addressing. */
+    /* GDB AVR memory map: 0x000000-0x7FFFFF = FLASH, 0x800000+ = SRAM/IO.
+     * AVR-Dx UPDI memory map: FLASH at UPDI 0x800000+, SRAM at UPDI 0x4000+.
+     * SRAM writes go via mem_write (low UPDI addr); FLASH writes go via
+     * the NVM controller using the UPDI 24-bit FLASH-base address. */
     int rc;
     if (addr >= 0x800000u) {
         rc = updi_mem_write(ctx->updi_fd, addr & 0x7FFFFFu, data, len);
     } else {
-        rc = updi_nvm_write_flash(ctx->updi_fd, addr, data, len);
+        rc = updi_nvm_write_flash(ctx->updi_fd, addr | UPDI_FLASH_BASE,
+                                  data, len);
     }
     return (rc < 0) ? reply_err(fd, "E01") : reply_ok(fd);
 }
@@ -378,17 +388,54 @@ static int dh_continue(int fd, const char *pkt, void *vctx)
 {
     (void)pkt;
     RspContext *ctx = (RspContext *)vctx;
+
     if (updi_run(ctx->updi_fd) < 0) return reply_err(fd, "E01");
     fsm_invalidate(ctx->fsm);
-    /* Poll for halt by issuing updi_halt() until it succeeds. Returning to
-     * the wire happens via a stop-reason packet. */
-    while (updi_halt(ctx->updi_fd) < 0) {
-        /* loop */
+
+    /* Wait for the gdb client to send a Ctrl-C (\x03) interrupt byte.
+     * GDB normally transmits exactly one 0x03 when the user types
+     * Ctrl-C or invokes `interrupt`.  Other bytes outside a packet are
+     * tolerated and discarded.  EOF/socket-error halts the chip and
+     * returns -1 so the event loop can tear down cleanly.            */
+    for (;;) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        int sel = select(fd + 1, &rfds, NULL, NULL, NULL);
+        if (sel < 0) {
+            if (errno == EINTR) continue;
+            (void)updi_halt(ctx->updi_fd);
+            return -1;
+        }
+        if (sel == 0) continue;
+
+        char c;
+        ssize_t n;
+        do { n = read(fd, &c, 1); } while (n < 0 && errno == EINTR);
+        if (n <= 0) {
+            (void)updi_halt(ctx->updi_fd);
+            return -1;
+        }
+        if (c == '\x03') {
+            break;                  /* interrupt request */
+        }
+        /* Ignore any other stray bytes while running.  GDB should not
+         * send packets during vCont;c, but be liberal in what we accept. */
     }
+
+    if (updi_halt(ctx->updi_fd) < 0) return reply_err(fd, "E01");
+    fsm_invalidate(ctx->fsm);
     if (ctx->fsm) {
         (void)fsm_build_thread_list(ctx->fsm, ctx->idx, ctx->updi_fd);
     }
-    return dh_halt_reason(fd, "?", vctx);
+    /* Report SIGINT (signal 2) for user-initiated interrupt. */
+    {
+        int aid = ctx->fsm ? fsm_get_active_thread(ctx->fsm) : 0;
+        if (aid <= 0) aid = 1;
+        char reply[32];
+        snprintf(reply, sizeof reply, "T02thread:%x;", (unsigned)aid);
+        return rsp_send_packet(fd, reply);
+    }
 }
 
 static int dh_step(int fd, const char *pkt, void *vctx)
@@ -419,13 +466,18 @@ static int dh_insert_bp(int fd, const char *pkt, void *vctx)
     BpSlot *slot = bp_alloc();
     if (slot == NULL) return reply_err(fd, "E08");
 
+    /* GDB AVR FLASH addresses live in 0x000000-0x7FFFFF.  Translate to
+     * the UPDI FLASH-space (0x800000+) for both the read-back of the
+     * original opcode and the page-RMW that plants the BREAK. */
+    uint32_t flash_addr = (addr & 0x7FFFFFu) | UPDI_FLASH_BASE;
     uint8_t orig[2];
-    if (updi_mem_read(ctx->updi_fd, addr, orig, 2u) < 0) return reply_err(fd, "E01");
+    if (updi_mem_read(ctx->updi_fd, flash_addr, orig, 2u) < 0)
+        return reply_err(fd, "E01");
     uint16_t saved = (uint16_t)(orig[0] | ((uint16_t)orig[1] << 8));
 
     uint8_t brk[2] = { (uint8_t)(AVR_BREAK_OPCODE & 0xFFu),
                        (uint8_t)((AVR_BREAK_OPCODE >> 8) & 0xFFu) };
-    if (updi_nvm_write_flash(ctx->updi_fd, addr, brk, 2u) < 0) {
+    if (updi_nvm_flash_patch(ctx->updi_fd, flash_addr, brk, 2u) < 0) {
         return reply_err(fd, "E01");
     }
     slot->addr       = addr;
@@ -449,7 +501,8 @@ static int dh_remove_bp(int fd, const char *pkt, void *vctx)
 
     uint8_t orig[2] = { (uint8_t)(slot->saved_word & 0xFFu),
                         (uint8_t)((slot->saved_word >> 8) & 0xFFu) };
-    if (updi_nvm_write_flash(ctx->updi_fd, addr, orig, 2u) < 0) {
+    uint32_t flash_addr = (addr & 0x7FFFFFu) | UPDI_FLASH_BASE;
+    if (updi_nvm_flash_patch(ctx->updi_fd, flash_addr, orig, 2u) < 0) {
         return reply_err(fd, "E01");
     }
     slot->in_use = false;
