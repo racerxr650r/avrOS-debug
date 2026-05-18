@@ -45,9 +45,9 @@ int  updi_console_poll(int fd, char *buf, size_t cap);
 
 /* ── Device-signature diagnostics (Phase 7) ──────────────────────────── */
 typedef struct {
-    uint8_t     device_id[3];   /* SIGROW DEVICEID0..2 @ 0x1100-0x1102 */
-    uint8_t     revid;          /* SIGROW REVID         @ 0x1103       */
-    uint8_t     serial[10];     /* SIGROW SERNUM0..9    @ 0x1110-0x1119 */
+    uint8_t     device_id[3];   /* SIGROW DEVICEID0..2 @ 0x1100-0x1102      */
+    uint8_t     revid;          /* SYSCFG.REVID        @ 0x0F01 (§8.3.2.1)  */
+    uint8_t     serial[16];     /* SIGROW SERNUM0..15  @ 0x1110-0x111F (§7.6) */
     uint8_t     asi_sys_status;
     uint8_t     asi_key_status;
     uint8_t     asi_statusb;

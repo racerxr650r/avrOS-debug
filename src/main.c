@@ -288,13 +288,25 @@ MAYBE_STATIC int run_device_mode(AppConfig *cfg)
     printf("Signature:       %02X %02X %02X\n",
            info.device_id[0], info.device_id[1], info.device_id[2]);
     printf("Family:          %s\n", lookup_device_family(info.device_id));
-    printf("Revision:        %c%u\n",
-           (char)('A' + ((info.revid >> 4) & 0x0Fu)),
-           (unsigned)(info.revid & 0x0Fu));
-    printf("Serial:          %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X\n",
-           info.serial[0], info.serial[1], info.serial[2], info.serial[3],
-           info.serial[4], info.serial[5], info.serial[6], info.serial[7],
-           info.serial[8], info.serial[9]);
+    {
+        /* Datasheet §8.3.2.1: REVID MAJOR encoding 0x01=A, 0x02=B, ...   *
+         * MINOR encoding 0x00=0, 0x01=1, ...                              */
+        unsigned major = (unsigned)(info.revid >> 4) & 0x0Fu;
+        unsigned minor = (unsigned)(info.revid     ) & 0x0Fu;
+        if (major == 0u)
+            printf("Revision:        ?%u (raw=0x%02X)\n",
+                   minor, info.revid);
+        else
+            printf("Revision:        %c%u\n",
+                   (char)('A' + (int)major - 1), minor);
+    }
+    printf("Serial:          "
+           "%02X %02X %02X %02X %02X %02X %02X %02X "
+           "%02X %02X %02X %02X %02X %02X %02X %02X\n",
+           info.serial[0],  info.serial[1],  info.serial[2],  info.serial[3],
+           info.serial[4],  info.serial[5],  info.serial[6],  info.serial[7],
+           info.serial[8],  info.serial[9],  info.serial[10], info.serial[11],
+           info.serial[12], info.serial[13], info.serial[14], info.serial[15]);
     printf("UPDI status:     SYS_STATUS=0x%02X  KEY_STATUS=0x%02X  STATUSB=0x%02X\n",
            info.asi_sys_status, info.asi_key_status, info.asi_statusb);
     fflush(stdout);

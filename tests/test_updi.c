@@ -159,6 +159,14 @@ static void prestuff_setptr_ack(int master)
     prestuff(master, &ack, 1);
 }
 
+/* 24-bit pointer-set: SYNCH, 0x6A, addr_lo, addr_mid, addr_hi -> 5 echo + 1 ACK */
+static void prestuff_setptr_ack_long(int master)
+{
+    uint8_t ack = UPDI_ACK;
+    prestuff_fill(master, 0x00, 5);
+    prestuff(master, &ack, 1);
+}
+
 static void prestuff_repeat_echo(int master)   { prestuff_fill(master, 0x00, 3); }
 static void prestuff_ldst_echo(int master)     { prestuff_fill(master, 0x00, 2); }
 
@@ -304,8 +312,46 @@ static void updi_mem_read_uses_repeat_ld_auto_increment_sequence(void)
     TEST_ASSERT_EQUAL_HEX8(0x24u, captured[8]);    /* LD ptr++       */
 }
 
-/* Test 9: mem_read passes a 0s + 100000us timeval to select() */
-static void updi_mem_read_calls_select_with_100ms_timeout_before_read(void)
+/* Test 8b: mem_read uses 24-bit ST_PTR (0x6A) when addr > 0xFFFF
+ * (mapped-Flash region above 64 KiB on AVR128DA/DB). */
+static void updi_mem_read_uses_24bit_addressing_above_64kib(void)
+{
+    uint8_t  databuf[4];
+    uint8_t  captured[16];
+    size_t   n;
+    int      rc;
+
+    open_pty_fixture();
+    prestuff_setptr_ack_long(g_master_fd);   /* 5 echo + 1 ACK */
+    prestuff_repeat_echo(g_master_fd);
+    prestuff_ldst_echo(g_master_fd);
+    prestuff_fill(g_master_fd, 0x7Eu, 4);
+
+    /* Target: 0x012345 = lo 0x45, mid 0x23, hi 0x01 */
+    rc = updi_mem_read(g_slave_fd, 0x012345u, databuf, sizeof(databuf));
+    TEST_ASSERT_EQUAL_INT(0, rc);
+
+    n = drain_master(g_master_fd, captured, sizeof(captured));
+    TEST_ASSERT_EQUAL_size_t(10u, n);   /* 5 + 3 + 2 */
+
+    /* ST_PTR_LONG frame: SYNCH, 0x6A, 0x45, 0x23, 0x01 */
+    TEST_ASSERT_EQUAL_HEX8(UPDI_SYNCH, captured[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x6Au,      captured[1]);
+    TEST_ASSERT_EQUAL_HEX8(0x45u,      captured[2]);
+    TEST_ASSERT_EQUAL_HEX8(0x23u,      captured[3]);
+    TEST_ASSERT_EQUAL_HEX8(0x01u,      captured[4]);
+    /* REPEAT + LD ptr++ */
+    TEST_ASSERT_EQUAL_HEX8(UPDI_SYNCH, captured[5]);
+    TEST_ASSERT_EQUAL_HEX8(0xA0u,      captured[6]);
+    TEST_ASSERT_EQUAL_HEX8(0x03u,      captured[7]);   /* count - 1 = 3 */
+    TEST_ASSERT_EQUAL_HEX8(UPDI_SYNCH, captured[8]);
+    TEST_ASSERT_EQUAL_HEX8(0x24u,      captured[9]);
+
+    TEST_ASSERT_EQUAL_HEX8(0x7Eu, databuf[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x7Eu, databuf[3]);
+}
+
+/* Test 9: mem_read passes a 0s + 100000us timeval to select() */static void updi_mem_read_calls_select_with_100ms_timeout_before_read(void)
 {
     uint8_t  databuf[16];
     int      rc;
@@ -796,6 +842,7 @@ int main(void)
     /* Phase C */
     RUN_TEST(updi_mem_read_splits_request_larger_than_256_bytes);
     RUN_TEST(updi_mem_read_uses_repeat_ld_auto_increment_sequence);
+    RUN_TEST(updi_mem_read_uses_24bit_addressing_above_64kib);
     RUN_TEST(updi_mem_read_calls_select_with_100ms_timeout_before_read);
     RUN_TEST(updi_mem_read_returns_minus1_on_select_timeout);
     RUN_TEST(updi_mem_write_returns_0_on_success);

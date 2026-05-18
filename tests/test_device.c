@@ -242,16 +242,17 @@ static void prestuff_ldcs(int master, uint8_t resp)
 
 /* Prestuff a full successful updi_read_device_info() byte stream onto
  * the master end of the PTY:
- *   - SIGROW @ 0x1100 (3 bytes signature)
- *   - REVID  @ 0x1103 (1 byte)
- *   - SERNUM @ 0x1110 (10 bytes)
+ *   - SIGROW.DEVICEID0..2 @ 0x1100 (3 bytes signature)
+ *   - SYSCFG.REVID        @ 0x0F01 (1 byte; datasheet §8.3.2.1)
+ *   - SIGROW.SERNUM0..15  @ 0x1110 (16 bytes; datasheet §7.6.2.3)
  *   - LDCS ASI_SYS_STATUS / ASI_KEY_STATUS / ASI_STATUSB                */
 static void prestuff_device_info_success(int master)
 {
     static const uint8_t sig[3]    = { 0x1E, 0x97, 0x0A };  /* AVR128DA28 */
     static const uint8_t revid     = 0xA6;
-    static const uint8_t serial[10] = {
-        0x00, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E, 0x6F, 0x70, 0x81, 0x92
+    static const uint8_t serial[16] = {
+        0x00, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E, 0x6F, 0x70,
+        0x81, 0x92, 0xA3, 0xB4, 0xC5, 0xD6, 0xE7, 0xF8
     };
 
     prestuff_memread_setup(master);
@@ -261,7 +262,7 @@ static void prestuff_device_info_success(int master)
     prestuff(master, &revid, 1);
 
     prestuff_memread_setup(master);
-    prestuff(master, serial, 10);
+    prestuff(master, serial, 16);
 
     prestuff_ldcs(master, 0x82);   /* ASI_SYS_STATUS */
     prestuff_ldcs(master, 0x10);   /* ASI_KEY_STATUS */
@@ -366,10 +367,11 @@ static void updi_read_device_info_returns_sigrow_and_asi_bytes(void)
     TEST_ASSERT_EQUAL_HEX8(0x0A, info.device_id[2]);
     TEST_ASSERT_EQUAL_HEX8(0xA6, info.revid);
 
-    static const uint8_t expect_ser[10] = {
-        0x00, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E, 0x6F, 0x70, 0x81, 0x92
+    static const uint8_t expect_ser[16] = {
+        0x00, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E, 0x6F, 0x70,
+        0x81, 0x92, 0xA3, 0xB4, 0xC5, 0xD6, 0xE7, 0xF8
     };
-    TEST_ASSERT_EQUAL_HEX8_ARRAY(expect_ser, info.serial, 10);
+    TEST_ASSERT_EQUAL_HEX8_ARRAY(expect_ser, info.serial, 16);
 
     TEST_ASSERT_EQUAL_HEX8(0x82, info.asi_sys_status);
     TEST_ASSERT_EQUAL_HEX8(0x10, info.asi_key_status);

@@ -146,3 +146,142 @@ jobs:
         run: |
           echo "One or more test suites failed — see the PR comment for details."
           exit 1
+
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write   # post / update the PR comment
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: make prereqs
+
+      - name: Install gcovr
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcovr
+          gcovr --version
+
+      # Build with --coverage, run every unit test suite, and emit
+      # line + branch coverage reports under build/coverage/. The
+      # coverage target itself runs `make test-ci COVERAGE=1`, so
+      # test failures here will also fail the coverage job.
+      - name: Build and run with coverage
+        id: run_coverage
+        run: make coverage
+        continue-on-error: true
+
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: build/coverage/
+          retention-days: 14
+
+      - name: Post coverage summary
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          COVERAGE_OUTCOME: ${{ steps.run_coverage.outcome }}
+        with:
+          script: |
+            const fs   = require('fs');
+            const path = require('path');
+
+            const summaryPath = 'build/coverage/coverage.json';
+            let data = null;
+            try {
+              data = JSON.parse(fs.readFileSync(summaryPath, 'utf8'));
+            } catch (e) {
+              data = null;
+            }
+
+            const sha = context.payload.pull_request.head.sha.slice(0, 7);
+            const ok  = process.env.COVERAGE_OUTCOME === 'success';
+
+            const pct = (v) =>
+              (v === undefined || v === null) ? '—' : `${Number(v).toFixed(1)}%`;
+            const ratio = (c, t) =>
+              (c === undefined || t === undefined) ? '—' : `${c} / ${t}`;
+
+            // Health badge based on branch coverage
+            function badge(p) {
+              if (p === undefined || p === null) return '⚠️';
+              if (p >= 80) return '✅';
+              if (p >= 60) return '🟡';
+              return '🔴';
+            }
+
+            let md = `## Code Coverage\n\n`;
+            if (!ok) {
+              md += `❌ Coverage build failed — see the workflow log for details.\n\n`;
+            }
+            if (!data) {
+              md += `⚠️ No coverage report was produced (commit \`${sha}\`).\n`;
+            } else {
+              md += `Commit \`${sha}\` — instrumented with \`--coverage\` and \`gcovr\`.\n\n`;
+              md += `| Metric | Covered | Percent |\n`;
+              md += `| --- | ---: | ---: |\n`;
+              md += `| Lines     | ${ratio(data.line_covered, data.line_total)}         | ${badge(data.line_percent)} ${pct(data.line_percent)} |\n`;
+              md += `| **Branches** | ${ratio(data.branch_covered, data.branch_total)} | ${badge(data.branch_percent)} ${pct(data.branch_percent)} |\n`;
+              md += `| Functions | ${ratio(data.function_covered, data.function_total)} | ${badge(data.function_percent)} ${pct(data.function_percent)} |\n\n`;
+
+              const files = (data.files || [])
+                .slice()
+                .sort((a, b) => a.filename.localeCompare(b.filename));
+              if (files.length > 0) {
+                md += `<details><summary>Per-file coverage</summary>\n\n`;
+                md += `| File | Lines | Branches | Functions |\n`;
+                md += `| --- | ---: | ---: | ---: |\n`;
+                for (const f of files) {
+                  md += `| \`${f.filename}\` ` +
+                        `| ${pct(f.line_percent)} (${f.line_covered}/${f.line_total}) ` +
+                        `| ${badge(f.branch_percent)} ${pct(f.branch_percent)} (${f.branch_covered}/${f.branch_total}) ` +
+                        `| ${pct(f.function_percent)} (${f.function_covered}/${f.function_total}) |\n`;
+                }
+                md += `\n</details>\n`;
+              }
+              md += `\n[Full HTML report available as the \`coverage-report\` artifact on this workflow run.]\n`;
+            }
+
+            // Write to the Actions job summary page
+            await core.summary.addRaw(md).write();
+
+            // Post or update a single sticky PR comment
+            const marker = '<!-- aod-ci-coverage-summary -->';
+            const body   = `${marker}\n${md}`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner:        context.repo.owner,
+              repo:         context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c => c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      # Propagate coverage-build failure so the PR check turns red.
+      - name: Fail job if coverage failed
+        if: steps.run_coverage.outcome == 'failure'
+        run: |
+          echo "Coverage build / test run failed — see the PR comment for details."
+          exit 1

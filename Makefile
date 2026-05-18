@@ -5,6 +5,20 @@
 #   test         Build ELF fixtures, build all test binaries, run them
 #   test-ci      Like test, but writes per-suite output to build/test-results/*.txt
 #                (used by CI to build a structured test summary)
+#   coverage     Rebuild with --coverage, run all unit tests, and emit a
+#                line + branch coverage report under build/coverage/
+#                (txt, Cobertura XML, JSON summary, drill-down HTML).
+#                Requires `gcovr` (pip install gcovr).
+#   hw-test      Run on-target hardware integration tests (Groups A + B, safe)
+#                Manual only — never wired into `make test`.
+#                Override port: make hw-test HW_PORT=/dev/ttyUSB0
+#                                  (PORT= accepted as alias)
+#                See `HW_*` variables below for all knobs.
+#   hw-test-nvm  Add destructive NVM page write/verify; requires
+#                HW_TEST_NVM_CONFIRM=YES
+#   hw-test-rsp  Spawn the RSP server and probe it over TCP; requires
+#                HW_TEST_ELF=path/to/fw.elf
+#   hw-test-all  Run all hw-test groups (needs both opt-ins above)
 #   clean        Remove all build artefacts
 #   check-tools  Verify all required host tools are present on PATH
 #   install      Install binary + man page under $(PREFIX) [default: /usr/local]
@@ -16,9 +30,29 @@
 #
 # Variables:
 #   ASAN=1     Add -fsanitize=address,undefined to both host and test builds
+#   COVERAGE=1 Add gcov instrumentation (--coverage -O0) to host and test builds
+#              (normally set automatically by the `coverage` target)
 #   PREFIX     Install prefix (default: /usr/local)
 #   VERSION    Package version string (default: `git describe` or 0.0.0)
 #   V=1        Verbose build (show full commands)
+#
+# hw-test variables (all optional; environment or `make VAR=value`):
+#   HW_PORT              serial device (default /dev/ttyAMA2)
+#                        PORT= is accepted as a shorthand alias.
+#   HW_DEVICE_ID         expected SIGROW DEVICEID, e.g. "1E 97 0A"
+#                        (enables Group-A A3 deviceid check)
+#   HW_SRAM_ADDR         scratch SRAM byte address for B-group round-trips
+#                        (default 0x7000 — mid-RAM on AVR128DA, clear of
+#                        .data/.bss and stack; pick another address if the
+#                        running firmware uses this region — B1c will warn)
+#   HW_FLASH_PAGE_ADDR   scratch FLASH page for NVM test (default 0x7E00,
+#                        the last page of AVR128DA28; override for larger
+#                        parts, e.g. 0x1FE00 for AVR128DA48/DB)
+#   HW_ADDR_24BIT        address >0xFFFF to exercise ST_PTR_LONG; 0 = skip
+#   HW_TEST_ELF          ELF for hw-test-rsp child process
+#   HW_RSP_PORT          TCP port for RSP smoke test (default 1234)
+#   HW_VERBOSE           0/1/2 — per-step trace + hex dumps (default 0)
+#   HW_TEST_NVM_CONFIRM  must be YES to allow hw-test-nvm (destructive)
 
 # ── Toolchain ────────────────────────────────────────────────────────────────
 CC        := gcc
@@ -52,6 +86,18 @@ else
   SAN_FLAGS :=
 endif
 
+# ── Coverage flag ────────────────────────────────────────────────────────────
+# COVERAGE=1 instruments host + test builds with gcov line/branch counters.
+# -O0 keeps the gcov line/branch map accurate; we override the optimisation
+# level only inside the coverage step so normal builds stay at -O2.
+ifeq ($(COVERAGE),1)
+  COV_CFLAGS  := --coverage -O0 -fprofile-arcs -ftest-coverage -fno-inline -fno-inline-small-functions -fno-default-inline
+  COV_LDFLAGS := --coverage
+else
+  COV_CFLAGS  :=
+  COV_LDFLAGS :=
+endif
+
 # ── Verbose flag ─────────────────────────────────────────────────────────────
 ifeq ($(V),1)
   Q :=
@@ -65,7 +111,7 @@ CFLAGS := -std=c99 -D_POSIX_C_SOURCE=200809L \
            -Wstrict-prototypes -Wmissing-prototypes \
            -Wshadow \
            -O2 -g \
-           $(SAN_FLAGS)
+           $(SAN_FLAGS) $(COV_CFLAGS)
 
 # Test builds: suppress warnings on __wrap_* stubs (no header declares them),
 # and pass -DUNIT_TEST so src/main.c can exclude its main() entry point.
@@ -291,6 +337,161 @@ test-ci: fixtures $(addprefix $(TESTBINDIR)/,$(TEST_NAMES))
 	done; \
 	exit $$FAIL
 
+# ── coverage target ──────────────────────────────────────────────────────────
+# Build the host sources + every Unity test suite with gcov instrumentation,
+# run them, then drive `gcovr` to produce a line + branch coverage report.
+#
+# Outputs (under build/coverage/):
+#   summary.txt        plain-text gcovr --print-summary
+#   coverage.txt       per-file gcovr report (lines + branches)
+#   coverage.xml       Cobertura XML (for CI ingestion)
+#   coverage.json      gcovr JSON summary (for programmatic parsing)
+#   html/index.html    drill-down HTML report (uploaded as a CI artifact)
+#
+# Usage:
+#   make coverage              # full clean build + tests + report
+#   make coverage GCOVR_FILTER='^src/updi\.c'   # restrict to one file
+#
+# Notes:
+#   * Forces a clean build because gcov data files are tied to the exact
+#     compilation flags.
+#   * COVERAGE=1 also disables inlining so branch counters stay aligned
+#     with the source.
+#   * ASAN and COVERAGE are mutually compatible but ASAN slows test runs;
+#     CI runs coverage with ASAN off.
+GCOVR_FILTER ?= ^src/
+GCOVR        ?= gcovr
+
+.PHONY: coverage
+coverage:
+	@echo "── coverage: rebuilding with --coverage ─────────────────"
+	$(Q)$(MAKE) --no-print-directory clean
+	$(Q)$(MAKE) --no-print-directory test-ci COVERAGE=1 ASAN=
+	@mkdir -p $(BUILDDIR)/coverage/html
+	@echo "── coverage: generating report (lines + branches) ───────"
+	$(Q)$(GCOVR) --root . \
+	    --filter '$(GCOVR_FILTER)' \
+	    --exclude '^tests/' \
+	    --exclude '^tools/' \
+	    --print-summary \
+	    --txt              $(BUILDDIR)/coverage/coverage.txt \
+	    --cobertura        $(BUILDDIR)/coverage/coverage.xml \
+	    --json-summary     $(BUILDDIR)/coverage/coverage.json \
+	    --json-summary-pretty \
+	    --html-details     $(BUILDDIR)/coverage/html/index.html \
+	    --html-title       "avr-updi-gdb coverage" \
+	    | tee $(BUILDDIR)/coverage/summary.txt
+	@echo ""
+	@echo "── coverage: per-file (lines + branches) ────────────────"
+	@cat $(BUILDDIR)/coverage/coverage.txt
+	@echo ""
+	@echo "Report artefacts:"
+	@echo "  $(BUILDDIR)/coverage/summary.txt"
+	@echo "  $(BUILDDIR)/coverage/coverage.txt"
+	@echo "  $(BUILDDIR)/coverage/coverage.xml   (Cobertura)"
+	@echo "  $(BUILDDIR)/coverage/coverage.json  (gcovr JSON summary)"
+	@echo "  $(BUILDDIR)/coverage/html/index.html"
+
+# ── hw-test target ────────────────────────────────────────────────────────────
+# On-target hardware integration tests. MANUAL ONLY — never wired into `make
+# test` (which must remain hardware-independent for CI). Runs against a real
+# AVR-Dx target connected via UPDI (single-wire) on a serial device.
+#
+# Usage:
+#   make hw-test                                     # safe (Groups A + B)
+#   make hw-test HW_PORT=/dev/ttyUSB0
+#   make hw-test PORT=/dev/ttyAMA2                   # PORT= alias accepted
+#   make hw-test HW_SRAM_ADDR=0x6000 HW_VERBOSE=1    # probe alt SRAM, trace
+#   make hw-test HW_DEVICE_ID="1E 97 0A"             # enable deviceid check
+#   make hw-test HW_ADDR_24BIT=0x10000               # exercise ST_PTR_LONG
+#   make hw-test-nvm   HW_TEST_NVM_CONFIRM=YES       # opt-in destructive NVM
+#   make hw-test-nvm   HW_TEST_NVM_CONFIRM=YES HW_FLASH_PAGE_ADDR=0x1FE00
+#   make hw-test-rsp   HW_TEST_ELF=path/to/fw.elf    # spawn RSP server + probe
+#   make hw-test-rsp   HW_TEST_ELF=fw.elf HW_RSP_PORT=2345
+#   make hw-test-all   HW_TEST_NVM_CONFIRM=YES HW_TEST_ELF=...
+#
+# Environment variables (all optional; passed through to the hw_test binary):
+#   HW_PORT              serial device (default /dev/ttyAMA2)
+#                        PORT= is accepted as a shorthand alias.
+#   HW_DEVICE_ID         expected SIGROW DEVICEID, e.g. "1E 97 0A" — when
+#                        set, Group-A A3 verifies the chip matches
+#   HW_SRAM_ADDR         scratch SRAM byte address for B-group round-trips
+#                        (default 0x7000 — mid-RAM on AVR128DA, clear of
+#                        .data/.bss and stack). Pick another address if the
+#                        running firmware uses this region — diagnostic case
+#                        B1c will detect and warn.
+#   HW_FLASH_PAGE_ADDR   scratch FLASH page for NVM test (default 0x7E00,
+#                        which is the last page of AVR128DA28; override for
+#                        DA48/DB48 etc., e.g. 0x1FE00 for 128 KiB parts)
+#   HW_ADDR_24BIT        address >0xFFFF to exercise ST_PTR_LONG; 0 = skip B3
+#   HW_TEST_ELF          ELF for --with-rsp child process (hw-test-rsp/all)
+#   HW_RSP_PORT          TCP port for RSP smoke test (default 1234)
+#   HW_VERBOSE           0/1/2 — per-step trace and hex dumps (default 0)
+#   HW_TEST_NVM_CONFIRM  must be YES to allow hw-test-nvm (destructive)
+HW_PORT              ?= /dev/ttyAMA2
+HW_DEVICE_ID         ?=
+HW_SRAM_ADDR         ?=
+HW_FLASH_PAGE_ADDR   ?=
+HW_ADDR_24BIT        ?=
+HW_TEST_ELF          ?=
+HW_RSP_PORT          ?=
+HW_VERBOSE           ?=
+HW_TEST_NVM_CONFIRM  ?=
+# Accept PORT= as a shorthand alias for HW_PORT=
+ifneq ($(PORT),)
+HW_PORT := $(PORT)
+endif
+
+HW_TEST_SRC := tests/hw/hw_test.c
+HW_TEST_BIN := $(BUILDDIR)/hw_test
+HW_ENV       = HW_PORT='$(HW_PORT)' \
+               HW_DEVICE_ID='$(HW_DEVICE_ID)' \
+               HW_SRAM_ADDR='$(HW_SRAM_ADDR)' \
+               HW_FLASH_PAGE_ADDR='$(HW_FLASH_PAGE_ADDR)' \
+               HW_ADDR_24BIT='$(HW_ADDR_24BIT)' \
+               HW_TEST_ELF='$(HW_TEST_ELF)' \
+               HW_RSP_PORT='$(HW_RSP_PORT)' \
+               HW_VERBOSE='$(HW_VERBOSE)'
+
+$(HW_TEST_BIN): $(HW_TEST_SRC) $(BUILDDIR)/updi.o
+	@mkdir -p $(BUILDDIR)
+	$(Q)$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $^ $(LUTIL)
+	@echo "  LD  $@"
+
+.PHONY: hw-test hw-test-nvm hw-test-rsp hw-test-all
+hw-test: $(HW_TEST_BIN)
+	$(Q)$(HW_ENV) $(HW_TEST_BIN)
+
+# Destructive: programs the last FLASH page (HW_FLASH_PAGE_ADDR).
+# Requires explicit HW_TEST_NVM_CONFIRM=YES to fire.
+hw-test-nvm: $(HW_TEST_BIN)
+	@if [ "$(HW_TEST_NVM_CONFIRM)" != "YES" ]; then \
+	    echo "hw-test-nvm: refused — set HW_TEST_NVM_CONFIRM=YES to confirm"; \
+	    echo "             (this will erase + rewrite FLASH page at $(if $(HW_FLASH_PAGE_ADDR),$(HW_FLASH_PAGE_ADDR),0x7E00))"; \
+	    exit 1; \
+	fi
+	$(Q)$(HW_ENV) $(HW_TEST_BIN) --with-nvm
+
+# Spawns the RSP server as a child, probes TCP. Requires HW_TEST_ELF.
+hw-test-rsp: $(HW_TEST_BIN) all
+	@if [ -z "$(HW_TEST_ELF)" ]; then \
+	    echo "hw-test-rsp: refused — HW_TEST_ELF=path/to/fw.elf is required"; \
+	    exit 1; \
+	fi
+	$(Q)$(HW_ENV) $(HW_TEST_BIN) --with-rsp
+
+# Run Groups A + B + C + D in one go. NVM still requires explicit confirm.
+hw-test-all: $(HW_TEST_BIN) all
+	@if [ "$(HW_TEST_NVM_CONFIRM)" != "YES" ]; then \
+	    echo "hw-test-all: refused — set HW_TEST_NVM_CONFIRM=YES to include NVM"; \
+	    exit 1; \
+	fi
+	@if [ -z "$(HW_TEST_ELF)" ]; then \
+	    echo "hw-test-all: refused — HW_TEST_ELF=path/to/fw.elf is required"; \
+	    exit 1; \
+	fi
+	$(Q)$(HW_ENV) $(HW_TEST_BIN) --with-nvm --with-rsp
+
 # ── check-tools target ────────────────────────────────────────────────────────
 # LLR-INST-01: verify every required host tool is on PATH.
 .PHONY: check-tools
@@ -399,6 +600,8 @@ clean:
 	$(Q)rm -rf $(BUILDDIR) $(DISTDIR)
 	@echo "  CLEAN  $(BUILDDIR)/ $(DISTDIR)/"
 # ── help target ───────────────────────────────────────────────────────────
+# Prints the top-of-file comment block from `# Targets:` up to (but not
+# including) the first `# ──` section separator or the first non-comment line.
 .PHONY: help
 help:
-	@awk '/^# Targets:/{found=1} found{if(/^[^#]/ || /^#$$/)exit; sub(/^# ?/,""); print}' $(MAKEFILE_LIST)
+	@awk '/^# Targets:/{found=1} found{if(/^[^#]/ || /^# ──/)exit; sub(/^# ?/,""); print}' $(MAKEFILE_LIST)
