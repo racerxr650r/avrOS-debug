@@ -2,7 +2,7 @@
 
 Tracks the work defined in [doc/SDP.md §8 — Phase 7](../doc/SDP.md#phase-7--device-signature-diagnostic-mode).
 
-**Depends on:** Phases 0–6 complete (binary `avr-updi-gdb` builds clean, full test suite green, install/bundle targets working).
+**Depends on:** Phases 0–6 complete (binary `avrOSdb` builds clean, full test suite green, install/bundle targets working).
 
 ## Summary
 
@@ -23,7 +23,7 @@ During bring-up of new boards and adapters there is currently no first-line tool
 
 ### Documentation
 - [ ] `doc/UserManual.md` — `--device` row in the options table, a dedicated section with an annotated example output, and a Troubleshooting mention that `--device` is the first-line diagnostic.
-- [ ] `doc/avr-updi-gdb.1` — `--device` under SYNOPSIS and OPTIONS plus a third entry under EXAMPLES.
+- [ ] `doc/avrOSdb.1` — `--device` under SYNOPSIS and OPTIONS plus a third entry under EXAMPLES.
 
 ### Tests (`tests/test_device.c` — 6 tests)
 - [ ] (a) `parse_args` accepts `--device` without `<elf-file>` (LLR-MAIN-08).
@@ -44,20 +44,20 @@ During bring-up of new boards and adapters there is currently no first-line tool
 - `make test` runs `tests/test_device` reporting 6/6 passing; full suite green.
 - `python3 tools/lint_project.py` → 0 errors, 0 warnings.
 - Generated docs (SDD/HLRs/LLRs/STP/Traceability) re-render with no `UnicodeEncodeError` (run with `LC_ALL=C.UTF-8 PYTHONIOENCODING=utf-8`).
-- `man -l doc/avr-updi-gdb.1` exits 0.
-- On real hardware: `avr-updi-gdb --device /dev/ttyUSB0` prints a recognisable signature and family name and exits 0; with the adapter disconnected the same command exits 1 with a `stderr` diagnostic that explicitly names the failed UPDI step (`updi-open`, `break`, `synch`, `sigrow`, etc.).
+- `man -l doc/avrOSdb.1` exits 0.
+- On real hardware: `avrOSdb --device /dev/ttyUSB0` prints a recognisable signature and family name and exits 0; with the adapter disconnected the same command exits 1 with a `stderr` diagnostic that explicitly names the failed UPDI step (`updi-open`, `break`, `synch`, `sigrow`, etc.).
 
 ## CLI synopsis after Phase 7
 
 ```
-avr-updi-gdb [--port port] [--baud baud] [--load] <serial-device> <elf-file>
-avr-updi-gdb --device [--baud baud] <serial-device> [elf-file]
+avrOSdb [--port port] [--baud baud] [--load] <serial-device> <elf-file>
+avrOSdb --device [--baud baud] <serial-device> [elf-file]
 ```
 
 ## Example output (real `AVR128DA48`)
 
 ```
-$ avr-updi-gdb --device /dev/ttyUSB0
+$ avrOSdb --device /dev/ttyUSB0
 Serial device:   /dev/ttyUSB0
 Baud rate:       115200
 UPDI link:       up (SYNCH ack in 412 µs)
@@ -78,7 +78,7 @@ for d in SDD HLRs LLRs STP Traceability; do
   python3 tools/render_doc.py tools/templates/$d.md.j2 $d --out doc/$d.md
 done
 make clean && make && make test
-man -l doc/avr-updi-gdb.1 >/dev/null
+man -l doc/avrOSdb.1 >/dev/null
 ```
 
 ## Out of Scope

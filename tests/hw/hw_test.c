@@ -1,6 +1,6 @@
 /* tests/hw/hw_test.c — on-target hardware integration tests
  *
- * Validates avr-updi-gdb behaviours that PTY-based unit tests cannot prove:
+ * Validates avrOSdb behaviours that PTY-based unit tests cannot prove:
  * real UART timing, real UPDI silicon responses, the single-wire combiner
  * electrical path, and end-to-end pipelines.
  *
@@ -829,7 +829,7 @@ static void run_groupF_fuses(HwCfg *cfg, int fd)
     report_pass("F2", "fuse pretty-print round-trip", now_ms() - t0);
 }
 
-/* F3 — drive the real built avr-updi-gdb binary in --prog mode against
+/* F3 — drive the real built avrOSdb binary in --prog mode against
  * the AVR-DA bench using the all_nvm.elf fixture.  Verifies (a) the
  * load + verify pipeline survives on real silicon, (b) exit code is
  * 0 (not UPDI_EXIT_VERIFY_FAIL), and (c) stdout contains "verify: OK".
@@ -848,10 +848,10 @@ static void run_groupF_prog(HwCfg *cfg)
                     "fixture ELF not found (build first)");
         return;
     }
-    const char *bin = "build/avr-updi-gdb";
+    const char *bin = "build/avrOSdb";
     if (stat(bin, &st) != 0) {
         report_skip("F3", "--prog end-to-end with verify",
-                    "build/avr-updi-gdb not found (make first)");
+                    "build/avrOSdb not found (make first)");
         return;
     }
 
@@ -1064,7 +1064,7 @@ static void run_groupD(const HwCfg *cfg)
         return;
     }
 
-    /* Spawn: build/avr-updi-gdb --port <N> <serial> <elf>                  */
+    /* Spawn: build/avrOSdb --port <N> <serial> <elf>                  */
     pid_t child = fork();
     if (child < 0) {
         report_fail("D1", "RSP TCP accept", "fork failed");
@@ -1080,7 +1080,7 @@ static void run_groupD(const HwCfg *cfg)
             dup2(devnull, STDERR_FILENO);
             close(devnull);
         }
-        execl("build/avr-updi-gdb", "avr-updi-gdb",
+        execl("build/avrOSdb", "avrOSdb",
               "--port", portbuf,
               cfg->port, cfg->elf_path, (char *)NULL);
         _exit(127);

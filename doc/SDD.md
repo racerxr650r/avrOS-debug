@@ -12,7 +12,7 @@ command-line GDB stub application. It is intended for embedded application devel
 of the `aod` software.
 
 ### 1.2 Scope of the Document
-This document describes the design of the source modules that implement the avr-updi-gdb server:
+This document describes the design of the source modules that implement the avrOSdb server:
 
 *   [src/main.c](../src/main.c): Entry point, CLI argument parsing, and the top-level select()-based event loop.
 *   [src/updi.c](../src/updi.c): UPDI physical layer: UART serial management, UPDI protocol framing, NVM flash programming, and UPDI console bridge.
@@ -22,23 +22,23 @@ This document describes the design of the source modules that implement the avr-
 *   [src/monitor.c](../src/monitor.c): Custom monitor command handler: implements the `avros events` and `avros queues` sub-commands via non-intrusive UPDI reads.
 *   [Makefile](../Makefile): Build orchestration: compile, test, install, uninstall, check-tools, and bundle (Debian .deb, Red Hat .rpm, Homebrew formula) targets.
 *   [tests/hw/hw_test.c](../tests/hw/hw_test.c): On-target hardware integration test harness: links against `src/updi.c` and exercises the live UPDI silicon, device-info report, SRAM round-trips, NVM page programming, and the RSP server's TCP path. Manual-only — never wired into `make test`.
-*   [doc/avr-updi-gdb.1](../doc/avr-updi-gdb.1): Unix man page: reference documentation for the avr-updi-gdb command.
+*   [doc/avrOSdb.1](../doc/avrOSdb.1): Unix man page: reference documentation for the avrOSdb command.
 
 It does not cover the build system, IDE adapter layers (Cortex-Debug, Zed DAP), or Windows support, all of which are out of scope for the initial release (see `doc/PVD.md §7.2`).
 
 ### 1.3 Project Overview
-`avr-updi-gdb` is a POSIX C99 GDB stub that bridges the UPDI debug interface of modern AVR microcontrollers (DA/DB families) to standard IDEs over the GDB Remote Serial Protocol (RSP). A developer launches the stub, points it at a serial device and an ELF binary, and connects any GDB-compatible front-end — VS Code with Cortex-Debug, Zed with its DAP adapter, or bare `avr-gdb` — using the standard `target extended-remote` command.
+`avrOSdb` is a POSIX C99 GDB stub that bridges the UPDI debug interface of modern AVR microcontrollers (DA/DB families) to standard IDEs over the GDB Remote Serial Protocol (RSP). A developer launches the stub, points it at a serial device and an ELF binary, and connects any GDB-compatible front-end — VS Code with Cortex-Debug, Zed with its DAP adapter, or bare `avr-gdb` — using the standard `target extended-remote` command.
 
 The server connects to the target via a TTL-level UART serial adapter with a 1 kΩ resistor on the UPDI line. No external JTAG programmer or proprietary debugger hardware is required — only a USB-to-serial adapter or direct Raspberry Pi UART pins.
 
-Unlike conventional GDB stubs that expose a flat memory model, `avr-updi-gdb` provides native avrOS state-machine awareness. At attach time it parses the supplied ELF binary to locate the avrOS FSM registration tables in FLASH, then presents each registered finite state machine as a standard GDB virtual thread. The currently executing FSM appears as the active thread; all suspended FSMs appear as additional threads, each with a synthetic register frame whose PC points to the FSM's current state function pointer.
+Unlike conventional GDB stubs that expose a flat memory model, `avrOSdb` provides native avrOS state-machine awareness. At attach time it parses the supplied ELF binary to locate the avrOS FSM registration tables in FLASH, then presents each registered finite state machine as a standard GDB virtual thread. The currently executing FSM appears as the active thread; all suspended FSMs appear as additional threads, each with a synthetic register frame whose PC points to the FSM's current state function pointer.
 
-The project ships with a `make install` target that installs the compiled binary to `$(PREFIX)/bin/` and the accompanying Unix man page to `$(PREFIX)/share/man/man1/`. A `make check-tools` target validates that all required build tools (`gcc`, `make`, `avr-gcc`, `avr-binutils`) are present on the host before any compilation is attempted. A `make bundle` target produces native distribution packages for three platforms: a Debian binary package (`.deb`), a Red Hat RPM package (`.rpm`), and a Homebrew formula (`dist/avr-updi-gdb.rb`) for macOS. All output artefacts are written under the `dist/` directory. These targets ensure the project can be built, deployed, and distributed by a developer from a single `make` command sequence with no manual file copying.
+The project ships with a `make install` target that installs the compiled binary to `$(PREFIX)/bin/` and the accompanying Unix man page to `$(PREFIX)/share/man/man1/`. A `make check-tools` target validates that all required build tools (`gcc`, `make`, `avr-gcc`, `avr-binutils`) are present on the host before any compilation is attempted. A `make bundle` target produces native distribution packages for three platforms: a Debian binary package (`.deb`), a Red Hat RPM package (`.rpm`), and a Homebrew formula (`dist/avrOSdb.rb`) for macOS. All output artefacts are written under the `dist/` directory. These targets ensure the project can be built, deployed, and distributed by a developer from a single `make` command sequence with no manual file copying.
 
 **Planned — Phase 9 — CI-Grade Loader & Link Diagnostics (not yet implemented).** A forthcoming iteration extends the programmer and the `--device` diagnostic mode with the following capabilities so the tool can be trusted as a CI build/flash step and used as a first-line link-health probe. Tracked in GitHub issue #28; not yet bound to HLRs/LLRs.
 
 * **Read-back verify after `--load`.** After every successful NVM write, re-read the affected pages via UPDI and compare against the ELF payload. Mismatching pages shall be reported by `(window, page-aligned address, expected-CRC, actual-CRC)`, the application shall exit with a distinct non-zero exit code (`2`, reserved for verify failure as opposed to `1` for I/O failure), and shall not enter debug or open the GDB listener. Verify shall cover FLASH, EEPROM, USERROW, and FUSES windows; LOCK is excluded because lockbits become read-only post-write.
-* **`--prog` program-and-exit mode.** A new mutually-exclusive operating mode that programs the supplied ELF into NVM, verifies it (as above), and exits — no GDB listener is opened, no `updi_enter_debug()` is issued, the UPDI link is dropped cleanly with the target left running. Mode shall print, to `stdout`, the negotiated `baud=<N>` line at start-up and a single-line ANSI-aware progress bar (`[#####.....] 53%  page 27/51 erasing|writing|verifying <window>`) that updates in place when `stdout` is a TTY and degrades to one line per phase transition when piped. Intended use is `avr-updi-gdb --prog /dev/ttyUSB0 firmware.elf` from a CI script or a Makefile `flash:` target.
+* **`--prog` program-and-exit mode.** A new mutually-exclusive operating mode that programs the supplied ELF into NVM, verifies it (as above), and exits — no GDB listener is opened, no `updi_enter_debug()` is issued, the UPDI link is dropped cleanly with the target left running. Mode shall print, to `stdout`, the negotiated `baud=<N>` line at start-up and a single-line ANSI-aware progress bar (`[#####.....] 53%  page 27/51 erasing|writing|verifying <window>`) that updates in place when `stdout` is a TTY and degrades to one line per phase transition when piped. Intended use is `avrOSdb --prog /dev/ttyUSB0 firmware.elf` from a CI script or a Makefile `flash:` target.
 * **Fuses pretty-printer (`--device` mode).** Extend the existing `--device` SIGROW/REVID dump (LLR-MAIN-08, LLR-UPDI-26) to read all FUSE bytes, then decode each bit-field against the per-family fuse table (BODCFG, OSCCFG, SYSCFG0/1, CODESIZE, BOOTSIZE, …) using human-readable enum names rather than raw hex. Lock byte is decoded with the same scheme. Output format mirrors avrdude's `-Tu` so existing tooling can consume it.
 * **Auto-baud / link-quality probe (`--device` mode).** Replace the hard-coded 115200 baud with a probe that walks a candidate ladder (`230400, 200000, 150000, 115200, 57600, 38400, 19200`), at each step opening the link, issuing a small fixed UPDI transaction sequence (LDCS, NVMCTRL STATUS read × N), and recording the byte error / retry rate. The highest rate with zero retries over the sample window becomes the reported negotiated baud. Result is printed as `baud=<N> errors=<K>/<total>` per candidate and the chosen rate is highlighted. Probe is read-only; no NVM, fuses, or system-reset paths are touched.
 
@@ -75,7 +75,7 @@ Phase 9 work shall reuse the existing layered architecture (§2.1): the NVM read
 ## 2. System Overview
 
 ### 2.1 System Architecture
-`avr-updi-gdb` is a single-process C99 application. Responsibilities are divided into six source modules arranged in protocol layers: an entry-point and event-loop layer, a hardware layer (UPDI), a network layer (GDB RSP), and three application-layer modules (ELF parser, FSM mapper, monitor handler).
+`avrOSdb` is a single-process C99 application. Responsibilities are divided into six source modules arranged in protocol layers: an entry-point and event-loop layer, a hardware layer (UPDI), a network layer (GDB RSP), and three application-layer modules (ELF parser, FSM mapper, monitor handler).
 
 **Concurrency model:** The application is entirely single-threaded. All I/O multiplexing is performed by a single `select()` call inside `event_loop()`. No POSIX threads (`pthreads`) are used at any point. All module entry points are called synchronously and must return before the next I/O event can be processed. Long-blocking operations (e.g., NVM flash write, UPDI link initialisation) are therefore only permitted at startup or in response to explicit GDB commands, never in the event-loop hot path.
 
@@ -133,7 +133,7 @@ The startup and attach sequence proceeds as follows:
 ## 3. Detailed Design for [src/main.c](../src/main.c)
 
 ### 3.1 Purpose and Responsibilities
-[src/main.c](../src/main.c) is the entry point for the `avr-updi-gdb` executable, providing CLI argument parsing, resource initialization, and the top-level `select()`-based event loop that multiplexes the GDB client socket and the UPDI serial device.
+[src/main.c](../src/main.c) is the entry point for the `avrOSdb` executable, providing CLI argument parsing, resource initialization, and the top-level `select()`-based event loop that multiplexes the GDB client socket and the UPDI serial device.
 
 *   Define `main()` and parse command-line arguments into an `AppConfig` struct.
 *   Open the UART serial device and pass the file descriptor to the UPDI layer.
@@ -155,8 +155,8 @@ This variable is checked at the top of each `event_loop()` iteration and is also
 
 #### 3.2.2 Command-Line Arguments
 
-`avr-updi-gdb [--port <port>] [--baud <baud>] [--erase] [--load] [--allow-lock-updi] <serial-device> <elf-file>`
-`avr-updi-gdb --device [--baud <baud>] <serial-device> [elf-file]`
+`avrOSdb [--port <port>] [--baud <baud>] [--erase] [--load] [--allow-lock-updi] <serial-device> <elf-file>`
+`avrOSdb --device [--baud <baud>] <serial-device> [elf-file]`
 
 *   `--port <port>` — TCP port for the GDB listener (default: `1234`).
 *   `--baud <baud>` — UART baud rate (default: `115200`).
@@ -1109,7 +1109,7 @@ Debug builds add `-fsanitize=address,undefined` for runtime error detection.
 
 | Target | Description |
 | ------ | ----------- |
-| `all` | Build the `avr-updi-gdb` binary (default). |
+| `all` | Build the `avrOSdb` binary (default). |
 | `clean` | Remove build artefacts. |
 | `test` | Build and run the unit test suite. |
 | `install` | Copy the binary to `$(PREFIX)/bin` (default `/usr/local/bin`). |

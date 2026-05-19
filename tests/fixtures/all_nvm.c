@@ -23,11 +23,11 @@
  * read-back mismatch is easy to localise.
  *
  * NOTE: avr-gcc emits .eeprom at VMA 0x00810000 and .user_signatures
- * at VMA 0x00850000 (legacy ELF NVM mapping). avr-updi-gdb
+ * at VMA 0x00850000 (legacy ELF NVM mapping). avrOSdb
  * load_segments() does not perform an ELF-to-UPDI rebase for those
  * regions yet, so the hw-test harness invokes the per-window writers
  * directly with the fixture's payload bytes rather than running
- * `avr-updi-gdb --load` on this ELF. The fixture exists so that the
+ * `avrOSdb --load` on this ELF. The fixture exists so that the
  * payload bytes are produced by avr-gcc (i.e. by the same toolchain
  * a user would use) rather than hand-coded in the test binary.
  */

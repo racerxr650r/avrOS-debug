@@ -35,7 +35,7 @@
 
 | Tool | Version | Purpose |
 | ---- | ------- | ------- |
-| `gcc` or `clang` | ≥ gcc 4.8 / clang 3.4 | C99 host compiler for the `avr-updi-gdb` binary and all unit tests |
+| `gcc` or `clang` | ≥ gcc 4.8 / clang 3.4 | C99 host compiler for the `avrOSdb` binary and all unit tests |
 | `make` | ≥ 3.81 | Build orchestration (`all`, `clean`, `test`, `install` targets) |
 | `avr-gcc` | ≥ 12.0 | AVR cross-compiler; generates the `.elf` fixture binaries consumed by `tests/test_elf.c` |
 | `avr-binutils` | matching `avr-gcc` | Provides `avr-nm` for verifying fixture symbol addresses against expected values |
@@ -50,18 +50,18 @@
 
 ## 1. Motivation
 
-`avr-updi-gdb` fills the gap between the AVR UPDI debug interface and standard GDB-based IDEs while adding first-class avrOS FSM task visibility. Without this stub, developers must choose between low-level UPDI tools with no source-level debugging, or generic GDB stubs that have no awareness of the avrOS cooperative task model. The result is that avrOS application developers cannot set breakpoints, inspect task state, or understand which FSM is running — the core debugging workflows that every RTOS user expects.
+`avrOSdb` fills the gap between the AVR UPDI debug interface and standard GDB-based IDEs while adding first-class avrOS FSM task visibility. Without this stub, developers must choose between low-level UPDI tools with no source-level debugging, or generic GDB stubs that have no awareness of the avrOS cooperative task model. The result is that avrOS application developers cannot set breakpoints, inspect task state, or understand which FSM is running — the core debugging workflows that every RTOS user expects.
 
 This implementation follows the complete specification stack authored in this repository (PVD → SDD → HLRs → LLRs → STP), which reached lint-clean status (0 errors, 0 warnings) before any source code was written. See [doc/PVD.md](PVD.md) for the full product vision.
 
 ## 2. Goals
 
-1. Deliver a working `avr-updi-gdb` binary built from 6 C99 source modules (`main`, `updi`, `gdb_rsp`, `elf_parser`, `fsm_mapper`, `monitor`).
+1. Deliver a working `avrOSdb` binary built from 6 C99 source modules (`main`, `updi`, `gdb_rsp`, `elf_parser`, `fsm_mapper`, `monitor`).
 2. All 54 Low-Level Requirements fully implemented and verified by 106 passing tests across 7 test files.
 3. Binary compiles without warnings under `-std=c99 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L`.
 4. No heap allocation on the hot path; only `elf_open()` allocates (freed by `elf_close()` at session end).
 5. Portable: builds and all tests pass on Linux (x86-64, ARM64) and macOS (Intel, Apple Silicon).
-6. Runtime dependencies: only libc — verified by `ldd avr-updi-gdb` showing no libraries beyond libc.
+6. Runtime dependencies: only libc — verified by `ldd avrOSdb` showing no libraries beyond libc.
 7. `python3 tools/lint_project.py` continues to report 0 errors, 0 warnings throughout the implementation.
 
 ## 3. Non-Goals
@@ -100,7 +100,7 @@ All changes are reviewed before merge. The reviewer checklist:
 
 ### 5.3 Continuous Integration
 
-Every commit runs: `make test` (builds and executes all unit test binaries) and `python3 tools/lint_project.py`. Both must exit 0. The integration test phase additionally runs `make` to produce the final `avr-updi-gdb` binary and verifies `ldd` output shows only libc.
+Every commit runs: `make test` (builds and executes all unit test binaries) and `python3 tools/lint_project.py`. Both must exit 0. The integration test phase additionally runs `make` to produce the final `avrOSdb` binary and verifies `ldd` output shows only libc.
 
 ### 5.4 Release Process
 
@@ -111,7 +111,7 @@ Source-only releases. Tag `vX.Y.Z` on `main` once all 106 tests pass and the bin
 | Level | Scope | Tools | Coverage Target |
 | ----- | ----- | ----- | --------------- |
 | Unit | Per-module isolation — each source module tested independently against mock/stub dependencies | [Unity](https://github.com/ThrowTheSwitch/Unity) (vendored as `tests/unity/unity.c`) + `gcc`/`ld` `--wrap` linker mocking for POSIX symbols and inter-module calls | 100% LLR coverage (54 LLRs, 102 unit tests) |
-| Integration | Full `avr-updi-gdb` binary launched via `fork()`/`execv()` with PTY UART and loopback TCP socket | Custom C harness (`tests/test_integration.c`) | All 4 integration tests tracing to HLR-005, HLR-020, HLR-033, HLR-034 |
+| Integration | Full `avrOSdb` binary launched via `fork()`/`execv()` with PTY UART and loopback TCP socket | Custom C harness (`tests/test_integration.c`) | All 4 integration tests tracing to HLR-005, HLR-020, HLR-033, HLR-034 |
 
 Tests are traced to Low-Level Requirements in [doc/Project.xml](Project.xml)
 and reported in the [Software Test Plan](STP.md) and
@@ -157,7 +157,7 @@ and reported in the [Software Test Plan](STP.md) and
 | `test_monitor` | `src/monitor.c`, `src/gdb_rsp.c`, `src/elf_parser.c` | `updi_mem_read` | — |
 | `test_rsp` | `src/gdb_rsp.c`, `src/fsm_mapper.c`, `src/monitor.c` | `updi_mem_read`, `updi_halt`, `updi_run`, `updi_step`, `updi_nvm_write_flash`, `updi_console_poll`, `fsm_build_thread_list`, `fsm_get_registers`, `fsm_get_active_thread`, `fsm_invalidate`, `monitor_dispatch` | — |
 | `test_main` | `src/main.c` | `updi_open`, `updi_close`, `updi_console_poll`, `rsp_listen`, `rsp_accept`, `rsp_close`, `rsp_recv_packet`, `rsp_dispatch`, `elf_open`, `elf_find_avros_tables`, `elf_close`, `fsm_build_thread_list`, `select` | — |
-| `test_integration` | *(launches compiled `avr-updi-gdb` binary via `execv()`)* | *(none)* | — |
+| `test_integration` | *(launches compiled `avrOSdb` binary via `execv()`)* | *(none)* | — |
 
 **`src/elf.h` portability shim — complete required content** (guarded by `#ifndef AOD_ELF_H`):
 
@@ -422,13 +422,13 @@ AVR BREAK opcode: `0x9598` (16-bit instruction, written as little-endian bytes `
 
 1. `src/main.c` — implement `AppConfig` struct; `parse_args()` with defaults (`gdb_port=1234`, `baud_rate=115200`) and `fprintf(stderr, ...); exit(1)` on error; `event_loop()` with `select()` on up to 3 fds (listen socket, UPDI fd, GDB client fd); SIGINT/SIGTERM handler sets `volatile sig_atomic_t g_quit = 1` only; teardown order: `rsp_close(gdb_fd)` → `rsp_close(listen_fd)` → `elf_close()` → `updi_close()`.
 2. `tests/test_main.c` — 14 Unity tests. `fork()` + `waitpid()` pattern for `exit()` path tests; pipes capture stderr output; signal test calls the handler function directly and checks `g_quit == 1`. Linked with `--wrap` flags for all 5 module init/close functions plus `--wrap,select`.
-3. `tests/test_integration.c` — 4 integration tests. Builds the real `avr-updi-gdb` binary as a Makefile prerequisite; launches it via `fork()`/`execv()` with a PTY as the UART device and a local TCP port; a helper thread simulates the AVR side (responds to UPDI BREAK+SYNCH, handles `updi_mem_read` sequences); a raw TCP socket connects as the GDB client and sends RSP packets; tests measure startup latency (HLR-005), verify RSP packet purity (HLR-020), check build portability (HLR-033), and verify no non-libc dependencies (HLR-034).
+3. `tests/test_integration.c` — 4 integration tests. Builds the real `avrOSdb` binary as a Makefile prerequisite; launches it via `fork()`/`execv()` with a PTY as the UART device and a local TCP port; a helper thread simulates the AVR side (responds to UPDI BREAK+SYNCH, handles `updi_mem_read` sequences); a raw TCP socket connects as the GDB client and sends RSP packets; tests measure startup latency (HLR-005), verify RSP packet purity (HLR-020), check build portability (HLR-033), and verify no non-libc dependencies (HLR-034).
 
-**Acceptance:** `make test` runs all 7 test binaries; all 106 tests pass (14 + 23 + 11 + 13 + 28 + 14 + 4). `make` builds the final `avr-updi-gdb` binary without warnings. `ldd avr-updi-gdb` shows only libc. `python3 tools/lint_project.py` reports 0 errors, 0 warnings.
+**Acceptance:** `make test` runs all 7 test binaries; all 106 tests pass (14 + 23 + 11 + 13 + 28 + 14 + 4). `make` builds the final `avrOSdb` binary without warnings. `ldd avrOSdb` shows only libc. `python3 tools/lint_project.py` reports 0 errors, 0 warnings.
 
 **CLI argument specification:**
 
-`avr-updi-gdb [--port <port>] [--baud <baud>] [--load] <serial-device> <elf-file>`
+`avrOSdb [--port <port>] [--baud <baud>] [--load] <serial-device> <elf-file>`
 
 | Argument | Type | Default | Validation in `parse_args()` |
 | -------- | ---- | ------- | ---------------------------- |
@@ -481,17 +481,17 @@ AVR BREAK opcode: `0x9598` (16-bit instruction, written as little-endian bytes `
 ### Phase 6 — Installation Targets & Documentation
 
 1. **`make check-tools`** — pre-flight target that validates all required host tools are present (`gcc`/`cc`, `make`, `avr-gcc`, `avr-nm`). Prints a diagnostic naming each missing tool and exits non-zero if any are absent. This target must complete successfully before any build attempt.
-2. **`make install`** — installs the compiled `avr-updi-gdb` binary to `$(PREFIX)/bin/` (default `PREFIX=/usr/local`) and the man page to `$(PREFIX)/share/man/man1/`. Creates missing intermediate directories via `install -d`. Binary installed mode 0755; man page mode 0644.
-3. **`make uninstall`** — removes `$(PREFIX)/bin/avr-updi-gdb` and `$(PREFIX)/share/man/man1/avr-updi-gdb.1` with `rm -f`. Idempotent — exits 0 even if files are already absent.
+2. **`make install`** — installs the compiled `avrOSdb` binary to `$(PREFIX)/bin/` (default `PREFIX=/usr/local`) and the man page to `$(PREFIX)/share/man/man1/`. Creates missing intermediate directories via `install -d`. Binary installed mode 0755; man page mode 0644.
+3. **`make uninstall`** — removes `$(PREFIX)/bin/avrOSdb` and `$(PREFIX)/share/man/man1/avrOSdb.1` with `rm -f`. Idempotent — exits 0 even if files are already absent.
 4. **`make bundle`** — produces native distribution packages under `dist/` for two platforms:
-   - `dist/avr-updi-gdb_$(VERSION)_amd64.deb` — Debian/Ubuntu binary package built with `dpkg-deb`. Includes binary (mode 0755) and man page (mode 0644). `DEBIAN/control` declares `Package`, `Version`, `Architecture: amd64`, `Maintainer`, `Description`.
-   - `dist/avr-updi-gdb-$(VERSION)-1.x86_64.rpm` — Red Hat/Fedora RPM built with `rpmbuild`. Generated `.spec` declares `Name`, `Version`, `Release`, `Summary`, `License`, `%install`, `%files`.
+   - `dist/avrOSdb_$(VERSION)_amd64.deb` — Debian/Ubuntu binary package built with `dpkg-deb`. Includes binary (mode 0755) and man page (mode 0644). `DEBIAN/control` declares `Package`, `Version`, `Architecture: amd64`, `Maintainer`, `Description`.
+   - `dist/avrOSdb-$(VERSION)-1.x86_64.rpm` — Red Hat/Fedora RPM built with `rpmbuild`. Generated `.spec` declares `Name`, `Version`, `Release`, `Summary`, `License`, `%install`, `%files`.
    A `VERSION` variable (default: `git describe --tags --always`) parameterises all three package version strings. This is found in the file called `VERSION` in the project root directory
 5. **`doc/UserManual.md`** — hand-authored user manual covering: prerequisites + minimum versions, build instructions (`make`, `make test`, `make install`), connection wiring for the UPDI serial adapter (1 kΩ resistor, TX/RX orientation), all CLI options, at least two complete usage examples (one with `--load`, one without), and a desciption of how to integrate with VS Code's built in debuger.
-6. **`doc/avr-updi-gdb.1`** — Unix man page in `groff` format. Required sections: NAME, SYNOPSIS, DESCRIPTION, OPTIONS, OPERANDS, EXIT STATUS, EXAMPLES, SEE ALSO. Must parse cleanly under `man -l doc/avr-updi-gdb.1` on Linux.
+6. **`doc/avrOSdb.1`** — Unix man page in `groff` format. Required sections: NAME, SYNOPSIS, DESCRIPTION, OPTIONS, OPERANDS, EXIT STATUS, EXAMPLES, SEE ALSO. Must parse cleanly under `man -l doc/avrOSdb.1` on Linux.
 7. **`tests/test_install.c`** — 8 integration-style tests: (a) `check-tools` exits non-zero on missing tool; (b) `make install` places binary at correct prefix path; (c) `make install` places man page and it renders without error; (d) `make uninstall` removes installed files; (e) user manual exists and contains all required section headings; (f) `make bundle` produces a valid `.deb`; (g) `make bundle` produces a valid `.rpm`; (h) `make bundle` produces a valid Homebrew formula.
 
-**Acceptance:** `make check-tools` exits 0 when all tools are present. `make install PREFIX=/tmp/test` and `make uninstall PREFIX=/tmp/test` succeed. `make bundle VERSION=0.1.0` produces all three artefacts under `dist/`. `man -l doc/avr-updi-gdb.1` exits 0. `make test` runs `tests/test_install` and reports 8/8 passing. `python3 tools/lint_project.py` reports 0 errors, 0 warnings.
+**Acceptance:** `make check-tools` exits 0 when all tools are present. `make install PREFIX=/tmp/test` and `make uninstall PREFIX=/tmp/test` succeed. `make bundle VERSION=0.1.0` produces all three artefacts under `dist/`. `man -l doc/avrOSdb.1` exits 0. `make test` runs `tests/test_install` and reports 8/8 passing. `python3 tools/lint_project.py` reports 0 errors, 0 warnings.
 
 **`make install` implementation pattern:**
 
@@ -502,11 +502,11 @@ MANDIR  := $(PREFIX)/share/man/man1
 
 install: all
 	install -d $(BINDIR) $(MANDIR)
-	install -m 0755 $(BINFILE) $(BINDIR)/avr-updi-gdb
-	install -m 0644 doc/avr-updi-gdb.1 $(MANDIR)/avr-updi-gdb.1
+	install -m 0755 $(BINFILE) $(BINDIR)/avrOSdb
+	install -m 0644 doc/avrOSdb.1 $(MANDIR)/avrOSdb.1
 
 uninstall:
-	rm -f $(BINDIR)/avr-updi-gdb $(MANDIR)/avr-updi-gdb.1
+	rm -f $(BINDIR)/avrOSdb $(MANDIR)/avrOSdb.1
 
 check-tools:
 	@command -v $(CC)      >/dev/null 2>&1 || { echo "ERROR: C compiler not found ($(CC))"; exit 1; }
@@ -515,22 +515,22 @@ check-tools:
 	@echo "All required tools found."
 ```
 
-**`doc/avr-updi-gdb.1` man page required sections:**
+**`doc/avrOSdb.1` man page required sections:**
 
 | Section | Content |
 | ------- | ------- |
-| `NAME` | `avr-updi-gdb — UPDI-to-GDB stub with avrOS FSM awareness` |
-| `SYNOPSIS` | `avr-updi-gdb [--port port] [--baud baud] [--load] serial-device elf-file` |
+| `NAME` | `avrOSdb — UPDI-to-GDB stub with avrOS FSM awareness` |
+| `SYNOPSIS` | `avrOSdb [--port port] [--baud baud] [--load] serial-device elf-file` |
 | `DESCRIPTION` | Overview of UPDI bridging and avrOS FSM virtual threads |
 | `OPTIONS` | `--port`, `--baud`, `--load` with types, defaults, and constraints |
 | `OPERANDS` | `serial-device` and `elf-file` positional arguments |
 | `EXIT STATUS` | Codes 0 and 1 with conditions |
-| `EXAMPLES` | `avr-updi-gdb /dev/ttyUSB0 firmware.elf` and `avr-updi-gdb --load --port 1234 /dev/ttyUSB0 firmware.elf` |
+| `EXAMPLES` | `avrOSdb /dev/ttyUSB0 firmware.elf` and `avrOSdb --load --port 1234 /dev/ttyUSB0 firmware.elf` |
 | `SEE ALSO` | `avr-gdb(1)`, `avrdude(1)` |
 
 ### Phase 7 — Device-Signature Diagnostic Mode
 
-1. **`--device` CLI flag** — when present on the command line, `avr-updi-gdb` shall enter a one-shot diagnostic mode that opens the UPDI link, reads the target SIGROW and ASI status registers, prints a verbose human-readable report to `stdout`, and exits without binding the GDB listener. The `<elf-file>` operand shall be optional in this mode. Mode is mutually exclusive with `--load`; specifying both is a usage error.
+1. **`--device` CLI flag** — when present on the command line, `avrOSdb` shall enter a one-shot diagnostic mode that opens the UPDI link, reads the target SIGROW and ASI status registers, prints a verbose human-readable report to `stdout`, and exits without binding the GDB listener. The `<elf-file>` operand shall be optional in this mode. Mode is mutually exclusive with `--load`; specifying both is a usage error.
 
 2. **`updi_read_device_info()`** — new public function in `src/updi.c`/`src/updi.h`. Returns a populated `UpdiDeviceInfo` struct (DEVICEID0..2, REVID, 10-byte SERNUM, ASI_SYS_STATUS, ASI_KEY_STATUS, ASI_STATUSB, and any UPDI errors encountered during the read). The function shall be non-destructive — no CPU halt and no NVM activity — and shall return 0 on success or a negative UPDI error code on failure. SIGROW is read from physical address 0x1100; REVID from SYSCFG offset 0x0F01.
 
@@ -540,7 +540,7 @@ check-tools:
 
 5. **Documentation updates.**
    - `doc/UserManual.md` shall gain a new top-level section (between current §4 Command-Line Invocation and §5 Examples) describing `--device` and showing one annotated example output.
-   - `doc/avr-updi-gdb.1` shall add `--device` under OPTIONS and a third example under EXAMPLES.
+   - `doc/avrOSdb.1` shall add `--device` under OPTIONS and a third example under EXAMPLES.
 
 6. **`tests/test_device.c`** — 6 tests:
    - (a) `parse_args` accepts `--device` and clears the `<elf-file>` mandatory-operand rule.
@@ -550,19 +550,19 @@ check-tools:
    - (e) End-to-end: subprocess invocation with `--device` and a mock-PTY-backed serial device produces stdout output containing `Signature:`, `Family:`, `UPDI status:`, and `Serial:` lines.
    - (f) The device-mode path does **not** call `rsp_listen()` (verified by linking against a stub that aborts the test if invoked).
 
-**Acceptance:** `make test` shows `tests/test_device` passing 6/6. `avr-updi-gdb --device /dev/ttyUSB0` against real hardware prints a recognisable signature and exits 0. Against a disconnected adapter the same command exits 1 with a diagnostic that explicitly names the failed UPDI operation (BREAK, SYNCH, or first CS read). `python3 tools/lint_project.py` reports 0 errors, 0 warnings after Project.xml is updated with HLR-044 and the new LLRs.
+**Acceptance:** `make test` shows `tests/test_device` passing 6/6. `avrOSdb --device /dev/ttyUSB0` against real hardware prints a recognisable signature and exits 0. Against a disconnected adapter the same command exits 1 with a diagnostic that explicitly names the failed UPDI operation (BREAK, SYNCH, or first CS read). `python3 tools/lint_project.py` reports 0 errors, 0 warnings after Project.xml is updated with HLR-044 and the new LLRs.
 
 **CLI synopsis after Phase 7:**
 
 ```
-avr-updi-gdb [--port port] [--baud baud] [--load] <serial-device> <elf-file>
-avr-updi-gdb --device [--baud baud] <serial-device> [elf-file]
+avrOSdb [--port port] [--baud baud] [--load] <serial-device> <elf-file>
+avrOSdb --device [--baud baud] <serial-device> [elf-file]
 ```
 
 **Example output (real `AVR128DA48`):**
 
 ```
-$ avr-updi-gdb --device /dev/ttyUSB0
+$ avrOSdb --device /dev/ttyUSB0
 Serial device:   /dev/ttyUSB0
 Baud rate:       115200
 UPDI link:       up (SYNCH ack in 412 µs)
@@ -645,21 +645,21 @@ Exact base addresses are part-specific; the dispatcher classifies segments by ad
 10. **CLI surface.** Add `--allow-lock-updi` to `parse_args()`. Help text and synopsis updated accordingly:
 
     ```
-    avr-updi-gdb [--port port] [--baud baud] [--erase] [--load] [--allow-lock-updi]
+    avrOSdb [--port port] [--baud baud] [--erase] [--load] [--allow-lock-updi]
                  <serial-device> <elf-file>
     ```
 
 11. **Documentation updates.**
     - `doc/UserManual.md` §5.2 "Flash and debug from cold" — enumerate non-FLASH sections programmed by `--load`; document the `--erase` requirement for lockbit segments; add a fuse-byte example.
     - `doc/UserManual.md` — new subsection "Programming fuses, EEPROM, and lockbits" describing the section→window mapping, the `--allow-lock-updi` interlock, and recovery from a UPDIDIS-locked target.
-    - `doc/avr-updi-gdb.1` — add `--allow-lock-updi` under OPTIONS; expand `--load` description with the section list.
+    - `doc/avrOSdb.1` — add `--allow-lock-updi` under OPTIONS; expand `--load` description with the section list.
     - `README.md` — replace the FLASH-only sentence with "programs FLASH, EEPROM, fuses, USERROW, and lockbits".
 
 **Acceptance:**
 - `make test` runs all suites including the extended `test_updi` and `test_main`; new tests pass.
 - `python3 tools/lint_project.py` reports 0 errors, 0 warnings after Project.xml carries HLR-046, HLR-047, and the new LLRs.
-- `build/avr-updi-gdb --erase --load /dev/ttyUSB0 build/fixtures/all_nvm.elf` against real hardware programs every section and exits 0; reading the target back with `--device` shows the expected fuse / lock bytes.
-- `build/avr-updi-gdb --load /dev/ttyUSB0 build/fixtures/all_nvm.elf` (no `--erase`) against a chip with a `.lock` segment exits 1 with a diagnostic naming the missing `--erase`.
+- `build/avrOSdb --erase --load /dev/ttyUSB0 build/fixtures/all_nvm.elf` against real hardware programs every section and exits 0; reading the target back with `--device` shows the expected fuse / lock bytes.
+- `build/avrOSdb --load /dev/ttyUSB0 build/fixtures/all_nvm.elf` (no `--erase`) against a chip with a `.lock` segment exits 1 with a diagnostic naming the missing `--erase`.
 
 **Out of scope (explicit, deferred to a later phase):**
 - Reading EEPROM / USERROW back for verification after a load.

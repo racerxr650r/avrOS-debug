@@ -4,7 +4,7 @@
  * AVR-DD device-pack header avr-gcc embeds an
  * `.note.gnu.avr.deviceinfo` ELF note containing the lowercase
  * part-name string "avr64dd32".  When this ELF is fed to
- * `avr-updi-gdb` while attached to the bench AVR128DA28 board
+ * `avrOSdb` while attached to the bench AVR128DA28 board
  * (`/dev/ttyAMA2`), `elf_open()` populates
  * `ElfContext.device_name = "avr64dd32"` which
  * `updi_family_from_partname()` classifies as "AVR-DD".  SIGROW

@@ -1,4 +1,4 @@
-# Product Vision Document: avrOS UPDI GDB Server (avr-updi-gdb)
+# Product Vision Document: avrOS UPDI GDB Server (avrOSdb)
 
 **Version:** 0.1
 **Date:** 2026-04-26
@@ -6,13 +6,13 @@
 
 ## 1. Purpose
 
-This Product Vision Document (PVD) defines *why* `avr-updi-gdb` exists, *who* it is for, *what* problem it solves, and the *measurable outcomes* that determine whether it is succeeding. It sits above the Software Design Document (SDD), High-Level Requirements (HLRs), Low-Level Requirements (LLRs), and Software Test Plan (STP), and is the document the rest of the specification stack must remain aligned with.
+This Product Vision Document (PVD) defines *why* `avrOSdb` exists, *who* it is for, *what* problem it solves, and the *measurable outcomes* that determine whether it is succeeding. It sits above the Software Design Document (SDD), High-Level Requirements (HLRs), Low-Level Requirements (LLRs), and Software Test Plan (STP), and is the document the rest of the specification stack must remain aligned with.
 
 When in doubt about a feature, scope decision, or trade-off, this document is the reference.
 
 ## 2. Vision Statement
 
-`avr-updi-gdb` delivers a seamless, modern debugging experience for cooperative, single-stack embedded architectures by bridging the AVR UPDI interface directly to standard IDEs with native avrOS state-machine awareness without requiring JTAG or ICE controllers like Atmel-ICE. Instead it uses the Serial + 1k Resistor mod to enable debugging with just a USB to 5v serial adapter or directly connect to Raspberry Pi UART pins.
+`avrOSdb` delivers a seamless, modern debugging experience for cooperative, single-stack embedded architectures by bridging the AVR UPDI interface directly to standard IDEs with native avrOS state-machine awareness without requiring JTAG or ICE controllers like Atmel-ICE. Instead it uses the Serial + 1k Resistor mod to enable debugging with just a USB to 5v serial adapter or directly connect to Raspberry Pi UART pins.
 
 Embedded engineers developing for modern AVR microcontrollers (DA/DB families) on Linux and macOS can debug their finite state machines, queues, and memory pools visually in VS Code or Zed, no longer forced to manually parse raw SRAM dumps or fight hardware breakpoint limitations over a command-line interface.
 
@@ -30,16 +30,16 @@ The cumulative cost of this status quo is delayed bug resolution, over-reliance 
 
 ## 4. Target Users
 
-| Persona | Needs from `avr-updi-gdb` |
+| Persona | Needs from `avrOSdb` |
 | ------- | ------------------------- |
 | **Embedded Application Developer** | Needs to see active and suspended FSMs, pending events, and queue payloads directly in their IDE's UI. |
 | **Toolchain Integrator** | Needs a reliable, standard `target extended-remote` GDB interface to script launches in VS Code (Cortex-Debug) and Zed (DAP). |
 
-`avr-updi-gdb` is **not** aimed at: Developers using FreeRTOS or preemptive multitasking OSs, or developers targeting legacy ISP/JTAG AVR architectures (e.g., ATMega328p).
+`avrOSdb` is **not** aimed at: Developers using FreeRTOS or preemptive multitasking OSs, or developers targeting legacy ISP/JTAG AVR architectures (e.g., ATMega328p).
 
 ## 5. Value Proposition
 
-`avr-updi-gdb` eliminates the friction of embedded FSM debugging by doing 4 things, in order:
+`avrOSdb` eliminates the friction of embedded FSM debugging by doing 4 things, in order:
 
 1.  **UPDI Protocol Bridging** — Exposes modern AVR DA/DB memory and execution control safely to `avr-gdb` over a standard local port.
 2.  **Harvard Architecture Translation** — Automatically parses ELF `.text` sections to locate FLASH-resident system tables, mapping them to their dynamic SRAM status bytes without manual address configuration.
@@ -91,7 +91,7 @@ These principles are the tie-breakers when requirements conflict.
 
 ## 8. Success Metrics
 
-`avr-updi-gdb` is succeeding when:
+`avrOSdb` is succeeding when:
 
 | Metric | Target |
 | ------ | ------ |

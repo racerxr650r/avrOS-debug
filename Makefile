@@ -1,7 +1,7 @@
 # Makefile — avrOS-debug (aod)
 #
 # Targets:
-#   all          Build the avr-updi-gdb host binary
+#   all          Build the avrOSdb host binary
 #   test         Build ELF fixtures, build all test binaries, run them
 #   test-ci      Like test, but writes per-suite output to build/test-results/*.txt
 #                (used by CI to build a structured test summary)
@@ -61,7 +61,7 @@ AVR_STRIP := avr-strip
 PREFIX    ?= /usr/local
 BINDIR    := $(PREFIX)/bin
 MANDIR    := $(PREFIX)/share/man/man1
-MANPAGE   := doc/avr-updi-gdb.1
+MANPAGE   := doc/avrOSdb.1
 
 # Version string: command-line override > VERSION file > git describe > 0.0.0
 VERSION   ?= $(strip $(or $(shell cat VERSION 2>/dev/null),\
@@ -128,7 +128,7 @@ TESTBINDIR  := $(BUILDDIR)/tests
 FIXBINDIR   := $(BUILDDIR)/fixtures
 
 # ── Main binary ───────────────────────────────────────────────────────────────
-TARGET   := avr-updi-gdb
+TARGET   := avrOSdb
 SRCS     := $(SRCDIR)/main.c \
              $(SRCDIR)/updi.c \
              $(SRCDIR)/elf_parser.c \
@@ -230,7 +230,7 @@ TEST_WRAP_test_main  := updi_open updi_close updi_console_poll \
                         updi_nvm_write_fuses updi_nvm_write_lockbits \
                         updi_chip_erase updi_enter_debug \
                         updi_nvm_read updi_probe_baud updi_crc32 \
-                        updi_format_fuses \
+                        updi_format_fuses updi_set_nvm_progress \
                         rsp_listen rsp_accept rsp_close \
                         rsp_recv_packet rsp_dispatch \
                         rsp_default_handlers \
@@ -416,7 +416,7 @@ coverage:
 	    --json-summary     $(BUILDDIR)/coverage/coverage.json \
 	    --json-summary-pretty \
 	    --html-details     $(BUILDDIR)/coverage/html/index.html \
-	    --html-title       "avr-updi-gdb coverage" \
+	    --html-title       "avrOSdb coverage" \
 	    | tee $(BUILDDIR)/coverage/summary.txt
 	@echo ""
 	@echo "── coverage: per-file (lines + branches) ────────────────"
@@ -568,9 +568,9 @@ uninstall:
 
 # ── bundle target ─────────────────────────────────────────────────────────────
 # LLR-INST-06..08: build dist/*.deb, dist/*.rpm, dist/*.rb (Homebrew formula).
-DEB_PKG   := $(DISTDIR)/avr-updi-gdb_$(VERSION)_amd64.deb
-RPM_PKG   := $(DISTDIR)/avr-updi-gdb-$(VERSION)-1.x86_64.rpm
-BREW_FILE := $(DISTDIR)/avr-updi-gdb.rb
+DEB_PKG   := $(DISTDIR)/avrOSdb_$(VERSION)_amd64.deb
+RPM_PKG   := $(DISTDIR)/avrOSdb-$(VERSION)-1.x86_64.rpm
+BREW_FILE := $(DISTDIR)/avrOSdb.rb
 
 .PHONY: bundle bundle-deb bundle-rpm bundle-brew
 bundle: bundle-deb bundle-rpm bundle-brew
@@ -586,7 +586,7 @@ bundle-deb: $(BUILDDIR)/$(TARGET) $(MANPAGE)
 	              $(BUILDDIR)/deb/usr/share/man/man1
 	$(Q)install -m 0755 $(BUILDDIR)/$(TARGET) $(BUILDDIR)/deb/usr/bin/$(TARGET)
 	$(Q)install -m 0644 $(MANPAGE) $(BUILDDIR)/deb/usr/share/man/man1/$(notdir $(MANPAGE))
-	$(Q)printf 'Package: avr-updi-gdb\nVersion: %s\nArchitecture: amd64\nMaintainer: John Anderson <racerxr650r@example.com>\nDescription: UPDI-to-GDB debug stub with avrOS FSM awareness\n .\n A GDB Remote Serial Protocol server bridging avr-gdb to AVR DA/DB\n targets over the UPDI single-wire debug interface. Adds first-class\n awareness of avrOS cooperative FSM tasks as GDB virtual threads.\nSection: devel\nPriority: optional\n' $(VERSION) > $(BUILDDIR)/deb/DEBIAN/control
+	$(Q)printf 'Package: avrOSdb\nVersion: %s\nArchitecture: amd64\nMaintainer: John Anderson <racerxr650r@example.com>\nDescription: UPDI-to-GDB debug stub with avrOS FSM awareness\n .\n A GDB Remote Serial Protocol server bridging avr-gdb to AVR DA/DB\n targets over the UPDI single-wire debug interface. Adds first-class\n awareness of avrOS cooperative FSM tasks as GDB virtual threads.\nSection: devel\nPriority: optional\n' $(VERSION) > $(BUILDDIR)/deb/DEBIAN/control
 	$(Q)dpkg-deb --build --root-owner-group $(BUILDDIR)/deb $(DEB_PKG) >/dev/null
 	@echo "  BUNDLE  $(DEB_PKG)"
 
@@ -602,19 +602,19 @@ bundle-rpm: $(BUILDDIR)/$(TARGET) $(MANPAGE)
 	              $(BUILDDIR)/rpm/buildroot/usr/share/man/man1
 	$(Q)install -m 0755 $(BUILDDIR)/$(TARGET) $(BUILDDIR)/rpm/buildroot/usr/bin/$(TARGET)
 	$(Q)install -m 0644 $(MANPAGE) $(BUILDDIR)/rpm/buildroot/usr/share/man/man1/$(notdir $(MANPAGE))
-	$(Q)printf 'Name:    avr-updi-gdb\nVersion: %s\nRelease: 1\nSummary: UPDI-to-GDB debug stub with avrOS FSM awareness\nLicense: MIT\nBuildArch: x86_64\n\n%%description\nA GDB Remote Serial Protocol server bridging avr-gdb to AVR DA/DB\ntargets over the UPDI single-wire debug interface.\n\n%%install\nmkdir -p %%{buildroot}/usr/bin %%{buildroot}/usr/share/man/man1\ncp -a $(abspath $(BUILDDIR))/rpm/buildroot/usr/bin/$(TARGET) %%{buildroot}/usr/bin/\ncp -a $(abspath $(BUILDDIR))/rpm/buildroot/usr/share/man/man1/$(notdir $(MANPAGE)) %%{buildroot}/usr/share/man/man1/\n\n%%files\n/usr/bin/avr-updi-gdb\n/usr/share/man/man1/avr-updi-gdb.1\n' $(VERSION) > $(BUILDDIR)/rpm/SPECS/avr-updi-gdb.spec
+	$(Q)printf 'Name:    avrOSdb\nVersion: %s\nRelease: 1\nSummary: UPDI-to-GDB debug stub with avrOS FSM awareness\nLicense: MIT\nBuildArch: x86_64\n\n%%description\nA GDB Remote Serial Protocol server bridging avr-gdb to AVR DA/DB\ntargets over the UPDI single-wire debug interface.\n\n%%install\nmkdir -p %%{buildroot}/usr/bin %%{buildroot}/usr/share/man/man1\ncp -a $(abspath $(BUILDDIR))/rpm/buildroot/usr/bin/$(TARGET) %%{buildroot}/usr/bin/\ncp -a $(abspath $(BUILDDIR))/rpm/buildroot/usr/share/man/man1/$(notdir $(MANPAGE)) %%{buildroot}/usr/share/man/man1/\n\n%%files\n/usr/bin/avrOSdb\n/usr/share/man/man1/avrOSdb.1\n' $(VERSION) > $(BUILDDIR)/rpm/SPECS/avrOSdb.spec
 	$(Q)rpmbuild --quiet --define "_topdir $(abspath $(BUILDDIR))/rpm" \
 	             --define "_rpmdir $(abspath $(DISTDIR))" \
-	             --define "_rpmfilename avr-updi-gdb-$(VERSION)-1.x86_64.rpm" \
+	             --define "_rpmfilename avrOSdb-$(VERSION)-1.x86_64.rpm" \
 	             --define "_build_id_links none" \
 	             --target x86_64-linux \
-	             -bb $(BUILDDIR)/rpm/SPECS/avr-updi-gdb.spec >/dev/null
+	             -bb $(BUILDDIR)/rpm/SPECS/avrOSdb.spec >/dev/null
 	@echo "  BUNDLE  $(RPM_PKG)"
 
 # Homebrew formula — a self-contained .rb file (no tarball download required).
 bundle-brew: $(BUILDDIR)/$(TARGET) $(MANPAGE)
 	@mkdir -p $(DISTDIR)
-	$(Q)printf 'class AvrUpdiGdb < Formula\n  desc "UPDI-to-GDB debug stub with avrOS FSM awareness"\n  homepage "https://github.com/racerxr650r/avrOS-debug"\n  url "https://github.com/racerxr650r/avrOS-debug/archive/refs/tags/v%s.tar.gz"\n  sha256 "0000000000000000000000000000000000000000000000000000000000000000"\n  version "%s"\n  license "MIT"\n\n  def install\n    system "make"\n    bin.install "build/avr-updi-gdb"\n    man1.install "doc/avr-updi-gdb.1"\n  end\n\n  test do\n    assert_match "avr-updi-gdb", shell_output("#{bin}/avr-updi-gdb --help 2>&1", 1)\n  end\nend\n' $(VERSION) $(VERSION) > $(BREW_FILE)
+	$(Q)printf 'class Avrosdb < Formula\n  desc "UPDI-to-GDB debug stub with avrOS FSM awareness"\n  homepage "https://github.com/racerxr650r/avrOS-debug"\n  url "https://github.com/racerxr650r/avrOS-debug/archive/refs/tags/v%s.tar.gz"\n  sha256 "0000000000000000000000000000000000000000000000000000000000000000"\n  version "%s"\n  license "MIT"\n\n  def install\n    system "make"\n    bin.install "build/avrOSdb"\n    man1.install "doc/avrOSdb.1"\n  end\n\n  test do\n    assert_match "avrOSdb", shell_output("#{bin}/avrOSdb --help 2>&1", 1)\n  end\nend\n' $(VERSION) $(VERSION) > $(BREW_FILE)
 	@echo "  BUNDLE  $(BREW_FILE)"
 # ── prereqs target ───────────────────────────────────────────────────────────
 # Install all development prerequisites (Debian/Ubuntu; requires sudo).

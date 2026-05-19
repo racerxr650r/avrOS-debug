@@ -331,7 +331,7 @@ void tearDown(void)
  * ════════════════════════════════════════════════════════════════════ */
 static void parse_args_accepts_device_flag_without_elf_operand(void)
 {
-    char *argv[] = { (char*)"avr-updi-gdb",
+    char *argv[] = { (char*)"avrOSdb",
                      (char*)"--device",
                      (char*)"/dev/ttyUSB0" };
     AppConfig cfg;
@@ -356,7 +356,7 @@ static void parse_args_rejects_device_combined_with_load(void)
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[0]);
         close(pipefd[1]);
-        char *argv[] = { (char*)"avr-updi-gdb",
+        char *argv[] = { (char*)"avrOSdb",
                          (char*)"--device", (char*)"--load",
                          (char*)"/dev/ttyUSB0", (char*)"fw.elf" };
         AppConfig cfg;
@@ -504,7 +504,7 @@ static void device_mode_does_not_call_rsp_listen(void)
     int saved   = dup(STDOUT_FILENO);
     if (devnull >= 0) dup2(devnull, STDOUT_FILENO);
 
-    char *argv[] = { (char*)"avr-updi-gdb",
+    char *argv[] = { (char*)"avrOSdb",
                      (char*)"--device",
                      g_slave_name };
     int rc = app_main(3, argv);

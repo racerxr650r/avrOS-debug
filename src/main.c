@@ -1,4 +1,4 @@
-/* src/main.c — avr-updi-gdb entry point.
+/* src/main.c — avrOSdb entry point.
  *
  * Owns CLI parsing, top-level select()-based event loop, signal handling,
  * and guaranteed resource teardown (LLR-MAIN-01 .. LLR-MAIN-07). */
@@ -103,6 +103,7 @@ MAYBE_STATIC int  load_segments(AppConfig *cfg, ElfContext *ctx);
 MAYBE_STATIC int  verify_segments(AppConfig *cfg, ElfContext *ctx);
 MAYBE_STATIC int  run_device_mode(AppConfig *cfg);
 MAYBE_STATIC int  run_prog_mode(AppConfig *cfg);
+MAYBE_STATIC void run_autobaud_probe(AppConfig *cfg);
 MAYBE_STATIC void sig_handler(int signo);
 MAYBE_STATIC void progress_render(const char *phase, const char *window,
                                   unsigned page, unsigned total);
@@ -325,14 +326,36 @@ MAYBE_STATIC void event_loop(AppConfig *cfg, RspHandlers *h)
 /* Iterate PT_LOAD segments and flash each non-SRAM segment.
  * Returns 0 on success, -1 on any read or flash error. */
 /* ── Phase 9 — auto-baud probe visitor callback (LLR-MAIN-16) ─────────
- * One render line per ladder rung; called by updi_probe_baud(). */
+ * Silent by default: the probe runs at the start of every mode but we
+ * only want the single `baud=#####` line printed elsewhere.  Kept as a
+ * no-op stub so updi_probe_baud()'s callback-required contract holds
+ * and the function pointer is non-NULL for ld --wrap test stubs.    */
 static void autobaud_report_cb(int baud, int errors, int samples, void *user)
 {
-    (void)user;
-    fprintf(stdout, "  baud=%-6d errors=%d/%d%s\n",
-            baud, errors, samples,
-            (errors == 0) ? "  OK" : "");
-    fflush(stdout);
+    (void)baud; (void)errors; (void)samples; (void)user;
+}
+
+/* LLR-MAIN-16: shared auto-baud entry point.  Invoked unconditionally by
+ * every mode (--device, --prog, and the GDB-server path) before the
+ * first updi_open(), unless the operator passed --no-autobaud.  On
+ * success the chosen rung overwrites cfg->baud_rate; on total failure
+ * the configured baud is left in place with a warning.               */
+MAYBE_STATIC void run_autobaud_probe(AppConfig *cfg)
+{
+    if (cfg->no_autobaud)
+        return;
+
+    int chosen = updi_probe_baud(cfg->serial_device, 8,
+                                 autobaud_report_cb, NULL);
+    if (chosen > 0) {
+        cfg->baud_rate = chosen;
+    } else {
+        fprintf(stderr,
+                "warning: auto-baud probe failed at every rung; "
+                "falling back to configured baud %d\n",
+                cfg->baud_rate);
+        fflush(stderr);
+    }
 }
 
 /* ── Phase 9 — progress bar (LLR-MAIN-15) ──────────────────────────────
@@ -385,26 +408,10 @@ MAYBE_STATIC int run_device_mode(AppConfig *cfg)
 
     memset(&info, 0, sizeof info);
 
-    /* LLR-MAIN-16 / LLR-UPDI-31: when autobaud is enabled (default in
-     * --device mode) probe the candidate-baud ladder before opening
-     * the link for the diagnostic read.  Successful probe overrides
-     * cfg->baud_rate; failure leaves the configured baud in place and
-     * prints a warning. */
-    if (!cfg->no_autobaud) {
-        fprintf(stdout, "Auto-baud probe:\n");
-        int chosen = updi_probe_baud(cfg->serial_device, 8,
-                                     autobaud_report_cb, NULL);
-        if (chosen > 0) {
-            cfg->baud_rate = chosen;
-            fprintf(stdout, "Chosen baud:     %d\n", chosen);
-        } else {
-            fprintf(stderr,
-                    "warning: auto-baud probe failed at every rung; "
-                    "falling back to configured baud %d\n",
-                    cfg->baud_rate);
-        }
-        fflush(stdout);
-    }
+    /* LLR-MAIN-16 / LLR-UPDI-31: probe the candidate-baud ladder before
+     * opening the link.  Centralised in run_autobaud_probe(); no-op when
+     * --no-autobaud was passed.                                         */
+    run_autobaud_probe(cfg);
 
     fd = updi_open(cfg->serial_device, cfg->baud_rate);
     if (fd < 0) {
@@ -519,10 +526,85 @@ MAYBE_STATIC int run_device_mode(AppConfig *cfg)
  *   sram_base..sram_base+sz   —                       silently skipped
  *
  * Returns 0 on success, -1 on any read or programming error. */
+
+/* ── Unified write/verify progress tracking ──────────────────────────
+ * load_segments() and verify_segments() each render a single progress
+ * bar that spans every PT_LOAD segment.  Progress is counted in 256 B
+ * "chunks" so FLASH (programmed 512 B per page) and non-FLASH (one
+ * byte per STS) share a common denominator; one FLASH page commit
+ * advances the counter by 2.  The bar is rendered via progress_render()
+ * which already handles the TTY-vs-pipe degradation.                */
+#define PROGRESS_CHUNK 256u
+
+static unsigned s_load_done_pages;
+static unsigned s_load_total_pages;
+static const char *s_load_window;
+
+/* Pre-scan the ELF and compute the total PROGRESS_CHUNK count we are
+ * going to program (across all non-SIGROW PT_LOAD segments).         */
+static int load_count_total_pages(ElfContext *ctx, unsigned *out_total)
+{
+    Elf32_Ehdr ehdr = ctx->ehdr;
+    unsigned total = 0;
+    for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
+        Elf32_Phdr ph;
+        off_t off = (off_t)ehdr.e_phoff +
+                    (off_t)i * (off_t)sizeof(Elf32_Phdr);
+        if (lseek(ctx->fd, off, SEEK_SET) < 0) return -1;
+        if (read(ctx->fd, &ph, sizeof ph) != (ssize_t)sizeof ph) return -1;
+        if (ph.p_type != PT_LOAD || ph.p_filesz == 0) continue;
+        if (ctx->sram_base != 0 && ph.p_vaddr >= ctx->sram_base) continue;
+
+        if (ph.p_vaddr < UPDI_FLASH_BASE) {
+            /* FLASH: pad to page boundary first. */
+            uint32_t padded = (ph.p_filesz + UPDI_FLASH_PAGE_SIZE - 1u) &
+                              ~(UPDI_FLASH_PAGE_SIZE - 1u);
+            total += (padded + PROGRESS_CHUNK - 1u) / PROGRESS_CHUNK;
+        } else {
+            uint32_t band = ph.p_vaddr & ELF_VMA_BAND_MASK;
+            if (band == ELF_VMA_SIGROW) continue;   /* skipped */
+            total += ((unsigned)ph.p_filesz + PROGRESS_CHUNK - 1u)
+                     / PROGRESS_CHUNK;
+        }
+    }
+    *out_total = total;
+    return 0;
+}
+
+/* Callback invoked from updi_nvm_write_flash() after each FLASH page
+ * commit.  Maps the per-call `done` bytes to the global page counter
+ * and repaints the bar.                                              */
+static void load_flash_progress_cb(uint32_t addr, size_t done, size_t total,
+                                   void *user)
+{
+    (void)addr; (void)user;
+    /* `done` is cumulative within this updi_nvm_write_flash() call;
+     * the caller has stashed the pre-segment cumulative count in
+     * s_load_done_pages.  Re-render using that base + done/CHUNK.    */
+    static unsigned seg_base_pages;
+    if (done == UPDI_FLASH_PAGE_SIZE) {
+        /* First page of a fresh segment — snapshot the base. */
+        seg_base_pages = s_load_done_pages;
+    }
+    unsigned cur = seg_base_pages + (unsigned)(done / PROGRESS_CHUNK);
+    progress_render("programming", s_load_window,
+                    cur, s_load_total_pages);
+    if (done == total) {
+        s_load_done_pages = cur;     /* commit at end of segment */
+    }
+}
+
 MAYBE_STATIC int load_segments(AppConfig *cfg, ElfContext *ctx)
 {
     Elf32_Ehdr ehdr = ctx->ehdr;
     const UpdiDeviceMap *dev = updi_get_device();
+
+    s_load_done_pages  = 0;
+    s_load_total_pages = 0;
+    s_load_window      = "FLASH";
+    if (load_count_total_pages(ctx, &s_load_total_pages) < 0) return -1;
+    updi_set_nvm_progress(load_flash_progress_cb, NULL);
+
     for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
         Elf32_Phdr ph;
         off_t off = (off_t)ehdr.e_phoff +
@@ -572,35 +654,35 @@ MAYBE_STATIC int load_segments(AppConfig *cfg, ElfContext *ctx)
 
         /* SIGROW: read-only, log and skip. */
         if (in_sigrow) {
-            printf("SIGROW segment @0x%06x ignored (read-only)\n",
-                   (unsigned)updi_addr);
+            fprintf(stdout, "SIGROW segment @0x%06x ignored (read-only)\n",
+                    (unsigned)updi_addr);
             continue;
         }
 
         /* FLASH window: pad to 512-byte page boundary with 0xFF (erased). */
         if (in_flash) {
+            s_load_window = "FLASH";
             if ((updi_addr % UPDI_FLASH_PAGE_SIZE) != 0u) {
                 fprintf(stderr,
                         "error: FLASH segment vaddr 0x%06x not page-aligned\n",
                         (unsigned)updi_addr);
+                updi_set_nvm_progress(NULL, NULL);
                 return -1;
             }
             uint32_t padded = (ph.p_filesz + UPDI_FLASH_PAGE_SIZE - 1u) &
                               ~(UPDI_FLASH_PAGE_SIZE - 1u);
             uint8_t *buf = malloc(padded);
-            if (!buf) return -1;
+            if (!buf) { updi_set_nvm_progress(NULL, NULL); return -1; }
             memset(buf, 0xFF, padded);
             if (lseek(ctx->fd, (off_t)ph.p_offset, SEEK_SET) < 0 ||
                 read(ctx->fd, buf, ph.p_filesz) != (ssize_t)ph.p_filesz) {
                 free(buf);
+                updi_set_nvm_progress(NULL, NULL);
                 return -1;
             }
             int rc = updi_nvm_write_flash(cfg->updi_fd, updi_addr, buf, padded);
             free(buf);
-            if (rc < 0) return -1;
-            printf("loaded %u bytes @ 0x%06x (FLASH, padded to %u)\n",
-                   (unsigned)ph.p_filesz, (unsigned)updi_addr,
-                   (unsigned)padded);
+            if (rc < 0) { updi_set_nvm_progress(NULL, NULL); return -1; }
             continue;
         }
 
@@ -665,11 +747,19 @@ MAYBE_STATIC int load_segments(AppConfig *cfg, ElfContext *ctx)
         if (rc < 0) {
             fprintf(stderr, "error: %s programming failed (rc=%d)\n",
                     kind, rc);
+            updi_set_nvm_progress(NULL, NULL);
             return -1;
         }
-        printf("loaded %u bytes @ 0x%06x (%s)\n",
-               (unsigned)ph.p_filesz, (unsigned)updi_addr, kind);
+        /* Non-FLASH writers are atomic per segment; advance the unified
+         * progress counter by ceil(filesz / PROGRESS_CHUNK) in one step. */
+        s_load_window = kind;
+        s_load_done_pages += ((unsigned)ph.p_filesz + PROGRESS_CHUNK - 1u)
+                             / PROGRESS_CHUNK;
+        progress_render("programming", kind,
+                        s_load_done_pages, s_load_total_pages);
     }
+    progress_finish();
+    updi_set_nvm_progress(NULL, NULL);
     return 0;
 }
 
@@ -686,8 +776,38 @@ MAYBE_STATIC int verify_segments(AppConfig *cfg, ElfContext *ctx)
 {
     Elf32_Ehdr ehdr = ctx->ehdr;
     const UpdiDeviceMap *dev = updi_get_device();
-    const size_t CHUNK = 256;
+    const size_t CHUNK = PROGRESS_CHUNK;
     int rc_overall = 0;
+
+    /* Defensive: discard the first FLASH read after the program phase.
+     * Even with NVMCTRL.CTRLA cleared to NOCMD inside updi_nvm_write_flash,
+     * the very first LDS burst into the FLASH window can return stale
+     * page-buffer data on AVR-Dx silicon.  A throw-away 1-byte read
+     * flushes the controller before the CRC compare begins.            */
+    {
+        uint8_t dummy;
+        (void)updi_nvm_read(cfg->updi_fd, UPDI_FLASH_BASE, &dummy, 1);
+    }
+
+    /* Pre-scan: total CHUNK count across every verifiable segment. */
+    unsigned total_pages = 0;
+    for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
+        Elf32_Phdr ph;
+        off_t off = (off_t)ehdr.e_phoff +
+                    (off_t)i * (off_t)sizeof(Elf32_Phdr);
+        if (lseek(ctx->fd, off, SEEK_SET) < 0) return -1;
+        if (read(ctx->fd, &ph, sizeof ph) != (ssize_t)sizeof ph) return -1;
+        if (ph.p_type != PT_LOAD || ph.p_filesz == 0) continue;
+        if (ctx->sram_base != 0 && ph.p_vaddr >= ctx->sram_base) continue;
+        if (ph.p_vaddr >= UPDI_FLASH_BASE) {
+            uint32_t band = ph.p_vaddr & ELF_VMA_BAND_MASK;
+            if (band == ELF_VMA_LOCK || band == ELF_VMA_SIGROW) continue;
+        }
+        total_pages += ((unsigned)ph.p_filesz + (unsigned)CHUNK - 1u)
+                       / (unsigned)CHUNK;
+    }
+
+    unsigned done_pages = 0;
 
     for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
         Elf32_Phdr ph;
@@ -765,11 +885,12 @@ MAYBE_STATIC int verify_segments(AppConfig *cfg, ElfContext *ctx)
                         (unsigned)exp_crc, (unsigned)act_crc);
                 rc_overall = -1;
             }
-            progress_render("verifying", kind, p + 1u, pages);
+            done_pages++;
+            progress_render("verifying", kind, done_pages, total_pages);
         }
-        progress_finish();
         free(expect);
     }
+    progress_finish();
     return rc_overall;
 }
 
@@ -788,6 +909,9 @@ MAYBE_STATIC int run_prog_mode(AppConfig *cfg)
         return 1;
     }
 
+    /* LLR-MAIN-16: probe the baud ladder before opening UPDI. */
+    run_autobaud_probe(cfg);
+
     cfg->updi_fd = updi_open(cfg->serial_device, cfg->baud_rate);
     if (cfg->updi_fd < 0) {
         fprintf(stderr, "error: updi-open failed for '%s'\n",
@@ -799,8 +923,34 @@ MAYBE_STATIC int run_prog_mode(AppConfig *cfg)
     fprintf(stdout, "baud=%d\n", cfg->baud_rate);
     fflush(stdout);
 
-    if (cfg->force_device != NULL && cfg->force_device[0] != '\0') {
-        if (updi_select_device(cfg->updi_fd, cfg->force_device) < 0) {
+    /* LLR-MAIN-13: identify the per-family memory map before any NVM
+     * write touches USERROW/EEPROM/FUSES/LOCK windows.  Unconditional
+     * SIGROW autodetect (unless --force-device overrides) so the
+     * ELF↔silicon family cross-check below sees an unbiased result. */
+    const char *elf_family =
+        updi_family_from_partname(elf_ctx.device_name);
+    if (updi_select_device(cfg->updi_fd, cfg->force_device) < 0) {
+        updi_close(cfg->updi_fd); cfg->updi_fd = -1;
+        elf_close(&elf_ctx);
+        return 1;
+    }
+
+    /* LLR-MAIN-13: ELF↔silicon family mismatch guard.  When the ELF
+     * names a known family and the user did NOT supply --force-device,
+     * the autodetected family must match the ELF-declared family or we
+     * abort — programming FUSES/EEPROM/USERROW/LOCK at the wrong base
+     * for the silicon actually attached silently corrupts non-FLASH
+     * NVM.  --force-device is the explicit escape hatch.              */
+    if (elf_family != NULL
+        && (cfg->force_device == NULL || cfg->force_device[0] == '\0')) {
+        const char *active = updi_get_device()->family;
+        if (active == NULL || strcmp(active, elf_family) != 0) {
+            fprintf(stderr,
+                    "error: ELF was built for %s (family %s) but target "
+                    "reports %s (use --force-device=%s to override)\n",
+                    elf_ctx.device_name, elf_family,
+                    (active != NULL ? active : "?"),
+                    (active != NULL ? active : elf_family));
             updi_close(cfg->updi_fd); cfg->updi_fd = -1;
             elf_close(&elf_ctx);
             return 1;
@@ -882,6 +1032,9 @@ int MAIN_NAME(int argc, char *argv[])
         goto teardown;
     }
     elf_opened = true;
+
+    /* LLR-MAIN-16: probe the baud ladder before opening UPDI. */
+    run_autobaud_probe(&cfg);
 
     /* LLR-MAIN-03: open UPDI first; verify before listening. */
     cfg.updi_fd = updi_open(cfg.serial_device, cfg.baud_rate);

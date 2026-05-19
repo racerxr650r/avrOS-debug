@@ -125,7 +125,7 @@ static void test_make_install_places_binary_at_prefix_bin(void)
     TEST_ASSERT_EQUAL_INT_MESSAGE(0, rc, "make install must succeed");
 
     char bin_path[256];
-    snprintf(bin_path, sizeof bin_path, "%s/bin/avr-updi-gdb", prefix);
+    snprintf(bin_path, sizeof bin_path, "%s/bin/avrOSdb", prefix);
     TEST_ASSERT_TRUE_MESSAGE(file_exists(bin_path), "installed binary missing");
     TEST_ASSERT_TRUE_MESSAGE(path_executable(bin_path),
                              "installed binary not executable");
@@ -147,7 +147,7 @@ static void test_make_install_places_man_page_at_prefix_man1(void)
 
     char man_path[256];
     snprintf(man_path, sizeof man_path,
-             "%s/share/man/man1/avr-updi-gdb.1", prefix);
+             "%s/share/man/man1/avrOSdb.1", prefix);
     TEST_ASSERT_TRUE_MESSAGE(file_exists(man_path), "installed man page missing");
 
     if (tool_available("man")) {
@@ -180,9 +180,9 @@ static void test_make_uninstall_removes_all_installed_files(void)
     TEST_ASSERT_EQUAL_INT_MESSAGE(0, run_shell(cmd), "uninstall must succeed");
 
     char bin_path[256], man_path[256];
-    snprintf(bin_path, sizeof bin_path, "%s/bin/avr-updi-gdb", prefix);
+    snprintf(bin_path, sizeof bin_path, "%s/bin/avrOSdb", prefix);
     snprintf(man_path, sizeof man_path,
-             "%s/share/man/man1/avr-updi-gdb.1", prefix);
+             "%s/share/man/man1/avrOSdb.1", prefix);
     TEST_ASSERT_FALSE_MESSAGE(file_exists(bin_path),
         "binary must be removed after uninstall");
     TEST_ASSERT_FALSE_MESSAGE(file_exists(man_path),
@@ -242,7 +242,7 @@ static void test_make_bundle_produces_deb_package(void)
         "make --no-print-directory bundle-deb VERSION=0.1.0 >/dev/null 2>&1");
     TEST_ASSERT_EQUAL_INT_MESSAGE(0, rc, "make bundle-deb must succeed");
 
-    const char *deb = "dist/avr-updi-gdb_0.1.0_amd64.deb";
+    const char *deb = "dist/avrOSdb_0.1.0_amd64.deb";
     TEST_ASSERT_TRUE_MESSAGE(file_exists(deb), ".deb artefact missing");
 
     char cmd[256];
@@ -252,9 +252,9 @@ static void test_make_bundle_produces_deb_package(void)
 
     snprintf(cmd, sizeof cmd,
              "dpkg-deb --contents '%s' 2>/dev/null | "
-             "grep -q './usr/bin/avr-updi-gdb' && "
+             "grep -q './usr/bin/avrOSdb' && "
              "dpkg-deb --contents '%s' 2>/dev/null | "
-             "grep -q './usr/share/man/man1/avr-updi-gdb.1'", deb, deb);
+             "grep -q './usr/share/man/man1/avrOSdb.1'", deb, deb);
     TEST_ASSERT_EQUAL_INT_MESSAGE(0, run_shell(cmd),
         ".deb must contain both binary and man page");
 }
@@ -278,15 +278,15 @@ static void test_make_bundle_produces_rpm_package(void)
     }
     TEST_ASSERT_EQUAL_INT_MESSAGE(0, rc, "make bundle-rpm must succeed");
 
-    const char *rpm = "dist/avr-updi-gdb-0.1.0-1.x86_64.rpm";
+    const char *rpm = "dist/avrOSdb-0.1.0-1.x86_64.rpm";
     TEST_ASSERT_TRUE_MESSAGE(file_exists(rpm), ".rpm artefact missing");
 
     char cmd[256];
     snprintf(cmd, sizeof cmd,
              "rpm -qp --list '%s' 2>/dev/null | "
-             "grep -q '/usr/bin/avr-updi-gdb' && "
+             "grep -q '/usr/bin/avrOSdb' && "
              "rpm -qp --list '%s' 2>/dev/null | "
-             "grep -q '/usr/share/man/man1/avr-updi-gdb.1'", rpm, rpm);
+             "grep -q '/usr/share/man/man1/avrOSdb.1'", rpm, rpm);
     TEST_ASSERT_EQUAL_INT_MESSAGE(0, run_shell(cmd),
         ".rpm must contain both binary and man page");
 }
@@ -298,7 +298,7 @@ static void test_make_bundle_produces_homebrew_formula(void)
         "make --no-print-directory bundle-brew VERSION=0.1.0 >/dev/null 2>&1");
     TEST_ASSERT_EQUAL_INT_MESSAGE(0, rc, "make bundle-brew must succeed");
 
-    const char *brew = "dist/avr-updi-gdb.rb";
+    const char *brew = "dist/avrOSdb.rb";
     TEST_ASSERT_TRUE_MESSAGE(file_exists(brew), "Homebrew formula missing");
 
     if (tool_available("ruby")) {

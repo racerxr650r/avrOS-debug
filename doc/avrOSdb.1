@@ -1,8 +1,8 @@
-.TH AVR-UPDI-GDB 1 "2026-05-17" "avr-updi-gdb 0.1" "User Commands"
+.TH AVROSDB 1 "2026-05-17" "avrOSdb 0.1" "User Commands"
 .SH NAME
-avr-updi-gdb \- UPDI-to-GDB debug stub with avrOS FSM awareness
+avrOSdb \- UPDI-to-GDB debug stub with avrOS FSM awareness
 .SH SYNOPSIS
-.B avr-updi-gdb
+.B avrOSdb
 .RB [ \-\-port
 .IR port ]
 .RB [ \-\-baud
@@ -16,7 +16,7 @@ avr-updi-gdb \- UPDI-to-GDB debug stub with avrOS FSM awareness
 .I serial-device
 .I elf-file
 .br
-.B avr-updi-gdb
+.B avrOSdb
 .B \-\-prog
 .RB [ \-\-baud
 .IR baud ]
@@ -28,7 +28,7 @@ avr-updi-gdb \- UPDI-to-GDB debug stub with avrOS FSM awareness
 .I serial-device
 .I elf-file
 .br
-.B avr-updi-gdb
+.B avrOSdb
 .B \-\-device
 .RB [ \-\-baud
 .IR baud ]
@@ -38,7 +38,7 @@ avr-updi-gdb \- UPDI-to-GDB debug stub with avrOS FSM awareness
 .I serial-device
 .RI [ elf-file ]
 .SH DESCRIPTION
-.B avr-updi-gdb
+.B avrOSdb
 is a host-side GDB Remote Serial Protocol (RSP) server that bridges
 .BR avr-gdb (1)
 to AVR DA/DB targets over the UPDI single-wire debug interface.
@@ -174,7 +174,7 @@ different silicon family.
 When
 .B \-\-force\-device
 is not supplied,
-.B avr-updi-gdb
+.B avrOSdb
 selects the AVR-Dx family memory map (USERROW, EEPROM, FUSES, LOCK,
 SIGROW window bases and sizes) by reading SIGROW DEVICEID0..2 from
 the target and matching against the AVR-DA/DB signature table.
@@ -190,14 +190,14 @@ is
 .B not
 used as a selection input \(em doing so would defeat the mismatch
 check below by comparing the ELF family against the family
-.B avr-updi-gdb
+.B avrOSdb
 just told the UPDI layer to be. Instead the ELF-derived family is
 used purely as an assertion against the autodetected silicon.
 .PP
 After selection, when the ELF carried a recognised part-name and
 .B \-\-force\-device
 was not used,
-.B avr-updi-gdb
+.B avrOSdb
 verifies that the ELF-derived family matches the autodetected silicon
 family. On mismatch it prints
 .PP
@@ -253,7 +253,7 @@ Attach to a running target without flashing:
 .PP
 .RS
 .EX
-avr-updi-gdb /dev/ttyUSB0 firmware.elf
+avrOSdb /dev/ttyUSB0 firmware.elf
 .EE
 .RE
 .PP
@@ -261,7 +261,7 @@ Flash and debug from cold on a non-default port:
 .PP
 .RS
 .EX
-avr-updi-gdb \-\-load \-\-port 1234 \-\-baud 115200 \\
+avrOSdb \-\-load \-\-port 1234 \-\-baud 115200 \\
              /dev/ttyUSB0 firmware.elf
 .EE
 .RE
@@ -281,7 +281,7 @@ Verify the UPDI link without starting a GDB listener:
 .PP
 .RS
 .EX
-avr-updi-gdb \-\-device /dev/ttyUSB0
+avrOSdb \-\-device /dev/ttyUSB0
 .EE
 .RE
 .SH SEE ALSO

@@ -4,7 +4,7 @@ A UPDI-based GDB server that brings native avrOS state-machine awareness to stan
 
 ## Overview
 
-`avr-updi-gdb` bridges the AVR UPDI debug interface to `avr-gdb` over the standard GDB Remote Serial Protocol, using only a USB-to-TTL serial adapter (or Raspberry Pi UART) and a 1kΩ resistor. It automatically parses your ELF to locate avrOS system tables in FLASH, maps them to live SRAM state, and presents each cooperative FSM as a virtual GDB thread — so active and suspended state machines, pending events, queues, and memory pools are all visible directly in your IDE's debugging UI.
+`avrOSdb` bridges the AVR UPDI debug interface to `avr-gdb` over the standard GDB Remote Serial Protocol, using only a USB-to-TTL serial adapter (or Raspberry Pi UART) and a 1kΩ resistor. It automatically parses your ELF to locate avrOS system tables in FLASH, maps them to live SRAM state, and presents each cooperative FSM as a virtual GDB thread — so active and suspended state machines, pending events, queues, and memory pools are all visible directly in your IDE's debugging UI.
 
 ## Key Features
 
@@ -29,8 +29,8 @@ A UPDI-based GDB server that brings native avrOS state-machine awareness to stan
 ## Quick Start
 
 ```bash
-make                                          # builds build/avr-updi-gdb
-build/avr-updi-gdb /dev/ttyUSB0 firmware.elf  # start GDB server on :1234
+make                                          # builds build/avrOSdb
+build/avrOSdb /dev/ttyUSB0 firmware.elf  # start GDB server on :1234
 avr-gdb firmware.elf -ex 'target remote :1234'
 ```
 

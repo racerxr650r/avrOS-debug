@@ -248,6 +248,14 @@ int __wrap_updi_format_fuses(char *out, size_t cap,
     return 0;
 }
 
+/* Progress-callback setter: stub so load_segments/verify_segments link
+ * cleanly even though no current unit test exercises a write path. */
+void __wrap_updi_set_nvm_progress(UpdiNvmProgressCb cb, void *user);
+void __wrap_updi_set_nvm_progress(UpdiNvmProgressCb cb, void *user)
+{
+    (void)cb; (void)user;
+}
+
 /* HLR-046: per-family memory map.  Tests run against the compile-time
  * AVR-DA defaults already encoded in the UPDI_*_BASE/_SIZE macros, so
  * `__wrap_updi_select_device()` is a no-op success stub and

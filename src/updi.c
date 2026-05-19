@@ -64,6 +64,12 @@
 
 /* UPDI_FLASH_PAGE_SIZE is declared in updi.h */
 
+/* ── NVM write progress callback (optional, opt-in via setter) ────────
+ * File-scope so updi_nvm_write_flash() can invoke it from inside its
+ * page-program loop.  Default NULL = no-op.                          */
+static UpdiNvmProgressCb g_nvm_progress_cb   = NULL;
+static void             *g_nvm_progress_user = NULL;
+
 /* ── Multi-family per-device memory maps (HLR-046; declared in updi.h).
  *
  *  Address evidence (extracted with `pdftotext -layout` from datasheets
@@ -1115,6 +1121,9 @@ int updi_ocd_clear_hw_bp(int fd, int idx)
     return 0;
 }
 
+/* Forward decl: defined later in this file, used by updi_nvm_write_flash. */
+static int nvm_erase_page(int fd, uint32_t page_addr);
+
 /* Poll NVMCTRL.STATUS until FBUSY clears or the budget is exhausted.
  * AVR-Dx NVMSTATUS exposes only FBUSY (bit 0) and EEBUSY (bit 1); there
  * is no write-error flag, so completion is detected purely by !FBUSY.
@@ -1240,15 +1249,26 @@ int updi_nvm_write_flash(int fd, uint32_t word_addr, const uint8_t *data,
     }
 
     /* 4. Program each page (matches avrdude/pymcuprog AVR-Dx sequence).
-     *    Caller is responsible for chip-erase (--erase) prior to load;
-     *    we do not issue per-page FLPER here because FLWR alone commits
-     *    pre-erased FLASH page buffers, and avrdude does the same.    */
+     *    AVR-Dx FLWR only ANDs bits into the existing FLASH cells
+     *    (1->0 only).  Without a preceding erase, any cell that is
+     *    currently 0 stays 0, silently corrupting the page.  We
+     *    therefore issue FLPER (page erase) before every FLWR so the
+     *    operation is correct whether or not the caller did --erase.
+     *    Re-erasing an already-erased page is harmless (~3 ms).       */
     n_pages = len / UPDI_FLASH_PAGE_SIZE;
     for (pg = 0; pg < n_pages; pg++) {
         uint32_t       page_addr = word_addr +
                                    (uint32_t)(pg * UPDI_FLASH_PAGE_SIZE);
         const uint8_t *page_buf  = data + pg * UPDI_FLASH_PAGE_SIZE;
 
+        if (nvm_wait_not_busy(fd, page_addr, "pre-erase") < 0)
+            return -1;
+        if (nvm_erase_page(fd, page_addr) < 0) {
+            fprintf(stderr,
+                    "nvm_write_flash: page 0x%06x erase failed\n",
+                    (unsigned)page_addr);
+            return -1;
+        }
         if (nvm_wait_not_busy(fd, page_addr, "pre-write") < 0)
             return -1;
         if (updi_write_page_bulk(fd, page_addr, page_buf) < 0) {
@@ -1259,9 +1279,29 @@ int updi_nvm_write_flash(int fd, uint32_t word_addr, const uint8_t *data,
         }
         if (nvm_wait_not_busy(fd, page_addr, "post-write") < 0)
             return -1;
+
+        /* Optional progress hook: cumulative bytes programmed within
+         * this updi_nvm_write_flash() call.  No-op when no callback
+         * is installed.                                             */
+        if (g_nvm_progress_cb != NULL) {
+            size_t done_bytes = (pg + 1u) * UPDI_FLASH_PAGE_SIZE;
+            g_nvm_progress_cb(page_addr, done_bytes, len,
+                              g_nvm_progress_user);
+        }
     }
 
-    /* 5. Stay in NVMPROG — the GDB server (or --device) needs the CPU
+    /* 5. Clear NVMCTRL.CTRLA = NOCMD.  Leaving FLWR armed has been
+     *    observed to corrupt the first ~256 bytes returned by the very
+     *    next FLASH read burst on AVR-Dx silicon (the NVM controller's
+     *    page buffer remains "open" until the command is cleared or the
+     *    bus is exercised enough to flush it).  avrdude/pymcuprog both
+     *    issue NOCMD here for the same reason.                        */
+    if (updi_sts8(fd, NVMCTRL_CTRLA, NVMCTRL_CMD_NOCMD) < 0) {
+        fprintf(stderr, "nvm_write_flash: clear CMD failed\n");
+        return -1;
+    }
+
+    /* 6. Stay in NVMPROG — the GDB server (or --device) needs the CPU
      *    held halted for subsequent memory reads.  The caller invokes
      *    `updi_close()` to release the chip on shutdown.              */
     return 0;
@@ -1902,6 +1942,12 @@ const int updi_baud_ladder[] = {
 };
 const size_t updi_baud_ladder_count =
     sizeof(updi_baud_ladder) / sizeof(updi_baud_ladder[0]);
+
+void updi_set_nvm_progress(UpdiNvmProgressCb cb, void *user)
+{
+    g_nvm_progress_cb   = cb;
+    g_nvm_progress_user = user;
+}
 
 int updi_probe_baud(const char *serial_device,
                     int samples,

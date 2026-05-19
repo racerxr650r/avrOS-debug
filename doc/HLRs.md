@@ -6,7 +6,7 @@
 
 ## 1. System Startup and Command-Line Interface
 
-Requirements in this section govern how `avr-updi-gdb` is invoked, how it initialises its resources, and how quickly it becomes ready for a GDB connection.
+Requirements in this section govern how `avrOSdb` is invoked, how it initialises its resources, and how quickly it becomes ready for a GDB connection.
 
 *   <a id="HLR-001"></a>**HLR-001: CLI Argument Parsing.**
     The application shall accept the following command-line arguments: a required positional `<serial-device>` path, a required positional `<elf-file>` path, an optional `--port <port>` TCP port (default `1234`), an optional `--baud <baud>` UART baud rate (default `115200`), and an optional `--load` flag. Any unrecognised argument shall cause the application to print a usage message to `stderr` and exit with a non-zero status.
@@ -193,15 +193,15 @@ Requirements in this section govern the host platforms the server must support a
 Requirements in this section govern the Makefile installation targets and the user-facing documentation deliverables that accompany the compiled binary.
 
 *   <a id="HLR-041"></a>**HLR-041: Makefile Install and Uninstall Targets.**
-    The Makefile shall provide `install` and `uninstall` targets that accept a `PREFIX` variable (defaulting to `/usr/local`). The `install` target shall copy the compiled `avr-updi-gdb` binary to `$(PREFIX)/bin/` and the man page to `$(PREFIX)/share/man/man1/`. The `uninstall` target shall remove exactly those files. A `check-tools` target shall verify that all required host tools (`gcc`, `make`, `avr-gcc`, `avr-nm`) are available before any build step, printing a diagnostic and exiting non-zero if any required tool is absent.
+    The Makefile shall provide `install` and `uninstall` targets that accept a `PREFIX` variable (defaulting to `/usr/local`). The `install` target shall copy the compiled `avrOSdb` binary to `$(PREFIX)/bin/` and the man page to `$(PREFIX)/share/man/man1/`. The `uninstall` target shall remove exactly those files. A `check-tools` target shall verify that all required host tools (`gcc`, `make`, `avr-gcc`, `avr-nm`) are available before any build step, printing a diagnostic and exiting non-zero if any required tool is absent.
     *Trace:* [SDD Section 2.2](SDD.md).
 
 *   <a id="HLR-042"></a>**HLR-042: User Manual and Unix Man Page.**
-    The project shall provide a user manual (`doc/UserManual.md`) and a Unix man page (`doc/avr-updi-gdb.1`). The man page shall be parseable by the standard `man` utility and shall document the command synopsis, all options, operands, exit codes, and at least one usage example. The `doc/UserManual.md` shall document prerequisites, build instructions, usage, CLI options, and connection wiring for the UPDI adapter.
+    The project shall provide a user manual (`doc/UserManual.md`) and a Unix man page (`doc/avrOSdb.1`). The man page shall be parseable by the standard `man` utility and shall document the command synopsis, all options, operands, exit codes, and at least one usage example. The `doc/UserManual.md` shall document prerequisites, build instructions, usage, CLI options, and connection wiring for the UPDI adapter.
     *Trace:* [SDD Section 2.2](SDD.md).
 
 *   <a id="HLR-043"></a>**HLR-043: Distribution Package Bundle.**
-    The Makefile shall provide a `bundle` target that produces native distribution packages for three target platforms: a Debian binary package (`dist/avr-updi-gdb_$(VERSION)_amd64.deb`) for Debian/Ubuntu Linux, an RPM binary package (`dist/avr-updi-gdb-$(VERSION)-1.x86_64.rpm`) for Red Hat/Fedora Linux, and a Homebrew formula (`dist/avr-updi-gdb.rb`) for macOS. Each package shall include the `avr-updi-gdb` binary and the man page. All output artefacts shall be written under the `dist/` directory. A `VERSION` variable (defaulting to the value extracted from `git describe`) shall parameterise every package version string.
+    The Makefile shall provide a `bundle` target that produces native distribution packages for three target platforms: a Debian binary package (`dist/avrOSdb_$(VERSION)_amd64.deb`) for Debian/Ubuntu Linux, an RPM binary package (`dist/avrOSdb-$(VERSION)-1.x86_64.rpm`) for Red Hat/Fedora Linux, and a Homebrew formula (`dist/avrOSdb.rb`) for macOS. Each package shall include the `avrOSdb` binary and the man page. All output artefacts shall be written under the `dist/` directory. A `VERSION` variable (defaulting to the value extracted from `git describe`) shall parameterise every package version string.
     *Trace:* [SDD Section 2.2](SDD.md).
 
 ## 9. Diagnostics and Bring-up
@@ -241,7 +241,7 @@ Requirements in this section govern the Phase 9 features that turn the loader in
     *Trace:* [SDD Section 2.1](SDD.md), [SDD Section 3.2.2](SDD.md), [SDD Section 4.3.1](SDD.md).
 
 *   <a id="HLR-050"></a>**HLR-050: Program-and-Exit Mode.**
-    The application shall provide a new operating mode, activated by the `--prog` command-line flag and mutually exclusive with both `--device` and `--load`, that programs the supplied ELF into NVM, verifies the write per HLR-049, and exits — no GDB TCP listener shall be bound, no `updi_enter_debug()` shall be issued, and the target shall be left running with the UPDI link closed cleanly. On start-up the mode shall emit a single `baud=<N>` line on `stdout` reporting the negotiated UART rate. During programming the mode shall render an in-place single-line progress indicator (`[####....] %% page N/M phase window`) when `stdout` is a TTY (detected by `isatty(STDOUT_FILENO)`), and shall degrade to one line per page (or per phase transition) when `stdout` is piped or redirected. On verify success the mode shall print `verify: OK` and exit with status 0; on verify failure it shall exit with status `UPDI_EXIT_VERIFY_FAIL` (`2`); on any I/O or NVM failure it shall exit with status 1. Intended use is `avr-updi-gdb --prog <serial-device> <elf-file>` from a CI script or a Makefile `flash:` target.
+    The application shall provide a new operating mode, activated by the `--prog` command-line flag and mutually exclusive with both `--device` and `--load`, that programs the supplied ELF into NVM, verifies the write per HLR-049, and exits — no GDB TCP listener shall be bound, no `updi_enter_debug()` shall be issued, and the target shall be left running with the UPDI link closed cleanly. On start-up the mode shall emit a single `baud=<N>` line on `stdout` reporting the negotiated UART rate. During programming the mode shall render an in-place single-line progress indicator (`[####....] %% page N/M phase window`) when `stdout` is a TTY (detected by `isatty(STDOUT_FILENO)`), and shall degrade to one line per page (or per phase transition) when `stdout` is piped or redirected. On verify success the mode shall print `verify: OK` and exit with status 0; on verify failure it shall exit with status `UPDI_EXIT_VERIFY_FAIL` (`2`); on any I/O or NVM failure it shall exit with status 1. Intended use is `avrOSdb --prog <serial-device> <elf-file>` from a CI script or a Makefile `flash:` target.
     *Trace:* [SDD Section 2.1](SDD.md), [SDD Section 3.2.2](SDD.md), [SDD Section 4.3.1](SDD.md).
 
 *   <a id="HLR-051"></a>**HLR-051: Fuses Pretty-Printer in Device Mode.**
