@@ -53,7 +53,7 @@ Requirements in this section govern the hardware connection to the AVR target an
     *Trace:* [SDD Section 4.3.1](SDD.md).
 
 *   <a id="HLR-010"></a>**HLR-010: Execution Control.**
-    The application shall halt, resume, and single-step the AVR CPU core via the AVR On-Chip Debug (OCD) interface layered on top of UPDI, mapping directly to GDB continue, step, and stop operations. The Phase 2 UPDI module exposes `updi_halt`/`updi_run`/`updi_step` entry points as -1 stubs; full implementation is performed by the Phase 3 OCD layer using its own Microchip specification.
+    The application shall halt, resume, and single-step the AVR CPU core via the AVR On-Chip Debug (OCD) interface layered on top of UPDI, mapping directly to GDB continue, step, and stop operations. `updi_enter_debug()` shall arm OCD mode at session start by sending the `OCD ` 8-byte KEY followed by an `ASI_RESET_REQ` pulse, after which `updi_halt()`, `updi_run()`, `updi_step()`, `updi_ocd_poll_halted()`, and `updi_ocd_read_halt_status()` provide the primitives that the RSP layer composes into GDB stop/continue/step operations.
     *Trace:* [SDD Section 4.3.1](SDD.md).
 
 *   <a id="HLR-011"></a>**HLR-011: Non-Intrusive Background Memory Read.**
@@ -81,15 +81,15 @@ Requirements in this section govern the GDB RSP server behaviour, covering packe
     *Trace:* [SDD Section 5.2.2](SDD.md).
 
 *   <a id="HLR-014"></a>**HLR-014: Register Read and Write.**
-    The application shall respond to GDB register read (`g`) and write (`G`, `P`) packets, returning or updating the current AVR CPU register state (32 general-purpose registers, PC, SP, and status register) obtained from or written to the target via UPDI.
+    The application shall respond to GDB register read (`g`) and write (`G`, `P`) packets, returning or updating the current AVR CPU register state (32 general-purpose registers, PC, SP, and status register) obtained from or written to the target via the AVR-Dx OCD register file at UPDI base `0x0F80`. Reads against the active GDB thread (or against any thread when no FSM context is established) shall return live OCD values; reads against a non-active virtual FSM thread shall return the synthesized register frame from the FSM mapper.
     *Trace:* [SDD Section 5.3.1](SDD.md).
 
 *   <a id="HLR-015"></a>**HLR-015: Memory Read and Write.**
     The application shall respond to GDB memory read (`m`) and write (`M`, `X`) packets, mapping each request to the corresponding UPDI memory operation on the target. Requests addressing the FLASH region shall be routed to NVM read or write sequences as appropriate.
     *Trace:* [SDD Section 5.3.1](SDD.md).
 
-*   <a id="HLR-016"></a>**HLR-016: Software Breakpoints.**
-    The application shall implement software breakpoints by inserting a `BREAK` instruction at the requested FLASH address via UPDI NVM write, and restoring the original instruction on removal. The server shall support up to `RSP_MAX_BREAKPOINTS` (16) simultaneous software breakpoints; attempting to insert a breakpoint when the table is full shall return GDB error reply `E08`.
+*   <a id="HLR-016"></a>**HLR-016: Breakpoints.**
+    The application shall implement code breakpoints by programming the two AVR-Dx OCD hardware comparators (`BP0`, `BP1`). Both `Z0` (software breakpoint) and `Z1` (hardware breakpoint) requests from GDB shall be routed to the same two hardware comparators, since installing the AVR `BREAK` opcode at runtime would require exiting OCD mode, entering NVMPROG (which resets the CPU and destroys live register/SREG/SP state), patching the FLASH page, and re-entering OCD — a sequence whose state-preservation cost outweighs the benefit on parts with only 32 KiB of FLASH per session. The shadow of the two comparator slots shall live in the RSP session context so that detach/reattach cycles leave silicon in a known state. Attempting to install a third breakpoint shall return GDB error reply `E08`; a duplicate insert at an already-installed address shall return `OK` without re-programming the comparator.
     *Trace:* [SDD Section 4.3.1](SDD.md), [SDD Section 5.3.1](SDD.md).
 
 *   <a id="HLR-017"></a>**HLR-017: Single-Step Execution.**
@@ -97,7 +97,7 @@ Requirements in this section govern the GDB RSP server behaviour, covering packe
     *Trace:* [SDD Section 4.3.1](SDD.md), [SDD Section 5.3.1](SDD.md).
 
 *   <a id="HLR-018"></a>**HLR-018: Continue Execution.**
-    The application shall respond to the GDB continue (`c`/`C`) packet by resuming target CPU execution via the UPDI run primitive and blocking until a breakpoint, halt, or error condition is signalled.
+    The application shall respond to the GDB continue (`c`/`C`) packet by resuming target CPU execution via `updi_run()` and then polling for a stop condition. While polling, the server shall remain responsive to the GDB Ctrl-C (`0x03`) async-interrupt byte on the client socket and shall halt the target via `updi_halt()` when one is received. The stop-reason packet shall report SIGINT (`T02`) when the halt was caused by Ctrl-C and SIGTRAP (`T05`) for every other halt cause (hardware breakpoint, BREAK opcode, single-step, external break). To bound recovery time on a flaky UPDI link, the run-poll loop shall give up after a fixed number of consecutive `updi_ocd_poll_halted()` failures and return GDB error reply `E01` rather than spinning indefinitely.
     *Trace:* [SDD Section 4.3.1](SDD.md), [SDD Section 5.3.1](SDD.md).
 
 *   <a id="HLR-019"></a>**HLR-019: RSP Capability Negotiation and Lifecycle.**

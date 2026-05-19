@@ -203,6 +203,16 @@ static int updi_enter_nvmprog(int fd)
     struct timespec ts = { 0, 1000000L };   /* 1 ms */
     int last_status = -1;
 
+    /* Idempotency guard.  Re-issuing the NVMPROG key while the chip is
+     * already in NVMPROG resets out of NVMPROG without re-latching the
+     * key (observed empirically: SYS_STATUS=0x82 sticks indefinitely).
+     * Avrdude only enters NVMPROG once per session for the same reason. */
+    {
+        int s = updi_ldcs(fd, ASI_SYS_STATUS);
+        if (s >= 0 && (s & ASI_SYS_STATUS_NVMPROG))
+            return 0;
+    }
+
     if (updi_write_bytes(fd, key_cmd, sizeof(key_cmd)) < 0)
         return -1;
     if (updi_stcs(fd, ASI_RESET_REQ, ASI_RESET_REQ_RESET) < 0)
@@ -455,6 +465,26 @@ int updi_open(const char *device, int baud)
         if (rc < 0) continue;
 
         /*
+         * Issue a full system-reset pulse to clear any latched mode
+         * (NVMPROG, OCD, UROWPROG, etc.) from a prior session.  This
+         * matches avrdude's "device in reset status, trying to release
+         * it" recovery in -vvvv traces, except that we do it
+         * unconditionally — empirically the chip can be left with
+         * SYS_STATUS bit 7 set after an aborted debug session and
+         * refuses NVMPROG entry until reset is re-pulsed.
+         *
+         *   STCS 0x59 → ASI_RESET_REQ   ; assert reset
+         *   STCS 0x00 → ASI_RESET_REQ   ; release reset
+         *
+         * Both writes are harmless on a chip that is not already in
+         * reset.  See doc/reference/guesswork.md §ASI_RESET_REQ.
+         */
+        rc = updi_stcs(fd, ASI_RESET_REQ, ASI_RESET_REQ_RESET);
+        if (rc < 0) continue;
+        rc = updi_stcs(fd, ASI_RESET_REQ, 0x00u);
+        if (rc < 0) continue;
+
+        /*
          * Wake the target from UPDI SLEEP if necessary.  Reading the
          * 16-byte System Information Block (SYNCH + 0xE6, then 16
          * response bytes) is harmless on an awake target and reliably
@@ -505,6 +535,21 @@ void updi_close(int fd)
 {
     if (fd < 0)
         return;
+    /* Avrdude-style clean exit (verified by -vvvv trace):
+     *
+     *   STCS 0x59 → ASI_RESET_REQ   ; assert system reset
+     *   STCS 0x00 → ASI_RESET_REQ   ; release — chip exits NVMPROG/OCD
+     *   STCS 0x0C → ASI_CTRLB       ; UPDIDIS + CCDETDIS (link teardown)
+     *
+     * The reset pulse clears any latched NVMPROG/OCD mode so the next
+     * --open does not see SYS_STATUS with stale bits set (notably the
+     * 0x82 we observed after a debug session, which blocked NVMPROG
+     * entry).  Errors are intentionally ignored — close() must succeed
+     * even if the target stopped responding.                          */
+    (void)updi_stcs(fd, ASI_RESET_REQ, ASI_RESET_REQ_RESET);
+    (void)updi_stcs(fd, ASI_RESET_REQ, ASI_RESET_REQ_RUN);
+    (void)updi_stcs(fd, ASI_CTRLB,
+                    (uint8_t)(ASI_CTRLB_CCDETDIS | 0x04u /* UPDIDIS */));
     tcdrain(fd);
     close(fd);
 }
@@ -599,42 +644,241 @@ int updi_mem_write(int fd, uint32_t addr, const uint8_t *buf, size_t len)
     return 0;
 }
 
-/* ── CPU halt / single-step / run ─────────────────────────────────────── *
+/* ── CPU halt / single-step / run — OCD implementation ────────────────── *
  *                                                                         *
- * AVR-Dx UPDI exposes no halt/step bits in the ASI register space; full   *
- * CPU control lives in the OCD register space (separate, NDA-only spec)  *
- * and is not implemented here.  We approximate with what UPDI provides:   *
+ * The AVR-Dx exposes CPU debug control via an On-Chip Debugger (OCD)      *
+ * peripheral that is NOT publicly documented by Microchip.  The register  *
+ * map used below is the community-reverse-engineered consensus captured   *
+ * in doc/reference/guesswork.md, which has been independently verified    *
+ * against open-source debuggers Bloom and pyavrdebug.                     *
  *                                                                         *
- *   updi_halt() — re-enter NVMPROG mode.  This asserts system reset with  *
- *                 the NVMProg key latched, which leaves the CPU stopped   *
- *                 and gives us full bus access for memory I/O.            *
+ * OCD lives in TWO addressing spaces:                                     *
+ *   • ASI CS-space @ 0x04/0x05/0x0D — accessed via LDCS/STCS              *
+ *     (link-layer, available without halting the CPU).                    *
+ *   • Memory-mapped @ 0x0F80+      — accessed via LDS/STS                 *
+ *     (peripheral block, valid only while CPU is halted).                 *
  *                                                                         *
- *   updi_run()  — pulse system reset without the NVMProg key.  NVMPROG    *
- *                 clears and the CPU starts executing from the reset      *
- *                 vector (0x0000).  Note: this is "reset & run", not a    *
- *                 true "continue from current PC".                        *
- *                                                                         *
- *   updi_step() — true single-step requires OCD; not implemented.         */
+ * Activation requires a separate key handshake ('OCD     ') analogous to  *
+ * the NVMPROG key.  After the key is latched and a system-reset pulse is  *
+ * issued, the chip enters OCD mode and (because SOR_DIS defaults to 0)    *
+ * halts at the reset vector with STOPPED set in ASI_OCD_STATUS.           */
 
-int updi_halt(int fd)
+/* Send the 8-byte OCD activation key.  LSB-first per UPDI §35.3.3.13;
+ * the bytes on the wire are the reverse of the ASCII string "OCD     ". */
+static int updi_send_ocd_key(int fd)
 {
-    return updi_enter_nvmprog(fd);
+    static const uint8_t key_cmd[10] = {
+        UPDI_SYNCH, UPDI_OP_KEY,
+        /* "OCD     " reversed = "     DCO" */
+        ' ', ' ', ' ', ' ', ' ', 'D', 'C', 'O'
+    };
+    return updi_write_bytes(fd, key_cmd, sizeof(key_cmd));
 }
 
-int updi_run(int fd)
+/*
+ * Enter OCD (debug) mode.
+ *
+ *   1. KEY 'OCD     ' (LSB-first)
+ *   2. Pulse ASI_RESET_REQ: 0x59 → 0x00
+ *   3. Poll ASI_OCD_STATUS.STOPPED until set (CPU halted at reset vector)
+ *
+ * Once halted, the OCD memory-mapped registers at 0x0F80+ are accessible
+ * via standard LDS/STS, and CPU run/halt/step is driven from ASI CS 0x04.
+ *
+ * Returns 0 on success, -1 on I/O error or timeout.
+ */
+int updi_enter_debug(int fd)
 {
-    /* Reset pulse without re-latching the NVMProg key: NVMPROG clears
-     * and the CPU runs from the reset vector.  Until updi_halt() is
-     * called, NVMCTRL/SIGROW/SRAM reads via UPDI are not reliable      *
-     * because the CPU may concurrently access those buses.            */
+    struct timespec ts = { 0, 1000000L };   /* 1 ms */
+    int last = -1;
+
+    if (updi_send_ocd_key(fd) < 0)
+        return -1;
     if (updi_stcs(fd, ASI_RESET_REQ, ASI_RESET_REQ_RESET) < 0)
         return -1;
     if (updi_stcs(fd, ASI_RESET_REQ, ASI_RESET_REQ_RUN) < 0)
         return -1;
+
+    for (int i = 0; i < 200; i++) {
+        int s = updi_ldcs(fd, ASI_OCD_STATUS);
+        if (s < 0) return -1;
+        last = s;
+        if (s & ASI_OCD_STATUS_STOPPED)
+            return 0;
+        nanosleep(&ts, NULL);
+    }
+    fprintf(stderr,
+            "updi_enter_debug: STOPPED bit never set (last ASI_OCD_STATUS=0x%02x)\n",
+            last & 0xFF);
+    return -1;
+}
+
+int updi_halt(int fd)
+{
+    struct timespec ts = { 0, 500000L };    /* 0.5 ms */
+    if (updi_stcs(fd, ASI_OCD_CTRLA, ASI_OCD_CTRLA_STOP) < 0)
+        return -1;
+    for (int i = 0; i < 200; i++) {
+        int s = updi_ldcs(fd, ASI_OCD_STATUS);
+        if (s < 0) return -1;
+        if (s & ASI_OCD_STATUS_STOPPED)
+            return 0;
+        nanosleep(&ts, NULL);
+    }
+    return -1;
+}
+
+int updi_run(int fd)
+{
+    /* Writing RUN starts the CPU.  STOPPED clears immediately. */
+    return updi_stcs(fd, ASI_OCD_CTRLA, ASI_OCD_CTRLA_RUN);
+}
+
+int updi_step(int fd)
+{
+    /* Set OCD CTRL0.STEP, then RUN.  The CPU executes one instruction
+     * and re-asserts STOPPED.  Per guesswork.md the trick is reliable
+     * provided UPDICLKSEL is left at default (32 MHz). */
+    uint8_t c0 = 0;
+    if (updi_lds8(fd, OCD_CTRL0, &c0) < 0) return -1;
+    if (updi_sts8(fd, OCD_CTRL0, (uint8_t)(c0 | OCD_CTRL0_STEP)) < 0) return -1;
+    if (updi_stcs(fd, ASI_OCD_CTRLA, ASI_OCD_CTRLA_RUN) < 0) return -1;
+    /* Wait for halt. */
+    {
+        struct timespec ts = { 0, 200000L };  /* 0.2 ms */
+        for (int i = 0; i < 500; i++) {
+            int s = updi_ldcs(fd, ASI_OCD_STATUS);
+            if (s < 0) return -1;
+            if (s & ASI_OCD_STATUS_STOPPED) return 0;
+            nanosleep(&ts, NULL);
+        }
+    }
+    return -1;
+}
+
+int updi_ocd_poll_halted(int fd, int timeout_ms)
+{
+    struct timespec ts = { 0, 1000000L };   /* 1 ms */
+    int budget = (timeout_ms <= 0) ? 1 : timeout_ms;
+    for (int i = 0; i < budget; i++) {
+        int s = updi_ldcs(fd, ASI_OCD_STATUS);
+        if (s < 0) return -1;
+        if (s & ASI_OCD_STATUS_STOPPED) return 0;
+        nanosleep(&ts, NULL);
+    }
+    return -1;   /* not halted within budget */
+}
+
+int updi_ocd_read_halt_status(int fd, uint8_t *st0, uint8_t *st1)
+{
+    if (st0 && updi_lds8(fd, OCD_STATUS0, st0) < 0) return -1;
+    if (st1 && updi_lds8(fd, OCD_STATUS1, st1) < 0) return -1;
     return 0;
 }
 
-int updi_step(int fd) { (void)fd; return -1; }
+int updi_ocd_read_gpr(int fd, uint8_t n, uint8_t *val)
+{
+    if (n > 31u) return -1;
+    return updi_lds8(fd, OCD_REGFILE + n, val);
+}
+
+int updi_ocd_write_gpr(int fd, uint8_t n, uint8_t val)
+{
+    if (n > 31u) return -1;
+    return updi_sts8(fd, OCD_REGFILE + n, val);
+}
+
+int updi_ocd_read_pc(int fd, uint32_t *byte_addr)
+{
+    uint8_t lo = 0, hi = 0;
+    if (updi_lds8(fd, OCD_PC,     &lo) < 0) return -1;
+    if (updi_lds8(fd, OCD_PC + 1, &hi) < 0) return -1;
+    /* OCD.PC is a *word* address and reads PC+1 by silicon convention
+     * (see doc/reference/guesswork.md §"OCD.PC and PC").  Convert to a
+     * GDB byte address: (PC_word - 1) * 2.                              */
+    uint32_t pc_word = (uint32_t)lo | ((uint32_t)hi << 8);
+    if (pc_word == 0u) pc_word = 1u;       /* paranoia: never underflow */
+    *byte_addr = (pc_word - 1u) * 2u;
+    return 0;
+}
+
+int updi_ocd_write_pc(int fd, uint32_t byte_addr)
+{
+    /* Inverse of updi_ocd_read_pc(): store (byte_addr/2)+1 as a word
+     * address.  Beware: per guesswork, a fresh PC write makes the CPU
+     * "skip" exactly one instruction on the next step.  Callers that
+     * need precise positioning should use instruction injection.        */
+    uint32_t pc_word = (byte_addr >> 1u) + 1u;
+    if (updi_sts8(fd, OCD_PC,     (uint8_t)( pc_word        & 0xFFu)) < 0) return -1;
+    if (updi_sts8(fd, OCD_PC + 1, (uint8_t)((pc_word >> 8u) & 0xFFu)) < 0) return -1;
+    return 0;
+}
+
+int updi_ocd_read_sp(int fd, uint16_t *val)
+{
+    uint8_t lo = 0, hi = 0;
+    if (updi_lds8(fd, OCD_SP,     &lo) < 0) return -1;
+    if (updi_lds8(fd, OCD_SP + 1, &hi) < 0) return -1;
+    *val = (uint16_t)((uint16_t)lo | ((uint16_t)hi << 8));
+    return 0;
+}
+
+int updi_ocd_write_sp(int fd, uint16_t val)
+{
+    if (updi_sts8(fd, OCD_SP,     (uint8_t)( val        & 0xFFu)) < 0) return -1;
+    if (updi_sts8(fd, OCD_SP + 1, (uint8_t)((val >> 8u) & 0xFFu)) < 0) return -1;
+    return 0;
+}
+
+int updi_ocd_read_sreg (int fd, uint8_t *val) { return updi_lds8(fd, OCD_SREG, val); }
+int updi_ocd_write_sreg(int fd, uint8_t val)  { return updi_sts8(fd, OCD_SREG, val); }
+
+int updi_ocd_set_hw_bp(int fd, int idx, uint32_t byte_addr)
+{
+    uint32_t base;
+    uint8_t  enable_bit;
+    if (idx == 0)      { base = OCD_BP0A; enable_bit = OCD_CTRL1_BP0; }
+    else if (idx == 1) { base = OCD_BP1A; enable_bit = OCD_CTRL1_BP1; }
+    else return -1;
+
+    /* BPxA is a 17-bit byte-address field with bit 0 always 0
+     * (instruction-aligned).  Write 3 bytes; high byte holds bit 16. */
+    if (updi_sts8(fd, base,     (uint8_t)( byte_addr        & 0xFEu)) < 0) return -1;
+    if (updi_sts8(fd, base + 1, (uint8_t)((byte_addr >>  8) & 0xFFu)) < 0) return -1;
+    if (updi_sts8(fd, base + 2, (uint8_t)((byte_addr >> 16) & 0x01u)) < 0) return -1;
+
+    /* Enable the specific BP plus the global HWBP gate. */
+    {
+        uint8_t c0 = 0, c1 = 0;
+        if (updi_lds8(fd, OCD_CTRL0, &c0) < 0) return -1;
+        if (updi_lds8(fd, OCD_CTRL1, &c1) < 0) return -1;
+        if (updi_sts8(fd, OCD_CTRL1, (uint8_t)(c1 | enable_bit)) < 0) return -1;
+        if (updi_sts8(fd, OCD_CTRL0, (uint8_t)(c0 | OCD_CTRL0_HWBP)) < 0) return -1;
+    }
+    return 0;
+}
+
+int updi_ocd_clear_hw_bp(int fd, int idx)
+{
+    uint8_t enable_bit;
+    if (idx == 0)      enable_bit = OCD_CTRL1_BP0;
+    else if (idx == 1) enable_bit = OCD_CTRL1_BP1;
+    else return -1;
+
+    uint8_t c1 = 0;
+    if (updi_lds8(fd, OCD_CTRL1, &c1) < 0) return -1;
+    c1 = (uint8_t)(c1 & (uint8_t)~enable_bit);
+    if (updi_sts8(fd, OCD_CTRL1, c1) < 0) return -1;
+
+    /* If both BPs disabled, drop the global gate too. */
+    if ((c1 & (OCD_CTRL1_BP0 | OCD_CTRL1_BP1)) == 0u) {
+        uint8_t c0 = 0;
+        if (updi_lds8(fd, OCD_CTRL0, &c0) < 0) return -1;
+        c0 = (uint8_t)(c0 & (uint8_t)~OCD_CTRL0_HWBP);
+        if (updi_sts8(fd, OCD_CTRL0, c0) < 0) return -1;
+    }
+    return 0;
+}
 
 /* Poll NVMCTRL.STATUS until FBUSY clears or the budget is exhausted.
  * AVR-Dx NVMSTATUS exposes only FBUSY (bit 0) and EEBUSY (bit 1); there

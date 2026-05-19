@@ -15,7 +15,7 @@ Snapshot: **115 test(s)** across
 
 ### 3.1. [tests/test_main.c](../tests/test_main.c)
 
-Role: **unit**. **14 test(s).**
+Role: **unit**. **15 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -33,10 +33,11 @@ Role: **unit**. **14 test(s).**
 | 12 | <a id="sigint_handler_sets_g_quit_to_1"></a>`sigint_handler_sets_g_quit_to_1` | `LLR-MAIN-06` | Send SIGINT to the test process and verify that the signal handler installed by `main()` sets `g_quit` to 1 without performing any other operation. |
 | 13 | <a id="event_loop_exits_immediately_when_g_quit_is_1"></a>`event_loop_exits_immediately_when_g_quit_is_1` | `LLR-MAIN-06` | Set `g_quit = 1` before calling `event_loop()` and verify that the function returns immediately without calling `select()`. |
 | 14 | <a id="main_cleanup_closes_gdb_elf_updi_in_order"></a>`main_cleanup_closes_gdb_elf_updi_in_order` | `LLR-MAIN-07` | On a simulated clean shutdown, verify that `main()` calls `rsp_close(gdb_fd)`, `rsp_close(listen_fd)`, `elf_close()`, and `updi_close()` in that exact order, and returns exit code 0. |
+| 15 | <a id="main_calls_updi_enter_debug_after_updi_open_before_rsp_listen"></a>`main_calls_updi_enter_debug_after_updi_open_before_rsp_listen` | `LLR-MAIN-10` | Run `main()` with mocked `updi_open()`, `updi_enter_debug()`, and `rsp_listen()` recording call order. Verify (a) `updi_enter_debug()` is called exactly once after `updi_open()` succeeds and before `rsp_listen()`, and (b) when `updi_enter_debug()` returns non-zero, `main()` invokes the LLR-MAIN-07 teardown sequence and exits with code 1 without calling `rsp_listen()`. |
 
 ### 3.2. [tests/test_updi.c](../tests/test_updi.c)
 
-Role: **unit**. **22 test(s).**
+Role: **unit**. **33 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -58,15 +59,26 @@ Role: **unit**. **22 test(s).**
 | 16 | <a id="updi_nvm_write_flash_rejects_non_multiple_of_512_length"></a>`updi_nvm_write_flash_rejects_non_multiple_of_512_length` | `LLR-UPDI-07` | Call `updi_nvm_write_flash()` with a `len` that is not a non-zero multiple of 512 and verify the function returns -1. |
 | 17 | <a id="updi_nvm_write_flash_nvmprog_poll_timeout_returns_minus1"></a>`updi_nvm_write_flash_nvmprog_poll_timeout_returns_minus1` | `LLR-UPDI-07` | Inject a mock target that never sets the NVMPROG bit (`ASI_SYS_STATUS` bit 3) and verify that `updi_nvm_write_flash()` returns -1 after 100 polling iterations. |
 | 18 | <a id="updi_nvm_write_flash_per_page_busy_timeout_returns_minus1"></a>`updi_nvm_write_flash_per_page_busy_timeout_returns_minus1` | `LLR-UPDI-07` | Inject a mock target that never clears `NVMCTRL_STATUS` BUSY (bit 0) after a page write and verify that `updi_nvm_write_flash()` returns -1 after 20 polling iterations. |
-| 19 | <a id="updi_halt_returns_minus1_stub_until_ocd_layer"></a>`updi_halt_returns_minus1_stub_until_ocd_layer` | `LLR-UPDI-08` | Verify that `updi_halt()` returns -1 with no UART traffic in Phase 2 — it is a stub pending the Phase 3 OCD layer. |
-| 20 | <a id="updi_step_returns_minus1_stub_until_ocd_layer"></a>`updi_step_returns_minus1_stub_until_ocd_layer` | `LLR-UPDI-09` | Verify that `updi_step()` returns -1 with no UART traffic in Phase 2 — it is a stub pending the Phase 3 OCD layer. |
-| 21 | <a id="updi_run_returns_minus1_stub_until_ocd_layer"></a>`updi_run_returns_minus1_stub_until_ocd_layer` | `LLR-UPDI-10` | Verify that `updi_run()` returns -1 with no UART traffic in Phase 2 — it is a stub pending the Phase 3 OCD layer. |
-| 22 | <a id="updi_console_poll_returns_pending_bytes_without_halting"></a>`updi_console_poll_returns_pending_bytes_without_halting` | `LLR-UPDI-11`, `LLR-UPDI-12` | Pre-stuff the master end of the PTY with 4 bytes and verify that `updi_console_poll()` returns 4 and copies the bytes to the output buffer without calling `updi_halt()`. |
-| 23 | <a id="updi_console_poll_returns_0_when_output_buffer_empty"></a>`updi_console_poll_returns_0_when_output_buffer_empty` | `LLR-UPDI-12` | With no data pending on the master end, verify that `updi_console_poll()` returns 0 in a non-blocking manner. |
+| 19 | <a id="updi_enter_debug_writes_key_pulses_reset_and_polls_ocd_stopped"></a>`updi_enter_debug_writes_key_pulses_reset_and_polls_ocd_stopped` | `LLR-UPDI-15` | Drive a PTY responder that emulates an AVR-Dx in OCD mode. Verify that `updi_enter_debug()` (a) issues the UPDI KEY opcode (`SYNCH`+`0xE0|UPDI_KEY_64`) followed by the 8 ASCII bytes `"OCD   "` (reversed-byte order per the UPDI KEY protocol); (b) pulses `STCS ASI_RESET_REQ = 0x59` then `STCS ASI_RESET_REQ = 0x00`; (c) polls CS-space `ASI_OCD_STATUS` (LDCS opcode `0x80|0x05 = 0x85`) until `OCD_STATUS_STOPPED (0x01)` is observed, and returns 0. |
+| 20 | <a id="updi_enter_debug_returns_minus1_when_ocd_status_never_stopped"></a>`updi_enter_debug_returns_minus1_when_ocd_status_never_stopped` | `LLR-UPDI-15` | Drive a PTY responder that completes the KEY and RESET pulses but always returns `OCD_STATUS = 0x00`. Verify that `updi_enter_debug()` polls `ASI_OCD_STATUS` for the LLR-bounded number of iterations and then returns -1. |
+| 21 | <a id="updi_halt_writes_ocd_ctrla_stop_via_stcs"></a>`updi_halt_writes_ocd_ctrla_stop_via_stcs` | `LLR-UPDI-08` | Verify that `updi_halt()` issues `STCS ASI_OCD_CTRLA = OCD_CTRLA_STOP (0x01)` and returns 0 on the responder ACK. No FLASH/SRAM frames must appear on the wire. |
+| 22 | <a id="updi_run_writes_ocd_ctrla_run_via_stcs"></a>`updi_run_writes_ocd_ctrla_run_via_stcs` | `LLR-UPDI-10` | Verify that `updi_run()` issues `STCS ASI_OCD_CTRLA = OCD_CTRLA_RUN (0x02)` and returns 0 on responder ACK. |
+| 23 | <a id="updi_step_writes_ctrl0_step_bit_then_polls_stopped"></a>`updi_step_writes_ctrl0_step_bit_then_polls_stopped` | `LLR-UPDI-09` | Verify that `updi_step()` writes the STEP bit into the OCD `CTRL0` MMIO register at UPDI 0x0F80+offset and then polls `ASI_OCD_STATUS` for `STOPPED` before returning 0. |
+| 24 | <a id="updi_ocd_poll_halted_returns_0_when_stopped_set"></a>`updi_ocd_poll_halted_returns_0_when_stopped_set` | `LLR-UPDI-16` | Stage `ASI_OCD_STATUS = OCD_STATUS_STOPPED (0x01)` in the PTY responder and verify that `updi_ocd_poll_halted(fd, deadline_ms=1)` returns 0 on the first poll. With `OCD_STATUS = 0x00` it must return 1 (still running) after the deadline elapses, and -1 on LDCS link failure. |
+| 25 | <a id="updi_ocd_read_halt_status_returns_two_status_bytes"></a>`updi_ocd_read_halt_status_returns_two_status_bytes` | `LLR-UPDI-17` | Stage `OCD_STATUS0 = 0x00`, `OCD_STATUS1 = OCD_STATUS1_EXTBRK (0x10)` in the responder's MMIO image. Verify that `updi_ocd_read_halt_status()` reads both bytes from UPDI 0x0F80+STATUS0/STATUS1 and writes them into the caller's out-parameters. |
+| 26 | <a id="updi_ocd_read_gpr_reads_regfile_byte_at_ocd_offset"></a>`updi_ocd_read_gpr_reads_regfile_byte_at_ocd_offset` | `LLR-UPDI-18` | Verify that `updi_ocd_read_gpr(fd, n=5)` reads exactly one byte from UPDI address `0x0F80 + OCD_REGFILE_OFFSET + 5` and returns the responder-supplied value. |
+| 27 | <a id="updi_ocd_write_gpr_writes_single_byte_at_ocd_offset"></a>`updi_ocd_write_gpr_writes_single_byte_at_ocd_offset` | `LLR-UPDI-18` | Verify that `updi_ocd_write_gpr(fd, n=12, val=0xAB)` issues an ST-byte to UPDI address `0x0F80 + OCD_REGFILE_OFFSET + 12` with value `0xAB` and returns 0 on ACK. |
+| 28 | <a id="updi_ocd_read_write_sreg_round_trip"></a>`updi_ocd_read_write_sreg_round_trip` | `LLR-UPDI-19` | Verify that `updi_ocd_write_sreg(fd, 0x5A)` writes one byte to UPDI `0x0F80 + OCD_SREG_OFFSET` and that `updi_ocd_read_sreg(fd, &out)` reads it back from the same address. |
+| 29 | <a id="updi_ocd_read_write_sp_round_trip_little_endian"></a>`updi_ocd_read_write_sp_round_trip_little_endian` | `LLR-UPDI-20` | Verify that `updi_ocd_write_sp(fd, 0x3FFE)` writes two bytes little-endian to UPDI `0x0F80 + OCD_SP_OFFSET` and that `updi_ocd_read_sp(fd, &out)` reads them back as a 16-bit LE value. |
+| 30 | <a id="updi_ocd_read_write_pc_round_trip_32bit_le_byte_addr"></a>`updi_ocd_read_write_pc_round_trip_32bit_le_byte_addr` | `LLR-UPDI-20` | Verify that `updi_ocd_write_pc(fd, 0x00012345)` writes four bytes little-endian (PC as byte address) to UPDI `0x0F80 + OCD_PC_OFFSET` and that `updi_ocd_read_pc(fd, &out)` reads them back as a 32-bit LE value. |
+| 31 | <a id="updi_ocd_set_hw_bp_writes_bp_addr_and_enables_ctrl1"></a>`updi_ocd_set_hw_bp_writes_bp_addr_and_enables_ctrl1` | `LLR-UPDI-21` | Verify that `updi_ocd_set_hw_bp(fd, idx=0, addr=0x001234)` writes the 32-bit address (little-endian) to `BP0A` at UPDI `0x0F80 + OCD_BP0A_OFFSET` and then sets the corresponding enable bit in `CTRL1` at UPDI `0x0F80 + OCD_CTRL1_OFFSET`. With `idx=1` the same sequence targets `BP1A` and the BP1 enable bit. |
+| 32 | <a id="updi_ocd_clear_hw_bp_clears_only_target_slot"></a>`updi_ocd_clear_hw_bp_clears_only_target_slot` | `LLR-UPDI-22` | After setting both BP0 and BP1, verify that `updi_ocd_clear_hw_bp(fd, idx=0)` clears only the BP0 enable bit in `CTRL1` (read-modify-write) and leaves BP1 armed. |
+| 33 | <a id="updi_console_poll_returns_pending_bytes_without_halting"></a>`updi_console_poll_returns_pending_bytes_without_halting` | `LLR-UPDI-11`, `LLR-UPDI-12` | Pre-stuff the master end of the PTY with 4 bytes and verify that `updi_console_poll()` returns 4 and copies the bytes to the output buffer without calling `updi_halt()`. |
+| 34 | <a id="updi_console_poll_returns_0_when_output_buffer_empty"></a>`updi_console_poll_returns_0_when_output_buffer_empty` | `LLR-UPDI-12` | With no data pending on the master end, verify that `updi_console_poll()` returns 0 in a non-blocking manner. |
 
 ### 3.3. [tests/test_rsp.c](../tests/test_rsp.c)
 
-Role: **unit**. **29 test(s).**
+Role: **unit**. **33 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -75,30 +87,36 @@ Role: **unit**. **29 test(s).**
 | 3 | <a id="rsp_recv_packet_discards_leading_ack_nak_bytes"></a>`rsp_recv_packet_discards_leading_ack_nak_bytes` | `LLR-RSP-02` | Feed a byte stream that begins with `+` and `-` characters before the `$` delimiter and verify that `rsp_recv_packet()` discards them and correctly decodes the payload that follows. |
 | 4 | <a id="rsp_recv_packet_sends_plus_on_valid_checksum"></a>`rsp_recv_packet_sends_plus_on_valid_checksum` | `LLR-RSP-02` | Feed a well-formed RSP packet with a correct XOR checksum and verify that `rsp_recv_packet()` writes `+` to the socket and returns the payload length. |
 | 5 | <a id="rsp_recv_packet_sends_minus_and_returns_minus1_on_bad_checksum"></a>`rsp_recv_packet_sends_minus_and_returns_minus1_on_bad_checksum` | `LLR-RSP-02` | Feed an RSP packet with a deliberately corrupted checksum and verify that `rsp_recv_packet()` writes `-` to the socket and returns -1. |
-| 6 | <a id="on_read_regs_g_returns_78_char_hex_string"></a>`on_read_regs_g_returns_78_char_hex_string` | `LLR-RSP-03` | Invoke the `g` packet handler via `rsp_dispatch()` and verify that the RSP reply payload is exactly 78 hex characters, representing all 36 GDB AVR register values. |
-| 7 | <a id="on_read_regs_g_places_pc_little_endian_at_positions_70_77"></a>`on_read_regs_g_places_pc_little_endian_at_positions_70_77` | `LLR-RSP-03` | Inject a known PC value via the mock UPDI and verify that hex characters at positions 70–77 of the `g` reply encode the PC as 4-byte little-endian. |
-| 8 | <a id="on_write_regs_G_writes_all_registers_via_updi_mem_write"></a>`on_write_regs_G_writes_all_registers_via_updi_mem_write` | `LLR-RSP-04` | Dispatch a `G` packet containing 78 hex characters and verify that the handler calls `updi_mem_write()` with the decoded register values and returns `OK`. |
-| 9 | <a id="on_write_regs_P_writes_single_register_via_updi_mem_write"></a>`on_write_regs_P_writes_single_register_via_updi_mem_write` | `LLR-RSP-04` | Dispatch a `P` packet specifying register index 5 and a new value, and verify that the handler calls `updi_mem_write()` targeting only the R5 SRAM address and returns `OK`. |
-| 10 | <a id="on_read_mem_m_calls_updi_mem_read_and_returns_hex"></a>`on_read_mem_m_calls_updi_mem_read_and_returns_hex` | `LLR-RSP-05` | Dispatch an `m addr,4` packet for a SRAM address and verify that the handler calls `updi_mem_read()` with the decoded address and length and returns an 8-character hex string. |
-| 11 | <a id="on_write_mem_M_calls_updi_mem_write_for_sram_address"></a>`on_write_mem_M_calls_updi_mem_write_for_sram_address` | `LLR-RSP-06` | Dispatch an `M addr,4:data` packet targeting a SRAM address and verify that the handler calls `updi_mem_write()` and returns `OK`. |
-| 12 | <a id="on_write_mem_X_calls_nvm_write_flash_for_flash_address"></a>`on_write_mem_X_calls_nvm_write_flash_for_flash_address` | `LLR-RSP-06` | Dispatch an `X addr,2:data` packet targeting a FLASH address and verify that the handler calls `updi_nvm_write_flash()` and returns `OK`. |
-| 13 | <a id="on_insert_bp_writes_break_opcode_and_saves_original_word"></a>`on_insert_bp_writes_break_opcode_and_saves_original_word` | `LLR-RSP-07` | Dispatch a `Z0 addr,2` packet and verify that the handler reads and saves the original 2-byte instruction word, writes the AVR BREAK opcode (0x9598) via `updi_nvm_write_flash()`, and returns `OK`. |
-| 14 | <a id="on_insert_bp_duplicate_returns_ok_without_reflash"></a>`on_insert_bp_duplicate_returns_ok_without_reflash` | `LLR-RSP-07` | Dispatch the same `Z0 addr,2` breakpoint insert twice and verify that `updi_nvm_write_flash()` is called only once, and that the second call returns `OK` immediately. |
-| 15 | <a id="on_remove_bp_restores_saved_instruction_word"></a>`on_remove_bp_restores_saved_instruction_word` | `LLR-RSP-08` | After inserting a breakpoint with `Z0`, dispatch `z0` for the same address and verify that `updi_nvm_write_flash()` is called with the original saved instruction word. |
-| 16 | <a id="on_remove_bp_unknown_address_returns_error_reply"></a>`on_remove_bp_unknown_address_returns_error_reply` | `LLR-RSP-08` | Dispatch `z0` for an address that has no entry in the breakpoint table and verify that the handler returns a GDB error reply. |
-| 17 | <a id="on_insert_bp_returns_E08_when_table_full"></a>`on_insert_bp_returns_E08_when_table_full` | `LLR-RSP-09` | Fill all `RSP_MAX_BREAKPOINTS` (16) breakpoint table slots with distinct addresses, then dispatch one more `Z0` insert and verify the response is `E08`. |
-| 18 | <a id="on_step_s_calls_updi_step_and_sends_T05_stop_reason"></a>`on_step_s_calls_updi_step_and_sends_T05_stop_reason` | `LLR-RSP-10` | Dispatch an `s` packet and verify that the handler calls `updi_step()` once and sends a stop-reason reply of the form `T05thread:<id>;`. |
-| 19 | <a id="on_continue_calls_updi_run_then_fsm_invalidate"></a>`on_continue_calls_updi_run_then_fsm_invalidate` | `LLR-RSP-11` | Dispatch a `c` packet and verify that the handler calls `updi_run()` and then `fsm_invalidate()` in that order before polling for a halt. |
-| 20 | <a id="on_continue_rebuilds_thread_list_after_halt_and_sends_stop"></a>`on_continue_rebuilds_thread_list_after_halt_and_sends_stop` | `LLR-RSP-11` | After the simulated halt triggered by `on_continue`, verify that `fsm_build_thread_list()` is called and the handler sends a stop-reason packet to the GDB client. |
-| 21 | <a id="rsp_dispatch_qsupported_returns_feature_string_no_target_access"></a>`rsp_dispatch_qsupported_returns_feature_string_no_target_access` | `LLR-RSP-12` | Dispatch a `qSupported` packet and verify that a non-empty feature string is returned and that no UPDI calls are made. |
-| 22 | <a id="rsp_dispatch_qattached_returns_1_no_target_access"></a>`rsp_dispatch_qattached_returns_1_no_target_access` | `LLR-RSP-12` | Dispatch a `qAttached` packet and verify the reply is `1` and that no UPDI calls are made. |
-| 23 | <a id="on_detach_D_resumes_target_closes_socket_resets_gdb_fd"></a>`on_detach_D_resumes_target_closes_socket_resets_gdb_fd` | `LLR-RSP-13` | Dispatch a `D` packet and verify that the handler calls `updi_run()`, closes the GDB client socket, and sets `cfg->gdb_fd` to -1 without exiting the server process. |
-| 24 | <a id="on_kill_k_sets_g_quit_to_1"></a>`on_kill_k_sets_g_quit_to_1` | `LLR-RSP-14` | Dispatch a `k` packet and verify that `g_quit` is set to 1, causing the event loop to exit on its next iteration. |
-| 25 | <a id="on_monitor_qRcmd_passes_hex_body_to_monitor_dispatch"></a>`on_monitor_qRcmd_passes_hex_body_to_monitor_dispatch` | `LLR-RSP-15` | Dispatch a `qRcmd` packet with a hex-encoded command body and verify that `monitor_dispatch()` receives the same hex-encoded string without any pre-decoding. |
-| 26 | <a id="on_monitor_returns_ok_when_monitor_dispatch_succeeds"></a>`on_monitor_returns_ok_when_monitor_dispatch_succeeds` | `LLR-RSP-15` | Inject a mock `monitor_dispatch()` that returns 0 and verify that the `qRcmd` handler sends `OK` to the GDB client. |
-| 27 | <a id="on_monitor_sends_o_packet_error_on_updi_failure"></a>`on_monitor_sends_o_packet_error_on_updi_failure` | `LLR-RSP-15` | Inject a mock `monitor_dispatch()` that returns -1 and verify that the `qRcmd` handler sends an O-packet error message to the GDB console. |
-| 28 | <a id="H_packet_stores_thread_id_for_register_operations"></a>`H_packet_stores_thread_id_for_register_operations` | `LLR-RSP-16` | Dispatch `Hg3` (set thread 3 for register operations) and then a `g` packet, and verify that `fsm_get_registers()` is called with the thread entry for GDB thread ID 3. |
-| 29 | <a id="H_packet_minus1_and_0_both_map_to_active_fsm_thread"></a>`H_packet_minus1_and_0_both_map_to_active_fsm_thread` | `LLR-RSP-16` | Dispatch `Hg-1` and `Hg0` in turn, each followed by a `g` packet, and verify that both select the active FSM thread's register frame. |
+| 6 | <a id="on_read_regs_g_returns_78_char_hex_string"></a>`on_read_regs_g_returns_78_char_hex_string` | `LLR-RSP-03` | With the mock OCD layer returning canned values for `updi_ocd_read_gpr/sreg/sp/pc`, dispatch a `g` packet and verify that the RSP reply payload is exactly 78 hex characters in GDB's AVR register-block layout. |
+| 7 | <a id="on_read_regs_g_places_pc_little_endian_at_positions_70_77"></a>`on_read_regs_g_places_pc_little_endian_at_positions_70_77` | `LLR-RSP-03` | Inject a known PC byte address via the mocked `updi_ocd_read_pc()` and verify that hex characters at positions 70–77 of the `g` reply encode the PC as 4-byte little-endian. |
+| 8 | <a id="on_read_regs_non_active_thread_uses_fsm_register_frame"></a>`on_read_regs_non_active_thread_uses_fsm_register_frame` | `LLR-RSP-03` | Select a non-active virtual thread via `Hg`, dispatch a `g` packet, and verify that the handler routes the read through `fsm_get_registers()` (not the OCD register file). |
+| 9 | <a id="on_write_regs_G_writes_all_registers_via_ocd"></a>`on_write_regs_G_writes_all_registers_via_ocd` | `LLR-RSP-04` | Dispatch a `G` packet containing 78 hex characters and verify that the handler calls `updi_ocd_write_gpr()` 32 times (one per GPR) plus `updi_ocd_write_sreg()`, `updi_ocd_write_sp()`, and `updi_ocd_write_pc()` once each with the decoded values, and replies `OK`. |
+| 10 | <a id="on_write_regs_P_writes_single_register_via_ocd"></a>`on_write_regs_P_writes_single_register_via_ocd` | `LLR-RSP-04` | Dispatch a `P5=AB` packet and verify that the handler calls `updi_ocd_write_gpr(n=5, val=0xAB)` exactly once and that no other OCD writer is invoked. |
+| 11 | <a id="on_read_mem_m_calls_updi_mem_read_and_returns_hex"></a>`on_read_mem_m_calls_updi_mem_read_and_returns_hex` | `LLR-RSP-05` | Dispatch an `m addr,4` packet for a SRAM address and verify that the handler calls `updi_mem_read()` with the UPDI physical address (bit 23 flipped) and length, and returns an 8-character hex string. |
+| 12 | <a id="on_write_mem_M_calls_updi_mem_write_for_sram_address"></a>`on_write_mem_M_calls_updi_mem_write_for_sram_address` | `LLR-RSP-06` | Dispatch an `M addr,4:data` packet targeting a GDB data-space address and verify that the handler calls `updi_mem_write()` (not `updi_nvm_write_flash`) and replies `OK`. |
+| 13 | <a id="on_write_mem_X_calls_nvm_write_flash_for_flash_address"></a>`on_write_mem_X_calls_nvm_write_flash_for_flash_address` | `LLR-RSP-06` | Dispatch an `X addr,2:data` packet targeting a GDB program-space address and verify that the handler calls `updi_nvm_write_flash()` and replies `OK`. |
+| 14 | <a id="on_insert_bp_calls_updi_ocd_set_hw_bp_with_byte_addr"></a>`on_insert_bp_calls_updi_ocd_set_hw_bp_with_byte_addr` | `LLR-RSP-07` | Dispatch a `Z0 addr,2` packet and verify that the handler calls `updi_ocd_set_hw_bp(idx, byte_addr)` with the GDB byte address (masked to 23 bits) into the first free `RspContext.hw_bp_addr[]` slot, and replies `OK`. The handler shall not call `updi_nvm_write_flash()`. |
+| 15 | <a id="on_insert_bp_second_slot_succeeds"></a>`on_insert_bp_second_slot_succeeds` | `LLR-RSP-07` | Dispatch two `Z0` inserts at distinct addresses and verify that `updi_ocd_set_hw_bp()` is called once for slot 0 and once for slot 1, that both slots in `RspContext.hw_bp_addr[]` are populated, and that both replies are `OK`. |
+| 16 | <a id="on_insert_bp_duplicate_returns_ok_without_reprogramming"></a>`on_insert_bp_duplicate_returns_ok_without_reprogramming` | `LLR-RSP-07` | Dispatch the same `Z0 addr,2` breakpoint insert twice and verify that `updi_ocd_set_hw_bp()` is called only once and that the second call returns `OK` immediately. |
+| 17 | <a id="on_remove_bp_calls_updi_ocd_clear_hw_bp"></a>`on_remove_bp_calls_updi_ocd_clear_hw_bp` | `LLR-RSP-08` | After inserting a breakpoint with `Z0`, dispatch `z0` for the same address and verify that `updi_ocd_clear_hw_bp()` is called with the slot index that held it, the shadow slot is reset to `0xFFFFFFFF`, and the reply is `OK`. |
+| 18 | <a id="on_remove_bp_unknown_address_returns_ok_for_resync"></a>`on_remove_bp_unknown_address_returns_ok_for_resync` | `LLR-RSP-08` | Dispatch `z0` for an address that is not present in either `RspContext.hw_bp_addr[]` slot (e.g. after a server restart that lost the shadow) and verify that the handler replies `OK` rather than an error, so GDB resync after reconnect is non-fatal. |
+| 19 | <a id="on_insert_bp_returns_E08_when_both_slots_occupied"></a>`on_insert_bp_returns_E08_when_both_slots_occupied` | `LLR-RSP-09` | Fill both `RspContext.hw_bp_addr[]` slots with distinct addresses, then dispatch a third `Z0` insert at a different address and verify the reply is `E08` and that no further `updi_ocd_set_hw_bp()` call is made. |
+| 20 | <a id="on_step_s_calls_updi_step_and_sends_T05_stop_reason"></a>`on_step_s_calls_updi_step_and_sends_T05_stop_reason` | `LLR-RSP-10` | Dispatch an `s` packet with the mock `updi_ocd_read_halt_status()` returning `OCD_STATUS1 = 0x00` and verify that the handler calls `updi_step()` once, rebuilds the FSM thread list, and sends a stop-reason reply of the form `T05thread:<id>;`. |
+| 21 | <a id="on_continue_calls_updi_run_then_fsm_invalidate"></a>`on_continue_calls_updi_run_then_fsm_invalidate` | `LLR-RSP-11` | Dispatch a `c` packet with the mock `updi_ocd_poll_halted()` returning 0 on the first poll, and verify that the handler calls `updi_run()` and then `fsm_invalidate()` before entering the poll loop. |
+| 22 | <a id="on_continue_rebuilds_thread_list_after_halt_and_sends_stop"></a>`on_continue_rebuilds_thread_list_after_halt_and_sends_stop` | `LLR-RSP-11` | After the simulated halt triggered by `on_continue` (mock `updi_ocd_poll_halted()` returns 0 on the Nth call), verify that `fsm_build_thread_list()` is called and the handler sends a stop-reason packet to the GDB client. |
+| 23 | <a id="on_continue_ctrl_c_returns_T02"></a>`on_continue_ctrl_c_returns_T02` | `LLR-RSP-11` | Dispatch a `c` packet, then while `on_continue` is in its select/poll loop write `\x03` to the GDB client side of the socketpair. Verify that the handler calls `updi_halt()` and replies `T02thread:<id>;` (SIGINT). |
+| 24 | <a id="on_continue_returns_E01_after_UPDI_FAIL_MAX_consecutive_poll_failures"></a>`on_continue_returns_E01_after_UPDI_FAIL_MAX_consecutive_poll_failures` | `LLR-RSP-11` | Configure the mock `updi_ocd_poll_halted()` to return -1 unconditionally. Dispatch a `c` packet and verify that the handler gives up after `UPDI_FAIL_MAX` (8) consecutive failures and replies `E01` rather than spinning indefinitely. |
+| 25 | <a id="on_halt_reason_returns_T02_when_extbrk_set"></a>`on_halt_reason_returns_T02_when_extbrk_set` | `LLR-RSP-17` | Set the mock `updi_ocd_read_halt_status()` to return `OCD_STATUS1 = OCD_STATUS1_EXTBRK (0x10)`, dispatch a `?` packet, and verify the reply is `T02thread:<id>;` (SIGINT). With `OCD_STATUS1 = 0x00` the reply must be `T05thread:<id>;` (SIGTRAP). |
+| 26 | <a id="rsp_dispatch_qsupported_returns_feature_string_no_target_access"></a>`rsp_dispatch_qsupported_returns_feature_string_no_target_access` | `LLR-RSP-12` | Dispatch a `qSupported` packet and verify that a non-empty feature string is returned and that no UPDI calls are made. |
+| 27 | <a id="rsp_dispatch_qattached_returns_1_no_target_access"></a>`rsp_dispatch_qattached_returns_1_no_target_access` | `LLR-RSP-12` | Dispatch a `qAttached` packet and verify the reply is `1` and that no UPDI calls are made. |
+| 28 | <a id="on_detach_D_resumes_target_closes_socket_resets_gdb_fd"></a>`on_detach_D_resumes_target_closes_socket_resets_gdb_fd` | `LLR-RSP-13` | Dispatch a `D` packet and verify that the handler calls `updi_run()`, closes the GDB client socket, and sets `*ctx->gdb_fd_p` to -1 without exiting the server process. |
+| 29 | <a id="on_detach_clears_hw_bps_before_run"></a>`on_detach_clears_hw_bps_before_run` | `LLR-RSP-18` | Insert two `Z0` breakpoints, dispatch a `D` packet, and verify the call sequence: `updi_ocd_clear_hw_bp()` is called for both occupied slots BEFORE `updi_run()`, and afterwards both `RspContext.hw_bp_addr[]` slots are `0xFFFFFFFF`. This guarantees the next GDB session inherits clean silicon comparators. |
+| 30 | <a id="on_kill_k_sets_g_quit_to_1"></a>`on_kill_k_sets_g_quit_to_1` | `LLR-RSP-14` | Dispatch a `k` packet and verify that `g_quit` is set to 1, causing the event loop to exit on its next iteration. |
+| 31 | <a id="on_monitor_qRcmd_passes_hex_body_to_monitor_dispatch"></a>`on_monitor_qRcmd_passes_hex_body_to_monitor_dispatch` | `LLR-RSP-15` | Dispatch a `qRcmd` packet with a hex-encoded command body and verify that `monitor_dispatch()` receives the same hex-encoded string without any pre-decoding. |
+| 32 | <a id="on_monitor_returns_ok_when_monitor_dispatch_succeeds"></a>`on_monitor_returns_ok_when_monitor_dispatch_succeeds` | `LLR-RSP-15` | Inject a mock `monitor_dispatch()` that returns 0 and verify that the `qRcmd` handler sends `OK` to the GDB client. |
+| 33 | <a id="on_monitor_sends_o_packet_error_on_updi_failure"></a>`on_monitor_sends_o_packet_error_on_updi_failure` | `LLR-RSP-15` | Inject a mock `monitor_dispatch()` that returns -1 and verify that the `qRcmd` handler sends an O-packet error message to the GDB console. |
+| 34 | <a id="H_packet_stores_thread_id_for_register_operations"></a>`H_packet_stores_thread_id_for_register_operations` | `LLR-RSP-16` | Dispatch `Hg3` (set thread 3 for register operations) and then a `g` packet, and verify that `fsm_get_registers()` is called with the thread entry for GDB thread ID 3. |
+| 35 | <a id="H_packet_minus1_and_0_both_map_to_active_fsm_thread"></a>`H_packet_minus1_and_0_both_map_to_active_fsm_thread` | `LLR-RSP-16` | Dispatch `Hg-1` and `Hg0` in turn, each followed by a `g` packet, and verify that both select the active FSM thread's register frame. |
 
 ### 3.4. [tests/test_elf.c](../tests/test_elf.c)
 
@@ -197,7 +215,7 @@ Role: **unit**. **6 test(s).**
 
 ### 3.10. [tests/hw/hw_test.c](../tests/hw/hw_test.c)
 
-Role: **hardware**. **18 test(s).**
+Role: **hardware**. **19 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -219,6 +237,7 @@ Role: **hardware**. **18 test(s).**
 | 16 | <a id="C2_flash_read_back_verify"></a>`C2_flash_read_back_verify` | `LLR-HWTEST-04` | Read the FLASH page written by C1 and assert a byte-for-byte match against the written pattern. Skipped unless `HW_TEST_NVM_CONFIRM=YES`. |
 | 17 | <a id="D1_rsp_server_accepts_tcp_connection"></a>`D1_rsp_server_accepts_tcp_connection` | `LLR-HWTEST-05` | When `HW_TEST_RSP=YES`, `fork`+`execl` the production `build/avr-updi-gdb` against the configured serial port; open a TCP client to `127.0.0.1:HW_RSP_PORT` and assert the connect succeeds within a bounded timeout. Skipped otherwise. |
 | 18 | <a id="D2_rsp_qsupported_round_trip"></a>`D2_rsp_qsupported_round_trip` | `LLR-HWTEST-05` | Send an RSP `$qSupported#37` packet to the spawned server and assert a non-empty, properly-framed RSP reply is received. Skipped unless `HW_TEST_RSP=YES`. On completion the harness shall terminate the spawned server cleanly via SIGTERM + `waitpid`. |
+| 19 | <a id="D3_rsp_ctrl_c_interrupt_returns_T02"></a>`D3_rsp_ctrl_c_interrupt_returns_T02` | `LLR-RSP-11`, `LLR-UPDI-08`, `LLR-HWTEST-05` | With the spawned server running and a connected TCP client, dispatch a `c` (continue) RSP packet, wait long enough for the loop to enter its poll/select state, then send a single `0x03` byte (GDB Ctrl-C async-interrupt) on the same TCP connection. Assert that the server replies with a stop-reason packet whose signal field is `T02` (SIGINT) and that the live target is observably halted afterwards (via a subsequent `g` packet succeeding). Skipped unless `HW_TEST_RSP=YES`. Exercises the production async-interrupt path end-to-end through real silicon, validating both LLR-RSP-11 (Ctrl-C path) and LLR-UPDI-08 (`updi_halt()`). |
 
 ## 4. LLR Coverage Matrix
 
@@ -238,6 +257,7 @@ verified by code review — see
 | `LLR-MAIN-07` | `main` | `HLR-035` | `main_cleanup_closes_gdb_elf_updi_in_order` |
 | `LLR-MAIN-08` | `main` | `HLR-044` | `parse_args_accepts_device_flag_without_elf_operand`, `parse_args_rejects_device_combined_with_load` |
 | `LLR-MAIN-09` | `main` | `HLR-044` | `run_device_mode_prints_report_to_stdout`, `device_mode_does_not_call_rsp_listen` |
+| `LLR-MAIN-10` | `main` | `HLR-010` | `main_calls_updi_enter_debug_after_updi_open_before_rsp_listen` |
 | `LLR-UPDI-01` | `updi` | `HLR-006` | `updi_open_sets_8e2_raw_half_duplex_via_termios`, `updi_open_returns_minus1_on_device_open_failure` |
 | `LLR-UPDI-02` | `updi` | `HLR-006`, `HLR-036` | `updi_open_asserts_wake_byte_then_stcs_ctrlb`, `updi_open_restores_session_baud_after_break` |
 | `LLR-UPDI-03` | `updi` | `HLR-036` | `updi_open_issues_stcs_ctrla_and_ldcs_statusa`, `updi_open_retries_cold_start_3_times_on_no_ack`, `updi_open_returns_minus1_after_3_consecutive_link_failures` |
@@ -245,29 +265,39 @@ verified by code review — see
 | `LLR-UPDI-05` | `updi` | `HLR-007`, `HLR-037` | `updi_mem_read_calls_select_with_100ms_timeout_before_read`, `updi_mem_read_returns_minus1_on_select_timeout` |
 | `LLR-UPDI-06` | `updi` | `HLR-008` | `updi_mem_write_returns_0_on_success`, `updi_mem_write_returns_minus1_on_updi_nak` |
 | `LLR-UPDI-07` | `updi` | `HLR-009`, `HLR-037` | `updi_nvm_write_flash_rejects_unaligned_address`, `updi_nvm_write_flash_rejects_non_multiple_of_512_length`, `updi_nvm_write_flash_nvmprog_poll_timeout_returns_minus1`, `updi_nvm_write_flash_per_page_busy_timeout_returns_minus1` |
-| `LLR-UPDI-08` | `updi` | `HLR-010` | `updi_halt_returns_minus1_stub_until_ocd_layer` |
-| `LLR-UPDI-09` | `updi` | `HLR-010` | `updi_step_returns_minus1_stub_until_ocd_layer` |
-| `LLR-UPDI-10` | `updi` | `HLR-010` | `updi_run_returns_minus1_stub_until_ocd_layer` |
+| `LLR-UPDI-08` | `updi` | `HLR-010` | `updi_halt_writes_ocd_ctrla_stop_via_stcs`, `D3_rsp_ctrl_c_interrupt_returns_T02` |
+| `LLR-UPDI-09` | `updi` | `HLR-010` | `updi_step_writes_ctrl0_step_bit_then_polls_stopped` |
+| `LLR-UPDI-10` | `updi` | `HLR-010` | `updi_run_writes_ocd_ctrla_run_via_stcs` |
 | `LLR-UPDI-11` | `updi` | `HLR-011` | `updi_console_poll_returns_pending_bytes_without_halting` |
 | `LLR-UPDI-12` | `updi` | `HLR-012` | `updi_console_poll_returns_pending_bytes_without_halting`, `updi_console_poll_returns_0_when_output_buffer_empty` |
 | `LLR-UPDI-13` | `updi` | `HLR-044` | `updi_read_device_info_returns_sigrow_and_asi_bytes`, `updi_read_device_info_reports_failed_step_on_nak` |
 | `LLR-UPDI-14` | `updi` | `HLR-006`, `HLR-036` | `updi_open_restores_session_baud_after_break` |
+| `LLR-UPDI-15` | `updi` | `HLR-010` | `updi_enter_debug_writes_key_pulses_reset_and_polls_ocd_stopped`, `updi_enter_debug_returns_minus1_when_ocd_status_never_stopped` |
+| `LLR-UPDI-16` | `updi` | `HLR-010`, `HLR-018` | `updi_ocd_poll_halted_returns_0_when_stopped_set` |
+| `LLR-UPDI-17` | `updi` | `HLR-010`, `HLR-018` | `updi_ocd_read_halt_status_returns_two_status_bytes` |
+| `LLR-UPDI-18` | `updi` | `HLR-014` | `updi_ocd_read_gpr_reads_regfile_byte_at_ocd_offset`, `updi_ocd_write_gpr_writes_single_byte_at_ocd_offset` |
+| `LLR-UPDI-19` | `updi` | `HLR-014` | `updi_ocd_read_write_sreg_round_trip` |
+| `LLR-UPDI-20` | `updi` | `HLR-014` | `updi_ocd_read_write_sp_round_trip_little_endian`, `updi_ocd_read_write_pc_round_trip_32bit_le_byte_addr` |
+| `LLR-UPDI-21` | `updi` | `HLR-016` | `updi_ocd_set_hw_bp_writes_bp_addr_and_enables_ctrl1` |
+| `LLR-UPDI-22` | `updi` | `HLR-016` | `updi_ocd_clear_hw_bp_clears_only_target_slot` |
 | `LLR-RSP-01` | `rsp` | `HLR-003`, `HLR-038` | `rsp_listen_sets_so_reuseaddr_before_bind`, `rsp_accept_sets_tcp_nodelay_on_client_socket` |
 | `LLR-RSP-02` | `rsp` | `HLR-013` | `rsp_recv_packet_discards_leading_ack_nak_bytes`, `rsp_recv_packet_sends_plus_on_valid_checksum`, `rsp_recv_packet_sends_minus_and_returns_minus1_on_bad_checksum` |
-| `LLR-RSP-03` | `rsp` | `HLR-014` | `on_read_regs_g_returns_78_char_hex_string`, `on_read_regs_g_places_pc_little_endian_at_positions_70_77` |
-| `LLR-RSP-04` | `rsp` | `HLR-014` | `on_write_regs_G_writes_all_registers_via_updi_mem_write`, `on_write_regs_P_writes_single_register_via_updi_mem_write` |
+| `LLR-RSP-03` | `rsp` | `HLR-014`, `HLR-026` | `on_read_regs_g_returns_78_char_hex_string`, `on_read_regs_g_places_pc_little_endian_at_positions_70_77`, `on_read_regs_non_active_thread_uses_fsm_register_frame` |
+| `LLR-RSP-04` | `rsp` | `HLR-014` | `on_write_regs_G_writes_all_registers_via_ocd`, `on_write_regs_P_writes_single_register_via_ocd` |
 | `LLR-RSP-05` | `rsp` | `HLR-015` | `on_read_mem_m_calls_updi_mem_read_and_returns_hex` |
 | `LLR-RSP-06` | `rsp` | `HLR-015` | `on_write_mem_M_calls_updi_mem_write_for_sram_address`, `on_write_mem_X_calls_nvm_write_flash_for_flash_address` |
-| `LLR-RSP-07` | `rsp` | `HLR-016` | `on_insert_bp_writes_break_opcode_and_saves_original_word`, `on_insert_bp_duplicate_returns_ok_without_reflash` |
-| `LLR-RSP-08` | `rsp` | `HLR-016` | `on_remove_bp_restores_saved_instruction_word`, `on_remove_bp_unknown_address_returns_error_reply` |
-| `LLR-RSP-09` | `rsp` | `HLR-016` | `on_insert_bp_returns_E08_when_table_full` |
+| `LLR-RSP-07` | `rsp` | `HLR-016` | `on_insert_bp_calls_updi_ocd_set_hw_bp_with_byte_addr`, `on_insert_bp_second_slot_succeeds`, `on_insert_bp_duplicate_returns_ok_without_reprogramming` |
+| `LLR-RSP-08` | `rsp` | `HLR-016` | `on_remove_bp_calls_updi_ocd_clear_hw_bp`, `on_remove_bp_unknown_address_returns_ok_for_resync` |
+| `LLR-RSP-09` | `rsp` | `HLR-016` | `on_insert_bp_returns_E08_when_both_slots_occupied` |
 | `LLR-RSP-10` | `rsp` | `HLR-017` | `on_step_s_calls_updi_step_and_sends_T05_stop_reason` |
-| `LLR-RSP-11` | `rsp` | `HLR-018` | `on_continue_calls_updi_run_then_fsm_invalidate`, `on_continue_rebuilds_thread_list_after_halt_and_sends_stop` |
+| `LLR-RSP-11` | `rsp` | `HLR-018` | `on_continue_calls_updi_run_then_fsm_invalidate`, `on_continue_rebuilds_thread_list_after_halt_and_sends_stop`, `on_continue_ctrl_c_returns_T02`, `on_continue_returns_E01_after_UPDI_FAIL_MAX_consecutive_poll_failures`, `D3_rsp_ctrl_c_interrupt_returns_T02` |
 | `LLR-RSP-12` | `rsp` | `HLR-019` | `rsp_dispatch_qsupported_returns_feature_string_no_target_access`, `rsp_dispatch_qattached_returns_1_no_target_access` |
-| `LLR-RSP-13` | `rsp` | `HLR-019` | `on_detach_D_resumes_target_closes_socket_resets_gdb_fd` |
+| `LLR-RSP-13` | `rsp` | `HLR-016`, `HLR-019` | `on_detach_D_resumes_target_closes_socket_resets_gdb_fd` |
 | `LLR-RSP-14` | `rsp` | `HLR-019`, `HLR-035` | `on_kill_k_sets_g_quit_to_1` |
 | `LLR-RSP-15` | `rsp` | `HLR-029`, `HLR-030` | `on_monitor_qRcmd_passes_hex_body_to_monitor_dispatch`, `on_monitor_returns_ok_when_monitor_dispatch_succeeds`, `on_monitor_sends_o_packet_error_on_updi_failure` |
 | `LLR-RSP-16` | `rsp` | `HLR-025` | `H_packet_stores_thread_id_for_register_operations`, `H_packet_minus1_and_0_both_map_to_active_fsm_thread` |
+| `LLR-RSP-17` | `rsp` | `HLR-017`, `HLR-018` | `on_halt_reason_returns_T02_when_extbrk_set` |
+| `LLR-RSP-18` | `rsp` | `HLR-016`, `HLR-019` | `on_detach_clears_hw_bps_before_run` |
 | `LLR-ELF-01` | `elf` | `HLR-021` | `elf_open_accepts_valid_avr_elf32_binary`, `elf_open_returns_minus1_on_invalid_elf_magic`, `elf_open_returns_minus1_on_wrong_machine_type` |
 | `LLR-ELF-02` | `elf` | `HLR-021`, `HLR-040` | `elf_open_loads_symtab_and_strtab_into_heap_buffers`, `elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure` |
 | `LLR-ELF-03` | `elf` | `HLR-021` | `elf_find_avros_tables_performs_single_linear_scan`, `elf_find_avros_tables_populates_all_7_avros_sentinel_fields` |
@@ -300,5 +330,5 @@ verified by code review — see
 | `LLR-HWTEST-02` | `hwtest` | `HLR-045`, `HLR-044` | `A1_port_open_and_cold_start_handshake`, `A2_read_device_info`, `A3_deviceid_matches_expected`, `A4_signature_non_zero_non_ff`, `A5_revid_non_zero`, `A6_sernum_non_zero_non_ff`, `A7_nvmprog_bit_clear` |
 | `LLR-HWTEST-03` | `hwtest` | `HLR-045`, `HLR-011` | `B0_sram_single_byte_round_trip`, `B1_sram_64_byte_round_trip`, `B1a_sigrow_read_repeatability`, `B1b_sram_constant_0xAA_round_trip`, `B1c_sram_write_once_read_twice`, `B2_sram_600_byte_round_trip`, `B3_flash_24bit_addressing_smoke` |
 | `LLR-HWTEST-04` | `hwtest` | `HLR-045`, `HLR-008` | `C1_flash_erase_and_write`, `C2_flash_read_back_verify` |
-| `LLR-HWTEST-05` | `hwtest` | `HLR-045`, `HLR-014` | `D1_rsp_server_accepts_tcp_connection`, `D2_rsp_qsupported_round_trip` |
+| `LLR-HWTEST-05` | `hwtest` | `HLR-045`, `HLR-014` | `D1_rsp_server_accepts_tcp_connection`, `D2_rsp_qsupported_round_trip`, `D3_rsp_ctrl_c_interrupt_returns_T02` |
 | `LLR-HWTEST-06` | `hwtest` | `HLR-045` | `B0_sram_single_byte_round_trip` |

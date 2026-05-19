@@ -329,6 +329,28 @@ NVM controller registers (accessed via UPDI ST/LD at base address `0x1000`):
 | `NVMCTRL_CTRLA`  | `0x00` | NVM command register; write command code to initiate NVM operation. |
 | `NVMCTRL_STATUS` | `0x02` | Status register; bit 0 = BUSY. |
 
+AVR-Dx OCD (On-Chip Debug) register block — accessed via UPDI LDS/STS at UPDI base `0x0F80`. The CPU must be halted before reading or writing these registers; behaviour against a running CPU is undefined.
+
+| Register | UPDI address | Width | Description |
+| -------- | ------------ | ----- | ----------- |
+| `OCD_BP0A`    | `0x0F80` | 3 B | Hardware breakpoint 0 address (LE byte address). |
+| `OCD_BP1A`    | `0x0F84` | 3 B | Hardware breakpoint 1 address (LE byte address). |
+| `OCD_CTRL0`   | `0x0F88` | 1 B | OCD control 0; `OCD_CTRL0_HWBP` (0x01) global HW-BP enable, `OCD_CTRL0_STEP` (0x04) arms single-step on next RUN. |
+| `OCD_CTRL1`   | `0x0F89` | 1 B | OCD control 1; `OCD_CTRL1_BP0` (0x01) and `OCD_CTRL1_BP1` (0x02) enable individual comparators. |
+| `OCD_STATUS0` | `0x0F8C` | 1 B | OCD halt status 0. |
+| `OCD_STATUS1` | `0x0F8D` | 1 B | OCD halt status 1; `OCD_STATUS1_EXTBRK` (0x10) = external break / STOP / Ctrl-C halt cause. |
+| `OCD_PC`      | `0x0F94` | 2 B | Program counter (word-aligned PC+1 storage; converted to/from GDB byte address by `updi_ocd_read_pc()` / `updi_ocd_write_pc()`). |
+| `OCD_SP`      | `0x0F98` | 2 B | Stack pointer (little-endian SPL\|SPH). |
+| `OCD_SREG`    | `0x0F9C` | 1 B | Status register. |
+| `OCD_REGFILE` | `0x0FA0` | 32 B | General-purpose register file r0..r31. |
+
+UPDI CS-space OCD registers (accessed via LDCS/STCS):
+
+| CS register | Offset | Description |
+| ----------- | ------ | ----------- |
+| `ASI_OCD_CTRLA`  | `0x04` | OCD control: write `ASI_OCD_CTRLA_STOP` (0x01) to halt, `ASI_OCD_CTRLA_RUN` (0x02) to resume. |
+| `ASI_OCD_STATUS` | `0x05` | OCD status; `ASI_OCD_STATUS_STOPPED` (0x01) = CPU halted. |
+
 
 #### 4.3.2 Key Functions
 
@@ -347,11 +369,24 @@ NVM controller registers (accessed via UPDI ST/LD at base address `0x1000`):
 
 *   **`int updi_mem_write(int fd, uint32_t addr, const uint8_t *buf, size_t len)`** — Write len bytes to target address addr via UPDI ST; return 0 or -1.
 *   **`int updi_halt(int fd)`**
-    *   Purpose: Halt the CPU core. **Phase 2 stub**: returns -1 unconditionally; the full halt sequence (OCD register manipulation, STOPPED-bit polling) belongs to the AVR On-Chip Debug specification and is implemented in Phase 3 alongside the OCD layer.
-    *   Return Value: -1 (stub, until OCD layer is implemented).
+    *   Purpose: Halt the AVR-Dx CPU by writing `ASI_OCD_CTRLA_STOP` (0x01) to `ASI_OCD_CTRLA` (UPDI CS `0x04`) via STCS, then polling `ASI_OCD_STATUS` via LDCS until `ASI_OCD_STATUS_STOPPED` (0x01) is observed.
+    *   Return Value: 0 on success; -1 on UPDI failure or if STOPPED is not asserted within the LDCS poll budget.
 
-*   **`int updi_run(int fd)`** — Resume CPU execution. Phase 2 stub: returns -1 until the OCD layer is implemented.
-*   **`int updi_step(int fd)`** — Single-step one instruction and halt. Phase 2 stub: returns -1 until the OCD layer is implemented.
+*   **`int updi_run(int fd)`** — Resume the halted CPU by writing ASI_OCD_CTRLA_RUN (0x02) to ASI_OCD_CTRLA via STCS; returns 0 immediately without polling. Callers that need to wait for a halt use updi_ocd_poll_halted().
+*   **`int updi_step(int fd)`** — Single-step one instruction: set OCD_CTRL0_STEP in OCD_CTRL0 via STS, write ASI_OCD_CTRLA_RUN to ASI_OCD_CTRLA via STCS, then poll ASI_OCD_STATUS until STOPPED. Returns 0 or -1.
+*   **`int updi_enter_debug(int fd)`** — Arm AVR-Dx OCD mode for the lifetime of the session: send the UPDI KEY opcode + 8-byte 'OCD     ' key, pulse ASI_RESET_REQ (0x59 then 0x00), and poll ASI_OCD_STATUS for STOPPED. Called once per session from main.c after updi_open() and any --load step.
+*   **`int updi_ocd_poll_halted(int fd, int timeout_ms)`** — Poll ASI_OCD_STATUS at ~1 ms intervals for the STOPPED bit. Returns 0 if STOPPED, +1 on timeout (CPU still running), -1 on UPDI failure.
+*   **`int updi_ocd_read_halt_status(int fd, uint8_t *status0, uint8_t *status1)`** — Read OCD_STATUS0 (0x0F8C) and OCD_STATUS1 (0x0F8D) via UPDI LDS into the caller's bytes. OCD_STATUS1.EXTBRK (0x10) distinguishes external-break / Ctrl-C halts from hardware-breakpoint, single-step, BREAK-opcode, change-of-flow, and interrupt halts.
+*   **`int updi_ocd_read_gpr(int fd, uint8_t n, uint8_t *val)`** — Read AVR GPR r<n> (0..31) via UPDI LDS at OCD_REGFILE + n (0x0FA0 + n). CPU must be halted.
+*   **`int updi_ocd_write_gpr(int fd, uint8_t n, uint8_t val)`** — Write AVR GPR r<n> via UPDI STS at OCD_REGFILE + n. CPU must be halted.
+*   **`int updi_ocd_read_sreg(int fd, uint8_t *val)`** — Read AVR SREG via UPDI LDS at OCD_SREG (0x0F9C).
+*   **`int updi_ocd_write_sreg(int fd, uint8_t val)`** — Write AVR SREG via UPDI STS at OCD_SREG.
+*   **`int updi_ocd_read_sp(int fd, uint16_t *val)`** — Read AVR SP (little-endian SPL|SPH) via UPDI LDS at OCD_SP (0x0F98).
+*   **`int updi_ocd_write_sp(int fd, uint16_t val)`** — Write AVR SP via UPDI STS at OCD_SP.
+*   **`int updi_ocd_read_pc(int fd, uint32_t *byte_addr)`** — Read OCD_PC (0x0F94) via UPDI LDS and convert the silicon's word-aligned PC+1 storage to a GDB byte address (shift left 1, undo the AVR +1 post-increment).
+*   **`int updi_ocd_write_pc(int fd, uint32_t byte_addr)`** — Convert a GDB byte address back to the word-aligned PC+1 form and write OCD_PC via UPDI STS.
+*   **`int updi_ocd_set_hw_bp(int fd, uint8_t idx, uint32_t byte_addr)`** — Program hardware-breakpoint comparator idx (0 or 1) to a GDB byte address: write the 3-byte LE address to OCD_BP0A/OCD_BP1A via UPDI STS, set the matching OCD_CTRL1_BP0/OCD_CTRL1_BP1 enable bit, and set the global OCD_CTRL0_HWBP enable bit.
+*   **`int updi_ocd_clear_hw_bp(int fd, uint8_t idx)`** — Disable hardware-breakpoint comparator idx by clearing the matching OCD_CTRL1_BP0/OCD_CTRL1_BP1 bit via UPDI LDS/STS read-modify-write on OCD_CTRL1.
 *   **`int updi_nvm_write_flash(int fd, uint32_t word_addr, const uint8_t *data, size_t len)`**
     *   Purpose: Erase and program one or more FLASH pages starting at word_addr using the UPDI NVM controller write-page sequence.
     *   Pre-condition: Target CPU is halted (`updi_halt()` has been called); `word_addr` is aligned to a FLASH page boundary; `len` is a non-zero multiple of the target FLASH page size (512 bytes for AVR DA/DB).
@@ -407,7 +442,7 @@ NVM controller registers (accessed via UPDI ST/LD at base address `0x1000`):
 | `updi_nvm_write_flash()` page BUSY poll | ≈ 20 ms per page | 20 reads of `NVMCTRL_STATUS` (bit 0 = BUSY). |
 | Cold-start slow-path BREAK | ≥ ≈ 60 ms per attempt | Two `0x00` bytes at 300 baud, mirroring avrdude's serialupdi. |
 
-Note: `updi_halt()`, `updi_run()`, and `updi_step()` are deferred stubs in Phase 2 and contribute no entries to the timing table.
+Note: `updi_halt()`, `updi_run()`, `updi_step()`, and `updi_ocd_poll_halted()` use a bounded LDCS poll on `ASI_OCD_STATUS` (typical halt latency ≤ 1 ms after `STCS ASI_OCD_CTRLA = STOP`); `updi_ocd_poll_halted()` exposes the deadline as a millisecond argument so the RSP `c` handler can multiplex OCD polling with a `select()` on the GDB client socket.
 
 **UPDI command opcode encoding:** Each command frame begins with a single command byte followed by its operands. Key opcodes (AVR128DA §35.3.3):
 
@@ -422,7 +457,7 @@ Note: `updi_halt()`, `updi_run()`, and `updi_step()` are deferred stubs in Phase
 | `REPEAT`        | `0xA0`     | Set repeat count for the next bulk transfer (n-1 in operand). |
 | `KEY`           | `0xE0`     | Transmit 8-byte key to unlock a privileged mode. |
 
-**Test approach for `src/updi.c`:** Unit-testable using a POSIX pseudo-terminal pair (`openpty()`): one end is passed to `updi_open()`, the other is driven by the test harness. Test cases cover: termios 8E2 configuration (with PARENB-fallback under PTYs), the cold-start wake-byte/STCS-CCDETDIS/STCS-IBDLY/LDCS-STATUSA probe and its 3-retry policy, the 3-frame `ST_PTR_WORD`/`REPEAT`/`LD-or-ST` burst, the 100 ms `select()` deadline, NVM precondition checks, NVMPROG and per-page BUSY timeouts, and that `updi_halt`/`updi_run`/`updi_step` return -1 stubs until the OCD layer lands.
+**Test approach for `src/updi.c`:** Unit-testable using a POSIX pseudo-terminal pair (`openpty()`): one end is passed to `updi_open()`, the other is driven by the test harness. Test cases cover: termios 8E2 configuration (with PARENB-fallback under PTYs), the cold-start wake-byte/STCS-CCDETDIS/STCS-IBDLY/LDCS-STATUSA probe and its 3-retry policy, the 3-frame `ST_PTR_WORD`/`REPEAT`/`LD-or-ST` burst, the 100 ms `select()` deadline, NVM precondition checks, NVMPROG and per-page BUSY timeouts, and the OCD control primitives (`updi_enter_debug`, `updi_halt`, `updi_run`, `updi_step`, `updi_ocd_poll_halted`, `updi_ocd_read_halt_status`, and the OCD register-file readers/writers).
 
 ### 4.4 Dependencies
 
@@ -489,23 +524,25 @@ TCP server socket on the configured port (default `1234`). Accepts exactly one c
 
 | Field | Packet(s) handled | Description |
 | ----- | ----------------- | ----------- |
-| `on_halt_reason`  | `?`                       | Stop-reason query; returns `T05thread:<id>;` |
-| `on_read_regs`    | `g`                       | Read all 36 GDB AVR registers (R0-R31, SREG, SPL, SPH, PC) by delegating to `fsm_get_registers()`, which synthesizes the per-thread register frame from the cached FSM state and the live SREG/SP read via `updi_mem_read()` for the active thread. |
-| `on_write_regs`   | `G`, `P`                  | Write all registers (`G`) or a single register (`P n=vv`); both call `updi_mem_write()` against the CPU register file (base 0x1000). |
-| `on_read_mem`     | `m addr,len`              | Read memory; dispatches to UPDI for both FLASH and SRAM addresses. |
-| `on_write_mem`    | `M addr,len:data`, `X addr,len:bin` | Write memory: `updi_nvm_write_flash()` for FLASH addresses, `updi_mem_write()` for SRAM addresses (selected by the GDB-unified 0x800000 bit). |
-| `on_continue`     | `c`, `vCont;c`            | Resume target; calls `updi_run()` and `fsm_invalidate()`. |
-| `on_step`         | `s`, `vCont;s`            | Single-step; calls `updi_step()`. |
-| `on_insert_bp`    | `Z0 addr,kind`            | Insert software breakpoint by patching FLASH with AVR BREAK opcode. |
-| `on_remove_bp`    | `z0 addr,kind`            | Remove software breakpoint by restoring the saved instruction word. |
+| `on_halt_reason`  | `?`                       | Stop-reason query; calls `signal_for_halt_status()` (reads `OCD_STATUS1` via `updi_ocd_read_halt_status()`) and replies `T02thread:<id>;` (SIGINT) when `OCD_STATUS1.EXTBRK` is set or `T05thread:<id>;` (SIGTRAP) otherwise. |
+| `on_read_regs`    | `g`                       | Read all 35 GDB AVR registers (R0-R31, SREG, SP, PC; 78 hex chars) live from the OCD register file via `updi_ocd_read_gpr()` / `read_sreg()` / `read_sp()` / `read_pc()` when the selected GDB thread is the active FSM thread (or when no FSM thread is established); delegate to `fsm_get_registers()` for non-active virtual threads. |
+| `on_write_regs`   | `G`, `P`                  | Write all registers (`G`) or a single register (`P n=vv`); both route per-slot to `updi_ocd_write_gpr/sreg/sp/pc` (no `updi_mem_write()`). |
+| `on_read_mem`     | `m addr,len`              | Read memory; flips GDB unified-address bit 23 to produce the UPDI physical address before calling `updi_mem_read()`. |
+| `on_write_mem`    | `M addr,len:data`, `X addr,len:bin` | Write memory: `updi_nvm_write_flash()` for program-space addresses (GDB bit 23 clear), `updi_mem_write()` for data-space addresses (GDB bit 23 set). |
+| `on_continue`     | `c`, `vCont;c`            | Resume target via `updi_run()`, invalidate the FSM cache, multiplex `select(client_fd)` against `updi_ocd_poll_halted(1 ms)` to deliver Ctrl-C interrupts during the run, then halt and reply with `T02thread:<id>;` (Ctrl-C) or the signal from `signal_for_halt_status()`. Bounds UPDI poll failures with `UPDI_FAIL_MAX = 8`. |
+| `on_step`         | `s`, `vCont;s`            | Single-step via `updi_step()`, rebuild the FSM thread list, reply with the stop-reason packet produced by `on_halt_reason`. |
+| `on_insert_bp`    | `Z0`, `Z1`                | Install a hardware-breakpoint comparator in one of two `RspContext.hw_bp_addr[]` slots via `updi_ocd_set_hw_bp()`; both `Z0` and `Z1` route to the same two comparators. |
+| `on_remove_bp`    | `z0`, `z1`                | Release a hardware-breakpoint comparator via `updi_ocd_clear_hw_bp()` and reset the shadow slot. |
 | `on_thread_info`  | `qfThreadInfo`/`qsThreadInfo` | Enumerate virtual thread IDs from `FsmContext`. |
 | `on_thread_extra` | `qThreadExtraInfo`        | Return FSM name string as hex-encoded ASCII. |
 | `on_set_thread_g` | `Hg<tid>`                 | Select virtual thread for subsequent `g`/`G`/`P` operations; thread IDs -1 and 0 both map to the active FSM thread. |
 | `on_set_thread_c` | `Hc<tid>`                 | Select virtual thread for subsequent `c`/`s` operations. |
 | `on_monitor`      | `qRcmd`                   | Forward the raw ASCII-hex command body to `monitor_dispatch()`. |
-| `on_detach`       | `D`, `k`                  | Detach (`D`: resume target and close client fd) or kill (`k`: set the global quit flag). |
+| `on_detach`       | `D`, `k`                  | Detach (`D`: call `hw_bp_clear_all(ctx)` to release both OCD comparators, then `updi_run()` and close the client fd) or kill (`k`: set the global quit flag). |
 
-**Breakpoint table:** `RSP_MAX_BREAKPOINTS` (16) software breakpoint slots are maintained as a static array of `{ uint32_t addr; uint16_t saved_word; }` structures. The AVR BREAK opcode (`0x9598`) is written to the target via `updi_nvm_write_flash()` on insertion and the saved instruction word is restored on removal.
+**Breakpoint shadow:** The two AVR-Dx OCD hardware-breakpoint comparators (`BP0`, `BP1`) are tracked in the session context as `RspContext.hw_bp_addr[0..1]`, each storing the GDB byte address currently programmed or the sentinel `HW_BP_SLOT_EMPTY` (`0xFFFFFFFF`). Both `Z0` (software) and `Z1` (hardware) GDB packets route to the same two comparators — patching the AVR `BREAK` opcode into FLASH at runtime would require exiting OCD mode, entering NVMPROG (which resets the CPU and destroys live register/SREG/SP state), patching, and re-entering OCD, a sequence whose state-preservation cost outweighs the benefit. `on_insert_bp` programs silicon via `updi_ocd_set_hw_bp()`; `on_remove_bp` releases via `updi_ocd_clear_hw_bp()`; `on_detach` calls the `hw_bp_clear_all()` helper so silicon is left clean for the next session.
+
+**Async Ctrl-C interrupt:** While `on_continue` is polling the target for a halt, it uses `select()` on the GDB client fd with a 5 ms timeout to detect the GDB Ctrl-C async-interrupt byte (`0x03`). On detection it calls `updi_halt()` and replies `T02thread:<id>;` (SIGINT). The poll loop also bounds consecutive `updi_ocd_poll_halted()` failures with `UPDI_FAIL_MAX = 8` and replies `E01` if the link degrades to that point, rather than spinning indefinitely.
 
 **Packet buffer:** `RSP_PACKET_MAX` (2048 bytes) is the compile-time maximum for a single RSP payload, sized to accommodate a full AVR `g`-packet response (35 registers × 2 hex chars/byte = 70 bytes) plus worst-case `qXfer` memory-map XML overhead.
 
@@ -556,8 +593,9 @@ TCP server socket on the configured port (default `1234`). Accepts exactly one c
 | -------- | ---- | ---- | ------- |
 | `pkt_buf[RSP_PACKET_MAX]` | `char[2048]` | 2 KiB | Receive buffer for one RSP packet payload. |
 | `rsp_buf[RSP_PACKET_MAX+8]` | `char[2056]` | 2 KiB | Transmit buffer: framed `$payload#XX`. |
-| `bp_table[RSP_MAX_BREAKPOINTS]` | `struct { uint32_t addr; uint16_t saved_word; }[16]` | 96 B | Software breakpoint table. |
 | `g_thread`, `c_thread` | `int` | 8 B | Selected GDB thread IDs for register and continue operations. |
+
+(The previous 96-byte software-breakpoint table has been removed; the two hardware-breakpoint shadow slots now live in `RspContext.hw_bp_addr[]` and are session-scoped.)
 
 Total static BSS in `src/gdb_rsp.c`: approximately 4.2 KiB.
 
@@ -566,7 +604,7 @@ Total static BSS in `src/gdb_rsp.c`: approximately 4.2 KiB.
 *   `SO_REUSEADDR` — allows rapid server restart without waiting for TIME_WAIT to expire.
 *   `TCP_NODELAY` — disables Nagle's algorithm; each `write()` is sent immediately, which is critical for GDB round-trip latency (GDB sends many small packets and waits for each response before continuing).
 
-**Test approach for `src/gdb_rsp.c`:** Unit-testable using a pair of connected loopback sockets. Test cases cover: packet reception with correct and incorrect checksums, ACK/NAK behaviour before and after `QStartNoAckMode`, `rsp_dispatch()` routing to each handler, empty-response for unknown packets, breakpoint table insert/remove/overflow, and client disconnect detection.
+**Test approach for `src/gdb_rsp.c`:** Unit-testable using a pair of connected loopback sockets (`socketpair()`) with all `updi_*` and `fsm_*` symbols replaced by `ld --wrap` stubs that record call sequences and return canned values. Test cases cover: packet reception with correct and incorrect checksums; ACK/NAK behaviour before and after `QStartNoAckMode`; `rsp_dispatch()` routing to each handler; empty-response for unknown packets; `G`/`P` writes routed per slot to `updi_ocd_write_gpr/sreg/sp/pc`; `g` reads served from the OCD register file for the active thread; `Z0`/`Z1` insert programming an OCD comparator via `updi_ocd_set_hw_bp()`; `z0`/`z1` releasing via `updi_ocd_clear_hw_bp()`; a third unique-address insert returning `E08`; Ctrl-C (`\x03`) on the client socket halting the target during `c` and the reply carrying signal `T02`; `D` (detach) calling `hw_bp_clear_all()` before `updi_run()` so silicon comparators are released; and the `UPDI_FAIL_MAX = 8` retry bound preventing `c` from spinning on a degraded UPDI link.
 
 ### 5.4 Dependencies
 
@@ -580,7 +618,7 @@ Total static BSS in `src/gdb_rsp.c`: approximately 4.2 KiB.
 *   **Checksum mismatch** Send `-` (NAK) and await retransmit from the GDB client.
 *   **Unrecognized packet type** Send the empty response `$#00` as required by the RSP specification.
 *   **Client disconnect** Close the client fd, reopen the listener, and wait for the next GDB connection.
-*   **Breakpoint table full** Return GDB error packet `E08`; no breakpoint is installed.
+*   **Breakpoint comparators exhausted** Return GDB error packet `E08`; no comparator is programmed. The AVR-Dx provides only two HW comparators (`BP0`/`BP1`), so GDB receives `E08` on the third unique-address `Z0`/`Z1` insert.
 
 ## 6. Detailed Design for [src/elf_parser.c](../src/elf_parser.c)
 
@@ -1012,7 +1050,7 @@ typedef struct {
     | Name | Value | Purpose |
     | ---- | ----- | ------- |
     | `RSP_PACKET_MAX`      | `2048` | Maximum RSP payload size in bytes; sized for a full AVR register dump plus `qXfer` XML overhead. |
-    | `RSP_MAX_BREAKPOINTS` | `16`   | Capacity of the static software breakpoint table. |
+    | `RSP_MAX_BREAKPOINTS` | `2`    | Number of AVR-Dx OCD hardware-breakpoint comparators tracked by the RSP session context (`BP0` and `BP1`). |
 
 *   **Compile-time constants** (in [src/fsm_mapper.c](../src/fsm_mapper.c)):
 

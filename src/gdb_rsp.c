@@ -27,25 +27,22 @@
 
 /* ── Static buffers ──────────────────────────────────────────────────── */
 
-static char   pkt_buf[RSP_PACKET_MAX + 1];     /* not used by lib; reserved */
 static char   rsp_buf[RSP_PACKET_MAX + 8];
-
-typedef struct {
-    uint32_t addr;
-    uint16_t saved_word;
-    bool     in_use;
-} BpSlot;
-
-static BpSlot bp_table[RSP_MAX_BREAKPOINTS];
 
 static bool g_noack = false;
 
 void rsp_set_noack(bool e) { g_noack = e; }
 bool rsp_get_noack(void)   { return g_noack; }
 
-/* Suppress unused-static warning for the reserved external receive buffer
- * (some callers will reuse pkt_buf via a future helper). */
-__attribute__((used)) static char *_pkt_buf_keepalive = pkt_buf;
+/* GDB AVR address-space split: addresses < 0x800000 are program memory
+ * (FLASH); addresses >= 0x800000 are data space (SRAM/IO).  AVR-Dx UPDI
+ * uses the opposite convention — FLASH lives at UPDI 0x800000+ and SRAM
+ * at UPDI 0x000000+.  Translate by flipping bit 23.                    */
+#define GDB_AVR_DATA_FLAG   0x800000u
+#define GDB_AVR_ADDR_MASK   0x7FFFFFu
+
+/* Sentinel: no breakpoint installed in this HW comparator slot. */
+#define HW_BP_SLOT_EMPTY    0xFFFFFFFFu
 
 /* ── small helpers ───────────────────────────────────────────────────── */
 
@@ -213,30 +210,33 @@ int rsp_send_packet(int fd, const char *payload)
     return (write_all(fd, rsp_buf, plen + 4u) < 0) ? -1 : 0;
 }
 
-/* ── Breakpoint table helpers ───────────────────────────────────────── */
-
-static BpSlot *bp_find(uint32_t addr)
-{
-    for (size_t i = 0; i < RSP_MAX_BREAKPOINTS; ++i) {
-        if (bp_table[i].in_use && bp_table[i].addr == addr) return &bp_table[i];
-    }
-    return NULL;
-}
-
-static BpSlot *bp_alloc(void)
-{
-    for (size_t i = 0; i < RSP_MAX_BREAKPOINTS; ++i) {
-        if (!bp_table[i].in_use) return &bp_table[i];
-    }
-    return NULL;
-}
-
-static void bp_clear_all(void)
-{
-    memset(bp_table, 0, sizeof bp_table);
-}
-
 /* ── Default handlers ────────────────────────────────────────────────── */
+
+/* Map an OCD halt-status reading to a GDB stop-signal string.
+ * EXTBRK (host-issued STOP via OCD CTRLA, or external break pin)
+ * presents as SIGINT; everything else (HW BP, SW BP, JMP/INT trap,
+ * step completion, reset) presents as SIGTRAP — GDB's expected
+ * default after `?`.                                                  */
+static const char *signal_for_halt_status(int updi_fd)
+{
+    uint8_t st0 = 0, st1 = 0;
+    if (updi_ocd_read_halt_status(updi_fd, &st0, &st1) < 0)
+        return "T05";
+    if (st1 & OCD_STATUS1_EXTBRK) return "T02";
+    return "T05";
+}
+
+/* Clear all OCD HW breakpoints in silicon and reset the local shadow.
+ * Idempotent and tolerant of UPDI errors (used on detach).            */
+static void hw_bp_clear_all(RspContext *ctx)
+{
+    for (int i = 0; i < 2; i++) {
+        if (ctx->hw_bp_addr[i] != HW_BP_SLOT_EMPTY) {
+            (void)updi_ocd_clear_hw_bp(ctx->updi_fd, i);
+            ctx->hw_bp_addr[i] = HW_BP_SLOT_EMPTY;
+        }
+    }
+}
 
 /* These handlers each call rsp_send_packet() exactly once. */
 
@@ -251,28 +251,109 @@ static int dh_halt_reason(int fd, const char *pkt, void *vctx)
     int aid = ctx->fsm ? fsm_get_active_thread(ctx->fsm) : 0;
     if (aid <= 0) aid = 1;
     char reply[32];
-    snprintf(reply, sizeof reply, "%sthread:%x;", RSP_STOP_SIGTRAP, (unsigned)aid);
+    snprintf(reply, sizeof reply, "%sthread:%x;",
+             signal_for_halt_status(ctx->updi_fd), (unsigned)aid);
     return rsp_send_packet(fd, reply);
+}
+
+/* Hex-encode one byte into *p (advances p by 2 chars). */
+static void rsp_hex_byte(char **p, uint8_t v)
+{
+    static const char H[] = "0123456789abcdef";
+    *(*p)++ = H[(v >> 4) & 0xFu];
+    *(*p)++ = H[v & 0xFu];
+}
+
+/* Read live AVR CPU state via OCD into a 39-byte GDB AVR register block:
+ *   r0..r31 (32 bytes) | SREG (1) | SPL (1) | SPH (1) | PC (4 LE)
+ * = 78 hex chars.  Returns 0 on success, -1 on UPDI error.              */
+static int ocd_read_avr_regblock(int updi_fd, char *out_hex)
+{
+    uint8_t  gpr[32];
+    uint8_t  sreg = 0;
+    uint16_t sp = 0;
+    uint32_t pc_byte = 0;
+    for (uint8_t i = 0; i < 32u; i++) {
+        if (updi_ocd_read_gpr(updi_fd, i, &gpr[i]) < 0) return -1;
+    }
+    if (updi_ocd_read_sreg(updi_fd, &sreg)   < 0) return -1;
+    if (updi_ocd_read_sp  (updi_fd, &sp)     < 0) return -1;
+    if (updi_ocd_read_pc  (updi_fd, &pc_byte) < 0) return -1;
+
+    char *p = out_hex;
+    for (int i = 0; i < 32; i++) rsp_hex_byte(&p, gpr[i]);
+    rsp_hex_byte(&p, sreg);
+    rsp_hex_byte(&p, (uint8_t)(sp & 0xFFu));
+    rsp_hex_byte(&p, (uint8_t)((sp >> 8) & 0xFFu));
+    rsp_hex_byte(&p, (uint8_t)( pc_byte        & 0xFFu));
+    rsp_hex_byte(&p, (uint8_t)((pc_byte >>  8) & 0xFFu));
+    rsp_hex_byte(&p, (uint8_t)((pc_byte >> 16) & 0xFFu));
+    rsp_hex_byte(&p, (uint8_t)((pc_byte >> 24) & 0xFFu));
+    *p = '\0';
+    return 0;
 }
 
 static int dh_read_regs(int fd, const char *pkt, void *vctx)
 {
     (void)pkt;
     RspContext *ctx = (RspContext *)vctx;
-    char reg[80] = {0};
     int tid = ctx->g_thread_p ? *ctx->g_thread_p : 0;
-    if (tid <= 0) tid = ctx->fsm ? fsm_get_active_thread(ctx->fsm) : 1;
+    int aid = ctx->fsm ? fsm_get_active_thread(ctx->fsm) : 0;
+    if (tid <= 0) tid = aid;
     if (tid <= 0) tid = 1;
-    if (fsm_get_registers(ctx->fsm, tid, reg) < 0) {
-        return reply_err(fd, "E01");
+
+    /* Active thread → live CPU regs via OCD; non-active threads → the
+     * FSM-reconstructed view (PC = saved state_fn, R-file zeros).
+     * When no FSM thread is active (e.g. --load without --device), we
+     * still want live CPU state from OCD rather than synthetic zeros.  */
+    char reg[80] = {0};
+    if (aid <= 0 || tid == aid) {
+        if (ocd_read_avr_regblock(ctx->updi_fd, reg) < 0)
+            return reply_err(fd, "E01");
+        return rsp_send_packet(fd, reg);
     }
+    if (fsm_get_registers(ctx->fsm, tid, reg) < 0)
+        return reply_err(fd, "E01");
     return rsp_send_packet(fd, reg);
+}
+
+/* Route a single GDB AVR register slot to its OCD writer.
+ *   regnum 0..31  : r0..r31 (1 byte)
+ *   regnum 32     : SREG    (1 byte)
+ *   regnum 33     : SP      (2 bytes, little-endian SPL|SPH)
+ *   regnum 34     : PC      (4 bytes, little-endian byte address)
+ */
+static int ocd_write_avr_reg(int updi_fd, uint32_t regnum,
+                             const uint8_t *bytes, size_t nb)
+{
+    if (regnum < 32u) {
+        if (nb < 1u) return -1;
+        return updi_ocd_write_gpr(updi_fd, (uint8_t)regnum, bytes[0]);
+    }
+    if (regnum == 32u) {
+        if (nb < 1u) return -1;
+        return updi_ocd_write_sreg(updi_fd, bytes[0]);
+    }
+    if (regnum == 33u) {
+        if (nb < 2u) return -1;
+        uint16_t sp = (uint16_t)(bytes[0] | ((uint16_t)bytes[1] << 8));
+        return updi_ocd_write_sp(updi_fd, sp);
+    }
+    if (regnum == 34u) {
+        if (nb < 4u) return -1;
+        uint32_t pc = (uint32_t)bytes[0]
+                    | ((uint32_t)bytes[1] << 8)
+                    | ((uint32_t)bytes[2] << 16)
+                    | ((uint32_t)bytes[3] << 24);
+        return updi_ocd_write_pc(updi_fd, pc);
+    }
+    return -1; /* unknown reg */
 }
 
 static int dh_write_regs(int fd, const char *pkt, void *vctx)
 {
     /* Accepts both Gxx... and Pn=xx... */
-    (void)vctx;
+    RspContext *ctx = (RspContext *)vctx;
     if (pkt[0] == 'P') {
         /* P<reg>=<hex...> */
         const char *p = pkt + 1;
@@ -291,28 +372,44 @@ static int dh_write_regs(int fd, const char *pkt, void *vctx)
             if (hi < 0 || lo < 0) return reply_err(fd, "E01");
             bytes[i] = (uint8_t)((hi << 4) | lo);
         }
-        RspContext *ctx = (RspContext *)vctx;
-        if (updi_mem_write(ctx->updi_fd, 0x1000u + regnum, bytes, nb) < 0) {
+        if (ocd_write_avr_reg(ctx->updi_fd, regnum, bytes, nb) < 0) {
             return reply_err(fd, "E01");
         }
         return reply_ok(fd);
     }
-    /* G<78 hex chars> */
+    /* G<hex...> — full 39-byte AVR reg block */
     const char *p = pkt + 1;
     size_t nibbles = strlen(p);
-    if (nibbles < 64u || (nibbles & 1u)) return reply_err(fd, "E01");
-    size_t nb = nibbles / 2u;
-    uint8_t bytes[64];
-    if (nb > sizeof bytes) nb = sizeof bytes;
-    for (size_t i = 0; i < nb; ++i) {
+    if (nibbles < 78u || (nibbles & 1u)) return reply_err(fd, "E01");
+    uint8_t bytes[39];
+    for (size_t i = 0; i < sizeof bytes; ++i) {
         int hi = hex_nibble(p[i * 2]);
         int lo = hex_nibble(p[i * 2 + 1]);
         if (hi < 0 || lo < 0) return reply_err(fd, "E01");
         bytes[i] = (uint8_t)((hi << 4) | lo);
     }
-    RspContext *ctx = (RspContext *)vctx;
-    if (updi_mem_write(ctx->updi_fd, 0x1000u, bytes, nb) < 0) {
+    /* r0..r31 */
+    for (uint8_t n = 0; n < 32u; ++n) {
+        if (updi_ocd_write_gpr(ctx->updi_fd, n, bytes[n]) < 0)
+            return reply_err(fd, "E01");
+    }
+    /* SREG */
+    if (updi_ocd_write_sreg(ctx->updi_fd, bytes[32]) < 0)
         return reply_err(fd, "E01");
+    /* SP (LE) */
+    {
+        uint16_t sp = (uint16_t)(bytes[33] | ((uint16_t)bytes[34] << 8));
+        if (updi_ocd_write_sp(ctx->updi_fd, sp) < 0)
+            return reply_err(fd, "E01");
+    }
+    /* PC (LE, 4 bytes, byte address) */
+    {
+        uint32_t pc = (uint32_t)bytes[35]
+                    | ((uint32_t)bytes[36] << 8)
+                    | ((uint32_t)bytes[37] << 16)
+                    | ((uint32_t)bytes[38] << 24);
+        if (updi_ocd_write_pc(ctx->updi_fd, pc) < 0)
+            return reply_err(fd, "E01");
     }
     return reply_ok(fd);
 }
@@ -332,8 +429,9 @@ static int dh_read_mem(int fd, const char *pkt, void *vctx)
      * 0x800000+ = SRAM/IO (data memory).  AVR-Dx UPDI memory map: FLASH at
      * UPDI 0x800000+, SRAM/IO at UPDI 0x000000+.  Swap the bit-23 sense to
      * translate between the two spaces. */
-    uint32_t updi_addr = (addr >= 0x800000u) ? (addr & 0x7FFFFFu)
-                                             : (addr | UPDI_FLASH_BASE);
+    uint32_t updi_addr = (addr & GDB_AVR_DATA_FLAG)
+                       ? (addr & GDB_AVR_ADDR_MASK)
+                       : (addr | UPDI_FLASH_BASE);
     uint8_t buf[512];
     if (updi_mem_read(ctx->updi_fd, updi_addr, buf, len) < 0) {
         return reply_err(fd, "E01");
@@ -375,8 +473,8 @@ static int dh_write_mem(int fd, const char *pkt, void *vctx)
      * SRAM writes go via mem_write (low UPDI addr); FLASH writes go via
      * the NVM controller using the UPDI 24-bit FLASH-base address. */
     int rc;
-    if (addr >= 0x800000u) {
-        rc = updi_mem_write(ctx->updi_fd, addr & 0x7FFFFFu, data, len);
+    if (addr & GDB_AVR_DATA_FLAG) {
+        rc = updi_mem_write(ctx->updi_fd, addr & GDB_AVR_ADDR_MASK, data, len);
     } else {
         rc = updi_nvm_write_flash(ctx->updi_fd, addr | UPDI_FLASH_BASE,
                                   data, len);
@@ -392,35 +490,57 @@ static int dh_continue(int fd, const char *pkt, void *vctx)
     if (updi_run(ctx->updi_fd) < 0) return reply_err(fd, "E01");
     fsm_invalidate(ctx->fsm);
 
-    /* Wait for the gdb client to send a Ctrl-C (\x03) interrupt byte.
-     * GDB normally transmits exactly one 0x03 when the user types
-     * Ctrl-C or invokes `interrupt`.  Other bytes outside a packet are
-     * tolerated and discarded.  EOF/socket-error halts the chip and
-     * returns -1 so the event loop can tear down cleanly.            */
+    /* Wait for either:
+     *   (a) the CPU to halt by itself (HW breakpoint, BREAK opcode,
+     *       JMP-trap, etc.) — detected by polling ASI_OCD_STATUS, or
+     *   (b) the gdb client sending a Ctrl-C (\x03) byte — user
+     *       interrupt or `interrupt` command in gdb.
+     *
+     * Poll once per 5 ms.  This is well below human latency on (b)
+     * yet adds only ~200 transactions/s on the UPDI link.  Tolerate up
+     * to UPDI_FAIL_MAX consecutive UPDI poll failures before giving up
+     * — protects against an infinite spin if the target loses power or
+     * the serial link is yanked mid-run.                              */
+    bool got_ctrl_c = false;
+    enum { UPDI_FAIL_MAX = 8 };
+    int  updi_fails = 0;
     for (;;) {
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(fd, &rfds);
-        int sel = select(fd + 1, &rfds, NULL, NULL, NULL);
+        struct timeval tv = { 0, 5 * 1000 };  /* 5 ms */
+        int sel = select(fd + 1, &rfds, NULL, NULL, &tv);
         if (sel < 0) {
             if (errno == EINTR) continue;
             (void)updi_halt(ctx->updi_fd);
             return -1;
         }
-        if (sel == 0) continue;
-
-        char c;
-        ssize_t n;
-        do { n = read(fd, &c, 1); } while (n < 0 && errno == EINTR);
-        if (n <= 0) {
-            (void)updi_halt(ctx->updi_fd);
-            return -1;
+        if (sel > 0 && FD_ISSET(fd, &rfds)) {
+            char c;
+            ssize_t n;
+            do { n = read(fd, &c, 1); } while (n < 0 && errno == EINTR);
+            if (n <= 0) {
+                (void)updi_halt(ctx->updi_fd);
+                return -1;
+            }
+            if (c == '\x03') {
+                got_ctrl_c = true;
+                break;
+            }
+            /* Liberal: discard any other stray bytes mid-run. */
+            continue;
         }
-        if (c == '\x03') {
-            break;                  /* interrupt request */
+        /* select() timed out — probe OCD STATUS for spontaneous halt. */
+        int s = updi_ocd_poll_halted(ctx->updi_fd, 1);
+        if (s == 0) { updi_fails = 0; break; }       /* halted */
+        if (s < 0) {
+            if (++updi_fails >= UPDI_FAIL_MAX) {
+                (void)updi_halt(ctx->updi_fd);
+                return reply_err(fd, "E01");
+            }
+        } else {
+            updi_fails = 0;
         }
-        /* Ignore any other stray bytes while running.  GDB should not
-         * send packets during vCont;c, but be liberal in what we accept. */
     }
 
     if (updi_halt(ctx->updi_fd) < 0) return reply_err(fd, "E01");
@@ -428,12 +548,13 @@ static int dh_continue(int fd, const char *pkt, void *vctx)
     if (ctx->fsm) {
         (void)fsm_build_thread_list(ctx->fsm, ctx->idx, ctx->updi_fd);
     }
-    /* Report SIGINT (signal 2) for user-initiated interrupt. */
+    /* Signal: SIGINT (T02) for user-Ctrl-C, SIGTRAP (T05) otherwise. */
     {
         int aid = ctx->fsm ? fsm_get_active_thread(ctx->fsm) : 0;
         if (aid <= 0) aid = 1;
+        const char *sig = got_ctrl_c ? "T02" : "T05";
         char reply[32];
-        snprintf(reply, sizeof reply, "T02thread:%x;", (unsigned)aid);
+        snprintf(reply, sizeof reply, "%sthread:%x;", sig, (unsigned)aid);
         return rsp_send_packet(fd, reply);
     }
 }
@@ -450,62 +571,72 @@ static int dh_step(int fd, const char *pkt, void *vctx)
     return dh_halt_reason(fd, "?", vctx);
 }
 
+/* AVR-Dx OCD provides exactly two hardware breakpoint comparators
+ * (BP0, BP1).  The per-session shadow lives in RspContext so detach
+ * and reattach cycles leave silicon in a known state.                */
+
 static int dh_insert_bp(int fd, const char *pkt, void *vctx)
 {
     RspContext *ctx = (RspContext *)vctx;
-    /* Z0,addr,kind  — only Z0 (software bp) supported. */
-    if (pkt[1] != '0') return reply_empty(fd);
+    /* Z0 = software breakpoint, Z1 = hardware breakpoint.
+     *
+     * Z0 in OCD mode would normally be implemented by patching FLASH
+     * with the AVR BREAK opcode.  That requires exiting OCD, entering
+     * NVMPROG (which issues a system-reset pulse), patching the page,
+     * then re-entering OCD — a sequence that destroys live CPU state
+     * (PC/SREG/GPRs) and is non-trivial to save/restore over UPDI.
+     *
+     * Pragmatic choice: route Z0 to the same two HW comparators so
+     * plain `break` Just Works up to two simultaneous breakpoints,
+     * matching what microchip-pic-avr-tools / pyedbglib do for the
+     * same silicon.  When all slots are full we return E08 so GDB
+     * surfaces the limit to the user.                                */
+    char kind = pkt[1];
+    if (kind != '0' && kind != '1') return reply_empty(fd);
     const char *p = pkt + 2;
     if (*p != ',') return reply_err(fd, "E01");
     ++p;
     uint32_t addr;
     if (parse_hex_u32(&p, &addr) < 0) return reply_err(fd, "E01");
 
-    if (bp_find(addr) != NULL) return reply_ok(fd);
-
-    BpSlot *slot = bp_alloc();
-    if (slot == NULL) return reply_err(fd, "E08");
-
-    /* GDB AVR FLASH addresses live in 0x000000-0x7FFFFF.  Translate to
-     * the UPDI FLASH-space (0x800000+) for both the read-back of the
-     * original opcode and the page-RMW that plants the BREAK. */
-    uint32_t flash_addr = (addr & 0x7FFFFFu) | UPDI_FLASH_BASE;
-    uint8_t orig[2];
-    if (updi_mem_read(ctx->updi_fd, flash_addr, orig, 2u) < 0)
-        return reply_err(fd, "E01");
-    uint16_t saved = (uint16_t)(orig[0] | ((uint16_t)orig[1] << 8));
-
-    uint8_t brk[2] = { (uint8_t)(AVR_BREAK_OPCODE & 0xFFu),
-                       (uint8_t)((AVR_BREAK_OPCODE >> 8) & 0xFFu) };
-    if (updi_nvm_flash_patch(ctx->updi_fd, flash_addr, brk, 2u) < 0) {
-        return reply_err(fd, "E01");
+    /* Already set?  Idempotent OK. */
+    for (int i = 0; i < 2; i++) {
+        if (ctx->hw_bp_addr[i] == addr) return reply_ok(fd);
     }
-    slot->addr       = addr;
-    slot->saved_word = saved;
-    slot->in_use     = true;
+    int slot_i = -1;
+    for (int i = 0; i < 2; i++) {
+        if (ctx->hw_bp_addr[i] == HW_BP_SLOT_EMPTY) { slot_i = i; break; }
+    }
+    if (slot_i < 0) return reply_err(fd, "E08");          /* both slots used */
+    uint32_t flash_byte = addr & GDB_AVR_ADDR_MASK;       /* gdb→byte */
+    if (updi_ocd_set_hw_bp(ctx->updi_fd, slot_i, flash_byte) < 0)
+        return reply_err(fd, "E01");
+    ctx->hw_bp_addr[slot_i] = addr;
     return reply_ok(fd);
 }
 
 static int dh_remove_bp(int fd, const char *pkt, void *vctx)
 {
     RspContext *ctx = (RspContext *)vctx;
-    if (pkt[1] != '0') return reply_empty(fd);
+    /* Z0 and Z1 both map to HW comparators (see dh_insert_bp). */
+    char kind = pkt[1];
+    if (kind != '0' && kind != '1') return reply_empty(fd);
     const char *p = pkt + 2;
     if (*p != ',') return reply_err(fd, "E01");
     ++p;
     uint32_t addr;
     if (parse_hex_u32(&p, &addr) < 0) return reply_err(fd, "E01");
 
-    BpSlot *slot = bp_find(addr);
-    if (slot == NULL) return reply_err(fd, "E02");
-
-    uint8_t orig[2] = { (uint8_t)(slot->saved_word & 0xFFu),
-                        (uint8_t)((slot->saved_word >> 8) & 0xFFu) };
-    uint32_t flash_addr = (addr & 0x7FFFFFu) | UPDI_FLASH_BASE;
-    if (updi_nvm_flash_patch(ctx->updi_fd, flash_addr, orig, 2u) < 0) {
-        return reply_err(fd, "E01");
+    for (int i = 0; i < 2; i++) {
+        if (ctx->hw_bp_addr[i] == addr) {
+            if (updi_ocd_clear_hw_bp(ctx->updi_fd, i) < 0)
+                return reply_err(fd, "E01");
+            ctx->hw_bp_addr[i] = HW_BP_SLOT_EMPTY;
+            return reply_ok(fd);
+        }
     }
-    slot->in_use = false;
+    /* No record (e.g. server restarted mid-session) — report OK so a
+     * GDB resync is non-fatal.                                       */
     return reply_ok(fd);
 }
 
@@ -619,19 +750,26 @@ static int dh_detach(int fd, const char *pkt, void *vctx)
         if (ctx->quit_p) *ctx->quit_p = 1;
         return reply_ok(fd);
     }
-    /* D */
+    /* D — release HW breakpoint comparators in silicon (otherwise the
+     * next session inherits stale BPs from a different GDB process)
+     * and resume the CPU before closing the GDB socket.              */
+    hw_bp_clear_all(ctx);
     (void)updi_run(ctx->updi_fd);
     (void)reply_ok(fd);
     if (ctx->gdb_fd_p) {
         if (*ctx->gdb_fd_p >= 0) rsp_close(*ctx->gdb_fd_p);
         *ctx->gdb_fd_p = -1;
     }
-    bp_clear_all();
     return 0;
 }
 
 void rsp_default_handlers(RspHandlers *h, RspContext *ctx)
 {
+    /* Mark both HW BP comparators empty.  Caller may have memset()
+     * RspContext to zero, but the slot-empty sentinel is 0xFFFFFFFF.  */
+    ctx->hw_bp_addr[0] = HW_BP_SLOT_EMPTY;
+    ctx->hw_bp_addr[1] = HW_BP_SLOT_EMPTY;
+
     h->on_halt_reason  = dh_halt_reason;
     h->on_read_regs    = dh_read_regs;
     h->on_write_regs   = dh_write_regs;

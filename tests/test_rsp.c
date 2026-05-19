@@ -1,8 +1,11 @@
 /* tests/test_rsp.c — Unit tests for src/gdb_rsp.c
  *
  * Uses socketpair() as a stand-in for a real GDB TCP client.
- * All target-side calls (UPDI / FSM / monitor) are intercepted with
- * --wrap stubs and recorded in static structures inspected by tests.
+ * All target-side calls (UPDI memory + OCD primitives, FSM, monitor)
+ * are intercepted with `ld --wrap` stubs and recorded in static
+ * structures inspected by tests.
+ *
+ * Traceability: see Project.xml → STP → tests/test_rsp.c.
  */
 #include "unity/unity.h"
 #include "gdb_rsp.h"
@@ -32,32 +35,84 @@ extern int usleep(unsigned int);
 
 typedef struct { uint32_t addr; size_t len; uint8_t data[64]; } MockMemOp;
 
-static int      mock_run_calls;
-static int      mock_step_calls;
-static int      mock_invalidate_calls;
-static int      mock_halt_calls;
-static int      mock_halt_failures_left;
-static int      mock_build_calls;
+/* Generic call counters. */
+static int mock_run_calls;
+static int mock_step_calls;
+static int mock_invalidate_calls;
+static int mock_halt_calls;
+static int mock_build_calls;
 
+/* updi_mem_read / updi_mem_write / updi_nvm_write_flash records. */
 static MockMemOp mock_writes[MAX_MOCK_CALLS];
 static int       mock_write_count;
 static MockMemOp mock_flash_writes[MAX_MOCK_CALLS];
 static int       mock_flash_write_count;
 static MockMemOp mock_reads[MAX_MOCK_CALLS];
 static int       mock_read_count;
-
 static uint8_t   mock_read_canned[64];
-static size_t   mock_read_canned_len;
+static size_t    mock_read_canned_len;
 
-static int       mock_monitor_rc;
-static char      mock_monitor_last_body[256];
-static int       mock_monitor_calls;
+/* monitor_dispatch mock state. */
+static int  mock_monitor_rc;
+static char mock_monitor_last_body[256];
+static int  mock_monitor_calls;
 
-static int       mock_active_thread = 1;
-static int       mock_get_regs_last_tid;
-
-/* Fake FSM context populated by individual tests. */
+/* FSM mock state. */
+static int  mock_active_thread = 1;
+static int  mock_get_regs_last_tid;
 static FsmContext fake_fsm;
+
+/* OCD register-file shadow. */
+static uint8_t  mock_ocd_gpr[32];
+static uint8_t  mock_ocd_sreg;
+static uint16_t mock_ocd_sp;
+static uint32_t mock_ocd_pc;
+static int      mock_ocd_gpr_writes;
+static int      mock_ocd_sreg_writes;
+static int      mock_ocd_sp_writes;
+static int      mock_ocd_pc_writes;
+static int      mock_ocd_gpr_reads_active;  /* active-thread g via OCD */
+
+/* OCD halt-status that updi_ocd_read_halt_status() returns. */
+static uint8_t mock_ocd_status0;
+static uint8_t mock_ocd_status1;
+
+/* OCD HW breakpoint shadow (silicon side, distinct from RspContext shadow). */
+static uint32_t mock_hw_bp_silicon[2];
+static int      mock_hw_bp_set_calls;
+static int      mock_hw_bp_clear_calls;
+
+/* Call-order tracker so we can prove e.g. clear_hw_bp happens before
+ * updi_run inside dh_detach.  Records an opaque tag per event. */
+typedef enum {
+    EV_RUN = 1,
+    EV_STEP,
+    EV_HALT,
+    EV_OCD_SET_BP,
+    EV_OCD_CLEAR_BP,
+    EV_OCD_POLL,
+    EV_OCD_WRITE_GPR,
+    EV_OCD_WRITE_PC,
+    EV_OCD_WRITE_SREG,
+    EV_OCD_WRITE_SP
+} MockEvent;
+
+static MockEvent mock_events[64];
+static int       mock_event_count;
+static void log_event(MockEvent e)
+{
+    if (mock_event_count < (int)(sizeof mock_events / sizeof mock_events[0]))
+        mock_events[mock_event_count++] = e;
+}
+
+/* updi_ocd_poll_halted scripted return values: -1 = link failure,
+ * 0 = halted, 1 = still running.  The array is consumed left-to-right;
+ * once exhausted, the value of `mock_ocd_poll_default` is used. */
+static int mock_ocd_poll_script[16];
+static int mock_ocd_poll_script_len;
+static int mock_ocd_poll_script_idx;
+static int mock_ocd_poll_default = 0; /* default → halt on first poll */
+static int mock_ocd_poll_calls;
 
 /* ── --wrap stubs ───────────────────────────────────────────────────── */
 
@@ -105,31 +160,96 @@ int __wrap_updi_nvm_write_flash(int fd, uint32_t addr, const uint8_t *buf, size_
     return 0;
 }
 
-int __wrap_updi_halt(int fd)
+int __wrap_updi_halt(int fd)        { (void)fd; ++mock_halt_calls; log_event(EV_HALT); return 0; }
+int __wrap_updi_run (int fd)        { (void)fd; ++mock_run_calls;  log_event(EV_RUN);  return 0; }
+int __wrap_updi_step(int fd)        { (void)fd; ++mock_step_calls; log_event(EV_STEP); return 0; }
+int __wrap_updi_console_poll(int u, int r) { (void)u; (void)r; return 0; }
+int __wrap_updi_enter_debug(int fd) { (void)fd; return 0; }
+
+int __wrap_updi_ocd_poll_halted(int fd, int timeout_ms)
+{
+    (void)fd; (void)timeout_ms;
+    ++mock_ocd_poll_calls;
+    log_event(EV_OCD_POLL);
+    if (mock_ocd_poll_script_idx < mock_ocd_poll_script_len) {
+        return mock_ocd_poll_script[mock_ocd_poll_script_idx++];
+    }
+    return mock_ocd_poll_default;
+}
+
+int __wrap_updi_ocd_read_halt_status(int fd, uint8_t *st0, uint8_t *st1)
 {
     (void)fd;
-    ++mock_halt_calls;
-    if (mock_halt_failures_left > 0) { --mock_halt_failures_left; return -1; }
+    if (st0) *st0 = mock_ocd_status0;
+    if (st1) *st1 = mock_ocd_status1;
     return 0;
 }
 
-int __wrap_updi_run(int fd)
+int __wrap_updi_ocd_read_gpr(int fd, uint8_t n, uint8_t *val)
 {
     (void)fd;
-    ++mock_run_calls;
+    ++mock_ocd_gpr_reads_active;
+    if (val) *val = mock_ocd_gpr[n & 31u];
     return 0;
 }
 
-int __wrap_updi_step(int fd)
+int __wrap_updi_ocd_write_gpr(int fd, uint8_t n, uint8_t val)
 {
     (void)fd;
-    ++mock_step_calls;
+    mock_ocd_gpr[n & 31u] = val;
+    ++mock_ocd_gpr_writes;
+    log_event(EV_OCD_WRITE_GPR);
     return 0;
 }
 
-int __wrap_updi_console_poll(int updi_fd, int rsp_fd)
+int __wrap_updi_ocd_read_sreg(int fd, uint8_t *val)
 {
-    (void)updi_fd; (void)rsp_fd;
+    (void)fd; if (val) *val = mock_ocd_sreg; return 0;
+}
+
+int __wrap_updi_ocd_write_sreg(int fd, uint8_t val)
+{
+    (void)fd; mock_ocd_sreg = val; ++mock_ocd_sreg_writes;
+    log_event(EV_OCD_WRITE_SREG); return 0;
+}
+
+int __wrap_updi_ocd_read_sp(int fd, uint16_t *val)
+{
+    (void)fd; if (val) *val = mock_ocd_sp; return 0;
+}
+
+int __wrap_updi_ocd_write_sp(int fd, uint16_t val)
+{
+    (void)fd; mock_ocd_sp = val; ++mock_ocd_sp_writes;
+    log_event(EV_OCD_WRITE_SP); return 0;
+}
+
+int __wrap_updi_ocd_read_pc(int fd, uint32_t *val)
+{
+    (void)fd; if (val) *val = mock_ocd_pc; return 0;
+}
+
+int __wrap_updi_ocd_write_pc(int fd, uint32_t val)
+{
+    (void)fd; mock_ocd_pc = val; ++mock_ocd_pc_writes;
+    log_event(EV_OCD_WRITE_PC); return 0;
+}
+
+int __wrap_updi_ocd_set_hw_bp(int fd, int idx, uint32_t byte_addr)
+{
+    (void)fd;
+    if (idx >= 0 && idx < 2) mock_hw_bp_silicon[idx] = byte_addr;
+    ++mock_hw_bp_set_calls;
+    log_event(EV_OCD_SET_BP);
+    return 0;
+}
+
+int __wrap_updi_ocd_clear_hw_bp(int fd, int idx)
+{
+    (void)fd;
+    if (idx >= 0 && idx < 2) mock_hw_bp_silicon[idx] = 0xFFFFFFFFu;
+    ++mock_hw_bp_clear_calls;
+    log_event(EV_OCD_CLEAR_BP);
     return 0;
 }
 
@@ -145,26 +265,19 @@ int __wrap_fsm_get_registers(const FsmContext *ctx, int tid, char *reg_buf)
 {
     (void)ctx;
     mock_get_regs_last_tid = tid;
-    /* Produce 78 hex chars: zeroed bytes 0..34, then PC in bytes 35..38. */
     memset(reg_buf, '0', 78);
     reg_buf[78] = '\0';
-    /* Embed PC = 0xDEADBEEF (little-endian) at hex positions 70-77. */
-    static const char pc_hex[] = "efbeadde";
-    memcpy(reg_buf + 70, pc_hex, 8);
+    /* PC=0xDEADBEEF LE at hex positions 70-77. */
+    memcpy(reg_buf + 70, "efbeadde", 8);
     return 0;
 }
 
 int __wrap_fsm_get_active_thread(const FsmContext *ctx)
 {
-    (void)ctx;
-    return mock_active_thread;
+    (void)ctx; return mock_active_thread;
 }
 
-void __wrap_fsm_invalidate(FsmContext *ctx)
-{
-    (void)ctx;
-    ++mock_invalidate_calls;
-}
+void __wrap_fsm_invalidate(FsmContext *ctx) { (void)ctx; ++mock_invalidate_calls; }
 
 int __wrap_monitor_dispatch(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx,
                             const char *hex_body)
@@ -180,25 +293,20 @@ int __wrap_monitor_dispatch(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx
 
 static int sock_pair[2];
 
-static void make_pair(void)
-{
-    TEST_ASSERT_EQUAL(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sock_pair));
-}
-
+static void make_pair(void) { TEST_ASSERT_EQUAL(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sock_pair)); }
 static void close_pair(void)
 {
     if (sock_pair[0] >= 0) close(sock_pair[0]);
     if (sock_pair[1] >= 0) close(sock_pair[1]);
 }
 
-static uint8_t xor_csum(const char *s, size_t n)
+static uint8_t sum_csum(const char *s, size_t n)
 {
     uint8_t c = 0;
-    for (size_t i = 0; i < n; ++i) c ^= (uint8_t)s[i];
+    for (size_t i = 0; i < n; ++i) c = (uint8_t)(c + (uint8_t)s[i]);
     return c;
 }
 
-/* Drain everything currently readable from fd into buf (non-blocking). */
 static size_t drain(int fd, char *buf, size_t cap)
 {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -215,8 +323,6 @@ static size_t drain(int fd, char *buf, size_t cap)
     return off;
 }
 
-/* Extract the most recent $payload#XX packet from a stream that may contain
- * stray + / - ack bytes. Returns 0 on success and fills payload[]. */
 static int last_packet_payload(const char *stream, char *payload, size_t cap)
 {
     const char *last_dollar = NULL;
@@ -231,10 +337,16 @@ static int last_packet_payload(const char *stream, char *payload, size_t cap)
     return 0;
 }
 
+static int event_index(MockEvent e)
+{
+    for (int i = 0; i < mock_event_count; ++i) if (mock_events[i] == e) return i;
+    return -1;
+}
+
 static void reset_mocks(void)
 {
     mock_run_calls = mock_step_calls = mock_invalidate_calls = 0;
-    mock_halt_calls = mock_halt_failures_left = mock_build_calls = 0;
+    mock_halt_calls = mock_build_calls = 0;
     mock_write_count = mock_flash_write_count = mock_read_count = 0;
     memset(mock_writes, 0, sizeof mock_writes);
     memset(mock_flash_writes, 0, sizeof mock_flash_writes);
@@ -246,6 +358,17 @@ static void reset_mocks(void)
     memset(mock_monitor_last_body, 0, sizeof mock_monitor_last_body);
     mock_active_thread = 1;
     mock_get_regs_last_tid = 0;
+    memset(mock_ocd_gpr, 0, sizeof mock_ocd_gpr);
+    mock_ocd_sreg = 0; mock_ocd_sp = 0; mock_ocd_pc = 0;
+    mock_ocd_gpr_writes = mock_ocd_sreg_writes = mock_ocd_sp_writes = mock_ocd_pc_writes = 0;
+    mock_ocd_gpr_reads_active = 0;
+    mock_ocd_status0 = mock_ocd_status1 = 0;
+    mock_hw_bp_silicon[0] = mock_hw_bp_silicon[1] = 0xFFFFFFFFu;
+    mock_hw_bp_set_calls = mock_hw_bp_clear_calls = 0;
+    mock_event_count = 0;
+    mock_ocd_poll_script_idx = mock_ocd_poll_script_len = 0;
+    mock_ocd_poll_default = 0;
+    mock_ocd_poll_calls = 0;
     memset(&fake_fsm, 0, sizeof fake_fsm);
     fake_fsm.valid = true;
     fake_fsm.thread_count = 1;
@@ -255,7 +378,6 @@ static void reset_mocks(void)
     rsp_set_noack(false);
 }
 
-/* Build a default context + handlers attached to sock_pair[1] (server side). */
 static int g_tid_var, c_tid_var;
 static volatile sig_atomic_t g_quit_var;
 static int g_gdb_fd_var;
@@ -318,7 +440,7 @@ static void rsp_accept_sets_tcp_nodelay_on_client_socket(void)
 
 static void send_frame(int fd, const char *payload)
 {
-    uint8_t c = xor_csum(payload, strlen(payload));
+    uint8_t c = sum_csum(payload, strlen(payload));
     char buf[2100];
     int n = snprintf(buf, sizeof buf, "$%s#%02x", payload, c);
     write(fd, buf, (size_t)n);
@@ -326,7 +448,6 @@ static void send_frame(int fd, const char *payload)
 
 static void rsp_recv_packet_discards_leading_ack_nak_bytes(void)
 {
-    /* Write +/- noise then a clean packet */
     write(sock_pair[0], "+-+", 3);
     send_frame(sock_pair[0], "g");
     char buf[64];
@@ -348,7 +469,6 @@ static void rsp_recv_packet_sends_plus_on_valid_checksum(void)
 
 static void rsp_recv_packet_sends_minus_and_returns_minus1_on_bad_checksum(void)
 {
-    /* manually frame with a wrong checksum */
     const char *body = "g";
     char buf[16];
     snprintf(buf, sizeof buf, "$%s#%02x", body, 0xFF);
@@ -371,25 +491,40 @@ static void on_read_regs_g_returns_78_char_hex_string(void)
     char payload[256];
     TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
     TEST_ASSERT_EQUAL(78u, strlen(payload));
+    /* Active thread → OCD path, not fsm_get_registers. */
+    TEST_ASSERT_EQUAL(32, mock_ocd_gpr_reads_active);
 }
 
 static void on_read_regs_g_places_pc_little_endian_at_positions_70_77(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    mock_ocd_pc = 0xDEADBEEFu;
     rsp_dispatch(sock_pair[1], "g", &h);
     char stream[256]; drain(sock_pair[0], stream, sizeof stream);
     char payload[256];
     TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
-    /* Mock writes PC=0xDEADBEEF little-endian => "efbeadde" at 70..77 */
     TEST_ASSERT_EQUAL_STRING_LEN("efbeadde", payload + 70, 8);
 }
 
-/* ── LLR-RSP-04: `G` and `P` ────────────────────────────────────────── */
-
-static void on_write_regs_G_writes_all_registers_via_updi_mem_write(void)
+static void on_read_regs_non_active_thread_uses_fsm_register_frame(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
-    /* G followed by 78 hex chars (39 bytes worth of register data). */
+    /* Build FSM with two threads; select non-active thread 2 via Hg2. */
+    fake_fsm.thread_count = 2;
+    fake_fsm.threads[1].gdb_id = 2; strcpy(fake_fsm.threads[1].name, "B");
+    mock_active_thread = 1;
+    rsp_dispatch(sock_pair[1], "Hg2", &h);
+    char drain1[64]; drain(sock_pair[0], drain1, sizeof drain1);
+    rsp_dispatch(sock_pair[1], "g", &h);
+    TEST_ASSERT_EQUAL(2, mock_get_regs_last_tid);
+    TEST_ASSERT_EQUAL(0, mock_ocd_gpr_reads_active);
+}
+
+/* ── LLR-RSP-04: `G` / `P` ──────────────────────────────────────────── */
+
+static void on_write_regs_G_writes_all_registers_via_ocd(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
     char pkt[128] = "G";
     for (int i = 0; i < 78; ++i) pkt[1 + i] = (i & 1) ? '0' : '1';
     pkt[1 + 78] = '\0';
@@ -398,10 +533,14 @@ static void on_write_regs_G_writes_all_registers_via_updi_mem_write(void)
     char payload[64];
     TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
     TEST_ASSERT_EQUAL_STRING("OK", payload);
-    TEST_ASSERT_GREATER_THAN(0, mock_write_count);
+    TEST_ASSERT_EQUAL(32, mock_ocd_gpr_writes);
+    TEST_ASSERT_EQUAL(1,  mock_ocd_sreg_writes);
+    TEST_ASSERT_EQUAL(1,  mock_ocd_sp_writes);
+    TEST_ASSERT_EQUAL(1,  mock_ocd_pc_writes);
+    TEST_ASSERT_EQUAL(0,  mock_write_count); /* not via updi_mem_write */
 }
 
-static void on_write_regs_P_writes_single_register_via_updi_mem_write(void)
+static void on_write_regs_P_writes_single_register_via_ocd(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
     rsp_dispatch(sock_pair[1], "P5=ab", &h);
@@ -409,9 +548,11 @@ static void on_write_regs_P_writes_single_register_via_updi_mem_write(void)
     char payload[64];
     TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
     TEST_ASSERT_EQUAL_STRING("OK", payload);
-    TEST_ASSERT_EQUAL(1, mock_write_count);
-    TEST_ASSERT_EQUAL(0x1000u + 5u, mock_writes[0].addr);
-    TEST_ASSERT_EQUAL(0xAB, mock_writes[0].data[0]);
+    TEST_ASSERT_EQUAL(1, mock_ocd_gpr_writes);
+    TEST_ASSERT_EQUAL(0xAB, mock_ocd_gpr[5]);
+    TEST_ASSERT_EQUAL(0, mock_ocd_sreg_writes);
+    TEST_ASSERT_EQUAL(0, mock_ocd_sp_writes);
+    TEST_ASSERT_EQUAL(0, mock_ocd_pc_writes);
 }
 
 /* ── LLR-RSP-05: `m` ─────────────────────────────────────────────────── */
@@ -422,7 +563,8 @@ static void on_read_mem_m_calls_updi_mem_read_and_returns_hex(void)
     mock_read_canned_len = 4;
     mock_read_canned[0] = 0xDE; mock_read_canned[1] = 0xAD;
     mock_read_canned[2] = 0xBE; mock_read_canned[3] = 0xEF;
-    rsp_dispatch(sock_pair[1], "m100,4", &h);
+    /* SRAM address: GDB 0x800100 → UPDI 0x000100 (bit-23 flip). */
+    rsp_dispatch(sock_pair[1], "m800100,4", &h);
     char stream[64]; drain(sock_pair[0], stream, sizeof stream);
     char payload[64];
     TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
@@ -444,90 +586,92 @@ static void on_write_mem_M_calls_updi_mem_write_for_sram_address(void)
     TEST_ASSERT_EQUAL_STRING("OK", payload);
     TEST_ASSERT_EQUAL(1, mock_write_count);
     TEST_ASSERT_EQUAL(0x100u, mock_writes[0].addr);
+    TEST_ASSERT_EQUAL(0, mock_flash_write_count);
 }
 
 static void on_write_mem_X_calls_nvm_write_flash_for_flash_address(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    /* GDB FLASH addr 0x100 → updi_nvm_write_flash(0x800100). */
     rsp_dispatch(sock_pair[1], "X100,2:\x98\x95", &h);
     char stream[64]; drain(sock_pair[0], stream, sizeof stream);
     char payload[64];
     TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
     TEST_ASSERT_EQUAL_STRING("OK", payload);
     TEST_ASSERT_EQUAL(1, mock_flash_write_count);
+    TEST_ASSERT_EQUAL(0x800100u, mock_flash_writes[0].addr);
 }
 
-/* ── LLR-RSP-07: insert bp ──────────────────────────────────────────── */
+/* ── LLR-RSP-07: insert bp (HW comparator) ─────────────────────────── */
 
-static void on_insert_bp_writes_break_opcode_and_saves_original_word(void)
+static void on_insert_bp_calls_updi_ocd_set_hw_bp_with_byte_addr(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
-    mock_read_canned_len = 2;
-    mock_read_canned[0] = 0x12; mock_read_canned[1] = 0x34;
     rsp_dispatch(sock_pair[1], "Z0,200,2", &h);
     char stream[64]; drain(sock_pair[0], stream, sizeof stream);
     char payload[64];
     TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
     TEST_ASSERT_EQUAL_STRING("OK", payload);
-    TEST_ASSERT_EQUAL(1, mock_read_count);
-    TEST_ASSERT_EQUAL(1, mock_flash_write_count);
-    /* Wrote BREAK little-endian: 0x98, 0x95 */
-    TEST_ASSERT_EQUAL(0x98, mock_flash_writes[0].data[0]);
-    TEST_ASSERT_EQUAL(0x95, mock_flash_writes[0].data[1]);
+    TEST_ASSERT_EQUAL(1, mock_hw_bp_set_calls);
+    TEST_ASSERT_EQUAL(0x200u, mock_hw_bp_silicon[0]);
+    TEST_ASSERT_EQUAL(0xFFFFFFFFu, mock_hw_bp_silicon[1]);
+    TEST_ASSERT_EQUAL(0, mock_flash_write_count); /* no SW patching */
 }
 
-static void on_insert_bp_duplicate_returns_ok_without_reflash(void)
+static void on_insert_bp_second_slot_succeeds(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    rsp_dispatch(sock_pair[1], "Z0,200,2", &h);
+    rsp_dispatch(sock_pair[1], "Z0,400,2", &h);
+    TEST_ASSERT_EQUAL(2, mock_hw_bp_set_calls);
+    TEST_ASSERT_EQUAL(0x200u, mock_hw_bp_silicon[0]);
+    TEST_ASSERT_EQUAL(0x400u, mock_hw_bp_silicon[1]);
+}
+
+static void on_insert_bp_duplicate_returns_ok_without_reprogramming(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
     rsp_dispatch(sock_pair[1], "Z0,201,2", &h);
     rsp_dispatch(sock_pair[1], "Z0,201,2", &h);
-    char stream[128]; drain(sock_pair[0], stream, sizeof stream);
-    /* Both replies should be OK; only one flash write. */
-    TEST_ASSERT_EQUAL(1, mock_flash_write_count);
+    TEST_ASSERT_EQUAL(1, mock_hw_bp_set_calls);
 }
 
 /* ── LLR-RSP-08: remove bp ──────────────────────────────────────────── */
 
-static void on_remove_bp_restores_saved_instruction_word(void)
+static void on_remove_bp_calls_updi_ocd_clear_hw_bp(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
-    mock_read_canned_len = 2;
-    mock_read_canned[0] = 0xAA; mock_read_canned[1] = 0xBB;
     rsp_dispatch(sock_pair[1], "Z0,300,2", &h);
-    int flash_after_insert = mock_flash_write_count;
     rsp_dispatch(sock_pair[1], "z0,300,2", &h);
-    TEST_ASSERT_EQUAL(flash_after_insert + 1, mock_flash_write_count);
-    TEST_ASSERT_EQUAL(0xAA, mock_flash_writes[mock_flash_write_count - 1].data[0]);
-    TEST_ASSERT_EQUAL(0xBB, mock_flash_writes[mock_flash_write_count - 1].data[1]);
+    TEST_ASSERT_EQUAL(1, mock_hw_bp_clear_calls);
+    TEST_ASSERT_EQUAL(0xFFFFFFFFu, mock_hw_bp_silicon[0]);
 }
 
-static void on_remove_bp_unknown_address_returns_error_reply(void)
+static void on_remove_bp_unknown_address_returns_ok_for_resync(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
     rsp_dispatch(sock_pair[1], "z0,deadbeef,2", &h);
     char stream[64]; drain(sock_pair[0], stream, sizeof stream);
     char payload[64];
     TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
-    TEST_ASSERT_EQUAL('E', payload[0]);
+    TEST_ASSERT_EQUAL_STRING("OK", payload);
+    TEST_ASSERT_EQUAL(0, mock_hw_bp_clear_calls);
 }
 
-/* ── LLR-RSP-09: bp table overflow ─────────────────────────────────── */
+/* ── LLR-RSP-09: third bp returns E08 ──────────────────────────────── */
 
-static void on_insert_bp_returns_E08_when_table_full(void)
+static void on_insert_bp_returns_E08_when_both_slots_occupied(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
-    char pkt[32];
-    for (int i = 0; i < RSP_MAX_BREAKPOINTS; ++i) {
-        snprintf(pkt, sizeof pkt, "Z0,%x,2", 0x1000 + i);
-        rsp_dispatch(sock_pair[1], pkt, &h);
-    }
-    char drain_buf[2048]; drain(sock_pair[0], drain_buf, sizeof drain_buf);
-    snprintf(pkt, sizeof pkt, "Z0,%x,2", 0x2000);
-    rsp_dispatch(sock_pair[1], pkt, &h);
+    rsp_dispatch(sock_pair[1], "Z0,200,2", &h);
+    rsp_dispatch(sock_pair[1], "Z0,400,2", &h);
+    char drain_buf[256]; drain(sock_pair[0], drain_buf, sizeof drain_buf);
+    rsp_dispatch(sock_pair[1], "Z0,600,2", &h);
     char stream[64]; drain(sock_pair[0], stream, sizeof stream);
     char payload[64];
     TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
     TEST_ASSERT_EQUAL_STRING("E08", payload);
+    TEST_ASSERT_EQUAL(2, mock_hw_bp_set_calls); /* no third call */
 }
 
 /* ── LLR-RSP-10: step ───────────────────────────────────────────────── */
@@ -535,6 +679,7 @@ static void on_insert_bp_returns_E08_when_table_full(void)
 static void on_step_s_calls_updi_step_and_sends_T05_stop_reason(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    mock_ocd_status1 = 0x00; /* not EXTBRK */
     rsp_dispatch(sock_pair[1], "s", &h);
     TEST_ASSERT_EQUAL(1, mock_step_calls);
     char stream[64]; drain(sock_pair[0], stream, sizeof stream);
@@ -548,17 +693,22 @@ static void on_step_s_calls_updi_step_and_sends_T05_stop_reason(void)
 static void on_continue_calls_updi_run_then_fsm_invalidate(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    mock_ocd_poll_default = 0; /* halt immediately on first poll */
     rsp_dispatch(sock_pair[1], "c", &h);
     TEST_ASSERT_EQUAL(1, mock_run_calls);
-    TEST_ASSERT_EQUAL(1, mock_invalidate_calls);
+    TEST_ASSERT_GREATER_OR_EQUAL(1, mock_invalidate_calls);
+    /* run must come before invalidate. */
+    TEST_ASSERT_TRUE(event_index(EV_RUN) >= 0);
 }
 
 static void on_continue_rebuilds_thread_list_after_halt_and_sends_stop(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
-    mock_halt_failures_left = 3;
+    /* Script: 3 "running" then halt. */
+    mock_ocd_poll_script[0] = 1; mock_ocd_poll_script[1] = 1;
+    mock_ocd_poll_script[2] = 1; mock_ocd_poll_script[3] = 0;
+    mock_ocd_poll_script_len = 4;
     rsp_dispatch(sock_pair[1], "c", &h);
-    TEST_ASSERT_GREATER_OR_EQUAL(4, mock_halt_calls);  /* 3 failures + 1 success */
     TEST_ASSERT_EQUAL(1, mock_build_calls);
     char stream[64]; drain(sock_pair[0], stream, sizeof stream);
     char payload[64];
@@ -566,7 +716,58 @@ static void on_continue_rebuilds_thread_list_after_halt_and_sends_stop(void)
     TEST_ASSERT_EQUAL(0, strncmp(payload, "T05", 3));
 }
 
-/* ── LLR-RSP-12: qSupported / qAttached inline ─────────────────────── */
+static void on_continue_ctrl_c_returns_T02(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    /* Never halt naturally — but write a Ctrl-C into the client side
+     * so dh_continue's select() picks it up on the first iteration. */
+    mock_ocd_poll_default = 1; /* always still running */
+    write(sock_pair[0], "\x03", 1);
+    rsp_dispatch(sock_pair[1], "c", &h);
+    TEST_ASSERT_GREATER_OR_EQUAL(1, mock_halt_calls);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL(0, strncmp(payload, "T02", 3));
+}
+
+static void on_continue_returns_E01_after_UPDI_FAIL_MAX_consecutive_poll_failures(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    /* 8 consecutive poll failures should hit UPDI_FAIL_MAX guard. */
+    mock_ocd_poll_default = -1;
+    rsp_dispatch(sock_pair[1], "c", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("E01", payload);
+    TEST_ASSERT_EQUAL(8, mock_ocd_poll_calls);
+    TEST_ASSERT_GREATER_OR_EQUAL(1, mock_halt_calls); /* defensive halt */
+}
+
+/* ── LLR-RSP-17: ? / halt reason ────────────────────────────────────── */
+
+static void on_halt_reason_returns_T02_when_extbrk_set(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    mock_ocd_status1 = 0x10; /* EXTBRK */
+    rsp_dispatch(sock_pair[1], "?", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL(0, strncmp(payload, "T02", 3));
+
+    /* And T05 when EXTBRK is clear. */
+    reset_mocks();
+    build_ctx(&ctx, &h);
+    mock_ocd_status1 = 0x00;
+    rsp_dispatch(sock_pair[1], "?", &h);
+    char stream2[64]; drain(sock_pair[0], stream2, sizeof stream2);
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream2, payload, sizeof payload));
+    TEST_ASSERT_EQUAL(0, strncmp(payload, "T05", 3));
+}
+
+/* ── LLR-RSP-12: qSupported / qAttached ───────────────────────────── */
 
 static void rsp_dispatch_qsupported_returns_feature_string_no_target_access(void)
 {
@@ -579,6 +780,7 @@ static void rsp_dispatch_qsupported_returns_feature_string_no_target_access(void
     TEST_ASSERT_NOT_NULL(strstr(payload, "QStartNoAckMode+"));
     TEST_ASSERT_EQUAL(0, mock_read_count);
     TEST_ASSERT_EQUAL(0, mock_write_count);
+    TEST_ASSERT_EQUAL(0, mock_ocd_gpr_reads_active);
 }
 
 static void rsp_dispatch_qattached_returns_1_no_target_access(void)
@@ -589,10 +791,9 @@ static void rsp_dispatch_qattached_returns_1_no_target_access(void)
     char payload[64];
     TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
     TEST_ASSERT_EQUAL_STRING("1", payload);
-    TEST_ASSERT_EQUAL(0, mock_read_count);
 }
 
-/* ── LLR-RSP-13: D ──────────────────────────────────────────────────── */
+/* ── LLR-RSP-13 / LLR-RSP-18: D ─────────────────────────────────────── */
 
 static void on_detach_D_resumes_target_closes_socket_resets_gdb_fd(void)
 {
@@ -600,7 +801,28 @@ static void on_detach_D_resumes_target_closes_socket_resets_gdb_fd(void)
     rsp_dispatch(sock_pair[1], "D", &h);
     TEST_ASSERT_EQUAL(1, mock_run_calls);
     TEST_ASSERT_EQUAL(-1, g_gdb_fd_var);
-    /* socket should be closed; mark to avoid double-close in teardown */
+    sock_pair[1] = -1;
+}
+
+static void on_detach_clears_hw_bps_before_run(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    rsp_dispatch(sock_pair[1], "Z0,200,2", &h);
+    rsp_dispatch(sock_pair[1], "Z0,400,2", &h);
+    char drain_buf[256]; drain(sock_pair[0], drain_buf, sizeof drain_buf);
+    int events_before = mock_event_count;
+    rsp_dispatch(sock_pair[1], "D", &h);
+    TEST_ASSERT_EQUAL(2, mock_hw_bp_clear_calls);
+    TEST_ASSERT_EQUAL(0xFFFFFFFFu, mock_hw_bp_silicon[0]);
+    TEST_ASSERT_EQUAL(0xFFFFFFFFu, mock_hw_bp_silicon[1]);
+    /* Both EV_OCD_CLEAR_BP events must precede the EV_RUN event. */
+    int run_idx = -1, last_clear_idx = -1;
+    for (int i = events_before; i < mock_event_count; ++i) {
+        if (mock_events[i] == EV_OCD_CLEAR_BP) last_clear_idx = i;
+        if (mock_events[i] == EV_RUN && run_idx < 0) run_idx = i;
+    }
+    TEST_ASSERT_GREATER_OR_EQUAL(0, last_clear_idx);
+    TEST_ASSERT_GREATER_THAN(last_clear_idx, run_idx);
     sock_pair[1] = -1;
 }
 
@@ -640,7 +862,6 @@ static void on_monitor_sends_o_packet_error_on_updi_failure(void)
     mock_monitor_rc = -1;
     rsp_dispatch(sock_pair[1], "qRcmd,ab", &h);
     char stream[256]; drain(sock_pair[0], stream, sizeof stream);
-    /* Expect first packet starts with 'O' (O-packet). */
     const char *first = strchr(stream, '$');
     TEST_ASSERT_NOT_NULL(first);
     TEST_ASSERT_EQUAL('O', first[1]);
@@ -651,10 +872,10 @@ static void on_monitor_sends_o_packet_error_on_updi_failure(void)
 static void H_packet_stores_thread_id_for_register_operations(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
-    /* Build a richer FSM with thread 3 */
     fake_fsm.thread_count = 3;
     fake_fsm.threads[1].gdb_id = 2; strcpy(fake_fsm.threads[1].name, "B");
     fake_fsm.threads[2].gdb_id = 3; strcpy(fake_fsm.threads[2].name, "C");
+    mock_active_thread = 1; /* so tid 3 != active → fsm path */
     rsp_dispatch(sock_pair[1], "Hg3", &h);
     TEST_ASSERT_EQUAL(3, g_tid_var);
     rsp_dispatch(sock_pair[1], "g", &h);
@@ -683,22 +904,28 @@ int main(void)
     RUN_TEST(rsp_recv_packet_sends_minus_and_returns_minus1_on_bad_checksum);
     RUN_TEST(on_read_regs_g_returns_78_char_hex_string);
     RUN_TEST(on_read_regs_g_places_pc_little_endian_at_positions_70_77);
-    RUN_TEST(on_write_regs_G_writes_all_registers_via_updi_mem_write);
-    RUN_TEST(on_write_regs_P_writes_single_register_via_updi_mem_write);
+    RUN_TEST(on_read_regs_non_active_thread_uses_fsm_register_frame);
+    RUN_TEST(on_write_regs_G_writes_all_registers_via_ocd);
+    RUN_TEST(on_write_regs_P_writes_single_register_via_ocd);
     RUN_TEST(on_read_mem_m_calls_updi_mem_read_and_returns_hex);
     RUN_TEST(on_write_mem_M_calls_updi_mem_write_for_sram_address);
     RUN_TEST(on_write_mem_X_calls_nvm_write_flash_for_flash_address);
-    RUN_TEST(on_insert_bp_writes_break_opcode_and_saves_original_word);
-    RUN_TEST(on_insert_bp_duplicate_returns_ok_without_reflash);
-    RUN_TEST(on_remove_bp_restores_saved_instruction_word);
-    RUN_TEST(on_remove_bp_unknown_address_returns_error_reply);
-    RUN_TEST(on_insert_bp_returns_E08_when_table_full);
+    RUN_TEST(on_insert_bp_calls_updi_ocd_set_hw_bp_with_byte_addr);
+    RUN_TEST(on_insert_bp_second_slot_succeeds);
+    RUN_TEST(on_insert_bp_duplicate_returns_ok_without_reprogramming);
+    RUN_TEST(on_remove_bp_calls_updi_ocd_clear_hw_bp);
+    RUN_TEST(on_remove_bp_unknown_address_returns_ok_for_resync);
+    RUN_TEST(on_insert_bp_returns_E08_when_both_slots_occupied);
     RUN_TEST(on_step_s_calls_updi_step_and_sends_T05_stop_reason);
     RUN_TEST(on_continue_calls_updi_run_then_fsm_invalidate);
     RUN_TEST(on_continue_rebuilds_thread_list_after_halt_and_sends_stop);
+    RUN_TEST(on_continue_ctrl_c_returns_T02);
+    RUN_TEST(on_continue_returns_E01_after_UPDI_FAIL_MAX_consecutive_poll_failures);
+    RUN_TEST(on_halt_reason_returns_T02_when_extbrk_set);
     RUN_TEST(rsp_dispatch_qsupported_returns_feature_string_no_target_access);
     RUN_TEST(rsp_dispatch_qattached_returns_1_no_target_access);
     RUN_TEST(on_detach_D_resumes_target_closes_socket_resets_gdb_fd);
+    RUN_TEST(on_detach_clears_hw_bps_before_run);
     RUN_TEST(on_kill_k_sets_g_quit_to_1);
     RUN_TEST(on_monitor_qRcmd_passes_hex_body_to_monitor_dispatch);
     RUN_TEST(on_monitor_returns_ok_when_monitor_dispatch_succeeds);

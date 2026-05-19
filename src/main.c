@@ -434,6 +434,17 @@ int MAIN_NAME(int argc, char *argv[])
         }
     }
 
+    /* Transition target into OCD (debug) mode before accepting GDB
+     * connections.  This sends the 'OCD     ' key + a reset pulse; the
+     * CPU halts at the reset vector (SOR_DIS=0 by default), giving GDB
+     * a clean stopped state to attach to.  Any NVMPROG state left over
+     * from --erase / --load is dropped by the reset.                  */
+    if (updi_enter_debug(cfg.updi_fd) < 0) {
+        fprintf(stderr, "error: failed to enter OCD debug mode\n");
+        exit_code = 1;
+        goto teardown;
+    }
+
     cfg.listen_fd = rsp_listen(cfg.gdb_port);
     if (cfg.listen_fd < 0) {
         fprintf(stderr, "error: cannot bind GDB listener on port %u\n",

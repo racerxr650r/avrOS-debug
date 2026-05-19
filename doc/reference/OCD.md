@@ -324,3 +324,17 @@ These commands handle reading/writing Flash, SRAM, and setting breakpoints.
 | **`Z1`** *`[addr]`* | Insert Hardware Breakpoint | `OCD_PSB0_L/H` (`0x0F90`)<br>
 
 <br>`OCD_PSB1_L/H` (`0x0F94`) | Write the target address into an available Program Space Breakpoint register pair. Enable the specific PSB in the hidden debug control bits (implementation varies slightly by chip family). |
+
+
+-------------------------------------------------------------------------------
+
+Microchip website reference: https://onlinedocs.microchip.com/oxy/GUID-8D61C0B9-A97F-4F4D-99F8-1D7424264C2A-en-US-1/GUID-01833F80-6EE5-4242-8DE7-7AEEBD48E7BE.html
+
+
+---------------------------------------------------------------------------------
+
+These projects are another source of AVR-Dx and UPDI info; https://github.com/SpenceKonde
+
+----------------------------------------------------------------------------------
+
+Python version of AVR OCD debugger https://github.com/mraardvark/pyavrdebug

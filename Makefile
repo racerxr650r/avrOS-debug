@@ -156,7 +156,8 @@ DFP_FLAGS  := $(if $(wildcard $(DFP)/gcc/dev/$(AVR_MCU)),\
                    -B $(DFP)/gcc/dev/$(AVR_MCU) -I$(DFP)/include,)
 AVR_CFLAGS := -mmcu=$(AVR_MCU) $(DFP_FLAGS) -Os -g
 FIXTURE_SRCS   := $(FIXTUREDIR)/avros_full.c \
-                  $(FIXTUREDIR)/avros_partial.c
+                  $(FIXTUREDIR)/avros_partial.c \
+                  $(FIXTUREDIR)/avros_break.c
 FIXTURE_ELFS   := $(patsubst $(FIXTUREDIR)/%.c,$(FIXBINDIR)/%.elf,$(FIXTURE_SRCS))
 # not_avr.elf is a plain i386 ELF — built with the host gcc targeting ELF
 NOT_AVR_SRC    := $(FIXTUREDIR)/not_avr.c
@@ -194,6 +195,13 @@ TEST_SRCS_test_rsp := $(TESTDIR)/test_rsp.c \
                        $(SRCDIR)/monitor.c
 TEST_WRAP_test_rsp  := updi_mem_read updi_mem_write updi_halt updi_run updi_step \
                        updi_nvm_write_flash updi_console_poll \
+                       updi_enter_debug \
+                       updi_ocd_poll_halted updi_ocd_read_halt_status \
+                       updi_ocd_read_gpr updi_ocd_write_gpr \
+                       updi_ocd_read_sreg updi_ocd_write_sreg \
+                       updi_ocd_read_sp updi_ocd_write_sp \
+                       updi_ocd_read_pc updi_ocd_write_pc \
+                       updi_ocd_set_hw_bp updi_ocd_clear_hw_bp \
                        fsm_build_thread_list fsm_get_registers \
                        fsm_get_active_thread fsm_invalidate \
                        monitor_dispatch
@@ -203,7 +211,7 @@ TEST_EXTRA_LDFLAGS_test_rsp :=
 # static parse_args() / event_loop() / load_flash_segments() helpers.
 TEST_SRCS_test_main := $(TESTDIR)/test_main.c
 TEST_WRAP_test_main  := updi_open updi_close updi_console_poll \
-                        updi_nvm_write_flash \
+                        updi_nvm_write_flash updi_enter_debug \
                         rsp_listen rsp_accept rsp_close \
                         rsp_recv_packet rsp_dispatch \
                         rsp_default_handlers \
