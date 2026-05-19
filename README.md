@@ -13,7 +13,7 @@ A UPDI-based GDB server that brings native avrOS state-machine awareness to stan
 - **Hardware breakpoints** — both `break` (Z0) and `hbreak` (Z1) requests from GDB are routed to the two on-silicon comparators; a third simultaneous breakpoint is reported back as `E08`
 - **Asynchronous interrupt** — Ctrl-C in GDB halts a running target via OCD STOP and reports `SIGINT` (`T02`)
 - **Clean detach** — `detach` releases both HW comparators in silicon and lets the CPU run free before closing the socket
-- **Flash programming** — `--load` programs the ELF's `.text` / `.data` segments via the UPDI NVM controller; `--erase` performs a chip-erase prior to load
+- **NVM programming** — `--load` programs every `PT_LOAD` segment of the ELF to the correct AVR-Dx NVM kind: FLASH (`.text`/`.data`), EEPROM, USERROW, FUSES, and LOCK. SIGROW segments are skipped (read-only). `--erase` performs a chip-erase prior to load, and is required when programming LOCK; `--allow-lock-updi` is required to write any LOCK pattern other than the unlock value `0x5CC5C55C` (every other 4-byte pattern risks permanently disabling UPDI).
 - **Link diagnostics** — `--device` performs a one-shot, non-destructive read of SIGROW signature and ASI status registers and exits without starting a listener
 - **Harvard architecture translation** — automatic ELF parsing to resolve FLASH-resident avrOS tables to their SRAM status bytes
 - **FSM virtual threads** — cooperative state machines appear as native threads in the IDE Call Stack pane
