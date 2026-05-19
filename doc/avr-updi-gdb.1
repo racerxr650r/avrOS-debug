@@ -9,6 +9,19 @@ avr-updi-gdb \- UPDI-to-GDB debug stub with avrOS FSM awareness
 .IR baud ]
 .RB [ \-\-erase ]
 .RB [ \-\-load ]
+.RB [ \-\-no\-verify ]
+.RB [ \-\-allow\-lock\-updi ]
+.RB [ \-\-force\-device
+.IR family ]
+.I serial-device
+.I elf-file
+.br
+.B avr-updi-gdb
+.B \-\-prog
+.RB [ \-\-baud
+.IR baud ]
+.RB [ \-\-erase ]
+.RB [ \-\-no\-verify ]
 .RB [ \-\-allow\-lock\-updi ]
 .RB [ \-\-force\-device
 .IR family ]
@@ -19,6 +32,7 @@ avr-updi-gdb \- UPDI-to-GDB debug stub with avrOS FSM awareness
 .B \-\-device
 .RB [ \-\-baud
 .IR baud ]
+.RB [ \-\-no\-autobaud ]
 .RB [ \-\-force\-device
 .IR family ]
 .I serial-device
@@ -102,16 +116,48 @@ is accepted as a LOCK payload, protecting against accidental UPDI
 lock-out.
 .TP
 .B \-\-device
-One-shot diagnostic. Open UPDI, read the SIGROW signature, revision,
-serial number and ASI status registers, print a human-readable report
-to standard output and exit. No TCP listener is opened, no ELF is
+One-shot diagnostic. Open UPDI, run an auto-baud link-quality probe
+(suppressed by
+.BR \-\-no\-autobaud ),
+read the SIGROW signature, revision, serial number, ASI status
+registers, FUSES, and LOCK byte, print a human-readable report \(em
+including the per-rung baud table and a decoded fuse listing \(em to
+standard output and exit. No TCP listener is opened, no ELF is
 loaded, and the target CPU is not halted. Useful as a first-line check
-for wiring, target power, and the UPDIDIS fuse. Mutually exclusive
-with
-.BR \-\-load .
+for wiring, target power, link quality, and the UPDIDIS fuse. Mutually
+exclusive with
+.BR \-\-load " and " \-\-prog .
 The
 .I elf-file
 operand is optional in this mode.
+.TP
+.B \-\-prog
+Program-and-exit (CI / build-server) mode. Equivalent to
+.B \-\-load
+followed by an immediate orderly exit \(em no GDB TCP listener is
+opened, the target is
+.B not
+halted, and the CPU starts running the freshly programmed image. On
+success prints
+.B verify: OK
+to standard output and exits 0. Mutually exclusive with
+.BR \-\-load " and " \-\-device .
+.TP
+.B \-\-no\-verify
+Suppress the read-back verify pass that normally follows
+.B \-\-load
+or
+.BR \-\-prog .
+Use sparingly \(em verify is the only mechanism that detects partial
+or silently-corrupted writes.
+.TP
+.B \-\-no\-autobaud
+Used with
+.B \-\-device
+only. Suppress the link-quality auto-baud probe and use the rate
+supplied via
+.B \-\-baud
+(or its default) unchanged.
 .TP
 .BI \-\-force\-device " family"
 Override automatic AVR family detection. Accepts one of
@@ -185,14 +231,23 @@ Normal shutdown
 .BR SIGTERM ,
 or GDB
 .B k
-kill packet).
+kill packet), or successful
+.BR \-\-prog " / " \-\-load " verify pass.
 .TP
 .B 1
 Bad arguments, serial-device open failure, TCP bind failure,
 .B \-\-load
-flash write failure, or
+flash write failure,
 .B \-\-device
-SIGROW read failure.
+SIGROW read failure, or family mismatch.
+.TP
+.B 2
+Read-back verify mismatch following
+.B \-\-load
+or
+.BR \-\-prog .
+The faulting page(s) are reported on standard error with the expected
+and actual CRC32 checksums.
 .SH EXAMPLES
 Attach to a running target without flashing:
 .PP

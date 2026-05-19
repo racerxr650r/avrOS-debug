@@ -714,6 +714,244 @@ static void run_groupE(const HwCfg *cfg, int fd)
 }
 
 /* ──────────────────────────────────────────────────────────────────── *
+ *  Group F — Phase 9 link diagnostics & loader read-back               *
+ *                                                                      *
+ *  F1: updi_probe_baud()    — non-destructive ladder probe             *
+ *  F2: updi_format_fuses()  — non-destructive FUSES+LOCK pretty-print  *
+ *  F3: --prog end-to-end    — destructive, --with-nvm gated, exits 0   *
+ *                              with read-back verify on real silicon   *
+ * ──────────────────────────────────────────────────────────────────── */
+
+/* Visitor callback for F1 — records one entry per ladder rung in a
+ * caller-provided fixed-size buffer so the test can assert against
+ * the ladder content. */
+typedef struct {
+    int baud;
+    int errors;
+    int samples;
+} F1Rung;
+
+static F1Rung g_f1_rungs[16];
+static int    g_f1_n;
+
+static void f1_visitor(int baud, int errors, int samples, void *user)
+{
+    (void)user;
+    if (g_f1_n < (int)(sizeof g_f1_rungs / sizeof g_f1_rungs[0])) {
+        g_f1_rungs[g_f1_n].baud    = baud;
+        g_f1_rungs[g_f1_n].errors  = errors;
+        g_f1_rungs[g_f1_n].samples = samples;
+        g_f1_n++;
+    }
+    VLOG(1, "F1 rung baud=%d errors=%d/%d\n", baud, errors, samples);
+}
+
+static void run_groupF_link(HwCfg *cfg)
+{
+    /* F1 — auto-baud ladder probe. updi_probe_baud opens and closes its
+     * own UPDI fd at every rung, so the caller must NOT hold one open. */
+    double t0 = now_ms();
+    g_f1_n = 0;
+    int chosen = updi_probe_baud(cfg->port, 8, f1_visitor, NULL);
+    double dt = now_ms() - t0;
+
+    if (chosen < 0) {
+        report_fail("F1", "auto-baud probe finds a reliable rung",
+                    "every ladder rung failed");
+    } else if (g_f1_n == 0) {
+        report_fail("F1", "auto-baud probe finds a reliable rung",
+                    "no visitor calls — ladder empty?");
+    } else if (chosen < 19200) {
+        char why[64];
+        snprintf(why, sizeof why, "chosen=%d below 19200", chosen);
+        report_fail("F1", "auto-baud probe finds a reliable rung", why);
+    } else {
+        char desc[80];
+        snprintf(desc, sizeof desc,
+                 "auto-baud picks %d (%d rungs tested)", chosen, g_f1_n);
+        report_pass("F1", desc, dt);
+    }
+}
+
+static void run_groupF_fuses(HwCfg *cfg, int fd)
+{
+    (void)cfg;
+    /* F2 — fuse pretty-print round-trip.  Reads the FUSES + LOCK
+     * windows for the AVR-DA bench part via updi_nvm_read() and feeds
+     * them to updi_format_fuses().  Verifies the decoder produced
+     * the expected field labels rather than checking specific values
+     * (which depend on the as-shipped fuse contents of the bench).   */
+    double t0 = now_ms();
+    const UpdiDeviceMap *dev = updi_get_device();
+    if (dev == NULL || dev->fuses_size == 0) {
+        report_skip("F2", "fuse pretty-print round-trip",
+                    "no device map selected");
+        return;
+    }
+
+    uint8_t  raw[16]  = {0};
+    uint8_t  lock[4]  = {0};
+    if (updi_nvm_read(fd, dev->fuses_base, raw,
+                      dev->fuses_size > sizeof raw ? sizeof raw
+                                                   : dev->fuses_size) < 0) {
+        report_fail("F2", "fuse pretty-print round-trip",
+                    "updi_nvm_read FUSES failed");
+        return;
+    }
+    if (updi_nvm_read(fd, dev->lock_base, lock, sizeof lock) < 0) {
+        report_fail("F2", "fuse pretty-print round-trip",
+                    "updi_nvm_read LOCK failed");
+        return;
+    }
+
+    char out[2048];
+    int n = updi_format_fuses(out, sizeof out, raw, dev->fuses_size,
+                              lock, sizeof lock);
+    if (n <= 0) {
+        report_fail("F2", "fuse pretty-print round-trip",
+                    "updi_format_fuses returned <= 0");
+        return;
+    }
+    /* Assertions: decoder emitted at least one bitfield from each
+     * expected fuse byte plus the LOCK summary. */
+    if (strstr(out, "WDTCFG")  == NULL ||
+        strstr(out, "OSCCFG")  == NULL ||
+        strstr(out, "SYSCFG0") == NULL ||
+        strstr(out, "Lock:")   == NULL) {
+        report_fail("F2", "fuse pretty-print round-trip",
+                    "missing expected fuse label in output");
+        return;
+    }
+    if (g_verbose >= 1) {
+        printf("hw-test:     decoder output (%d bytes):\n", n);
+        fputs(out, stdout);
+    }
+    report_pass("F2", "fuse pretty-print round-trip", now_ms() - t0);
+}
+
+/* F3 — drive the real built avr-updi-gdb binary in --prog mode against
+ * the AVR-DA bench using the all_nvm.elf fixture.  Verifies (a) the
+ * load + verify pipeline survives on real silicon, (b) exit code is
+ * 0 (not UPDI_EXIT_VERIFY_FAIL), and (c) stdout contains "verify: OK".
+ * Destructive: writes FLASH + EEPROM + USERROW windows. */
+static void run_groupF_prog(HwCfg *cfg)
+{
+    if (!cfg->with_nvm) {
+        report_skip("F3", "--prog end-to-end with verify",
+                    "use --with-nvm to enable (destructive)");
+        return;
+    }
+    const char *elf = cfg->nvm_elf ? cfg->nvm_elf : DEF_NVM_ELF;
+    struct stat st;
+    if (stat(elf, &st) != 0) {
+        report_skip("F3", "--prog end-to-end with verify",
+                    "fixture ELF not found (build first)");
+        return;
+    }
+    const char *bin = "build/avr-updi-gdb";
+    if (stat(bin, &st) != 0) {
+        report_skip("F3", "--prog end-to-end with verify",
+                    "build/avr-updi-gdb not found (make first)");
+        return;
+    }
+
+    /* Capture stdout via a pipe so we can grep for "verify: OK". */
+    int pfd[2];
+    if (pipe(pfd) < 0) {
+        report_fail("F3", "--prog end-to-end with verify", "pipe() failed");
+        return;
+    }
+
+    char baud_str[16]; snprintf(baud_str, sizeof baud_str, "%d", cfg->baud);
+    char *argv[] = {
+        (char*)bin,
+        (char*)"--prog", (char*)"--erase", (char*)"--baud", baud_str,
+        (char*)cfg->port, (char*)elf, NULL
+    };
+
+    double t0 = now_ms();
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pfd[0]); close(pfd[1]);
+        report_fail("F3", "--prog end-to-end with verify", "fork() failed");
+        return;
+    }
+    if (pid == 0) {
+        dup2(pfd[1], STDOUT_FILENO);
+        dup2(pfd[1], STDERR_FILENO);
+        close(pfd[0]); close(pfd[1]);
+        execv(bin, argv);
+        _exit(127);
+    }
+    close(pfd[1]);
+
+    char buf[8192];
+    size_t off = 0;
+    ssize_t r;
+    while ((r = read(pfd[0], buf + off, sizeof buf - 1 - off)) > 0) {
+        off += (size_t)r;
+        if (off >= sizeof buf - 1) break;
+    }
+    buf[off] = '\0';
+    close(pfd[0]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    double dt = now_ms() - t0;
+
+    if (g_verbose >= 1) {
+        fputs("hw-test:     --prog output:\n", stdout);
+        fputs(buf, stdout);
+    }
+
+    if (!WIFEXITED(status)) {
+        report_fail("F3", "--prog end-to-end with verify",
+                    "child did not exit normally");
+        return;
+    }
+    int ec = WEXITSTATUS(status);
+    if (ec != 0) {
+        char why[80];
+        snprintf(why, sizeof why,
+                 "exit=%d (expected 0; %d would mean verify-fail)",
+                 ec, UPDI_EXIT_VERIFY_FAIL);
+        report_fail("F3", "--prog end-to-end with verify", why);
+        return;
+    }
+    if (strstr(buf, "verify: OK") == NULL) {
+        report_fail("F3", "--prog end-to-end with verify",
+                    "stdout did not contain 'verify: OK'");
+        return;
+    }
+    report_pass("F3", "--prog end-to-end with verify", dt);
+}
+
+static void run_groupF(HwCfg *cfg, int *out_fd_after)
+{
+    /* F1 manages its own UPDI fds; close the harness fd first. */
+    if (*out_fd_after >= 0) {
+        updi_close(*out_fd_after);
+        *out_fd_after = -1;
+    }
+    run_groupF_link(cfg);
+
+    /* F2 needs a re-opened fd at the configured baud. */
+    int fd = updi_open(cfg->port, cfg->baud);
+    if (fd < 0) {
+        report_skip("F2", "fuse pretty-print round-trip",
+                    "could not re-open UPDI after F1");
+    } else {
+        run_groupF_fuses(cfg, fd);
+        updi_close(fd);
+    }
+
+    /* F3 spawns the real binary which will open its own fd. */
+    run_groupF_prog(cfg);
+
+    *out_fd_after = -1;
+}
+
+/* ──────────────────────────────────────────────────────────────────── *
  *  Group D — RSP server smoke (--with-rsp)                             *
  * ──────────────────────────────────────────────────────────────────── */
 
@@ -1046,6 +1284,9 @@ int main(int argc, char *argv[])
     if (fd >= 0) run_groupB(&cfg, fd);
     if (fd >= 0) run_groupC(&cfg, fd);
     if (fd >= 0) run_groupE(&cfg, fd);
+    /* Group F (Phase 9) — autobaud + fuse pretty-print + --prog verify.
+     * F1 needs the UPDI fd closed so it can open its own at each rung. */
+    run_groupF(&cfg, &fd);
     if (fd >= 0) updi_close(fd);    /* free the UART before spawning RSP server */
     run_groupD(&cfg);
 

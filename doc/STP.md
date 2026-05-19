@@ -15,7 +15,7 @@ Snapshot: **115 test(s)** across
 
 ### 3.1. [tests/test_main.c](../tests/test_main.c)
 
-Role: **unit**. **29 test(s).**
+Role: **unit**. **32 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -48,10 +48,13 @@ Role: **unit**. **29 test(s).**
 | 27 | <a id="main_force_device_overrides_elf_deviceinfo"></a>`main_force_device_overrides_elf_deviceinfo` | `LLR-MAIN-13` | Plant `mk_elf_planted_device_name = "avr64dd32"` (would map to AVR-DD) but also pass `--force-device=AVR-DA`. Verify that the wrapped `updi_select_device()` was called with `force_family == "AVR-DA"` and that `app_main()` returned 0, demonstrating the documented precedence `--force-device > deviceinfo`. |
 | 28 | <a id="main_aborts_on_elf_vs_silicon_family_mismatch"></a>`main_aborts_on_elf_vs_silicon_family_mismatch` | `LLR-MAIN-13` | Plant `mk_elf_planted_device_name = "avr64dd32"` (AVR-DD) and override `mk_updi_get_device_family = "AVR-DA"` so the post-select check sees a family mismatch. Run `app_main()` with no `--force-device`. Verify that `app_main()` returns 1, that the wrapped `updi_select_device()` ran exactly once, and that the wrapped `rsp_listen()` was NOT invoked — i.e. the application aborted before opening the GDB listener. |
 | 29 | <a id="main_passes_null_to_select_when_elf_lacks_deviceinfo"></a>`main_passes_null_to_select_when_elf_lacks_deviceinfo` | `LLR-MAIN-13` | Leave `mk_elf_planted_device_name` empty (`\0`), run `app_main()` with no `--force-device`. Verify the wrapped `updi_select_device()` was called once and that the captured `force_family` argument was the empty string (the wrap normalises `NULL` to `""`), confirming that `app_main()` falls through to the SIGROW autodetect path when the ELF carries no deviceinfo note. |
+| 30 | <a id="parse_args_prog_mode_sets_flag"></a>`parse_args_prog_mode_sets_flag` | `LLR-MAIN-14` | Call `parse_args()` with argv `{ "prog", "--prog", "/dev/x", "a.elf" }` and assert `cfg.prog_mode == true`, `cfg.device_info == false`, and `cfg.load_flash == false` — confirming `--prog` is recognised, sets only `prog_mode`, and does not implicitly set the other operating-mode flags. |
+| 31 | <a id="parse_args_no_verify_sets_flag"></a>`parse_args_no_verify_sets_flag` | `LLR-MAIN-14` | Call `parse_args()` with argv `{ "prog", "--load", "--no-verify", "/dev/x", "a.elf" }` and assert `cfg.no_verify == true` — confirming the verify-suppression flag is recognised and stored on `AppConfig`. |
+| 32 | <a id="parse_args_no_autobaud_sets_flag"></a>`parse_args_no_autobaud_sets_flag` | `LLR-MAIN-17` | Call `parse_args()` with argv `{ "prog", "--device", "--no-autobaud", "/dev/x" }` and assert `cfg.no_autobaud == true` — confirming the autobaud-suppression flag is recognised and stored on `AppConfig` so `run_device_mode()` can gate its probe call accordingly. |
 
 ### 3.2. [tests/test_updi.c](../tests/test_updi.c)
 
-Role: **unit**. **44 test(s).**
+Role: **unit**. **47 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -100,6 +103,9 @@ Role: **unit**. **44 test(s).**
 | 43 | <a id="updi_select_device_unknown_family_returns_minus1"></a>`updi_select_device_unknown_family_returns_minus1` | `LLR-UPDI-27` | Call `updi_select_device(-1, "AVR-XYZ")` and verify the function returns -1 (unknown family name) without modifying the active descriptor. |
 | 44 | <a id="updi_family_from_partname_maps_all_known_prefixes"></a>`updi_family_from_partname_maps_all_known_prefixes` | `LLR-UPDI-28` | Call `updi_family_from_partname()` once per supported family with a representative lowercase part-name (`"avr128da28"`, `"avr128db48"`, `"avr64dd32"`, `"avr32du28"`, `"avr32sd20"`) and verify the returned string equals the matching `g_device_table[]` family literal (`"AVR-DA"`, `"AVR-DB"`, `"AVR-DD"`, `"AVR-DU"`, `"AVR-SD"`). |
 | 45 | <a id="updi_family_from_partname_rejects_invalid_inputs"></a>`updi_family_from_partname_rejects_invalid_inputs` | `LLR-UPDI-28` | Verify `updi_family_from_partname()` returns `NULL` for `NULL`, the empty string, strings not beginning with `"avr"` (`"not-an-avr"`), the unsupported NVMCTRL v3 families (`"avr32ea48"`, `"avr16eb14"`), and inputs missing the digit run between `"avr"` and the family-letters (`"avrda28"`). NULL signals "no usable identification" to `app_main()` (LLR-MAIN-13). |
+| 46 | <a id="updi_crc32_returns_zero_for_empty_buffer"></a>`updi_crc32_returns_zero_for_empty_buffer` | `LLR-UPDI-30` | Call `updi_crc32(NULL, 0)` and assert the result equals `0x00000000` — the canonical IEEE 802.3 CRC-32 of the empty message (verified against zlib and crc32 CLI tools). |
+| 47 | <a id="updi_crc32_matches_known_vector_for_123456789"></a>`updi_crc32_matches_known_vector_for_123456789` | `LLR-UPDI-30` | Call `updi_crc32()` with the canonical IEEE 802.3 / zlib test vector — the 9-byte ASCII string `"123456789"` — and assert the result equals the published expected value `0xCBF43926`. |
+| 48 | <a id="updi_crc32_matches_known_vector_for_single_zero_byte"></a>`updi_crc32_matches_known_vector_for_single_zero_byte` | `LLR-UPDI-30` | Call `updi_crc32()` with a single 0x00 byte and assert the result equals `0xD202EF8D`, the canonical IEEE 802.3 CRC-32 of a one-byte zero message. Confirms that the polynomial reflection, initial value (`0xFFFFFFFF`), and final XOR (`0xFFFFFFFF`) are all implemented correctly even on the shortest non-empty input. |
 
 ### 3.3. [tests/test_rsp.c](../tests/test_rsp.c)
 
@@ -242,7 +248,7 @@ Role: **unit**. **6 test(s).**
 
 ### 3.10. [tests/hw/hw_test.c](../tests/hw/hw_test.c)
 
-Role: **hardware**. **19 test(s).**
+Role: **hardware**. **22 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -265,6 +271,9 @@ Role: **hardware**. **19 test(s).**
 | 17 | <a id="D1_rsp_server_accepts_tcp_connection"></a>`D1_rsp_server_accepts_tcp_connection` | `LLR-HWTEST-05` | When `HW_TEST_RSP=YES`, `fork`+`execl` the production `build/avr-updi-gdb` against the configured serial port; open a TCP client to `127.0.0.1:HW_RSP_PORT` and assert the connect succeeds within a bounded timeout. Skipped otherwise. |
 | 18 | <a id="D2_rsp_qsupported_round_trip"></a>`D2_rsp_qsupported_round_trip` | `LLR-HWTEST-05` | Send an RSP `$qSupported#37` packet to the spawned server and assert a non-empty, properly-framed RSP reply is received. Skipped unless `HW_TEST_RSP=YES`. On completion the harness shall terminate the spawned server cleanly via SIGTERM + `waitpid`. |
 | 19 | <a id="D3_rsp_ctrl_c_interrupt_returns_T02"></a>`D3_rsp_ctrl_c_interrupt_returns_T02` | `LLR-RSP-11`, `LLR-UPDI-08`, `LLR-HWTEST-05` | With the spawned server running and a connected TCP client, dispatch a `c` (continue) RSP packet, wait long enough for the loop to enter its poll/select state, then send a single `0x03` byte (GDB Ctrl-C async-interrupt) on the same TCP connection. Assert that the server replies with a stop-reason packet whose signal field is `T02` (SIGINT) and that the live target is observably halted afterwards (via a subsequent `g` packet succeeding). Skipped unless `HW_TEST_RSP=YES`. Exercises the production async-interrupt path end-to-end through real silicon, validating both LLR-RSP-11 (Ctrl-C path) and LLR-UPDI-08 (`updi_halt()`). |
+| 20 | <a id="F1_autobaud_picks_reliable_rung"></a>`F1_autobaud_picks_reliable_rung` | `LLR-HWTEST-07`, `LLR-UPDI-31` | Close the harness UPDI fd, then call `updi_probe_baud(cfg->port, 8, visitor, NULL)`. The visitor records each rung's `{baud, errors, samples}` triple for the log. PASS if the returned baud is ≥ 19200 (the slowest rung in the ladder) — proving the probe walked the ladder, observed at least one zero-error rung on live silicon, and returned the highest-rate working candidate. Exercises the full read-only probe path end-to-end. |
+| 21 | <a id="F2_fuse_pretty_print_round_trip"></a>`F2_fuse_pretty_print_round_trip` | `LLR-HWTEST-07`, `LLR-UPDI-29`, `LLR-UPDI-32` | With the harness UPDI fd re-opened at `cfg->baud`, read the FUSES window and the 4-byte LOCK window via `updi_nvm_read()`, then call `updi_format_fuses()` into a 2 KiB stack buffer. PASS if the formatted output contains the literal substrings `WDTCFG`, `OSCCFG`, `SYSCFG0`, and `Lock:` — confirming the per-family fuse decode table fired and the lock-byte trailer was emitted. |
+| 22 | <a id="F3_prog_mode_end_to_end_with_verify"></a>`F3_prog_mode_end_to_end_with_verify` | `LLR-HWTEST-07`, `LLR-MAIN-15`, `LLR-MAIN-16` | Destructive — gated by `HW_TEST_NVM_CONFIRM=YES`. With the harness UPDI fd closed, `fork` and `execl` the production `build/avr-updi-gdb --prog --erase --baud <N> <port> <elf>` against the bench ELF (`build/fixtures/all_nvm.elf` by default, which intentionally avoids FUSES/LOCK windows so the bench stays in a known state). Capture the child's stdout+stderr through an 8 KiB buffer. PASS if `WEXITSTATUS == 0` AND the captured output contains the literal `verify: OK`. Validates `--prog` end-to-end including chip-erase, FLASH/EEPROM/USERROW programming, and read-back verify against live silicon. |
 
 ## 4. LLR Coverage Matrix
 
@@ -288,6 +297,10 @@ verified by code review — see
 | `LLR-MAIN-11` | `main` | `HLR-004`, `HLR-046`, `HLR-047`, `HLR-048` | `parse_args_allow_lock_updi_sets_flag`, `load_segments_dispatches_eeprom_segment_to_eeprom_writer`, `load_segments_dispatches_fuses_segment_to_fuses_writer`, `load_segments_dispatches_userrow_segment_to_userrow_writer`, `load_segments_lock_requires_erase_else_exit_1`, `load_segments_lock_with_erase_dispatches_to_lockbits_writer`, `load_segments_sigrow_segment_is_skipped`, `load_segments_unknown_window_returns_minus1` |
 | `LLR-MAIN-12` | `main` | `HLR-048` | `parse_args_force_device_captures_family`, `parse_args_force_device_default_is_null` |
 | `LLR-MAIN-13` | `main` | `HLR-046`, `HLR-048` | `main_autoselects_family_from_elf_deviceinfo`, `main_force_device_overrides_elf_deviceinfo`, `main_aborts_on_elf_vs_silicon_family_mismatch`, `main_passes_null_to_select_when_elf_lacks_deviceinfo` |
+| `LLR-MAIN-14` | `main` | `HLR-049`, `HLR-050`, `HLR-052` | `parse_args_prog_mode_sets_flag`, `parse_args_no_verify_sets_flag` |
+| `LLR-MAIN-15` | `main` | `HLR-049`, `HLR-050` | `F3_prog_mode_end_to_end_with_verify` |
+| `LLR-MAIN-16` | `main` | `HLR-050`, `HLR-049` | `F3_prog_mode_end_to_end_with_verify` |
+| `LLR-MAIN-17` | `main` | `HLR-050`, `HLR-051`, `HLR-052` | `parse_args_no_autobaud_sets_flag` |
 | `LLR-UPDI-01` | `updi` | `HLR-006` | `updi_open_sets_8e2_raw_half_duplex_via_termios`, `updi_open_returns_minus1_on_device_open_failure` |
 | `LLR-UPDI-02` | `updi` | `HLR-006`, `HLR-036` | `updi_open_asserts_wake_byte_then_stcs_ctrlb`, `updi_open_restores_session_baud_after_break` |
 | `LLR-UPDI-03` | `updi` | `HLR-036` | `updi_open_issues_stcs_ctrla_and_ldcs_statusa`, `updi_open_retries_cold_start_3_times_on_no_ack`, `updi_open_returns_minus1_after_3_consecutive_link_failures` |
@@ -316,6 +329,10 @@ verified by code review — see
 | `LLR-UPDI-22` | `updi` | `HLR-016` | `updi_ocd_clear_hw_bp_clears_only_target_slot` |
 | `LLR-UPDI-27` | `updi` | `HLR-048`, `HLR-046` | `updi_get_device_default_is_avrda`, `updi_select_device_force_avrdd_sets_active_descriptor`, `updi_select_device_unknown_family_returns_minus1` |
 | `LLR-UPDI-28` | `updi` | `HLR-048` | `updi_family_from_partname_maps_all_known_prefixes`, `updi_family_from_partname_rejects_invalid_inputs` |
+| `LLR-UPDI-29` | `updi` | `HLR-049`, `HLR-051` | `F2_fuse_pretty_print_round_trip` |
+| `LLR-UPDI-30` | `updi` | `HLR-049` | `updi_crc32_returns_zero_for_empty_buffer`, `updi_crc32_matches_known_vector_for_123456789`, `updi_crc32_matches_known_vector_for_single_zero_byte` |
+| `LLR-UPDI-31` | `updi` | `HLR-052` | `F1_autobaud_picks_reliable_rung` |
+| `LLR-UPDI-32` | `updi` | `HLR-051` | `F2_fuse_pretty_print_round_trip` |
 | `LLR-RSP-01` | `rsp` | `HLR-003`, `HLR-038` | `rsp_listen_sets_so_reuseaddr_before_bind`, `rsp_accept_sets_tcp_nodelay_on_client_socket` |
 | `LLR-RSP-02` | `rsp` | `HLR-013` | `rsp_recv_packet_discards_leading_ack_nak_bytes`, `rsp_recv_packet_sends_plus_on_valid_checksum`, `rsp_recv_packet_sends_minus_and_returns_minus1_on_bad_checksum` |
 | `LLR-RSP-03` | `rsp` | `HLR-014`, `HLR-026` | `on_read_regs_g_returns_78_char_hex_string`, `on_read_regs_g_places_pc_little_endian_at_positions_70_77`, `on_read_regs_non_active_thread_uses_fsm_register_frame` |
@@ -369,3 +386,4 @@ verified by code review — see
 | `LLR-HWTEST-04` | `hwtest` | `HLR-045`, `HLR-008` | `C1_flash_erase_and_write`, `C2_flash_read_back_verify` |
 | `LLR-HWTEST-05` | `hwtest` | `HLR-045`, `HLR-014` | `D1_rsp_server_accepts_tcp_connection`, `D2_rsp_qsupported_round_trip`, `D3_rsp_ctrl_c_interrupt_returns_T02` |
 | `LLR-HWTEST-06` | `hwtest` | `HLR-045` | `B0_sram_single_byte_round_trip` |
+| `LLR-HWTEST-07` | `hwtest` | `HLR-045`, `HLR-049`, `HLR-050`, `HLR-051`, `HLR-052` | `F1_autobaud_picks_reliable_rung`, `F2_fuse_pretty_print_round_trip`, `F3_prog_mode_end_to_end_with_verify` |

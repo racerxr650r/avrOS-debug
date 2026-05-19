@@ -981,6 +981,26 @@ static void updi_family_from_partname_rejects_invalid_inputs(void)
     TEST_ASSERT_NULL(updi_family_from_partname("avrda28"));
 }
 
+/* ── Phase 9 — updi_crc32() IEEE 802.3 reference vectors (LLR-UPDI-30) ── */
+
+static void updi_crc32_returns_zero_for_empty_buffer(void)
+{
+    TEST_ASSERT_EQUAL_HEX32(0x00000000u, updi_crc32(NULL, 0));
+}
+
+static void updi_crc32_matches_known_vector_for_123456789(void)
+{
+    /* IEEE 802.3 / zlib canonical test vector. */
+    const unsigned char v[] = "123456789";
+    TEST_ASSERT_EQUAL_HEX32(0xCBF43926u, updi_crc32(v, 9));
+}
+
+static void updi_crc32_matches_known_vector_for_single_zero_byte(void)
+{
+    const unsigned char z[1] = { 0 };
+    TEST_ASSERT_EQUAL_HEX32(0xD202EF8Du, updi_crc32(z, 1));
+}
+
 /* ── Test runner ─────────────────────────────────────────────────────── */
 
 int main(void)
@@ -1032,6 +1052,11 @@ int main(void)
     RUN_TEST(updi_select_device_unknown_family_returns_minus1);
     RUN_TEST(updi_family_from_partname_maps_all_known_prefixes);
     RUN_TEST(updi_family_from_partname_rejects_invalid_inputs);
+
+    /* Phase 9 — CRC32 reference vectors (LLR-UPDI-30) */
+    RUN_TEST(updi_crc32_returns_zero_for_empty_buffer);
+    RUN_TEST(updi_crc32_matches_known_vector_for_123456789);
+    RUN_TEST(updi_crc32_matches_known_vector_for_single_zero_byte);
 
     return UNITY_END();
 }

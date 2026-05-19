@@ -186,6 +186,51 @@ int __wrap_updi_chip_erase(int fd)
     return mk_updi_chip_erase_ret;
 }
 
+/* Phase 9 wraps (LLR-MAIN-14, LLR-MAIN-15, LLR-MAIN-16, LLR-UPDI-30..32) */
+static int      mk_updi_nvm_read_calls;
+static int      mk_updi_nvm_read_ret    = 0;
+static int      mk_updi_nvm_read_mismatch; /* if !=0, return buffer differs */
+static int      mk_updi_probe_baud_calls;
+static int      mk_updi_probe_baud_ret  = 115200;
+static uint32_t mk_updi_crc32_value     = 0;
+static int      mk_updi_crc32_calls;
+
+int __wrap_updi_nvm_read(int fd, uint32_t addr, uint8_t *buf, size_t len);
+int __wrap_updi_nvm_read(int fd, uint32_t addr, uint8_t *buf, size_t len)
+{
+    (void)fd; (void)addr;
+    mk_updi_nvm_read_calls++;
+    if (mk_updi_nvm_read_ret < 0) return mk_updi_nvm_read_ret;
+    /* Fill with the deterministic byte 0xA5; verify_segments compares
+     * this against the ELF payload (which is also 0x00/0xFF padded
+     * test data), so it will mismatch unless the test arranges the
+     * payload to match.  When `mk_updi_nvm_read_mismatch` is non-zero
+     * we deliberately scribble a different pattern so verify reports
+     * mismatch even if the test ELF was all-zero.                    */
+    memset(buf, mk_updi_nvm_read_mismatch ? 0x5A : 0xFF, len);
+    return 0;
+}
+
+int __wrap_updi_probe_baud(const char *dev, int samples,
+                           void (*report)(int, int, int, void *),
+                           void *user);
+int __wrap_updi_probe_baud(const char *dev, int samples,
+                           void (*report)(int, int, int, void *),
+                           void *user)
+{
+    (void)dev; (void)samples; (void)report; (void)user;
+    mk_updi_probe_baud_calls++;
+    return mk_updi_probe_baud_ret;
+}
+
+uint32_t __wrap_updi_crc32(const uint8_t *buf, size_t len);
+uint32_t __wrap_updi_crc32(const uint8_t *buf, size_t len)
+{
+    (void)buf; (void)len;
+    mk_updi_crc32_calls++;
+    return mk_updi_crc32_value;
+}
+
 /* HLR-046: per-family memory map.  Tests run against the compile-time
  * AVR-DA defaults already encoded in the UPDI_*_BASE/_SIZE macros, so
  * `__wrap_updi_select_device()` is a no-op success stub and
@@ -649,9 +694,9 @@ static void test_main_load_flag_writes_all_pt_load_segments_to_flash(void)
     mk_elf_have_ehdr = 1;
     mk_elf_planted_sram = 0x800000u;
 
-    char *argv[] = { (char*)"prog", (char*)"--load",
+    char *argv[] = { (char*)"prog", (char*)"--load", (char*)"--no-verify",
                      (char*)"/dev/x", (char*)"a.elf" };
-    TEST_ASSERT_EQUAL_INT(0, app_main(4, argv));
+    TEST_ASSERT_EQUAL_INT(0, app_main(5, argv));
     TEST_ASSERT_EQUAL_INT(2, mk_updi_nvm_calls);
 }
 
@@ -775,6 +820,40 @@ static void test_parse_args_force_device_default_is_null(void)
     TEST_ASSERT_NULL(cfg.force_device);
 }
 
+/* ── Phase 9 — --prog / --no-verify / --no-autobaud parse_args tests ── */
+
+/* LLR-MAIN-14: parse_args() recognises --prog and sets cfg.prog_mode. */
+static void test_parse_args_prog_mode_sets_flag(void)
+{
+    char *argv[] = { (char*)"prog", (char*)"--prog",
+                     (char*)"/dev/x", (char*)"a.elf" };
+    AppConfig cfg;
+    parse_args(4, argv, &cfg);
+    TEST_ASSERT_TRUE(cfg.prog_mode);
+    TEST_ASSERT_FALSE(cfg.device_info);
+    TEST_ASSERT_FALSE(cfg.load_flash);
+}
+
+/* LLR-MAIN-14: parse_args() recognises --no-verify and sets cfg.no_verify. */
+static void test_parse_args_no_verify_sets_flag(void)
+{
+    char *argv[] = { (char*)"prog", (char*)"--load", (char*)"--no-verify",
+                     (char*)"/dev/x", (char*)"a.elf" };
+    AppConfig cfg;
+    parse_args(5, argv, &cfg);
+    TEST_ASSERT_TRUE(cfg.no_verify);
+}
+
+/* LLR-MAIN-17: parse_args() recognises --no-autobaud and sets cfg.no_autobaud. */
+static void test_parse_args_no_autobaud_sets_flag(void)
+{
+    char *argv[] = { (char*)"prog", (char*)"--device", (char*)"--no-autobaud",
+                     (char*)"/dev/x" };
+    AppConfig cfg;
+    parse_args(4, argv, &cfg);
+    TEST_ASSERT_TRUE(cfg.no_autobaud);
+}
+
 /* Shared driver: build an ELF with one PT_LOAD at `vma` of size `sz`,
  * run app_main with --load (+ optional extra argv tokens), return rc. */
 static int run_load_with_one_segment(uint32_t vma, uint32_t sz,
@@ -787,13 +866,14 @@ static int run_load_with_one_segment(uint32_t vma, uint32_t sz,
     mk_elf_planted_sram = 0xFFFFFFFFu;  /* none of our test VMAs collide */
 
     if (extra_flag) {
-        char *argv[] = { (char*)"prog", (char*)"--load", (char*)extra_flag,
+        char *argv[] = { (char*)"prog", (char*)"--load", (char*)"--no-verify",
+                         (char*)extra_flag,
                          (char*)"/dev/x", (char*)"a.elf" };
-        return app_main(5, argv);
+        return app_main(6, argv);
     }
-    char *argv[] = { (char*)"prog", (char*)"--load",
+    char *argv[] = { (char*)"prog", (char*)"--load", (char*)"--no-verify",
                      (char*)"/dev/x", (char*)"a.elf" };
-    return app_main(4, argv);
+    return app_main(5, argv);
 }
 
 /* LLR-MAIN-11: EEPROM segment (avr-libc VMA 0x810000) → translated to
@@ -972,6 +1052,9 @@ int main(void)
     RUN_TEST(test_parse_args_allow_lock_updi_sets_flag);
     RUN_TEST(test_parse_args_force_device_captures_family);
     RUN_TEST(test_parse_args_force_device_default_is_null);
+    RUN_TEST(test_parse_args_prog_mode_sets_flag);
+    RUN_TEST(test_parse_args_no_verify_sets_flag);
+    RUN_TEST(test_parse_args_no_autobaud_sets_flag);
     RUN_TEST(test_load_segments_dispatches_eeprom_segment_to_eeprom_writer);
     RUN_TEST(test_load_segments_dispatches_fuses_segment_to_fuses_writer);
     RUN_TEST(test_load_segments_dispatches_userrow_segment_to_userrow_writer);

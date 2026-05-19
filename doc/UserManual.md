@@ -133,8 +133,9 @@ CP210x) or `/dev/ttyACM0` (CDC ACM). On macOS the path is
 ## 4. Command-Line Invocation
 
 ```
-avr-updi-gdb [--port <port>] [--baud <baud>] [--erase] [--load] [--allow-lock-updi] [--force-device <family>] <serial-device> <elf-file>
-avr-updi-gdb --device [--baud <baud>] [--force-device <family>] <serial-device> [elf-file]
+avr-updi-gdb [--port <port>] [--baud <baud>] [--erase] [--load] [--no-verify] [--allow-lock-updi] [--force-device <family>] <serial-device> <elf-file>
+avr-updi-gdb --prog [--baud <baud>] [--erase] [--no-verify] [--allow-lock-updi] [--force-device <family>] <serial-device> <elf-file>
+avr-updi-gdb --device [--baud <baud>] [--no-autobaud] [--force-device <family>] <serial-device> [elf-file]
 ```
 
 ### Options
@@ -143,13 +144,24 @@ avr-updi-gdb --device [--baud <baud>] [--force-device <family>] <serial-device> 
 | ------ | ---- | ------- | ----------- |
 | `--port <port>` | uint16_t | `1234` | TCP port to listen on for the `avr-gdb` client. Range: `1 ≤ port ≤ 65535`. |
 | `--baud <baud>` | int | `115200` | UART baud rate to the UPDI adapter. Must be a positive integer accepted by the host `termios` layer. |
-| `--load` | flag | unset | Before entering the event loop, program every `PT_LOAD` segment of the supplied ELF to the matching AVR-Dx NVM kind (FLASH, EEPROM, USERROW, FUSES, LOCK) via the UPDI NVM controller. Segments are classified by virtual address against the unified UPDI windows; SIGROW segments are skipped (read-only); segments outside every programmable window cause `--load` to fail. |
+| `--load` | flag | unset | Before entering the event loop, program every `PT_LOAD` segment of the supplied ELF to the matching AVR-Dx NVM kind (FLASH, EEPROM, USERROW, FUSES, LOCK) via the UPDI NVM controller. Segments are classified by virtual address against the unified UPDI windows; SIGROW segments are skipped (read-only); segments outside every programmable window cause `--load` to fail. After `--load` completes the loader performs a read-back verify (see `--no-verify` below). |
 | `--erase` | flag | unset | Issue a UPDI chip-erase before any `--load` step. Required when the ELF contains a LOCK segment (lockbits can only be re-programmed after a chip-erase clears `LOCKSTATUS`). |
+| `--prog` | flag | unset | Program-and-exit (CI / build-server) mode. Equivalent to `--load` followed by an immediate orderly exit — no GDB TCP listener is opened, the target is **not** halted, and the CPU starts running the freshly programmed image. On success the loader prints `verify: OK` to stdout and exits 0. Mutually exclusive with `--load` and `--device`. |
+| `--no-verify` | flag | unset | Suppress the read-back verify pass that normally follows `--load` or `--prog`. Use sparingly — verify is the only mechanism that detects partial or silently-corrupted writes. |
+| `--no-autobaud` | flag | unset | (Used with `--device` only.) Suppress the link-quality auto-baud probe and use the rate supplied via `--baud` (or its default) unchanged. |
 | `--allow-lock-updi` | flag | unset | Allow `--load` to write LOCK byte patterns that would assert `UPDIDIS` and permanently disable the UPDI debug interface. Without this flag only the 4-byte unlock pattern `0x5CC5C55C` is accepted; every other LOCK value is rejected. |
-| `--device` | flag | unset | One-shot diagnostic: open UPDI, read the SIGROW signature + serial number and ASI status bytes, print a human-readable report to stdout and exit. No TCP listener is opened, no ELF is loaded, the target CPU is not halted. Mutually exclusive with `--load`. Makes `<elf-file>` optional. |
+| `--device` | flag | unset | One-shot diagnostic: open UPDI, run an auto-baud link-quality probe (unless `--no-autobaud`), read the SIGROW signature + serial number, ASI status bytes, FUSES, and LOCK byte, print a human-readable report (including the per-rung baud table and a decoded fuse listing) to stdout, then exit. No TCP listener is opened, no ELF is loaded, the target CPU is not halted. Mutually exclusive with `--load` and `--prog`. Makes `<elf-file>` optional. |
 | `--force-device <family>` | string | unset | Override automatic family detection. Accepts one of `AVR-DA`, `AVR-DB`, `AVR-DD`, `AVR-DU`, `AVR-SD` (case-insensitive). When set, this string is passed verbatim to the UPDI device-table selector and suppresses the ELF-vs-silicon family mismatch check (see §4.1 below). Use this when you knowingly want to debug an ELF against a different silicon family. |
 
-### 4.1 Device Family Selection
+### 4.1 Exit Status
+
+| Code | Meaning |
+| ---- | ------- |
+| `0` | Success (graceful exit; verify, if performed, passed). |
+| `1` | Generic failure — invalid CLI, I/O error, ELF parse failure, NVM write failure, family mismatch. |
+| `2` | Read-back verify mismatch after `--load` or `--prog`. The faulting page(s) are reported to stderr with expected and actual CRC32 checksums. |
+
+### 4.2 Device Family Selection
 
 `avr-updi-gdb` chooses which AVR-Dx family memory map (USERROW / EEPROM / FUSES / LOCK / SIGROW window sizes and bases) to apply by the following precedence:
 

@@ -36,6 +36,11 @@ typedef struct {
     bool        device_info;   /* --device one-shot diagnostic (LLR-MAIN-08) */
     bool        allow_lock_updi; /* --allow-lock-updi: permit lockbit value
                                   *  that disables UPDI (HLR-047)         */
+    bool        prog_mode;     /* --prog: program + verify + exit
+                                *  (LLR-MAIN-15, Phase 9)               */
+    bool        no_verify;     /* --no-verify: skip read-back verify
+                                *  after --load / --prog (LLR-MAIN-14)  */
+    bool        no_autobaud;   /* --no-autobaud: skip --device autobaud */
     const char *force_device;    /* --force-device=<family>: skip SIGROW
                                   *  autodetect and use the named family  */
     /* fds owned by main; -1 = closed/unset */
@@ -62,15 +67,25 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
         "usage: %s [--port <port>] [--baud <baud>] [--erase] [--load] "
+        "[--no-verify] [--allow-lock-updi] [--force-device=<family>] "
+        "<serial-device> <elf-file>\n"
+        "       %s --prog [--baud <baud>] [--erase] [--no-verify] "
         "[--allow-lock-updi] [--force-device=<family>] "
         "<serial-device> <elf-file>\n"
-        "       %s --device [--baud <baud>] [--force-device=<family>] "
-        "<serial-device> [elf-file]\n"
+        "       %s --device [--baud <baud>] [--no-autobaud] "
+        "[--force-device=<family>] <serial-device> [elf-file]\n"
         "\n"
         "  --erase            DESTRUCTIVE: chip-erase + unlock before --load.\n"
         "                     Required on a locked AVR-Dx target before NVMPROG.\n"
         "  --load             Program every PT_LOAD segment to the matching NVM\n"
         "                     window (FLASH, EEPROM, USERROW, FUSES, LOCK).\n"
+        "  --prog             Program + verify the ELF, then exit cleanly\n"
+        "                     without entering debug or opening a GDB listener.\n"
+        "                     Renders an ANSI progress bar on TTY stdout;\n"
+        "                     degrades to per-phase lines when piped.\n"
+        "                     Exit code 2 signals verify failure (CI use).\n"
+        "  --no-verify        Skip the read-back verify after --load / --prog.\n"
+        "  --no-autobaud      Skip the candidate-baud probe in --device mode.\n"
         "  --allow-lock-updi  Permit a lockbit write that disables UPDI.\n"
         "                     Without this flag, only the UPDI-unlock pattern\n"
         "                     0x5CC5C55C is accepted in the LOCK window.\n"
@@ -79,14 +94,19 @@ static void usage(const char *prog)
         "                     Only AVR-DA is hardware-validated; the other\n"
         "                     four families are declared from datasheet\n"
         "                     evidence only.\n",
-        prog, prog);
+        prog, prog, prog);
 }
 
 MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg);
 MAYBE_STATIC void event_loop(AppConfig *cfg, RspHandlers *h);
 MAYBE_STATIC int  load_segments(AppConfig *cfg, ElfContext *ctx);
+MAYBE_STATIC int  verify_segments(AppConfig *cfg, ElfContext *ctx);
 MAYBE_STATIC int  run_device_mode(AppConfig *cfg);
+MAYBE_STATIC int  run_prog_mode(AppConfig *cfg);
 MAYBE_STATIC void sig_handler(int signo);
+MAYBE_STATIC void progress_render(const char *phase, const char *window,
+                                  unsigned page, unsigned total);
+MAYBE_STATIC void progress_finish(void);
 
 /* ── Device family lookup (LLR-MAIN-09) ───────────────────────────────── *
  * Signature → family name table for AVR DA/DB devices. Values are the
@@ -150,6 +170,9 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
     cfg->erase_chip    = false;
     cfg->device_info   = false;
     cfg->allow_lock_updi = false;
+    cfg->prog_mode     = false;
+    cfg->no_verify     = false;
+    cfg->no_autobaud   = false;
     cfg->force_device  = NULL;
     cfg->listen_fd     = -1;
     cfg->gdb_fd        = -1;
@@ -181,6 +204,12 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
             }
         } else if (strcmp(a, "--device") == 0) {
             cfg->device_info = true;
+        } else if (strcmp(a, "--prog") == 0) {
+            cfg->prog_mode = true;
+        } else if (strcmp(a, "--no-verify") == 0) {
+            cfg->no_verify = true;
+        } else if (strcmp(a, "--no-autobaud") == 0) {
+            cfg->no_autobaud = true;
         } else if (a[0] == '-' && a[1] != '\0') {
             fprintf(stderr, "%s: unrecognised option '%s'\n", argv[0], a);
             usage(argv[0]);
@@ -207,11 +236,21 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
         exit(1);
     }
 
+    /* LLR-MAIN-15: --prog is mutually exclusive with --device and --load. */
+    if (cfg->prog_mode && (cfg->device_info || cfg->load_flash)) {
+        fprintf(stderr,
+                "%s: error: --prog is mutually exclusive with --device and --load\n",
+                argv[0]);
+        usage(argv[0]);
+        exit(1);
+    }
+
     if (cfg->serial_device == NULL) {
         usage(argv[0]);
         exit(1);
     }
-    /* --device makes <elf-file> optional (LLR-MAIN-08). */
+    /* --device makes <elf-file> optional (LLR-MAIN-08).
+     * --prog requires an ELF (LLR-MAIN-15).                            */
     if (!cfg->device_info && cfg->elf_path == NULL) {
         usage(argv[0]);
         exit(1);
@@ -285,6 +324,55 @@ MAYBE_STATIC void event_loop(AppConfig *cfg, RspHandlers *h)
 
 /* Iterate PT_LOAD segments and flash each non-SRAM segment.
  * Returns 0 on success, -1 on any read or flash error. */
+/* ── Phase 9 — auto-baud probe visitor callback (LLR-MAIN-16) ─────────
+ * One render line per ladder rung; called by updi_probe_baud(). */
+static void autobaud_report_cb(int baud, int errors, int samples, void *user)
+{
+    (void)user;
+    fprintf(stdout, "  baud=%-6d errors=%d/%d%s\n",
+            baud, errors, samples,
+            (errors == 0) ? "  OK" : "");
+    fflush(stdout);
+}
+
+/* ── Phase 9 — progress bar (LLR-MAIN-15) ──────────────────────────────
+ * On a TTY stdout, emit a carriage-return-anchored ANSI bar that
+ * repaints in place.  When stdout is a pipe (e.g. CI), degrade to one
+ * line per page so log captures stay sane.                            */
+MAYBE_STATIC void progress_render(const char *phase, const char *window,
+                                  unsigned page, unsigned total)
+{
+    if (total == 0) return;
+    unsigned pct = (unsigned)((page * 100u) / total);
+    if (isatty(STDOUT_FILENO)) {
+        const unsigned bar = 30u;
+        unsigned filled = (bar * page) / total;
+        if (filled > bar) filled = bar;
+        char buf[64];
+        size_t i = 0;
+        buf[i++] = '[';
+        for (unsigned k = 0; k < bar; k++)
+            buf[i++] = (k < filled) ? '#' : '.';
+        buf[i++] = ']';
+        buf[i]   = '\0';
+        fprintf(stdout, "\r%s %3u%%  page %u/%u  %s %s   ",
+                buf, pct, page, total, phase, window);
+        fflush(stdout);
+    } else {
+        fprintf(stdout, "%s %s page %u/%u (%u%%)\n",
+                phase, window, page, total, pct);
+        fflush(stdout);
+    }
+}
+
+MAYBE_STATIC void progress_finish(void)
+{
+    if (isatty(STDOUT_FILENO)) {
+        fputc('\n', stdout);
+        fflush(stdout);
+    }
+}
+
 /* run_device_mode (LLR-MAIN-09): one-shot diagnostic that opens UPDI,
  * reads SIGROW + ASI status via updi_read_device_info(), prints a
  * human-readable report to stdout, and returns the process exit code.
@@ -296,6 +384,27 @@ MAYBE_STATIC int run_device_mode(AppConfig *cfg)
     int            rc;
 
     memset(&info, 0, sizeof info);
+
+    /* LLR-MAIN-16 / LLR-UPDI-31: when autobaud is enabled (default in
+     * --device mode) probe the candidate-baud ladder before opening
+     * the link for the diagnostic read.  Successful probe overrides
+     * cfg->baud_rate; failure leaves the configured baud in place and
+     * prints a warning. */
+    if (!cfg->no_autobaud) {
+        fprintf(stdout, "Auto-baud probe:\n");
+        int chosen = updi_probe_baud(cfg->serial_device, 8,
+                                     autobaud_report_cb, NULL);
+        if (chosen > 0) {
+            cfg->baud_rate = chosen;
+            fprintf(stdout, "Chosen baud:     %d\n", chosen);
+        } else {
+            fprintf(stderr,
+                    "warning: auto-baud probe failed at every rung; "
+                    "falling back to configured baud %d\n",
+                    cfg->baud_rate);
+        }
+        fflush(stdout);
+    }
 
     fd = updi_open(cfg->serial_device, cfg->baud_rate);
     if (fd < 0) {
@@ -358,6 +467,34 @@ MAYBE_STATIC int run_device_mode(AppConfig *cfg)
     printf("UPDI status:     SYS_STATUS=0x%02X  KEY_STATUS=0x%02X  STATUSB=0x%02X\n",
            info.asi_sys_status, info.asi_key_status, info.asi_statusb);
     fflush(stdout);
+
+    /* LLR-MAIN-17 / LLR-UPDI-32: read FUSES + LOCK windows and render a
+     * human-readable pretty-print.  Soft-fail: if the read fails we
+     * just skip the section so a damaged device still reports SIGROW. */
+    {
+        const UpdiDeviceMap *dev = updi_get_device();
+        if (dev != NULL && dev->fuses_size > 0 && dev->fuses_size <= 64) {
+            uint8_t raw[64];
+            uint8_t lock[4];
+            int     have_lock = 0;
+            if (updi_nvm_read(fd, dev->fuses_base, raw, dev->fuses_size) == 0) {
+                if (dev->lock_base != 0 &&
+                    updi_nvm_read(fd, dev->lock_base, lock, sizeof lock) == 0)
+                    have_lock = 1;
+                char text[2048];
+                int n = updi_format_fuses(text, sizeof text,
+                                          raw,  dev->fuses_size,
+                                          have_lock ? lock : NULL,
+                                          have_lock ? sizeof lock : 0);
+                if (n > 0)
+                    fputs(text, stdout);
+            } else {
+                fprintf(stderr,
+                        "warning: FUSES read failed; skipping fuse decode\n");
+            }
+            fflush(stdout);
+        }
+    }
 
     updi_close(fd);
     cfg->updi_fd = -1;
@@ -536,6 +673,174 @@ MAYBE_STATIC int load_segments(AppConfig *cfg, ElfContext *ctx)
     return 0;
 }
 
+/* ── Phase 9 — read-back verify (LLR-MAIN-14, LLR-UPDI-30) ────────────
+ * Walks the same PT_LOAD segment classification load_segments() uses,
+ * but instead of writing, reads each silicon byte back via
+ * updi_nvm_read() and compares the page-CRC32 against the ELF payload.
+ * On mismatch, prints the offending window + page offset + expected
+ * and actual CRCs, then continues to the next segment so the operator
+ * gets a complete picture in a single run.
+ *
+ * Returns 0 on full match, -1 on any verify failure or read error.   */
+MAYBE_STATIC int verify_segments(AppConfig *cfg, ElfContext *ctx)
+{
+    Elf32_Ehdr ehdr = ctx->ehdr;
+    const UpdiDeviceMap *dev = updi_get_device();
+    const size_t CHUNK = 256;
+    int rc_overall = 0;
+
+    for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
+        Elf32_Phdr ph;
+        off_t off = (off_t)ehdr.e_phoff +
+                    (off_t)i * (off_t)sizeof(Elf32_Phdr);
+        if (lseek(ctx->fd, off, SEEK_SET) < 0) return -1;
+        if (read(ctx->fd, &ph, sizeof ph) != (ssize_t)sizeof ph) return -1;
+        if (ph.p_type != PT_LOAD || ph.p_filesz == 0) continue;
+
+        if (ctx->sram_base != 0 && ph.p_vaddr >= ctx->sram_base) continue;
+
+        uint32_t updi_addr;
+        const char *kind = NULL;
+        bool skip = false;
+
+        if (ph.p_vaddr < UPDI_FLASH_BASE) {
+            updi_addr = ph.p_vaddr | UPDI_FLASH_BASE;
+            kind = "FLASH";
+        } else {
+            uint32_t band = ph.p_vaddr & ELF_VMA_BAND_MASK;
+            uint32_t lo   = ph.p_vaddr & ELF_VMA_OFFSET_MASK;
+            switch (band) {
+            case ELF_VMA_EEPROM:
+                updi_addr = dev->eeprom_base + lo;  kind = "EEPROM"; break;
+            case ELF_VMA_USERROW:
+                updi_addr = dev->userrow_base + lo; kind = "USERROW"; break;
+            case ELF_VMA_FUSES:
+                updi_addr = dev->fuses_base + lo;   kind = "FUSES"; break;
+            case ELF_VMA_LOCK:
+                /* LOCK contents are not stable for read-back compare;
+                 * write succeeded if the chip is still talking.        */
+                skip = true; updi_addr = 0; break;
+            case ELF_VMA_SIGROW:
+                skip = true; updi_addr = 0; break;
+            default:
+                fprintf(stderr,
+                        "verify: segment vaddr 0x%06x not in any NVM window\n",
+                        (unsigned)ph.p_vaddr);
+                return -1;
+            }
+        }
+        if (skip) continue;
+
+        uint8_t *expect = malloc(ph.p_filesz);
+        if (!expect) return -1;
+        if (lseek(ctx->fd, (off_t)ph.p_offset, SEEK_SET) < 0 ||
+            read(ctx->fd, expect, ph.p_filesz) != (ssize_t)ph.p_filesz) {
+            free(expect);
+            return -1;
+        }
+
+        unsigned pages = (unsigned)((ph.p_filesz + CHUNK - 1u) / CHUNK);
+        uint8_t actual[CHUNK];
+
+        for (unsigned p = 0; p < pages; p++) {
+            size_t pos = (size_t)p * CHUNK;
+            size_t n   = (ph.p_filesz - pos) < CHUNK ? (ph.p_filesz - pos)
+                                                    : CHUNK;
+            if (updi_nvm_read(cfg->updi_fd,
+                              updi_addr + (uint32_t)pos,
+                              actual, n) < 0) {
+                fprintf(stderr,
+                        "\nverify: read failed @ 0x%06x len=%zu\n",
+                        (unsigned)(updi_addr + (uint32_t)pos), n);
+                free(expect);
+                return -1;
+            }
+            if (memcmp(actual, expect + pos, n) != 0) {
+                uint32_t exp_crc = updi_crc32(expect + pos, n);
+                uint32_t act_crc = updi_crc32(actual, n);
+                fprintf(stderr,
+                        "\nverify: mismatch %s @ 0x%06x len=%zu "
+                        "expected-crc=0x%08X actual-crc=0x%08X\n",
+                        kind, (unsigned)(updi_addr + (uint32_t)pos), n,
+                        (unsigned)exp_crc, (unsigned)act_crc);
+                rc_overall = -1;
+            }
+            progress_render("verifying", kind, p + 1u, pages);
+        }
+        progress_finish();
+        free(expect);
+    }
+    return rc_overall;
+}
+
+/* run_prog_mode (LLR-MAIN-15): program-and-exit pipeline.  Opens UPDI,
+ * optionally erases, loads, verifies (unless --no-verify), and returns
+ * 0 / 1 / UPDI_EXIT_VERIFY_FAIL.  Never starts the GDB listener or the
+ * event loop.                                                          */
+MAYBE_STATIC int run_prog_mode(AppConfig *cfg)
+{
+    ElfContext elf_ctx;
+    memset(&elf_ctx, 0, sizeof elf_ctx);
+    elf_ctx.fd = -1;
+
+    if (elf_open(cfg->elf_path, &elf_ctx) < 0) {
+        fprintf(stderr, "error: failed to open ELF '%s'\n", cfg->elf_path);
+        return 1;
+    }
+
+    cfg->updi_fd = updi_open(cfg->serial_device, cfg->baud_rate);
+    if (cfg->updi_fd < 0) {
+        fprintf(stderr, "error: updi-open failed for '%s'\n",
+                cfg->serial_device);
+        elf_close(&elf_ctx);
+        return 1;
+    }
+
+    fprintf(stdout, "baud=%d\n", cfg->baud_rate);
+    fflush(stdout);
+
+    if (cfg->force_device != NULL && cfg->force_device[0] != '\0') {
+        if (updi_select_device(cfg->updi_fd, cfg->force_device) < 0) {
+            updi_close(cfg->updi_fd); cfg->updi_fd = -1;
+            elf_close(&elf_ctx);
+            return 1;
+        }
+    }
+
+    if (cfg->erase_chip) {
+        if (updi_chip_erase(cfg->updi_fd) < 0) {
+            fprintf(stderr, "error: chip erase failed\n");
+            updi_close(cfg->updi_fd); cfg->updi_fd = -1;
+            elf_close(&elf_ctx);
+            return 1;
+        }
+    }
+
+    if (load_segments(cfg, &elf_ctx) < 0) {
+        updi_close(cfg->updi_fd); cfg->updi_fd = -1;
+        elf_close(&elf_ctx);
+        return 1;
+    }
+
+    int verify_rc = 0;
+    if (!cfg->no_verify) {
+        verify_rc = verify_segments(cfg, &elf_ctx);
+    }
+
+    updi_close(cfg->updi_fd); cfg->updi_fd = -1;
+    elf_close(&elf_ctx);
+
+    if (verify_rc < 0) {
+        fprintf(stderr, "verify: FAILED\n");
+        return UPDI_EXIT_VERIFY_FAIL;
+    }
+    if (!cfg->no_verify) {
+        fprintf(stdout, "verify: OK\n");
+        fflush(stdout);
+    }
+    return 0;
+}
+
 int MAIN_NAME(int argc, char *argv[])
 {
     AppConfig cfg;
@@ -552,6 +857,12 @@ int MAIN_NAME(int argc, char *argv[])
     /* LLR-MAIN-09: --device short-circuits the normal startup path. */
     if (cfg.device_info) {
         return run_device_mode(&cfg);
+    }
+
+    /* LLR-MAIN-15: --prog short-circuits to the program+verify+exit
+     * pipeline.  No GDB listener, no event loop. */
+    if (cfg.prog_mode) {
+        return run_prog_mode(&cfg);
     }
 
     /* Signal handlers (LLR-MAIN-06). */
@@ -638,6 +949,17 @@ int MAIN_NAME(int argc, char *argv[])
             fprintf(stderr, "error: load failed\n");
             exit_code = 1;
             goto teardown;
+        }
+        /* LLR-MAIN-14: read-back verify after --load (unless suppressed). */
+        if (!cfg.no_verify) {
+            int vrc = verify_segments(&cfg, &elf_ctx);
+            if (vrc < 0) {
+                fprintf(stderr, "verify: FAILED\n");
+                exit_code = UPDI_EXIT_VERIFY_FAIL;
+                goto teardown;
+            }
+            fprintf(stdout, "verify: OK\n");
+            fflush(stdout);
         }
     }
 
