@@ -203,6 +203,61 @@ typedef struct {
 
 int  updi_read_device_info(int fd, UpdiDeviceInfo *info);
 
+/* ── Phase 9 — read-back verify (HLR-PHASE9-VERIFY, LLR-UPDI-30) ─────
+ * Thin wrapper around updi_mem_read() with a verify-friendly contract:
+ * reads `len` bytes from the unified-address-space `addr` into the
+ * caller-supplied buffer, no NVM activity initiated.  Used by
+ * verify_segments() in src/main.c after every NVM write to compare
+ * silicon contents against the ELF payload.  Returns 0 on success,
+ * -1 on any UPDI read failure.                                       */
+int  updi_nvm_read(int fd, uint32_t addr, uint8_t *buf, size_t len);
+
+/* CRC-32 (IEEE 802.3 polynomial 0xEDB88320, init 0xFFFFFFFF, output
+ * inverted).  Pure host-side helper used by verify_segments() to
+ * summarise expected-vs-actual page contents in a compact form.     */
+uint32_t updi_crc32(const uint8_t *buf, size_t len);
+
+/* ── Phase 9 — auto-baud / link-quality probe (HLR-PHASE9-AUTOBAUD,
+ *    LLR-UPDI-31) ────────────────────────────────────────────────────
+ * Walk a fixed candidate-baud ladder (highest → lowest), opening
+ * UPDI at each rate and issuing a small fixed sequence of read-only
+ * LDCS probes (ASI_STATUSA × `samples`).  For each rung, reports the
+ * error count to the caller via the visitor callback (NULL skips
+ * reporting), and returns the highest baud that achieved zero errors
+ * over the sample window.  Strictly read-only: no STS/NVM/SYSRST
+ * writes are performed.  On total failure returns -1.
+ *
+ * `serial_device` is opened and closed inside this function; the
+ * caller should NOT pass an already-open fd.                        */
+typedef void (*UpdiBaudReport)(int baud, int errors, int samples, void *user);
+int  updi_probe_baud(const char *serial_device,
+                     int samples,
+                     UpdiBaudReport report, void *user);
+
+/* Candidate-baud ladder used by updi_probe_baud().  Exposed so tests
+ * and the `--device` printer can iterate the same list.             */
+extern const int updi_baud_ladder[];
+extern const size_t updi_baud_ladder_count;
+
+/* ── Phase 9 — fuse pretty-printer (HLR-PHASE9-FUSES, LLR-UPDI-32) ───
+ * Format the raw fuse bytes for the currently-selected device family
+ * (per `updi_get_device()`) into a human-readable multi-line buffer
+ * styled after `avrdude -Tu` output.  `raw[fuses_size]` is the
+ * caller-supplied FUSE-window snapshot read via updi_nvm_read().
+ * `lock[lock_size]` is the LOCK-window snapshot (4 bytes on every
+ * supported family).  Decoded bit-fields use the per-family fuse
+ * descriptor table next to g_device_table[].  Unknown bytes render
+ * as `raw=0x..`.  Returns bytes written (excluding NUL) or -1 if
+ * the output buffer is too small.                                  */
+int  updi_format_fuses(char *out, size_t cap,
+                       const uint8_t *raw,  size_t raw_len,
+                       const uint8_t *lock, size_t lock_len);
+
+/* Reserved process exit code for read-back verify failure
+ * (LLR-MAIN-14).  Distinct from 1 (I/O / config failure) so CI
+ * pipelines can disambiguate.                                      */
+#define UPDI_EXIT_VERIFY_FAIL 2
+
 /* ── Multi-family runtime device map ──────────────────────────────────
  * The compile-time `UPDI_*_BASE/_SIZE` macros above are the AVR-DA/DB
  * defaults retained for backward compatibility (Unity tests still refer

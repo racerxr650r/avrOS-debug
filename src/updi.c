@@ -3,6 +3,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/select.h>
@@ -1850,4 +1851,214 @@ int updi_read_device_info(int fd, UpdiDeviceInfo *info)
     info->asi_statusb = (uint8_t)v;
 
     return 0;
+}
+
+/* ── Phase 9 — read-back verify (LLR-UPDI-30) ────────────────────────── *
+ *
+ * updi_nvm_read() is a thin verify-friendly wrapper around the existing
+ * updi_mem_read() burst path.  It exists so the verify orchestrator in
+ * src/main.c (verify_segments()) need not directly reach into the
+ * memory primitives — see SDD §2.1 layering rule "NVM reads live in
+ * src/updi.c".  No NVM commands are issued; the read is non-destructive
+ * and the CPU is not halted.                                            */
+int updi_nvm_read(int fd, uint32_t addr, uint8_t *buf, size_t len)
+{
+    return updi_mem_read(fd, addr, buf, len);
+}
+
+/* CRC-32 (IEEE 802.3 polynomial), table-free byte-wise implementation.
+ * Used by verify_segments() to summarise expected-vs-actual page
+ * contents in 8 hex characters.                                        */
+uint32_t updi_crc32(const uint8_t *buf, size_t len)
+{
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= (uint32_t)buf[i];
+        for (int b = 0; b < 8; b++) {
+            uint32_t mask = (uint32_t)0 - (crc & 1u);
+            crc = (crc >> 1) ^ (0xEDB88320u & mask);
+        }
+    }
+    return ~crc;
+}
+
+/* ── Phase 9 — auto-baud / link-quality probe (LLR-UPDI-31) ──────────── *
+ *
+ * Walk a fixed candidate-baud ladder from fastest to slowest.  At each
+ * rung, open UPDI (which performs the full cold-start handshake and
+ * SIB read), then issue `samples` read-only LDCS probes on
+ * ASI_STATUSA.  STATUSA carries UPDIREV in its upper nibble and is
+ * always readable while UPDI is enabled (see updi_open()'s cold-start
+ * comment); a probe error is any LDCS failure or any response byte
+ * whose upper nibble is 0x0 (which would mean the link is not
+ * synchronised).
+ *
+ * The function reports the per-rung result to the caller via the
+ * visitor callback (so callers can render a baud=<N> errors=<K>/<total>
+ * line) and returns the highest rung that achieved zero errors.  On
+ * total failure (every rung failed to even open) returns -1.          */
+const int updi_baud_ladder[] = {
+    230400, 200000, 150000, 115200, 57600, 38400, 19200,
+};
+const size_t updi_baud_ladder_count =
+    sizeof(updi_baud_ladder) / sizeof(updi_baud_ladder[0]);
+
+int updi_probe_baud(const char *serial_device,
+                    int samples,
+                    UpdiBaudReport report, void *user)
+{
+    int best = -1;
+
+    if (serial_device == NULL || samples <= 0)
+        return -1;
+
+    for (size_t i = 0; i < updi_baud_ladder_count; i++) {
+        int baud = updi_baud_ladder[i];
+        int fd = updi_open(serial_device, baud);
+        if (fd < 0) {
+            if (report != NULL)
+                report(baud, samples, samples, user);
+            continue;
+        }
+
+        int errors = 0;
+        for (int s = 0; s < samples; s++) {
+            int v = updi_ldcs(fd, ASI_STATUSA);
+            if (v < 0 || (v & 0xF0u) == 0u)
+                errors++;
+        }
+
+        updi_close(fd);
+        if (report != NULL)
+            report(baud, errors, samples, user);
+
+        if (errors == 0 && best < 0)
+            best = baud;
+    }
+
+    return best;
+}
+
+/* ── Phase 9 — fuse pretty-printer (LLR-UPDI-32) ────────────────────── *
+ *
+ * The decoder is table-driven and family-aware.  The fuse layout is
+ * identical across AVR-DA / AVR-DB / AVR-DD / AVR-DU / AVR-SD at the
+ * FUSES window base — they share the AVR-Dx fuse map per datasheet
+ * §6 (Memories) / §8 (FUSE) — so a single descriptor table covers
+ * every family currently in g_device_table[].  Unknown bytes are
+ * still printed as `raw=0x..` so future families that introduce new
+ * fuses degrade gracefully.                                          */
+
+/* Each AVR-Dx fuse byte is a packed bitfield.  We describe each named
+ * field as `{ name, byte-offset-in-FUSES-window, low-bit, width }`.
+ * The decoder picks each field out and renders `<name>=<value>`.    */
+typedef struct {
+    const char *name;
+    uint8_t     byte;
+    uint8_t     shift;
+    uint8_t     width;
+} FuseField;
+
+/* AVR-Dx FUSES window (16 bytes at offset 0x1050).
+ * Source: AVR128DA datasheet §8.5 (Configuration and User Fuses). */
+static const FuseField g_avr_dx_fuses[] = {
+    /* 0x00 WDTCFG : PERIOD[3:0], WINDOW[7:4]                       */
+    { "WDTCFG.PERIOD",     0x00, 0, 4 },
+    { "WDTCFG.WINDOW",     0x00, 4, 4 },
+    /* 0x01 BODCFG : SLEEP[1:0], ACTIVE[3:2], SAMPFREQ[4], LVL[7:5] */
+    { "BODCFG.SLEEP",      0x01, 0, 2 },
+    { "BODCFG.ACTIVE",     0x01, 2, 2 },
+    { "BODCFG.SAMPFREQ",   0x01, 4, 1 },
+    { "BODCFG.LVL",        0x01, 5, 3 },
+    /* 0x02 OSCCFG : CLKSEL[2:0], OSCHFFRQ[3]                       */
+    { "OSCCFG.CLKSEL",     0x02, 0, 3 },
+    { "OSCCFG.OSCHFFRQ",   0x02, 3, 1 },
+    /* 0x05 SYSCFG0 : EESAVE[0], RSTPINCFG[3:2], CRCSEL[5], CRCSRC[7:6] */
+    { "SYSCFG0.EESAVE",    0x05, 0, 1 },
+    { "SYSCFG0.RSTPINCFG", 0x05, 2, 2 },
+    { "SYSCFG0.CRCSEL",    0x05, 5, 1 },
+    { "SYSCFG0.CRCSRC",    0x05, 6, 2 },
+    /* 0x06 SYSCFG1 : SUT[2:0], MVSYSCFG[4:3]                       */
+    { "SYSCFG1.SUT",       0x06, 0, 3 },
+    { "SYSCFG1.MVSYSCFG",  0x06, 3, 2 },
+    /* 0x07 CODESIZE: 8 bits                                        */
+    { "CODESIZE",          0x07, 0, 8 },
+    /* 0x08 BOOTSIZE: 8 bits                                        */
+    { "BOOTSIZE",          0x08, 0, 8 },
+};
+
+static int fmt_append(char *out, size_t cap, size_t *off, const char *fmt, ...)
+{
+    if (*off >= cap) return -1;
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(out + *off, cap - *off, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= cap - *off) return -1;
+    *off += (size_t)n;
+    return 0;
+}
+
+int updi_format_fuses(char *out, size_t cap,
+                      const uint8_t *raw,  size_t raw_len,
+                      const uint8_t *lock, size_t lock_len)
+{
+    if (out == NULL || cap == 0 || raw == NULL)
+        return -1;
+
+    const UpdiDeviceMap *dev = updi_get_device();
+    size_t off = 0;
+
+    if (fmt_append(out, cap, &off,
+                   "Fuses (%s, %zu bytes):\n",
+                   (dev->family ? dev->family : "?"), raw_len) < 0)
+        return -1;
+
+    for (size_t i = 0;
+         i < sizeof(g_avr_dx_fuses) / sizeof(g_avr_dx_fuses[0]);
+         i++) {
+        const FuseField *f = &g_avr_dx_fuses[i];
+        if (f->byte >= raw_len) continue;
+        uint8_t  byte = raw[f->byte];
+        uint8_t  mask = (uint8_t)(((1u << f->width) - 1u) << f->shift);
+        uint8_t  val  = (uint8_t)((byte & mask) >> f->shift);
+        if (fmt_append(out, cap, &off,
+                       "  0x%02X  %-22s = 0x%02X\n",
+                       (unsigned)f->byte, f->name, (unsigned)val) < 0)
+            return -1;
+    }
+
+    /* Any bytes the descriptor table did not cover are shown raw so
+     * unfamiliar layouts (e.g. a future AVR-Dx revision adding a new
+     * fuse offset) are still visible to the operator.                 */
+    bool covered[16] = { false };
+    for (size_t i = 0;
+         i < sizeof(g_avr_dx_fuses) / sizeof(g_avr_dx_fuses[0]);
+         i++) {
+        if (g_avr_dx_fuses[i].byte < sizeof(covered) / sizeof(covered[0]))
+            covered[g_avr_dx_fuses[i].byte] = true;
+    }
+    for (size_t i = 0; i < raw_len && i < sizeof(covered)/sizeof(covered[0]); i++) {
+        if (!covered[i]) {
+            if (fmt_append(out, cap, &off,
+                           "  0x%02X  %-22s = raw=0x%02X\n",
+                           (unsigned)i, "(reserved)",
+                           (unsigned)raw[i]) < 0)
+                return -1;
+        }
+    }
+
+    if (lock != NULL && lock_len >= 4) {
+        uint32_t v = (uint32_t)lock[0] |
+                     ((uint32_t)lock[1] << 8) |
+                     ((uint32_t)lock[2] << 16) |
+                     ((uint32_t)lock[3] << 24);
+        const char *state = (v == UPDI_LOCK_UNLOCKED) ? "UNLOCKED" : "LOCKED";
+        if (fmt_append(out, cap, &off,
+                       "Lock: 0x%08X (%s)\n",
+                       (unsigned)v, state) < 0)
+            return -1;
+    }
+
+    return (int)off;
 }

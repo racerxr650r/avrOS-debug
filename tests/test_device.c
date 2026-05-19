@@ -88,6 +88,39 @@ void __wrap_updi_close(int fd)
     mk_updi_close_calls++;
 }
 
+/* Phase 9 wraps (LLR-MAIN-16, LLR-MAIN-17): autobaud + fuse pretty-print
+ * call into UPDI-layer helpers that we stub here so the --device
+ * harness stays deterministic.  updi_probe_baud is hard-coded to
+ * "succeed at 115200" so the autobaud line shows up but does not
+ * actually drive the bench.  updi_nvm_read returns a hand-crafted
+ * FUSE+LOCK image that exercises the decoder paths.                  */
+static int      mk_updi_probe_baud_calls;
+static int      mk_updi_probe_baud_ret    = 115200;
+static int      mk_updi_nvm_read_calls;
+static uint8_t  mk_updi_nvm_read_pattern  = 0x00;
+
+int __wrap_updi_probe_baud(const char *dev, int samples,
+                           void (*report)(int, int, int, void *),
+                           void *user);
+int __wrap_updi_probe_baud(const char *dev, int samples,
+                           void (*report)(int, int, int, void *),
+                           void *user)
+{
+    (void)dev;
+    mk_updi_probe_baud_calls++;
+    if (report) report(mk_updi_probe_baud_ret, 0, samples, user);
+    return mk_updi_probe_baud_ret;
+}
+
+int __wrap_updi_nvm_read(int fd, uint32_t addr, uint8_t *buf, size_t len);
+int __wrap_updi_nvm_read(int fd, uint32_t addr, uint8_t *buf, size_t len)
+{
+    (void)fd; (void)addr;
+    mk_updi_nvm_read_calls++;
+    memset(buf, mk_updi_nvm_read_pattern, len);
+    return 0;
+}
+
 int __wrap_rsp_listen(uint16_t port);
 int __wrap_rsp_listen(uint16_t port)
 {

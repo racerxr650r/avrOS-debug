@@ -229,6 +229,8 @@ TEST_WRAP_test_main  := updi_open updi_close updi_console_poll \
                         updi_nvm_write_eeprom updi_nvm_write_userrow \
                         updi_nvm_write_fuses updi_nvm_write_lockbits \
                         updi_chip_erase updi_enter_debug \
+                        updi_nvm_read updi_probe_baud updi_crc32 \
+                        updi_format_fuses \
                         rsp_listen rsp_accept rsp_close \
                         rsp_recv_packet rsp_dispatch \
                         rsp_default_handlers \
@@ -254,6 +256,7 @@ TEST_EXTRA_LDFLAGS_test_install :=
 TEST_SRCS_test_device := $(TESTDIR)/test_device.c $(SRCDIR)/updi.c
 TEST_WRAP_test_device  := select updi_open updi_close \
                           updi_nvm_write_flash updi_console_poll \
+                          updi_probe_baud updi_nvm_read \
                           rsp_listen rsp_accept rsp_close \
                           rsp_recv_packet rsp_dispatch \
                           rsp_default_handlers \
