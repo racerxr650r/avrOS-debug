@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/select.h>
 #include <sys/time.h>
 #include <termios.h>
@@ -31,9 +32,19 @@
 
 /* ── ASI control / status bit positions (datasheet §35.5.9) ────────────── */
 #define ASI_SYS_STATUS_NVMPROG 0x08u /* bit 3 — NVM programming active       */
+#define ASI_SYS_STATUS_UROWPROG 0x04u/* bit 2 — USER_ROW programming active  */
 /* NB: §35.5.9 defines no halt/stopped bit in ASI_SYS_STATUS. CPU halt /
  *     step / run live in the OCD register space (separate spec) and are
  *     deferred to Phase 3.                                                 */
+
+/* ── ASI_KEY_STATUS bits (datasheet §35.5.5) ───────────────────────────── */
+#define ASI_KEY_STATUS_CHIPER    0x08u /* bit 3 — Chip-Erase key latched     */
+#define ASI_KEY_STATUS_NVMPROG   0x10u /* bit 4 — NVMProg     key latched    */
+#define ASI_KEY_STATUS_UROWWRITE 0x20u /* bit 5 — UserRow     key latched    */
+
+/* ── ASI_SYS_CTRLA bits (datasheet §35.5.8) ────────────────────────────── */
+#define ASI_SYS_CTRLA_CLKREQ     0x01u /* bit 0 — request system clock       */
+#define ASI_SYS_CTRLA_UROWDONE   0x02u /* bit 1 — commit USER_ROW write      */
 
 /* ── ASI_RESET_REQ values (datasheet §35.5.6) ──────────────────────────── */
 #define ASI_RESET_REQ_RUN    0x00u   /* clear reset                          */
@@ -45,11 +56,186 @@
 #define NVMCTRL_CMD_NOCMD    0x00u   /* clear pending command                */
 #define NVMCTRL_CMD_FLWR     0x02u   /* program page buffer to FLASH         */
 #define NVMCTRL_CMD_FLPER    0x08u   /* erase one FLASH page                 */
+#define NVMCTRL_CMD_EEERWR   0x13u   /* EEPROM/USERROW/FUSE byte erase+write */
 #define NVMCTRL_CMD_CHER     0x20u   /* chip erase (full FLASH)              */
 #define NVMCTRL_STATUS_FBUSY 0x01u   /* bit 0 = FLASH busy                   */
 #define NVMCTRL_STATUS_EEBUSY 0x02u  /* bit 1 = EEPROM busy                  */
 
 /* UPDI_FLASH_PAGE_SIZE is declared in updi.h */
+
+/* ── Multi-family per-device memory maps (HLR-046; declared in updi.h).
+ *
+ *  Address evidence (extracted with `pdftotext -layout` from datasheets
+ *  in doc/reference/):
+ *
+ *    AVR-DA  SIGROW@0x1100  USERROW 0x1080/32 B   EEPROM 0x1400/512 B
+ *    AVR-DB  SIGROW@0x1100  USERROW 0x1080/32 B   EEPROM 0x1400/512 B
+ *    AVR-DD  SIGROW@0x1100  USERROW 0x1080/128 B  EEPROM 0x1400/256 B
+ *    AVR-DU  SIGROW@0x1080  USERROW 0x1200/512 B  EEPROM 0x1400/256 B
+ *    AVR-SD  SIGROW@0x1080  USERROW 0x1200/512 B  EEPROM 0x1400/256 B
+ *
+ *  LOCK (0x1040/4 B) and FUSE (0x1050/16 B) are identical across all.  */
+static const UpdiDeviceMap g_device_table[] = {
+    /* AVR-DA — bench-validated reference family (HLR-046 E1/E2/E3).    */
+    { "AVR-DA",
+      0x001080u, 0x000020u,   /* USERROW base / size                   */
+      0x001400u, 0x000200u,   /* EEPROM  base / size                   */
+      0x001050u, 0x000010u,   /* FUSES   base / size                   */
+      0x001040u, 0x000004u,   /* LOCK    base / size                   */
+      0x001100u,              /* SIGROW base                           */
+      true                    /* hw-tested on AVR128DA28               */
+    },
+    { "AVR-DB",
+      0x001080u, 0x000020u,
+      0x001400u, 0x000200u,
+      0x001050u, 0x000010u,
+      0x001040u, 0x000004u,
+      0x001100u,
+      false
+    },
+    { "AVR-DD",
+      0x001080u, 0x000080u,   /* 128-byte USERROW per memory map       */
+      0x001400u, 0x000100u,   /* 256 B EEPROM                          */
+      0x001050u, 0x000010u,
+      0x001040u, 0x000004u,
+      0x001100u,
+      false
+    },
+    { "AVR-DU",
+      0x001200u, 0x000200u,   /* 512 B USERROW @ 0x1200                */
+      0x001400u, 0x000100u,
+      0x001050u, 0x000010u,
+      0x001040u, 0x000004u,
+      0x001080u,              /* SIGROW moved to 0x1080 on DU          */
+      false
+    },
+    { "AVR-SD",
+      0x001200u, 0x000200u,
+      0x001400u, 0x000100u,
+      0x001050u, 0x000010u,
+      0x001040u, 0x000004u,
+      0x001080u,
+      false
+    },
+};
+
+/* Default to the AVR-DA entry so call paths that bypass
+ * `updi_select_device()` (notably the unit tests, which link `updi.o`
+ * and exercise NVM writers directly via PTY harnesses without calling
+ * `updi_open()`) see the historical AVR-DA addresses.                  */
+static const UpdiDeviceMap *g_device = &g_device_table[0];
+
+const UpdiDeviceMap *updi_get_device(void)
+{
+    return g_device;
+}
+
+static int case_eq(const char *a, const char *b)
+{
+    while (*a && *b) {
+        unsigned char ca = (unsigned char)*a, cb = (unsigned char)*b;
+        if (ca >= 'a' && ca <= 'z') ca = (unsigned char)(ca - 'a' + 'A');
+        if (cb >= 'a' && cb <= 'z') cb = (unsigned char)(cb - 'a' + 'A');
+        if (ca != cb) return 0;
+        a++; b++;
+    }
+    return *a == 0 && *b == 0;
+}
+
+/* Autodetect helper: known AVR-DA / AVR-DB SIGROW.DEVICEID triplets
+ * (identical to main.c's `device_family[]`).  Returns "AVR-DA",
+ * "AVR-DB", or NULL.  AVR-DD signatures are not listed here because
+ * the bench has not exercised them; users select DD/DU/SD explicitly
+ * via `--force-device`.                                                */
+static const char *autodetect_family(const uint8_t id[3])
+{
+    if (id[0] != 0x1E) return NULL;
+    /* DEVICEID1: 0x95=32K, 0x96=64K, 0x97=128K.  DEVICEID2 low nibble
+     * encodes the family-specific pin/variant code; high nibble is the
+     * family discriminator (0=DA, 1=DB on flash-128K; ranges differ on
+     * smaller-flash parts).  Match the exact table.                   */
+    static const struct { uint8_t id[3]; const char *fam; } known[] = {
+        /* AVR128DA */
+        { { 0x1E, 0x97, 0x0A }, "AVR-DA" }, { { 0x1E, 0x97, 0x09 }, "AVR-DA" },
+        { { 0x1E, 0x97, 0x08 }, "AVR-DA" }, { { 0x1E, 0x97, 0x07 }, "AVR-DA" },
+        /* AVR64DA  */
+        { { 0x1E, 0x96, 0x15 }, "AVR-DA" }, { { 0x1E, 0x96, 0x14 }, "AVR-DA" },
+        { { 0x1E, 0x96, 0x13 }, "AVR-DA" }, { { 0x1E, 0x96, 0x12 }, "AVR-DA" },
+        /* AVR32DA  */
+        { { 0x1E, 0x95, 0x36 }, "AVR-DA" }, { { 0x1E, 0x95, 0x35 }, "AVR-DA" },
+        { { 0x1E, 0x95, 0x34 }, "AVR-DA" },
+        /* AVR128DB */
+        { { 0x1E, 0x97, 0x0E }, "AVR-DB" }, { { 0x1E, 0x97, 0x0D }, "AVR-DB" },
+        { { 0x1E, 0x97, 0x0C }, "AVR-DB" }, { { 0x1E, 0x97, 0x0B }, "AVR-DB" },
+        /* AVR64DB  */
+        { { 0x1E, 0x96, 0x19 }, "AVR-DB" }, { { 0x1E, 0x96, 0x18 }, "AVR-DB" },
+        { { 0x1E, 0x96, 0x17 }, "AVR-DB" }, { { 0x1E, 0x96, 0x16 }, "AVR-DB" },
+        /* AVR32DB  */
+        { { 0x1E, 0x95, 0x3A }, "AVR-DB" }, { { 0x1E, 0x95, 0x39 }, "AVR-DB" },
+        { { 0x1E, 0x95, 0x38 }, "AVR-DB" },
+    };
+    for (size_t i = 0; i < sizeof(known)/sizeof(known[0]); i++) {
+        if (known[i].id[0] == id[0] &&
+            known[i].id[1] == id[1] &&
+            known[i].id[2] == id[2])
+            return known[i].fam;
+    }
+    return NULL;
+}
+
+int updi_select_device(int fd, const char *force_family)
+{
+    if (force_family != NULL && force_family[0] != '\0') {
+        for (size_t i = 0; i < sizeof(g_device_table)/sizeof(g_device_table[0]); i++) {
+            if (case_eq(force_family, g_device_table[i].family)) {
+                g_device = &g_device_table[i];
+                if (!g_device->hw_tested) {
+                    fprintf(stderr,
+                            "warning: --force-device=%s selects a "
+                            "family that has NOT been hardware-validated; "
+                            "use at your own risk\n",
+                            g_device->family);
+                }
+                return 0;
+            }
+        }
+        fprintf(stderr,
+                "error: --force-device='%s' does not match any supported "
+                "family (AVR-DA, AVR-DB, AVR-DD, AVR-DU, AVR-SD)\n",
+                force_family);
+        return -1;
+    }
+
+    /* Autodetect probe path.  Read 3 bytes at the AVR-Dx SIGROW base
+     * (0x1100); on AVR-DU / AVR-SD this address holds Flash code and
+     * the DEVICEID0 byte will not be 0x1E — the user must pass
+     * `--force-device=<family>` for those chips.                      */
+    uint8_t sig[3];
+    if (updi_mem_read(fd, 0x1100u, sig, 3u) < 0) {
+        fprintf(stderr,
+                "error: updi_select_device: SIGROW@0x1100 read failed; "
+                "use --force-device=<AVR-DA|AVR-DB|AVR-DD|AVR-DU|AVR-SD>\n");
+        return -1;
+    }
+    const char *fam = autodetect_family(sig);
+    if (fam == NULL) {
+        fprintf(stderr,
+                "error: SIGROW signature %02X %02X %02X did not match "
+                "any AVR-DA/DB device; pass --force-device=<family> "
+                "(AVR-DA, AVR-DB, AVR-DD, AVR-DU, AVR-SD) to override\n",
+                sig[0], sig[1], sig[2]);
+        return -1;
+    }
+    for (size_t i = 0; i < sizeof(g_device_table)/sizeof(g_device_table[0]); i++) {
+        if (case_eq(fam, g_device_table[i].family)) {
+            g_device = &g_device_table[i];
+            return 0;
+        }
+    }
+    /* Cannot happen — `autodetect_family` only returns names that
+     * exist in the table.                                              */
+    return -1;
+}
 
 /* ── poll counts (each iteration = 1 ms via nanosleep) ─────────────────── */
 #define UPDI_NVMPROG_POLL_MAX    100   /* 100 ms */
@@ -1186,6 +1372,349 @@ int updi_chip_erase(int fd)
     }
     fprintf(stderr, "chip_erase: LOCKSTATUS did not clear within 2 s\n");
     return -1;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * Phase 8 — non-FLASH NVM programming (LLR-UPDI-16..19, HLR-046/047)
+ *
+ * EEPROM, USERROW (USER_SIGNATURES), FUSES, and LOCK bytes are all
+ * programmed via NVMCTRL.CMD = EEERWR (0x13).  Unlike FLASH which
+ * commits a 512-byte page buffer, EEERWR performs a byte-wise
+ * erase-then-write on every STS into the target window.
+ *
+ * Sequence (verified against avrdude 7.1 serialupdi wire trace):
+ *   1. updi_enter_nvmprog()       (idempotent)
+ *   2. wait NVMSTATUS.EEBUSY=0    (precondition)
+ *   3. STS(NVMCTRL.CTRLA)=EEERWR  (arm the command ONCE)
+ *   4. for each byte:
+ *        STS(addr++)=data         (erase+write triggered by the STS)
+ *        wait NVMSTATUS.EEBUSY=0  (~4 ms typ., 20 ms max)
+ *   5. STS(NVMCTRL.CTRLA)=NOCMD   (disarm)
+ *
+ * NOTE: Re-arming EEERWR before every byte (CTRLA write between data
+ * STSes) caused all but the first byte to be silently dropped on
+ * AVR128DA28 — apparently NVMCTRL treats a same-CMD CTRLA write as a
+ * no-op only when EEBUSY is clear AND no STS-driven operation is
+ * mid-flight; the safe protocol is "arm once, write many, disarm".
+ *
+ * The chip remains in NVMPROG on return so the caller can issue more
+ * writes or transition to OCD via updi_enter_debug().
+ * ──────────────────────────────────────────────────────────────────── */
+
+/* Poll NVMCTRL.STATUS until EEBUSY clears or the budget is exhausted.
+ * Matches nvm_wait_not_busy() but masks EEBUSY (bit 1) — the EEERWR
+ * command does not assert FBUSY.                                       */
+static int nvm_wait_not_eebusy(int fd, uint32_t addr, const char *phase)
+{
+    struct timespec ts = { 0, 1000000L };   /* 1 ms */
+    uint8_t last = 0xAAu;
+    for (int i = 0; i < 200; i++) {         /* up to 200 ms */
+        uint8_t nvm_st = 0;
+        if (updi_lds8(fd, NVMCTRL_STATUS, &nvm_st) < 0) {
+            fprintf(stderr,
+                    "nvm_eeprom_write: %s NVMSTATUS read failed @0x%06x\n",
+                    phase, (unsigned)addr);
+            return -1;
+        }
+        last = nvm_st;
+        if (!(nvm_st & NVMCTRL_STATUS_EEBUSY))
+            return 0;
+        nanosleep(&ts, NULL);
+    }
+    fprintf(stderr,
+            "nvm_eeprom_write: %s EEBUSY did not clear @0x%06x (last NVMSTATUS=0x%02x)\n",
+            phase, (unsigned)addr, last & 0xFF);
+    return -1;
+}
+
+/* Common byte-wise EEERWR programmer.  `kind` is a short tag used in
+ * diagnostic messages (e.g. "eeprom", "fuses").                        */
+static int nvm_eeprom_write_bytes(int fd, uint32_t addr,
+                                  const uint8_t *data, size_t len,
+                                  const char *kind)
+{
+    if (len == 0u || data == NULL) {
+        fprintf(stderr, "nvm_%s_write: bad args (len=%zu)\n", kind, len);
+        return -1;
+    }
+
+    if (updi_enter_nvmprog(fd) < 0) {
+        fprintf(stderr, "nvm_%s_write: failed to enter NVMPROG\n", kind);
+        return -1;
+    }
+
+    /* Precondition: NVMCTRL must be idle before arming a new command. */
+    if (nvm_wait_not_eebusy(fd, addr, kind) < 0)
+        return -1;
+
+    /* Arm EEERWR ONCE for the whole burst.  Re-arming between bytes
+     * (writing CTRLA while a CMD is loaded) was observed to silently
+     * abort all but the first byte on AVR128DA28. */
+    if (updi_sts8(fd, NVMCTRL_CTRLA, NVMCTRL_CMD_EEERWR) < 0) {
+        fprintf(stderr,
+                "nvm_%s_write: arm EEERWR failed @0x%06x\n",
+                kind, (unsigned)addr);
+        return -1;
+    }
+
+    for (size_t i = 0; i < len; i++) {
+        if (updi_sts8(fd, addr + (uint32_t)i, data[i]) < 0) {
+            fprintf(stderr,
+                    "nvm_%s_write: STS @0x%06x failed\n",
+                    kind, (unsigned)(addr + i));
+            return -1;
+        }
+        if (nvm_wait_not_eebusy(fd, addr + (uint32_t)i, kind) < 0)
+            return -1;
+    }
+
+    /* Clear pending command. */
+    if (updi_sts8(fd, NVMCTRL_CTRLA, NVMCTRL_CMD_NOCMD) < 0) {
+        fprintf(stderr, "nvm_%s_write: clear CMD failed\n", kind);
+        return -1;
+    }
+    return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * USER_SIGNATURES (USERROW) write — special UPDI UROW-key protocol.
+ *
+ * On AVR-Dx silicon the USER_ROW is NOT programmed through NVMCTRL.CMD
+ * like EEPROM/FUSES.  Instead the UPDI peripheral provides a dedicated
+ * "UserRowWrite" entry: latch the 64-bit key "NVMUs&te" (LSB-first on
+ * the wire), pulse RESET to enter UROWWRITE mode (ASI_KEY_STATUS bit 5),
+ * stream the entire 32-byte row via ST_PTR + REPEAT + ST_PTR_INC, then
+ * commit by writing ASI_SYS_CTRLA = UROWDONE.  The CPU stays halted
+ * throughout and the row programs atomically.
+ *
+ * Verified against avrdude 7.1 serialupdi -vvvv wire capture on a real
+ * AVR128DA28; identical opcode and ASI register sequence as pymcuprog's
+ * `write_user_row_locked_device()` path.
+ *
+ * NOTE: the user row writes atomically as a whole 32-byte page, so a
+ * partial-row request must be padded up to 32 bytes with 0xFF.  The
+ * caller's window check has already validated [addr, addr+len).
+ * ──────────────────────────────────────────────────────────────────── */
+/* USER_ROW page size: 32 B on AVR-DA/DB, 128 B on AVR-DD, 512 B on
+ * AVR-DU/SD.  The active row length comes from `updi_get_device()`;
+ * `UPDI_USERROW_ROW_LEN_MAX` (declared in updi.h) sizes the stack
+ * buffer below so a single code path serves every family.            */
+
+static int updi_enter_userrow_write(int fd)
+{
+    /* "NVMUs&te" stored LSB-first as required by §35.3.3.13. */
+    static const uint8_t key_cmd[] = {
+        UPDI_SYNCH, UPDI_OP_KEY,
+        0x65u, 0x74u, 0x26u, 0x73u, 0x55u, 0x4Du, 0x56u, 0x4Eu,
+    };
+    struct timespec ts = { 0, 1000000L };   /* 1 ms */
+    int ks;
+
+    /* UROW key requires the link to already be in NVMPROG so the CPU is
+     * halted and the bus is ours.  enter_nvmprog is idempotent. */
+    if (updi_enter_nvmprog(fd) < 0)
+        return -1;
+
+    if (updi_write_bytes(fd, key_cmd, sizeof(key_cmd)) < 0)
+        return -1;
+
+    /* Latch the key by pulsing RESET. */
+    if (updi_stcs(fd, ASI_RESET_REQ, ASI_RESET_REQ_RESET) < 0)
+        return -1;
+    if (updi_stcs(fd, ASI_RESET_REQ, ASI_RESET_REQ_RUN) < 0)
+        return -1;
+
+    /* Confirm UROWWRITE bit set in ASI_KEY_STATUS. */
+    for (int i = 0; i < 50; i++) {
+        ks = updi_ldcs(fd, ASI_KEY_STATUS);
+        if (ks < 0)
+            return -1;
+        if (ks & ASI_KEY_STATUS_UROWWRITE)
+            return 0;
+        nanosleep(&ts, NULL);
+    }
+    fprintf(stderr,
+            "updi_enter_userrow_write: UROWWRITE never latched "
+            "(last ASI_KEY_STATUS=0x%02x)\n", ks & 0xFF);
+    return -1;
+}
+
+static int nvm_userrow_write(int fd, uint32_t addr, const uint8_t *data, size_t len)
+{
+    uint8_t row[UPDI_USERROW_ROW_LEN_MAX];
+    size_t  off;
+    int     st;
+    struct timespec ts = { 0, 1000000L };   /* 1 ms */
+    const UpdiDeviceMap *dev = updi_get_device();
+    const size_t row_len = (size_t)dev->userrow_size;
+
+    if (row_len == 0u || row_len > sizeof(row)) {
+        fprintf(stderr,
+                "nvm_userrow_write: invalid USERROW row length %zu for %s\n",
+                row_len, dev->family);
+        return -1;
+    }
+
+    /* Pad the caller's partial-row data into a full row-sized image at
+     * the correct in-row offset.  Unwritten bytes stay 0xFF.          */
+    memset(row, 0xFFu, row_len);
+    off = (size_t)(addr - dev->userrow_base);
+    if (off + len > row_len) {
+        fprintf(stderr,
+                "nvm_userrow_write: range [%zu,%zu) overflows %zu-byte row\n",
+                off, off + len, row_len);
+        return -1;
+    }
+    memcpy(row + off, data, len);
+
+    if (updi_enter_userrow_write(fd) < 0) {
+        fprintf(stderr, "nvm_userrow_write: failed to enter UROW write\n");
+        return -1;
+    }
+
+    /* Stream the whole row starting at USERROW base. */
+    if (updi_mem_write(fd, dev->userrow_base, row, row_len) < 0) {
+        fprintf(stderr, "nvm_userrow_write: ST stream failed\n");
+        return -1;
+    }
+
+    /* Commit per datasheet §35.3.7.3 step 8: write UROWDONE.  We also
+     * preserve CLKREQ=1 (its reset-default) so the system clock keeps
+     * running while silicon transfers the RAM buffer into the row. */
+    if (updi_stcs(fd, ASI_SYS_CTRLA,
+                  (uint8_t)(ASI_SYS_CTRLA_UROWDONE | ASI_SYS_CTRLA_CLKREQ)) < 0) {
+        fprintf(stderr, "nvm_userrow_write: UROWDONE commit failed\n");
+        return -1;
+    }
+
+    /* Wait for ASI_SYS_STATUS.UROWPROG to clear (silicon programs the
+     * row asynchronously after the commit; typical < 10 ms). */
+    for (int i = 0; i < 200; i++) {
+        st = updi_ldcs(fd, ASI_SYS_STATUS);
+        if (st < 0)
+            return -1;
+        if (!(st & ASI_SYS_STATUS_UROWPROG))
+            break;
+        nanosleep(&ts, NULL);
+    }
+    if (st & ASI_SYS_STATUS_UROWPROG) {
+        fprintf(stderr,
+                "nvm_userrow_write: UROWPROG did not clear "
+                "(last ASI_SYS_STATUS=0x%02x)\n", st & 0xFF);
+        return -1;
+    }
+
+    /* Datasheet §35.3.7.3 step 11: write UROWWRITE in ASI_KEY_STATUS to
+     * reset the programming session.  Writing 1 to a latched-key bit
+     * clears it (§35.5.5).  The subsequent reset pulse drops the target
+     * out of NVMPROG too, so we re-enter NVMPROG afterwards for any
+     * read-back verify the caller may perform. */
+    if (updi_stcs(fd, ASI_KEY_STATUS, ASI_KEY_STATUS_UROWWRITE) < 0)
+        return -1;
+    if (updi_stcs(fd, ASI_RESET_REQ, ASI_RESET_REQ_RESET) < 0)
+        return -1;
+    if (updi_stcs(fd, ASI_RESET_REQ, ASI_RESET_REQ_RUN) < 0)
+        return -1;
+    if (updi_enter_nvmprog(fd) < 0) {
+        fprintf(stderr, "nvm_userrow_write: re-enter NVMPROG failed\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+/* Window-guard helper.  Returns 0 if [addr, addr+len) is fully inside
+ * [base, base+size); -1 otherwise (with diagnostic).                  */
+static int nvm_check_window(const char *kind, uint32_t addr, size_t len,
+                            uint32_t base, uint32_t size)
+{
+    if (len == 0u) {
+        fprintf(stderr, "nvm_%s_write: zero-length write rejected\n", kind);
+        return -1;
+    }
+    if (addr < base || (addr - base) + len > size) {
+        fprintf(stderr,
+                "nvm_%s_write: addr=0x%06x len=%zu outside window "
+                "[0x%06x,0x%06x)\n",
+                kind, (unsigned)addr, len,
+                (unsigned)base, (unsigned)(base + size));
+        return -1;
+    }
+    return 0;
+}
+
+int updi_nvm_write_eeprom(int fd, uint32_t addr, const uint8_t *data, size_t len)
+{
+    const UpdiDeviceMap *dev = updi_get_device();
+    if (nvm_check_window("eeprom", addr, len,
+                         dev->eeprom_base, dev->eeprom_size) < 0)
+        return -1;
+    return nvm_eeprom_write_bytes(fd, addr, data, len, "eeprom");
+}
+
+int updi_nvm_write_userrow(int fd, uint32_t addr, const uint8_t *data, size_t len)
+{
+    const UpdiDeviceMap *dev = updi_get_device();
+    if (nvm_check_window("userrow", addr, len,
+                         dev->userrow_base, dev->userrow_size) < 0)
+        return -1;
+    return nvm_userrow_write(fd, addr, data, len);
+}
+
+int updi_nvm_write_fuses(int fd, uint32_t addr, const uint8_t *data, size_t len)
+{
+    const UpdiDeviceMap *dev = updi_get_device();
+    if (nvm_check_window("fuses", addr, len,
+                         dev->fuses_base, dev->fuses_size) < 0)
+        return -1;
+    return nvm_eeprom_write_bytes(fd, addr, data, len, "fuses");
+}
+
+int updi_nvm_write_lockbits(int fd, uint32_t addr, const uint8_t *data,
+                            size_t len, bool allow_updi_disable)
+{
+    int s;
+    const UpdiDeviceMap *dev = updi_get_device();
+
+    if (nvm_check_window("lockbits", addr, len,
+                         dev->lock_base, dev->lock_size) < 0)
+        return -1;
+
+    /* Safety interlock A: chip must be in the post-erase state.
+     * AVR-Dx requires the lock bytes to be programmed only after a
+     * CHIPERASE has cleared the LOCKSTATUS flag (ASI_SYS_STATUS bit 1).
+     * If LOCKSTATUS is asserted we refuse the write. */
+    s = updi_ldcs(fd, ASI_SYS_STATUS);
+    if (s < 0) {
+        fprintf(stderr, "nvm_lockbits_write: SYS_STATUS read failed\n");
+        return -1;
+    }
+    if (s & 0x02u) {
+        fprintf(stderr,
+                "nvm_lockbits_write: refusing — LOCKSTATUS asserted; run "
+                "--erase first (SYS_STATUS=0x%02x)\n", s & 0xFF);
+        return UPDI_ERR_LOCKED;
+    }
+
+    /* Safety interlock B: refuse to program any value that disables the
+     * UPDI host link, unless the caller has explicitly opted in via
+     * --allow-lock-updi.  The only safe pattern is UPDI_LOCK_UNLOCKED
+     * (little-endian on the wire). */
+    if (!allow_updi_disable && len == 4u) {
+        uint32_t v = (uint32_t)data[0]       |
+                     ((uint32_t)data[1] << 8) |
+                     ((uint32_t)data[2] << 16) |
+                     ((uint32_t)data[3] << 24);
+        if (v != UPDI_LOCK_UNLOCKED) {
+            fprintf(stderr,
+                    "nvm_lockbits_write: refusing — value 0x%08x would "
+                    "disable UPDI; pass --allow-lock-updi to override\n",
+                    (unsigned)v);
+            return UPDI_ERR_LOCKED;
+        }
+    }
+
+    return nvm_eeprom_write_bytes(fd, addr, data, len, "lockbits");
 }
 
 int updi_console_poll(int fd, char *buf, size_t cap)

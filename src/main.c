@@ -34,6 +34,10 @@ typedef struct {
     bool        load_flash;
     bool        erase_chip;    /* --erase: DESTRUCTIVE chip erase before load */
     bool        device_info;   /* --device one-shot diagnostic (LLR-MAIN-08) */
+    bool        allow_lock_updi; /* --allow-lock-updi: permit lockbit value
+                                  *  that disables UPDI (HLR-047)         */
+    const char *force_device;    /* --force-device=<family>: skip SIGROW
+                                  *  autodetect and use the named family  */
     /* fds owned by main; -1 = closed/unset */
     int         listen_fd;
     int         gdb_fd;
@@ -58,17 +62,29 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
         "usage: %s [--port <port>] [--baud <baud>] [--erase] [--load] "
+        "[--allow-lock-updi] [--force-device=<family>] "
         "<serial-device> <elf-file>\n"
-        "       %s --device [--baud <baud>] <serial-device> [elf-file]\n"
+        "       %s --device [--baud <baud>] [--force-device=<family>] "
+        "<serial-device> [elf-file]\n"
         "\n"
-        "  --erase   DESTRUCTIVE: chip-erase + unlock before --load.\n"
-        "            Required on a locked AVR-Dx target before NVMPROG.\n",
+        "  --erase            DESTRUCTIVE: chip-erase + unlock before --load.\n"
+        "                     Required on a locked AVR-Dx target before NVMPROG.\n"
+        "  --load             Program every PT_LOAD segment to the matching NVM\n"
+        "                     window (FLASH, EEPROM, USERROW, FUSES, LOCK).\n"
+        "  --allow-lock-updi  Permit a lockbit write that disables UPDI.\n"
+        "                     Without this flag, only the UPDI-unlock pattern\n"
+        "                     0x5CC5C55C is accepted in the LOCK window.\n"
+        "  --force-device=F   Skip SIGROW autodetect and use family F\n"
+        "                     (AVR-DA|AVR-DB|AVR-DD|AVR-DU|AVR-SD).\n"
+        "                     Only AVR-DA is hardware-validated; the other\n"
+        "                     four families are declared from datasheet\n"
+        "                     evidence only.\n",
         prog, prog);
 }
 
 MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg);
 MAYBE_STATIC void event_loop(AppConfig *cfg, RspHandlers *h);
-MAYBE_STATIC int  load_flash_segments(AppConfig *cfg, ElfContext *ctx);
+MAYBE_STATIC int  load_segments(AppConfig *cfg, ElfContext *ctx);
 MAYBE_STATIC int  run_device_mode(AppConfig *cfg);
 MAYBE_STATIC void sig_handler(int signo);
 
@@ -133,6 +149,8 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
     cfg->load_flash    = false;
     cfg->erase_chip    = false;
     cfg->device_info   = false;
+    cfg->allow_lock_updi = false;
+    cfg->force_device  = NULL;
     cfg->listen_fd     = -1;
     cfg->gdb_fd        = -1;
     cfg->updi_fd       = -1;
@@ -150,6 +168,17 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
             cfg->load_flash = true;
         } else if (strcmp(a, "--erase") == 0) {
             cfg->erase_chip = true;
+        } else if (strcmp(a, "--allow-lock-updi") == 0) {
+            cfg->allow_lock_updi = true;
+        } else if (strncmp(a, "--force-device=", 15) == 0) {
+            cfg->force_device = a + 15;
+            if (cfg->force_device[0] == '\0') {
+                fprintf(stderr,
+                        "%s: --force-device= requires a family name "
+                        "(AVR-DA|AVR-DB|AVR-DD|AVR-DU|AVR-SD)\n", argv[0]);
+                usage(argv[0]);
+                exit(1);
+            }
         } else if (strcmp(a, "--device") == 0) {
             cfg->device_info = true;
         } else if (a[0] == '-' && a[1] != '\0') {
@@ -278,6 +307,18 @@ MAYBE_STATIC int run_device_mode(AppConfig *cfg)
     }
     cfg->updi_fd = fd;
 
+    /* Select the per-family memory map (HLR-046).  In diagnostic mode
+     * we apply only the explicit override; autodetect is left to the
+     * subsequent `updi_read_device_info()` call so the report shows
+     * the raw SIGROW bytes even on unknown silicon.                    */
+    if (cfg->force_device != NULL && cfg->force_device[0] != '\0') {
+        if (updi_select_device(fd, cfg->force_device) < 0) {
+            updi_close(fd);
+            cfg->updi_fd = -1;
+            return 1;
+        }
+    }
+
     rc = updi_read_device_info(fd, &info);
     if (rc < 0) {
         fprintf(stderr,
@@ -323,9 +364,28 @@ MAYBE_STATIC int run_device_mode(AppConfig *cfg)
     return 0;
 }
 
-MAYBE_STATIC int load_flash_segments(AppConfig *cfg, ElfContext *ctx)
+/* Iterate PT_LOAD segments and program each one to the NVM window that
+ * its UPDI address falls within (Phase 8, LLR-MAIN-11).
+ *
+ * avr-gcc / avr-libc emit non-FLASH sections at "ELF VMA bands" that are
+ * a toolchain convention, NOT silicon UPDI addresses.  This function
+ * translates each `p_vaddr` to the silicon address NVMCTRL decodes:
+ *
+ *   ELF VMA band              UPDI silicon window     writer
+ *   ─────────────────────     ─────────────────────   ─────────────────
+ *   0x000000..0x01FFFF        0x800000+offset (FLASH) updi_nvm_write_flash
+ *   0x810000+offset           0x1400+offset  (EEPROM) updi_nvm_write_eeprom
+ *   0x820000+offset           0x1050+offset  (FUSES)  updi_nvm_write_fuses
+ *   0x830000+offset           0x1040+offset  (LOCK)   updi_nvm_write_lockbits
+ *   0x840000+offset           0x1100+offset  (SIGROW) logged & skipped (RO)
+ *   0x850000+offset           0x1080+offset  (USERROW)updi_nvm_write_userrow
+ *   sram_base..sram_base+sz   —                       silently skipped
+ *
+ * Returns 0 on success, -1 on any read or programming error. */
+MAYBE_STATIC int load_segments(AppConfig *cfg, ElfContext *ctx)
 {
     Elf32_Ehdr ehdr = ctx->ehdr;
+    const UpdiDeviceMap *dev = updi_get_device();
     for (uint16_t i = 0; i < ehdr.e_phnum; i++) {
         Elf32_Phdr ph;
         off_t off = (off_t)ehdr.e_phoff +
@@ -333,40 +393,145 @@ MAYBE_STATIC int load_flash_segments(AppConfig *cfg, ElfContext *ctx)
         if (lseek(ctx->fd, off, SEEK_SET) < 0) return -1;
         if (read(ctx->fd, &ph, sizeof ph) != (ssize_t)sizeof ph) return -1;
         if (ph.p_type != PT_LOAD || ph.p_filesz == 0) continue;
-        /* Skip SRAM-only segments (VMA inside SRAM region). */
-        if (ctx->sram_base != 0 && ph.p_vaddr >= ctx->sram_base) continue;
 
-        /* updi_nvm_write_flash() requires page-aligned address and length;
-         * pad the tail of the segment with 0xFF (erased-flash value) so a
-         * non-aligned p_filesz can still be programmed page-by-page. */
-        if ((ph.p_vaddr % UPDI_FLASH_PAGE_SIZE) != 0u) {
+        /* SRAM segments (when an SRAM image is present in the ELF) are
+         * skipped silently. */
+        if (ctx->sram_base != 0 &&
+            ph.p_vaddr >= ctx->sram_base) {
+            continue;
+        }
+
+        /* Translate ELF VMA → silicon UPDI address.  FLASH uses p_vaddr
+         * starting at 0 and is rebased into the 0x800000 window.  Every
+         * other band is mapped to its silicon UPDI_*_BASE.              */
+        uint32_t updi_addr;
+        bool in_flash = false, in_eeprom = false, in_userrow = false;
+        bool in_fuses = false, in_lock = false, in_sigrow = false;
+
+        if (ph.p_vaddr < UPDI_FLASH_BASE) {
+            updi_addr = ph.p_vaddr | UPDI_FLASH_BASE;
+            in_flash = true;
+        } else {
+            uint32_t band = ph.p_vaddr & ELF_VMA_BAND_MASK;
+            uint32_t lo   = ph.p_vaddr & ELF_VMA_OFFSET_MASK;
+            switch (band) {
+            case ELF_VMA_EEPROM:
+                updi_addr = dev->eeprom_base + lo;  in_eeprom  = true; break;
+            case ELF_VMA_USERROW:
+                updi_addr = dev->userrow_base + lo; in_userrow = true; break;
+            case ELF_VMA_FUSES:
+                updi_addr = dev->fuses_base + lo;   in_fuses   = true; break;
+            case ELF_VMA_LOCK:
+                updi_addr = dev->lock_base + lo;    in_lock    = true; break;
+            case ELF_VMA_SIGROW:
+                updi_addr = dev->sigrow_base + lo;  in_sigrow  = true; break;
+            default:
+                fprintf(stderr,
+                        "error: segment vaddr 0x%06x not in any programmable "
+                        "NVM window\n", (unsigned)ph.p_vaddr);
+                return -1;
+            }
+        }
+
+        /* SIGROW: read-only, log and skip. */
+        if (in_sigrow) {
+            printf("SIGROW segment @0x%06x ignored (read-only)\n",
+                   (unsigned)updi_addr);
+            continue;
+        }
+
+        /* FLASH window: pad to 512-byte page boundary with 0xFF (erased). */
+        if (in_flash) {
+            if ((updi_addr % UPDI_FLASH_PAGE_SIZE) != 0u) {
+                fprintf(stderr,
+                        "error: FLASH segment vaddr 0x%06x not page-aligned\n",
+                        (unsigned)updi_addr);
+                return -1;
+            }
+            uint32_t padded = (ph.p_filesz + UPDI_FLASH_PAGE_SIZE - 1u) &
+                              ~(UPDI_FLASH_PAGE_SIZE - 1u);
+            uint8_t *buf = malloc(padded);
+            if (!buf) return -1;
+            memset(buf, 0xFF, padded);
+            if (lseek(ctx->fd, (off_t)ph.p_offset, SEEK_SET) < 0 ||
+                read(ctx->fd, buf, ph.p_filesz) != (ssize_t)ph.p_filesz) {
+                free(buf);
+                return -1;
+            }
+            int rc = updi_nvm_write_flash(cfg->updi_fd, updi_addr, buf, padded);
+            free(buf);
+            if (rc < 0) return -1;
+            printf("loaded %u bytes @ 0x%06x (FLASH, padded to %u)\n",
+                   (unsigned)ph.p_filesz, (unsigned)updi_addr,
+                   (unsigned)padded);
+            continue;
+        }
+
+        /* Classify against non-FLASH windows.  Each branch reads the
+         * exact segment payload (no padding) and dispatches to the
+         * matching NVM routine.                                       */
+        uint32_t base = 0, size = 0;
+        const char *kind = NULL;
+        int (*writer)(int, uint32_t, const uint8_t *, size_t) = NULL;
+        bool is_lockbits = false;
+
+        if (in_eeprom) {
+            base = dev->eeprom_base; size = dev->eeprom_size;
+            kind = "EEPROM"; writer = updi_nvm_write_eeprom;
+        } else if (in_userrow) {
+            base = dev->userrow_base; size = dev->userrow_size;
+            kind = "USERROW"; writer = updi_nvm_write_userrow;
+        } else if (in_fuses) {
+            base = dev->fuses_base; size = dev->fuses_size;
+            kind = "FUSES"; writer = updi_nvm_write_fuses;
+        } else if (in_lock) {
+            base = dev->lock_base; size = dev->lock_size;
+            kind = "LOCK"; is_lockbits = true;
+        } else {
             fprintf(stderr,
-                    "error: segment vaddr 0x%06x not page-aligned\n",
-                    (unsigned)ph.p_vaddr);
+                    "error: segment vaddr 0x%06x not in any programmable "
+                    "NVM window\n", (unsigned)updi_addr);
             return -1;
         }
-        uint32_t padded = (ph.p_filesz + UPDI_FLASH_PAGE_SIZE - 1u) &
-                          ~(UPDI_FLASH_PAGE_SIZE - 1u);
 
-        uint8_t *buf = malloc(padded);
+        if ((updi_addr - base) + ph.p_filesz > size) {
+            fprintf(stderr,
+                    "error: %s segment @0x%06x len=%u exceeds window size %u\n",
+                    kind, (unsigned)updi_addr,
+                    (unsigned)ph.p_filesz, (unsigned)size);
+            return -1;
+        }
+
+        /* LOCK segments require a prior --erase so LOCKSTATUS is clear. */
+        if (is_lockbits && !cfg->erase_chip) {
+            fprintf(stderr,
+                    "error: LOCK segment present but --erase was not supplied; "
+                    "lockbits can only be written after a chip-erase\n");
+            return -1;
+        }
+
+        uint8_t *buf = malloc(ph.p_filesz);
         if (!buf) return -1;
-        memset(buf, 0xFF, padded);
         if (lseek(ctx->fd, (off_t)ph.p_offset, SEEK_SET) < 0 ||
             read(ctx->fd, buf, ph.p_filesz) != (ssize_t)ph.p_filesz) {
             free(buf);
             return -1;
         }
-        /* AVR-Dx UPDI memory map: FLASH lives at 0x800000 + flash_offset
-         * in the 24-bit unified address space.  avr-gcc links .text at
-         * p_vaddr = 0x000000 (program-memory view), so OR in the UPDI
-         * FLASH base before driving the NVM controller. */
-        uint32_t updi_addr = ph.p_vaddr | UPDI_FLASH_BASE;
-        int rc = updi_nvm_write_flash(cfg->updi_fd, updi_addr, buf, padded);
+        int rc;
+        if (is_lockbits) {
+            rc = updi_nvm_write_lockbits(cfg->updi_fd, updi_addr, buf,
+                                         ph.p_filesz, cfg->allow_lock_updi);
+        } else {
+            rc = writer(cfg->updi_fd, updi_addr, buf, ph.p_filesz);
+        }
         free(buf);
-        if (rc < 0) return -1;
-        printf("loaded %u bytes @ 0x%06x → UPDI 0x%06x (padded to %u)\n",
-               (unsigned)ph.p_filesz, (unsigned)ph.p_vaddr,
-               (unsigned)updi_addr, (unsigned)padded);
+        if (rc < 0) {
+            fprintf(stderr, "error: %s programming failed (rc=%d)\n",
+                    kind, rc);
+            return -1;
+        }
+        printf("loaded %u bytes @ 0x%06x (%s)\n",
+               (unsigned)ph.p_filesz, (unsigned)updi_addr, kind);
     }
     return 0;
 }
@@ -416,6 +581,15 @@ int MAIN_NAME(int argc, char *argv[])
         goto teardown;
     }
 
+    /* HLR-046: identify the per-family memory map before any NVM
+     * write touches USERROW / EEPROM / FUSES / LOCK windows.  Failure
+     * here is fatal because load_segments() needs the map to translate
+     * ELF VMA bands to silicon addresses.                              */
+    if (updi_select_device(cfg.updi_fd, cfg.force_device) < 0) {
+        exit_code = 1;
+        goto teardown;
+    }
+
     /* LLR-MAIN-04: optional flash load before listener. */
     if (cfg.erase_chip) {
         printf("chip-erase (DESTRUCTIVE) requested\n");
@@ -427,8 +601,8 @@ int MAIN_NAME(int argc, char *argv[])
         printf("chip-erase complete; device unlocked\n");
     }
     if (cfg.load_flash) {
-        if (load_flash_segments(&cfg, &elf_ctx) < 0) {
-            fprintf(stderr, "error: flash load failed\n");
+        if (load_segments(&cfg, &elf_ctx) < 0) {
+            fprintf(stderr, "error: load failed\n");
             exit_code = 1;
             goto teardown;
         }

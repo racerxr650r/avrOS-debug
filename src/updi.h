@@ -4,18 +4,62 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 #define UPDI_SYNCH       0x55
 #define UPDI_ACK         0x40
 #define UPDI_MAX_BLOCK   256
 #define UPDI_BREAK_BAUD  300
 #define UPDI_ERR_WP      (-2)
+#define UPDI_ERR_LOCKED  (-3)
 #define UPDI_FLASH_PAGE_SIZE 512u
 /* AVR-Dx unified-UPDI memory map: FLASH section base.  Add to a
  * program-memory byte offset (avr-gcc .text VMA) to obtain the UPDI
  * physical address used by ST_PTR_LONG.  Section selection within FLASH
  * (>32 KiB parts) is done via NVMCTRL.CTRLB.FLMAP. */
 #define UPDI_FLASH_BASE      0x800000u
+
+/* AVR-Dx UPDI data-space addresses for non-FLASH NVM windows (Phase 8 —
+ * see HLR-046).  These are the SILICON addresses presented to the UPDI
+ * STS / LDS opcodes — i.e. what NVMCTRL actually decodes.  They are NOT
+ * the 0x8x0000-prefixed ELF VMAs that avr-gcc emits in `.eeprom`,
+ * `.user_signatures`, `.fuse`, `.lock`, `.signature` sections; see
+ * ELF_VMA_* below and `load_segments()` in main.c for the translation.
+ *
+ * Values cross-checked against Microchip pymcuprog device data for
+ * avr128da28 (Microchip.AVR-Dx_DFP 2.0.137).  Sizes are AVR128DA28
+ * defaults; the writers use these as upper bounds so over-large segments
+ * are rejected rather than silently truncated.                          */
+#define UPDI_EEPROM_BASE     0x001400u
+#define UPDI_EEPROM_SIZE     0x000200u  /* 512 B (AVR128DA28)            */
+#define UPDI_USERROW_BASE    0x001080u
+#define UPDI_USERROW_SIZE    0x000020u  /* 32 B                          */
+#define UPDI_FUSES_BASE      0x001050u
+#define UPDI_FUSES_SIZE      0x000010u  /* 16 B (9 used; rounded up)     */
+#define UPDI_LOCK_BASE       0x001040u
+#define UPDI_LOCK_SIZE       0x000004u  /* 4 lock bytes                  */
+#define UPDI_SIGROW_BASE     0x001100u
+#define UPDI_SIGROW_SIZE     0x000040u  /* 64 B signature row            */
+
+/* avr-libc AVR-Dx (avrxmega3 family) linker-script VMAs for non-FLASH
+ * ELF sections.  `load_segments()` recognises p_vaddr values in these
+ * bands and translates them to the corresponding silicon UPDI address
+ * (UPDI_*_BASE + offset-within-band) before dispatching to the writer.
+ * These bands are an ELF/toolchain convention, not silicon addresses. */
+#define ELF_VMA_EEPROM       0x810000u
+#define ELF_VMA_FUSES        0x820000u
+#define ELF_VMA_LOCK         0x830000u
+#define ELF_VMA_SIGROW       0x840000u
+#define ELF_VMA_USERROW      0x850000u
+#define ELF_VMA_BAND_MASK    0xFF0000u  /* top byte selects the band     */
+#define ELF_VMA_OFFSET_MASK  0x00FFFFu  /* low 16 bits are offset-in-band*/
+
+/* Lockbit value that disables UPDI access from the host (UPDIDIS pattern,
+ * AVR-Dx datasheet §6.3 — lockbits programmed to anything OTHER than
+ * 0x5CC5C55C disable UPDI on the next reset).  The conservative interlock
+ * in updi_nvm_write_lockbits() refuses any value that is NOT the unlock
+ * pattern unless --allow-lock-updi is set.                              */
+#define UPDI_LOCK_UNLOCKED   0x5CC5C55Cu
 
 /* SIB (System Information Block) read opcode: KEY family with SIB-direction
  * bit set and size selector = 32 bytes.  Issuing this opcode also wakes a
@@ -124,6 +168,24 @@ int  updi_ocd_clear_hw_bp(int fd, int idx);
 
 int  updi_nvm_write_flash(int fd, uint32_t word_addr, const uint8_t *data, size_t len);
 int  updi_nvm_flash_patch(int fd, uint32_t addr, const uint8_t *data, size_t len);
+
+/* ── Phase 8 — non-FLASH NVM programming (HLR-046, HLR-047) ─────────── */
+/* All four entry points expect addresses in the unified 24-bit UPDI
+ * address space (e.g. `UPDI_EEPROM_BASE + offset`).  They enter NVMPROG
+ * mode if not already entered (idempotent), program the requested bytes
+ * via NVMCTRL.CMD = EEERWR (0x13) with per-byte BUSY-clear polling, and
+ * return 0 on success or -1 on any failure.                            */
+int  updi_nvm_write_eeprom  (int fd, uint32_t addr, const uint8_t *data, size_t len);
+int  updi_nvm_write_userrow (int fd, uint32_t addr, const uint8_t *data, size_t len);
+int  updi_nvm_write_fuses   (int fd, uint32_t addr, const uint8_t *data, size_t len);
+
+/* Lockbits.  Returns `UPDI_ERR_LOCKED` if (a) the device is not in a
+ * post-chip-erase state (ASI_SYS_STATUS.LOCKSTATUS = 0 prerequisite is
+ * violated), or (b) the caller did not pass `allow_updi_disable` and the
+ * 4-byte payload is not the UPDI-unlock pattern (UPDI_LOCK_UNLOCKED).  */
+int  updi_nvm_write_lockbits(int fd, uint32_t addr, const uint8_t *data, size_t len,
+                             bool allow_updi_disable);
+
 int  updi_chip_erase(int fd);
 int  updi_console_poll(int fd, char *buf, size_t cap);
 
@@ -140,5 +202,61 @@ typedef struct {
 } UpdiDeviceInfo;
 
 int  updi_read_device_info(int fd, UpdiDeviceInfo *info);
+
+/* ── Multi-family runtime device map ──────────────────────────────────
+ * The compile-time `UPDI_*_BASE/_SIZE` macros above are the AVR-DA/DB
+ * defaults retained for backward compatibility (Unity tests still refer
+ * to them).  At runtime, `updi_select_device()` (called from main.c
+ * just after `updi_open()`) replaces these with a per-family map drawn
+ * from the static table in `updi.c`.  All NVM writers in updi.c and the
+ * ELF-band translator in main.c read the active map through
+ * `updi_get_device()`.
+ *
+ * The five supported families share the NVMCTRL v2 command set
+ * (FLWR=0x02, FLPER=0x08, EEERWR=0x13, CHER=0x20) and the same UPDI
+ * USERROW key sequence.  AVR-EA/AVR-EB use NVMCTRL v3 (different CMD
+ * bytes) and are intentionally NOT in the table — they will be added
+ * once their command set is wired up.
+ *
+ * Hardware-validation status: AVR-DA is exercised on bench silicon by
+ * the hw-test target (E1/E2/E3).  AVR-DB/DD/DU/SD are declared from
+ * datasheet evidence only and require `--force-device=<family>` to
+ * use, since their SIGROW location or memory map deviates from the
+ * autodetect probe path.                                              */
+typedef struct {
+    const char *family;          /* "AVR-DA", "AVR-DB", "AVR-DD",
+                                  *  "AVR-DU", "AVR-SD"                  */
+    uint32_t    userrow_base;
+    uint32_t    userrow_size;    /* also the page/commit row length      */
+    uint32_t    eeprom_base;
+    uint32_t    eeprom_size;
+    uint32_t    fuses_base;
+    uint32_t    fuses_size;
+    uint32_t    lock_base;
+    uint32_t    lock_size;
+    uint32_t    sigrow_base;
+    bool        hw_tested;       /* true ⇔ exercised on bench silicon    */
+} UpdiDeviceMap;
+
+/* Maximum USERROW row length across all supported families.  Used to
+ * size the stack buffer in `nvm_userrow_write()` so a single code path
+ * handles all five families.                                          */
+#define UPDI_USERROW_ROW_LEN_MAX  512u
+
+const UpdiDeviceMap *updi_get_device(void);
+
+/* Select the active per-family map.  If `force_family` is non-NULL it
+ * must match an entry's `family` string (case-insensitive) and the
+ * device is configured to that family without an autodetect probe.
+ * Otherwise the function reads SIGROW.DEVICEID[0..2] @ 0x1100 and
+ * matches against the autodetect list (currently AVR-DA / AVR-DB
+ * SIGROWs since those families place SIGROW at 0x1100).  Returns 0 on
+ * success, -1 with a diagnostic on the failure paths:
+ *
+ *   • unknown / unreadable SIGROW with no `--force-device`,
+ *   • `force_family` does not match any entry in the table,
+ *   • family identified as NVMCTRL v3 (AVR-EA / AVR-EB) — not yet
+ *     supported.                                                       */
+int  updi_select_device(int fd, const char *force_family);
 
 #endif /* AOD_UPDI_H */
