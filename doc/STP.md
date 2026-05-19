@@ -15,7 +15,7 @@ Snapshot: **115 test(s)** across
 
 ### 3.1. [tests/test_main.c](../tests/test_main.c)
 
-Role: **unit**. **15 test(s).**
+Role: **unit**. **25 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -34,10 +34,20 @@ Role: **unit**. **15 test(s).**
 | 13 | <a id="event_loop_exits_immediately_when_g_quit_is_1"></a>`event_loop_exits_immediately_when_g_quit_is_1` | `LLR-MAIN-06` | Set `g_quit = 1` before calling `event_loop()` and verify that the function returns immediately without calling `select()`. |
 | 14 | <a id="main_cleanup_closes_gdb_elf_updi_in_order"></a>`main_cleanup_closes_gdb_elf_updi_in_order` | `LLR-MAIN-07` | On a simulated clean shutdown, verify that `main()` calls `rsp_close(gdb_fd)`, `rsp_close(listen_fd)`, `elf_close()`, and `updi_close()` in that exact order, and returns exit code 0. |
 | 15 | <a id="main_calls_updi_enter_debug_after_updi_open_before_rsp_listen"></a>`main_calls_updi_enter_debug_after_updi_open_before_rsp_listen` | `LLR-MAIN-10` | Run `main()` with mocked `updi_open()`, `updi_enter_debug()`, and `rsp_listen()` recording call order. Verify (a) `updi_enter_debug()` is called exactly once after `updi_open()` succeeds and before `rsp_listen()`, and (b) when `updi_enter_debug()` returns non-zero, `main()` invokes the LLR-MAIN-07 teardown sequence and exits with code 1 without calling `rsp_listen()`. |
+| 16 | <a id="parse_args_allow_lock_updi_sets_flag"></a>`parse_args_allow_lock_updi_sets_flag` | `LLR-MAIN-11` | Call `parse_args()` with `--allow-lock-updi` present in argv and verify that the returned `AppConfig.allow_lock_updi` is `true`. |
+| 17 | <a id="parse_args_force_device_captures_family"></a>`parse_args_force_device_captures_family` | `LLR-MAIN-12` | Call `parse_args()` with `--force-device=AVR-DD` in argv and verify that `AppConfig.force_device` points to the string `"AVR-DD"`. |
+| 18 | <a id="parse_args_force_device_default_is_null"></a>`parse_args_force_device_default_is_null` | `LLR-MAIN-12` | Call `parse_args()` with no `--force-device` flag and verify that `AppConfig.force_device` defaults to `NULL` (autodetect path will be used). |
+| 19 | <a id="load_segments_dispatches_eeprom_segment_to_eeprom_writer"></a>`load_segments_dispatches_eeprom_segment_to_eeprom_writer` | `LLR-MAIN-11` | Build a one-segment ELF at vaddr `0x814000` size 8 and run `app_main(... --load ...)`. Verify wrapped `updi_nvm_write_eeprom` is called exactly once with `addr=0x814000` and `len=8`, while no other NVM writer is called. |
+| 20 | <a id="load_segments_dispatches_fuses_segment_to_fuses_writer"></a>`load_segments_dispatches_fuses_segment_to_fuses_writer` | `LLR-MAIN-11` | Build a one-segment ELF at vaddr `0x820004` size 2 and run `app_main(... --load ...)`. Verify wrapped `updi_nvm_write_fuses` is called exactly once with `addr=0x820004` and `len=2`. |
+| 21 | <a id="load_segments_dispatches_userrow_segment_to_userrow_writer"></a>`load_segments_dispatches_userrow_segment_to_userrow_writer` | `LLR-MAIN-11` | Build a one-segment ELF at vaddr `0x810080` size 16 and run `app_main(... --load ...)`. Verify wrapped `updi_nvm_write_userrow` is called exactly once with `addr=0x810080`. Regression test ensuring the classifier does not mis-route USERROW into the FLASH branch (the USERROW VMA lies between `UPDI_FLASH_BASE` and `UPDI_EEPROM_BASE`). |
+| 22 | <a id="load_segments_lock_requires_erase_else_exit_1"></a>`load_segments_lock_requires_erase_else_exit_1` | `LLR-MAIN-11` | Build a LOCK segment at vaddr `0x820040` size 4 and run `app_main(... --load ...)` WITHOUT `--erase`. Verify `app_main` returns 1 and that `updi_nvm_write_lockbits` was never called. |
+| 23 | <a id="load_segments_lock_with_erase_dispatches_to_lockbits_writer"></a>`load_segments_lock_with_erase_dispatches_to_lockbits_writer` | `LLR-MAIN-11` | Build a LOCK segment at vaddr `0x820040` size 4 and run `app_main(... --erase --load ...)`. Verify wrapped `updi_chip_erase` was called exactly once, then wrapped `updi_nvm_write_lockbits` was called exactly once with `addr=0x820040` and the recorded `allow_updi_disable` flag matching `cfg.allow_lock_updi` (false in this case). |
+| 24 | <a id="load_segments_sigrow_segment_is_skipped"></a>`load_segments_sigrow_segment_is_skipped` | `LLR-MAIN-11` | Build a SIGROW segment at vaddr `0x811080` size 4 and run `app_main(... --load ...)`. Verify NONE of the FLASH/EEPROM/USERROW/FUSES/LOCK writers were called and `app_main` returns 0. |
+| 25 | <a id="load_segments_unknown_window_returns_minus1"></a>`load_segments_unknown_window_returns_minus1` | `LLR-MAIN-11` | Build a segment at vaddr `0x830000` (outside every programmable UPDI window) and run `app_main(... --load ...)`. Verify `app_main` returns 1 (load failure) and that no NVM writer was called. |
 
 ### 3.2. [tests/test_updi.c](../tests/test_updi.c)
 
-Role: **unit**. **33 test(s).**
+Role: **unit**. **42 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -75,6 +85,15 @@ Role: **unit**. **33 test(s).**
 | 32 | <a id="updi_ocd_clear_hw_bp_clears_only_target_slot"></a>`updi_ocd_clear_hw_bp_clears_only_target_slot` | `LLR-UPDI-22` | After setting both BP0 and BP1, verify that `updi_ocd_clear_hw_bp(fd, idx=0)` clears only the BP0 enable bit in `CTRL1` (read-modify-write) and leaves BP1 armed. |
 | 33 | <a id="updi_console_poll_returns_pending_bytes_without_halting"></a>`updi_console_poll_returns_pending_bytes_without_halting` | `LLR-UPDI-11`, `LLR-UPDI-12` | Pre-stuff the master end of the PTY with 4 bytes and verify that `updi_console_poll()` returns 4 and copies the bytes to the output buffer without calling `updi_halt()`. |
 | 34 | <a id="updi_console_poll_returns_0_when_output_buffer_empty"></a>`updi_console_poll_returns_0_when_output_buffer_empty` | `LLR-UPDI-12` | With no data pending on the master end, verify that `updi_console_poll()` returns 0 in a non-blocking manner. |
+| 35 | <a id="updi_nvm_write_eeprom_rejects_addr_below_window"></a>`updi_nvm_write_eeprom_rejects_addr_below_window` | `LLR-UPDI-23` | Call `updi_nvm_write_eeprom(fd, UPDI_EEPROM_BASE - 1, data, 1)` and verify the function returns -1 without transmitting any bytes on the UPDI line (drain the master end and assert zero bytes captured). Confirms the EEPROM window guard rejects out-of-window addresses before any NVM activity. |
+| 36 | <a id="updi_nvm_write_eeprom_rejects_addr_above_window"></a>`updi_nvm_write_eeprom_rejects_addr_above_window` | `LLR-UPDI-23` | Call `updi_nvm_write_eeprom(fd, UPDI_EEPROM_BASE + UPDI_EEPROM_SIZE - 1, data, 2)` and verify the function returns -1: the second byte (at `UPDI_EEPROM_BASE + UPDI_EEPROM_SIZE`) lies past the EEPROM window. |
+| 37 | <a id="updi_nvm_write_fuses_rejects_len_exceeds_window"></a>`updi_nvm_write_fuses_rejects_len_exceeds_window` | `LLR-UPDI-25` | Call `updi_nvm_write_fuses(fd, UPDI_FUSES_BASE, data, UPDI_FUSES_SIZE + 1)` and verify the function returns -1: the payload extends one byte past the FUSES window. |
+| 38 | <a id="updi_nvm_write_userrow_rejects_zero_length"></a>`updi_nvm_write_userrow_rejects_zero_length` | `LLR-UPDI-24` | Call `updi_nvm_write_userrow(fd, UPDI_USERROW_BASE, NULL, 0)` and verify the function returns -1 without UPDI traffic. |
+| 39 | <a id="updi_nvm_write_lockbits_returns_locked_when_lockstatus_set"></a>`updi_nvm_write_lockbits_returns_locked_when_lockstatus_set` | `LLR-UPDI-26` | Pre-stuff the LDCS ASI_SYS_STATUS response with `0x02` (LOCKSTATUS asserted) and call `updi_nvm_write_lockbits(fd, UPDI_LOCK_BASE, unlock_pattern, 4, allow=true)`. Verify the function returns `UPDI_ERR_LOCKED` (-3) — even with the unlock pattern and `allow_updi_disable=true`, a locked device cannot be written. |
+| 40 | <a id="updi_nvm_write_lockbits_refuses_updidis_value_without_flag"></a>`updi_nvm_write_lockbits_refuses_updidis_value_without_flag` | `LLR-UPDI-26` | Pre-stuff the LDCS ASI_SYS_STATUS response with `0x00` (LOCKSTATUS clear, post-erase state) and call `updi_nvm_write_lockbits(fd, UPDI_LOCK_BASE, {0,0,0,0}, 4, allow=false)`. Verify the function returns `UPDI_ERR_LOCKED`: only the `UPDI_LOCK_UNLOCKED` (`0x5CC5C55C`) 4-byte pattern is accepted without `--allow-lock-updi`. |
+| 41 | <a id="updi_get_device_default_is_avrda"></a>`updi_get_device_default_is_avrda` | `LLR-UPDI-27` | Call `updi_get_device()` before any `updi_select_device()` invocation and verify the returned descriptor names AVR-DA, exposes the historical `UPDI_USERROW_BASE`/`UPDI_USERROW_SIZE` and `UPDI_EEPROM_BASE`/`UPDI_EEPROM_SIZE` constants, and has `hw_tested == true`. |
+| 42 | <a id="updi_select_device_force_avrdd_sets_active_descriptor"></a>`updi_select_device_force_avrdd_sets_active_descriptor` | `LLR-UPDI-27` | Call `updi_select_device(-1, "avr-dd")` (case-insensitive force path, no UPDI traffic). Verify the function returns 0, `updi_get_device()` now returns the AVR-DD descriptor (`userrow_size == 128`, `hw_tested == false`), then restore the AVR-DA default for subsequent tests. |
+| 43 | <a id="updi_select_device_unknown_family_returns_minus1"></a>`updi_select_device_unknown_family_returns_minus1` | `LLR-UPDI-27` | Call `updi_select_device(-1, "AVR-XYZ")` and verify the function returns -1 (unknown family name) without modifying the active descriptor. |
 
 ### 3.3. [tests/test_rsp.c](../tests/test_rsp.c)
 
@@ -258,6 +277,8 @@ verified by code review — see
 | `LLR-MAIN-08` | `main` | `HLR-044` | `parse_args_accepts_device_flag_without_elf_operand`, `parse_args_rejects_device_combined_with_load` |
 | `LLR-MAIN-09` | `main` | `HLR-044` | `run_device_mode_prints_report_to_stdout`, `device_mode_does_not_call_rsp_listen` |
 | `LLR-MAIN-10` | `main` | `HLR-010` | `main_calls_updi_enter_debug_after_updi_open_before_rsp_listen` |
+| `LLR-MAIN-11` | `main` | `HLR-004`, `HLR-046`, `HLR-047`, `HLR-048` | `parse_args_allow_lock_updi_sets_flag`, `load_segments_dispatches_eeprom_segment_to_eeprom_writer`, `load_segments_dispatches_fuses_segment_to_fuses_writer`, `load_segments_dispatches_userrow_segment_to_userrow_writer`, `load_segments_lock_requires_erase_else_exit_1`, `load_segments_lock_with_erase_dispatches_to_lockbits_writer`, `load_segments_sigrow_segment_is_skipped`, `load_segments_unknown_window_returns_minus1` |
+| `LLR-MAIN-12` | `main` | `HLR-048` | `parse_args_force_device_captures_family`, `parse_args_force_device_default_is_null` |
 | `LLR-UPDI-01` | `updi` | `HLR-006` | `updi_open_sets_8e2_raw_half_duplex_via_termios`, `updi_open_returns_minus1_on_device_open_failure` |
 | `LLR-UPDI-02` | `updi` | `HLR-006`, `HLR-036` | `updi_open_asserts_wake_byte_then_stcs_ctrlb`, `updi_open_restores_session_baud_after_break` |
 | `LLR-UPDI-03` | `updi` | `HLR-036` | `updi_open_issues_stcs_ctrla_and_ldcs_statusa`, `updi_open_retries_cold_start_3_times_on_no_ack`, `updi_open_returns_minus1_after_3_consecutive_link_failures` |
@@ -279,7 +300,12 @@ verified by code review — see
 | `LLR-UPDI-19` | `updi` | `HLR-014` | `updi_ocd_read_write_sreg_round_trip` |
 | `LLR-UPDI-20` | `updi` | `HLR-014` | `updi_ocd_read_write_sp_round_trip_little_endian`, `updi_ocd_read_write_pc_round_trip_32bit_le_byte_addr` |
 | `LLR-UPDI-21` | `updi` | `HLR-016` | `updi_ocd_set_hw_bp_writes_bp_addr_and_enables_ctrl1` |
+| `LLR-UPDI-23` | `updi` | `HLR-046`, `HLR-037` | `updi_nvm_write_eeprom_rejects_addr_below_window`, `updi_nvm_write_eeprom_rejects_addr_above_window` |
+| `LLR-UPDI-24` | `updi` | `HLR-046` | `updi_nvm_write_userrow_rejects_zero_length` |
+| `LLR-UPDI-25` | `updi` | `HLR-046` | `updi_nvm_write_fuses_rejects_len_exceeds_window` |
+| `LLR-UPDI-26` | `updi` | `HLR-047` | `updi_nvm_write_lockbits_returns_locked_when_lockstatus_set`, `updi_nvm_write_lockbits_refuses_updidis_value_without_flag` |
 | `LLR-UPDI-22` | `updi` | `HLR-016` | `updi_ocd_clear_hw_bp_clears_only_target_slot` |
+| `LLR-UPDI-27` | `updi` | `HLR-048`, `HLR-046` | `updi_get_device_default_is_avrda`, `updi_select_device_force_avrdd_sets_active_descriptor`, `updi_select_device_unknown_family_returns_minus1` |
 | `LLR-RSP-01` | `rsp` | `HLR-003`, `HLR-038` | `rsp_listen_sets_so_reuseaddr_before_bind`, `rsp_accept_sets_tcp_nodelay_on_client_socket` |
 | `LLR-RSP-02` | `rsp` | `HLR-013` | `rsp_recv_packet_discards_leading_ack_nak_bytes`, `rsp_recv_packet_sends_plus_on_valid_checksum`, `rsp_recv_packet_sends_minus_and_returns_minus1_on_bad_checksum` |
 | `LLR-RSP-03` | `rsp` | `HLR-014`, `HLR-026` | `on_read_regs_g_returns_78_char_hex_string`, `on_read_regs_g_places_pc_little_endian_at_positions_70_77`, `on_read_regs_non_active_thread_uses_fsm_register_frame` |
