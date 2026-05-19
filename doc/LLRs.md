@@ -39,6 +39,9 @@ Requirements for `main()`, `parse_args()`, and `event_loop()`. These functions o
 *   <a id="LLR-MAIN-09"></a>**LLR-MAIN-09** — When `cfg.device_info` is true, `main()` shall: (1) call `updi_open()`; (2) on success call `updi_read_device_info()`; (3) on success format and print to `stdout` a multi-line report containing `Serial device:`, `Baud rate:`, `Signature:` (3 hex bytes), `Family:` (looked up via a static `device_family[]` table indexed by signature \u2014 unknown signatures shall print `unknown device`), `Revision:`, `Serial:` (10 hex bytes), and `UPDI status: SYS_STATUS=0x.. KEY_STATUS=0x.. STATUSB=0x..`; (4) call `updi_close()` and return. The function shall **not** call `rsp_listen()`, `elf_find_avros_tables()`, `fsm_build_thread_list()`, or `event_loop()`. On any UPDI failure the function shall print a verbose diagnostic to `stderr` that names the failed step (e.g. `"updi-open"`, `"sigrow"`, `"sys-status"`) and return exit code 1.
     *Trace:* HLR-044 (Device-Signature Diagnostic Mode).
 
+*   <a id="LLR-MAIN-10"></a>**LLR-MAIN-10** — Before entering `event_loop()`, `main()` shall call `updi_enter_debug(cfg.updi_fd)`, after `updi_open()` and any optional `updi_nvm_write_flash()` (`--load`) steps and before `rsp_listen()`. A non-zero return shall be treated as a fatal initialisation failure and shall trigger the LLR-MAIN-07 teardown with exit code 1. This arms AVR-Dx OCD mode for the lifetime of the server so that all RSP `g`/`G`/`P`/`s`/`c`/`Z0`/`Z1` operations have a halted, OCD-addressable CPU register file available on first use.
+    *Trace:* HLR-010 (Execution Control).
+
 ## 3. src/updi.c — UPDI Physical Layer
 
 Requirements for all public functions in `src/updi.c`: link initialisation, memory access, execution control, NVM programming, and console bridging.
@@ -64,13 +67,13 @@ Requirements for all public functions in `src/updi.c`: link initialisation, memo
 *   <a id="LLR-UPDI-07"></a>**LLR-UPDI-07** — `updi_nvm_write_flash()` shall require `word_addr` to be aligned to a 512-byte FLASH page boundary and `len` to be a non-zero multiple of 512. It shall enter NVM programming mode by transmitting the `KEY` opcode (`0xE0`) with the 8-byte string `"NVMProg "`, asserting reset with `STCS ASI_RESET_REQ = 0x59`, releasing reset with `STCS ASI_RESET_REQ = 0x00`, then polling `ASI_SYS_STATUS` via LDCS for bit 3 (NVMPROG, mask `0x08`) up to 100 iterations (≈ 100 ms). For each page it shall write the page data via `updi_mem_write()`, write `0x03` (ERWP) to `NVMCTRL_CTRLA`, and poll `NVMCTRL_STATUS` bit 0 (BUSY) clear up to 20 iterations (≈ 20 ms). On exit it shall toggle `ASI_RESET_REQ` `0x59` then `0x00` to release the target. Timeout of either poll shall return -1; a `NVMCTRL_STATUS` WRERR (bit 2) shall return `UPDI_ERR_WP`.
     *Trace:* HLR-009 (FLASH Programming), HLR-037 (UPDI Operation Timeout Bounds).
 
-*   <a id="LLR-UPDI-08"></a>**LLR-UPDI-08** — `updi_halt()` is a Phase 2 stub. It shall return -1 unconditionally with no UART traffic. The full halt sequence (OCD register manipulation, STOPPED-bit polling) is part of the AVR On-Chip Debug specification and is implemented by the Phase 3 OCD layer.
+*   <a id="LLR-UPDI-08"></a>**LLR-UPDI-08** — `updi_halt()` shall halt the CPU by writing `ASI_OCD_CTRLA_STOP` (0x01) to `ASI_OCD_CTRLA` via STCS, then polling `ASI_OCD_STATUS` via LDCS for bit `ASI_OCD_STATUS_STOPPED` (0x01) set. The function shall return 0 once the STOPPED bit is observed and -1 on UPDI failure or if the bit does not become set within the LDCS poll budget.
     *Trace:* HLR-010 (Execution Control).
 
-*   <a id="LLR-UPDI-09"></a>**LLR-UPDI-09** — `updi_step()` is a Phase 2 stub. It shall return -1 unconditionally with no UART traffic. Single-step is implemented by the Phase 3 OCD layer.
+*   <a id="LLR-UPDI-09"></a>**LLR-UPDI-09** — `updi_step()` shall single-step the halted CPU by setting `OCD_CTRL0_STEP` (0x04) in `OCD_CTRL0` (UPDI byte address `0x0F88`) via STS, then writing `ASI_OCD_CTRLA_RUN` (0x02) to `ASI_OCD_CTRLA` via STCS to release the CPU for exactly one instruction, then polling `ASI_OCD_STATUS.STOPPED` until set. Returns 0 on success, -1 on UPDI failure.
     *Trace:* HLR-010 (Execution Control).
 
-*   <a id="LLR-UPDI-10"></a>**LLR-UPDI-10** — `updi_run()` is a Phase 2 stub. It shall return -1 unconditionally with no UART traffic. CPU resume is implemented by the Phase 3 OCD layer.
+*   <a id="LLR-UPDI-10"></a>**LLR-UPDI-10** — `updi_run()` shall resume the halted CPU by writing `ASI_OCD_CTRLA_RUN` (0x02) to `ASI_OCD_CTRLA` via STCS and shall return 0 immediately without polling — callers that need to wait for a subsequent halt shall use `updi_ocd_poll_halted()` directly. Returns -1 on UPDI failure.
     *Trace:* HLR-010 (Execution Control).
 
 *   <a id="LLR-UPDI-11"></a>**LLR-UPDI-11** — `updi_mem_read()` shall be callable while the target CPU is in the RUNNING state (not halted). The function shall not call `updi_halt()` internally, permitting non-intrusive SRAM sampling for the monitor sub-commands and console polling without interrupting firmware execution.
@@ -85,6 +88,30 @@ Requirements for all public functions in `src/updi.c`: link initialisation, memo
 *   <a id="LLR-UPDI-14"></a>**LLR-UPDI-14** — After each successful `LDCS ASI_STATUSA` link probe inside `updi_open()`, the function shall read the target's 32-byte System Information Block by transmitting `SYNCH` (`0x55`) followed by opcode `UPDI_OP_KEY_SIB` (`0xE6`) and reading exactly `UPDI_SIB_LEN` (32) bytes of response — looped over `read()` until the full block is collected. The SIB read serves two purposes: (1) it confirms the link end-to-end (target must be actively responding to return non-echo bytes), and (2) it wakes a target that was left in UPDI SLEEP from a prior debug session. Without this step a sleeping target will appear to accept every link-layer probe (STCS, LDCS) — those frames merely echo on the half-duplex line — yet reject every memory access, manifesting as `updi_mem_read()` returning -1 immediately after a successful `updi_open()`. avrdude's `serialupdi` issues this exact 32-byte SIB read on every connect; the response payload (e.g. `"    AVR P:2D:1-3M2 (A7.KV001.0)\0"`) is discarded by `updi_open()` since the caller currently only needs the wake side-effect. If the SIB read times out or returns fewer than 32 bytes the attempt shall be abandoned and the next cold-start attempt shall begin.
     *Trace:* HLR-006 (UPDI Hardware Connection), HLR-036 (UPDI Cold-Start Contention Handshake).
 
+*   <a id="LLR-UPDI-15"></a>**LLR-UPDI-15** — `updi_enter_debug()` shall arm the AVR-Dx OCD by transmitting the UPDI `KEY` opcode (`0xE0`) followed by the 8-byte key string `"OCD     "` (ASCII `0x20 0x20 0x20 0x20 0x20 0x44 0x43 0x4F` — `"OCD"` reversed and right-padded with spaces, per the AVR-Dx datasheet KEY-string LSB-first convention), then pulsing `ASI_RESET_REQ` with `0x59` followed by `0x00`, then polling `ASI_OCD_STATUS` for the STOPPED bit. It shall be called once per session by `main.c` after `updi_open()` and before `rsp_listen()`. Returns 0 on success, -1 on UPDI failure or if STOPPED is never observed.
+    *Trace:* HLR-010 (Execution Control).
+
+*   <a id="LLR-UPDI-16"></a>**LLR-UPDI-16** — `updi_ocd_poll_halted(fd, timeout_ms)` shall poll `ASI_OCD_STATUS` via LDCS at ≈1 ms intervals until either `ASI_OCD_STATUS_STOPPED` (0x01) is set or `timeout_ms` elapses. Returns 0 if STOPPED is observed, +1 if the deadline elapses with the CPU still running, and -1 on UPDI failure. The RSP `c` handler uses this primitive with a short (≈1 ms) deadline to multiplex OCD polling with select() on the GDB client socket.
+    *Trace:* HLR-010 (Execution Control), HLR-018 (Continue Execution).
+
+*   <a id="LLR-UPDI-17"></a>**LLR-UPDI-17** — `updi_ocd_read_halt_status(fd, *st0, *st1)` shall read the two OCD halt-cause bytes from `OCD_STATUS0` (`0x0F8C`) and `OCD_STATUS1` (`0x0F8D`) via UPDI LDS and store them in the caller's buffers. The bits in `OCD_STATUS1` distinguish the halt cause: `OCD_STATUS1_EXTBRK` (0x10) is set when the CPU halted due to an external break (STOP via STCS or Ctrl-C), `OCD_STATUS1_BP1`/`BP0STEP`/`SWBP`/`JMP`/`INT` indicate hardware-breakpoint/step/BREAK-opcode/change-of-flow/interrupt halts. Returns 0 on success, -1 on UPDI failure.
+    *Trace:* HLR-010 (Execution Control), HLR-018 (Continue Execution).
+
+*   <a id="LLR-UPDI-18"></a>**LLR-UPDI-18** — `updi_ocd_read_gpr(fd, n, *val)` and `updi_ocd_write_gpr(fd, n, val)` shall read or write byte register `r<n>` (`n` in `0..31`) via UPDI LDS/STS to `OCD_REGFILE + n` (`0x0FA0 + n`). The CPU must be halted; behaviour against a running CPU is undefined. Returns 0 on success, -1 on UPDI failure or out-of-range `n`.
+    *Trace:* HLR-014 (Register Read and Write).
+
+*   <a id="LLR-UPDI-19"></a>**LLR-UPDI-19** — `updi_ocd_read_sreg(fd, *val)` and `updi_ocd_write_sreg(fd, val)` shall read or write the AVR status register via UPDI LDS/STS to `OCD_SREG` (`0x0F9C`). The CPU must be halted. Returns 0 on success, -1 on UPDI failure.
+    *Trace:* HLR-014 (Register Read and Write).
+
+*   <a id="LLR-UPDI-20"></a>**LLR-UPDI-20** — `updi_ocd_read_sp(fd, *val)` and `updi_ocd_write_sp(fd, val)` shall read or write the 16-bit AVR stack pointer (little-endian SPL|SPH) via UPDI LDS/STS at `OCD_SP` (`0x0F98`). `updi_ocd_read_pc(fd, *byte_addr)` and `updi_ocd_write_pc(fd, byte_addr)` shall read or write the 16-bit OCD program-counter register at `OCD_PC` (`0x0F94`), converting between the silicon's word-aligned PC+1 storage and the GDB byte address — read shifts the stored 16-bit word left by one and subtracts the AVR `+1` post-increment; write performs the inverse. The CPU must be halted. Returns 0 on success, -1 on UPDI failure.
+    *Trace:* HLR-014 (Register Read and Write).
+
+*   <a id="LLR-UPDI-21"></a>**LLR-UPDI-21** — `updi_ocd_set_hw_bp(fd, idx, byte_addr)` shall program hardware breakpoint comparator `idx` (0 or 1) to the supplied AVR byte address by writing the 3-byte little-endian address to `OCD_BP0A` (`0x0F80`) for slot 0 or `OCD_BP1A` (`0x0F84`) for slot 1 via UPDI STS, then setting the matching `OCD_CTRL1_BP0` / `OCD_CTRL1_BP1` enable bit and the global `OCD_CTRL0_HWBP` enable bit. Returns 0 on success, -1 on UPDI failure or invalid `idx`.
+    *Trace:* HLR-016 (Breakpoints).
+
+*   <a id="LLR-UPDI-22"></a>**LLR-UPDI-22** — `updi_ocd_clear_hw_bp(fd, idx)` shall disable hardware breakpoint comparator `idx` (0 or 1) by clearing the matching `OCD_CTRL1_BP0` / `OCD_CTRL1_BP1` enable bit via UPDI LDS/STS read-modify-write on `OCD_CTRL1` (`0x0F89`). The function shall not clear the global `OCD_CTRL0_HWBP` bit (the other comparator may still be armed). Returns 0 on success, -1 on UPDI failure or invalid `idx`.
+    *Trace:* HLR-016 (Breakpoints).
+
 ## 4. src/gdb_rsp.c — GDB Remote Serial Protocol Server
 
 Requirements for RSP packet framing, dispatch, GDB packet handlers, session lifecycle, and socket configuration.
@@ -95,38 +122,38 @@ Requirements for RSP packet framing, dispatch, GDB packet handlers, session life
 *   <a id="LLR-RSP-02"></a>**LLR-RSP-02** — `rsp_recv_packet()` shall scan incoming bytes discarding pre-packet ACK/NAK characters until a `$` delimiter is received. It shall accumulate the payload with a running XOR checksum until `#` is received, then compare the computed checksum against the two ASCII-hex checksum bytes that follow. On match it shall write `+` to the socket and return the payload length; on mismatch it shall write `-` and return -1.
     *Trace:* HLR-013 (RSP Server Accessibility).
 
-*   <a id="LLR-RSP-03"></a>**LLR-RSP-03** — The `on_read_regs` handler for the `g` packet shall delegate to `fsm_get_registers()` for the currently selected virtual thread (stored in `RspContext.g_thread_p`, defaulting to the active FSM thread when zero or negative) and return the resulting 78-character hex string. The FSM mapper is responsible for placing R0-R31 at hex positions 0-63, SREG at 64-65, SPL at 66-67, SPH at 68-69, and PC as 4-byte little-endian at positions 70-77; live SREG/SP bytes for the active thread are read via `updi_mem_read()` from within `fsm_get_registers()`.
+*   <a id="LLR-RSP-03"></a>**LLR-RSP-03** — The `on_read_regs` handler for the `g` packet shall produce a 78-character hex string in GDB's AVR register-block layout: R0-R31 at hex positions 0-63, SREG at 64-65, SPL at 66-67, SPH at 68-69, and PC as 4-byte little-endian byte-address at positions 70-77. Reads against the active virtual thread — or against any thread when the FSM mapper has not identified one (e.g. `--load` without `--device`) — shall use the live OCD register file via `updi_ocd_read_gpr()`, `updi_ocd_read_sreg()`, `updi_ocd_read_sp()`, and `updi_ocd_read_pc()`. Reads against a non-active virtual thread shall delegate to `fsm_get_registers()` for the synthesized FSM register frame.
+    *Trace:* HLR-014 (Register Read and Write), HLR-026 (Virtual Thread Register Frame).
+
+*   <a id="LLR-RSP-04"></a>**LLR-RSP-04** — The `on_write_regs` handler shall accept both the full-register `G<78 hex>` and single-register `P<n>=<hex>` packets and shall route each register slot to the matching OCD writer: `updi_ocd_write_gpr()` for registers 0..31, `updi_ocd_write_sreg()` for register 32, `updi_ocd_write_sp()` for register 33 (little-endian 16-bit), and `updi_ocd_write_pc()` for register 34 (little-endian 32-bit byte-address). On success the handler shall reply `OK`; on any OCD failure or hex parse error it shall reply `E01`.
     *Trace:* HLR-014 (Register Read and Write).
 
-*   <a id="LLR-RSP-04"></a>**LLR-RSP-04** — The `on_write_regs` handler for the `G` packet and the single-register `P` handler shall write the supplied register values to the target's CPU register file via `updi_mem_write()` and return `OK` on success or an error reply on UPDI failure.
-    *Trace:* HLR-014 (Register Read and Write).
-
-*   <a id="LLR-RSP-05"></a>**LLR-RSP-05** — The `on_read_mem` handler for `m addr,len` shall call `updi_mem_read()` with the decoded address and length, and return the result as a hex string. Both FLASH and SRAM addresses shall be accepted; address-space routing is handled by `updi_mem_read()` based on the raw address value.
+*   <a id="LLR-RSP-05"></a>**LLR-RSP-05** — The `on_read_mem` handler for `m addr,len` shall translate the GDB unified-address `addr` to a UPDI physical address by flipping bit 23 (GDB FLASH at `< 0x800000` maps to UPDI `0x800000+`; GDB data space at `>= 0x800000` maps to UPDI `0x000000+`), then call `updi_mem_read()` and return the result as a hex string. Both FLASH and SRAM addresses shall be accepted.
     *Trace:* HLR-015 (Memory Read and Write).
 
-*   <a id="LLR-RSP-06"></a>**LLR-RSP-06** — The `on_write_mem` handler for `M addr,len:data` (hex-encoded) and `X addr,len:data` (binary-encoded) packets shall call `updi_mem_write()` for SRAM addresses and `updi_nvm_write_flash()` for FLASH addresses, returning `OK` on success or an error reply on failure.
+*   <a id="LLR-RSP-06"></a>**LLR-RSP-06** — The `on_write_mem` handler for `M addr,len:data` (hex-encoded) and `X addr,len:data` (binary-encoded) packets shall route by the GDB address space: writes with bit 23 set (data space) shall go to `updi_mem_write()` against the GDB-byte address with bit 23 cleared; writes with bit 23 clear (program space) shall go to `updi_nvm_write_flash()` against the GDB address OR'd with `UPDI_FLASH_BASE` (`0x800000`). Returns `OK` on success, `E01` on failure.
     *Trace:* HLR-015 (Memory Read and Write).
 
-*   <a id="LLR-RSP-07"></a>**LLR-RSP-07** — The `on_insert_bp` handler for `Z0 addr,kind` shall: (1) check the breakpoint table for an existing entry at the requested address; if not present, (2) read and save the 2-byte instruction word via `updi_mem_read()`, (3) write the AVR BREAK opcode (0x9598) via `updi_nvm_write_flash()`, and (4) return `OK`. A duplicate insert shall return `OK` without a second flash write.
-    *Trace:* HLR-016 (Software Breakpoints).
+*   <a id="LLR-RSP-07"></a>**LLR-RSP-07** — The `on_insert_bp` handler for `Z0` and `Z1` shall route both kinds to the same two AVR-Dx OCD hardware comparators tracked by `RspContext.hw_bp_addr[0..1]`. If the supplied address is already present in either slot the handler shall reply `OK` without re-programming silicon. Otherwise the handler shall find an empty slot (sentinel `0xFFFFFFFF`), call `updi_ocd_set_hw_bp()` with the GDB-byte address masked to 23 bits, record the address in the shadow, and reply `OK`. The handler shall not call `updi_nvm_write_flash()` — patching the AVR BREAK opcode into FLASH at runtime is incompatible with maintaining live OCD register state.
+    *Trace:* HLR-016 (Breakpoints).
 
-*   <a id="LLR-RSP-08"></a>**LLR-RSP-08** — The `on_remove_bp` handler for `z0 addr,kind` shall look up the requested address in the breakpoint table, restore the saved 2-byte instruction word via `updi_nvm_write_flash()`, remove the entry from the table, and return `OK`. If the address is not in the table, the handler shall return an error reply.
-    *Trace:* HLR-016 (Software Breakpoints).
+*   <a id="LLR-RSP-08"></a>**LLR-RSP-08** — The `on_remove_bp` handler for `z0` and `z1` shall locate the supplied address in `RspContext.hw_bp_addr[0..1]`, call `updi_ocd_clear_hw_bp()` for that slot, reset the slot to the empty sentinel, and reply `OK`. If the address is not present in either slot (e.g. the server has been restarted mid-session and lost the shadow) the handler shall reply `OK` rather than an error so a GDB resync after reconnect is non-fatal.
+    *Trace:* HLR-016 (Breakpoints).
 
-*   <a id="LLR-RSP-09"></a>**LLR-RSP-09** — When `on_insert_bp` is called and all `RSP_MAX_BREAKPOINTS` (16) breakpoint table slots are occupied, it shall not write to FLASH and shall return the GDB error reply `E08`.
-    *Trace:* HLR-016 (Software Breakpoints).
+*   <a id="LLR-RSP-09"></a>**LLR-RSP-09** — When `on_insert_bp` is called with both `RspContext.hw_bp_addr[]` slots occupied and the requested address does not match either slot, the handler shall not call `updi_ocd_set_hw_bp()` and shall reply with the GDB error packet `E08`. This surfaces the AVR-Dx two-comparator hardware limit to the user.
+    *Trace:* HLR-016 (Breakpoints).
 
-*   <a id="LLR-RSP-10"></a>**LLR-RSP-10** — The `on_step` handler for `s`/`vCont;s` shall call `updi_step()` and, on success, send a stop-reason packet of the form `T05thread:<active_thread_id>;` to the GDB client.
+*   <a id="LLR-RSP-10"></a>**LLR-RSP-10** — The `on_step` handler for `s`/`vCont;s` shall call `updi_step()`, invalidate the FSM thread cache, rebuild the thread list, and then reply with the stop-reason packet `T<sig>thread:<active_id>;` produced by the `on_halt_reason` handler. The signal returned by `signal_for_halt_status()` shall be `T02` (SIGINT) if `OCD_STATUS1.EXTBRK` is observed (e.g. the step landed back inside a software-halt window) and `T05` (SIGTRAP) otherwise.
     *Trace:* HLR-017 (Single-Step Execution).
 
-*   <a id="LLR-RSP-11"></a>**LLR-RSP-11** — The `on_continue` handler for `c`/`vCont;c` shall call `updi_run()` followed by `fsm_invalidate()`, then poll by calling `updi_halt()` until the CPU stops. On halt, it shall call `fsm_build_thread_list()` to rebuild the thread list and send a stop-reason packet to the GDB client.
+*   <a id="LLR-RSP-11"></a>**LLR-RSP-11** — The `on_continue` handler for `c`/`vCont;c` shall call `updi_run()` and `fsm_invalidate()`, then enter a poll loop that waits for either (a) a spontaneous CPU halt detected by `updi_ocd_poll_halted()` or (b) an async-interrupt byte (`\x03`) on the GDB client socket. The loop shall multiplex the two events using `select()` with a 5 ms timeout on the client socket; on socket-readable it shall consume one byte and break on `0x03`; on select-timeout it shall poll OCD with a 1 ms deadline. After the loop breaks the handler shall call `updi_halt()` to guarantee the CPU is stopped, rebuild the FSM thread list, and reply with `T02thread:<id>;` if Ctrl-C was received or `T05thread:<id>;` otherwise. The handler shall give up after `UPDI_FAIL_MAX` (8) consecutive `updi_ocd_poll_halted()` failures and reply `E01` rather than spinning indefinitely on a degraded UPDI link.
     *Trace:* HLR-018 (Continue Execution).
 
 *   <a id="LLR-RSP-12"></a>**LLR-RSP-12** — `rsp_dispatch()` shall handle the following packets inline without invoking any `RspHandlers` slot, because each response is a fixed string requiring no target interaction: `qSupported` (responds with `PacketSize=800;QStartNoAckMode+;multiprocess-;vContSupported+`), `qAttached` (responds `1`), `QStartNoAckMode` (calls `rsp_set_noack(true)` and responds `OK`), and `vCont?` (responds `vCont;c;s`).
     *Trace:* HLR-019 (RSP Capability Negotiation and Lifecycle).
 
-*   <a id="LLR-RSP-13"></a>**LLR-RSP-13** — The `on_detach` handler for the `D` packet shall call `updi_run()` to resume the target, close the GDB client socket, reset `cfg->gdb_fd` to -1, and allow the event loop to re-enter the listening state. The server process shall not exit.
-    *Trace:* HLR-019 (RSP Capability Negotiation and Lifecycle).
+*   <a id="LLR-RSP-13"></a>**LLR-RSP-13** — The `on_detach` handler for the `D` packet shall release both AVR-Dx OCD hardware-breakpoint comparators by calling `updi_ocd_clear_hw_bp()` for every occupied `RspContext.hw_bp_addr[]` slot and resetting the shadow to the empty sentinel, then call `updi_run()` to resume the target, send the `OK` reply, close the GDB client socket, and reset `*ctx->gdb_fd_p` to -1 so the event loop re-enters the listening state. The server process shall not exit. Without the comparator cleanup, BP0/BP1 remain armed in silicon and the next GDB session inherits stale breakpoints from the previous client.
+    *Trace:* HLR-016 (Breakpoints), HLR-019 (RSP Capability Negotiation and Lifecycle).
 
 *   <a id="LLR-RSP-14"></a>**LLR-RSP-14** — The `on_detach` handler for the `k` (kill) packet shall set `g_quit = 1` to cause the event loop to exit, triggering the full resource teardown sequence defined by LLR-MAIN-07.
     *Trace:* HLR-019 (RSP Capability Negotiation and Lifecycle), HLR-035 (Graceful Shutdown and Resource Release).
@@ -136,6 +163,12 @@ Requirements for RSP packet framing, dispatch, GDB packet handlers, session life
 
 *   <a id="LLR-RSP-16"></a>**LLR-RSP-16** — The `H` (set-thread) packet handler shall store the requested GDB thread ID in the session context and use it to select the virtual thread for subsequent `g`/`G`/`P` register operations. Thread ID -1 (all threads) and 0 (any thread) shall both be interpreted as selecting the active FSM thread.
     *Trace:* HLR-025 (Active Thread Identification).
+
+*   <a id="LLR-RSP-17"></a>**LLR-RSP-17** — The `signal_for_halt_status()` helper shall read `OCD_STATUS0`/`OCD_STATUS1` via `updi_ocd_read_halt_status()` and return the stop-signal string `"T02"` (SIGINT) if `OCD_STATUS1_EXTBRK` (0x10) is set in `OCD_STATUS1`, or `"T05"` (SIGTRAP) otherwise (covering hardware-breakpoint match, BREAK opcode, single-step, change-of-flow, and interrupt halts). On OCD read failure the helper shall default to `"T05"` so a degraded link still surfaces a non-empty stop reason to GDB.
+    *Trace:* HLR-017 (Single-Step Execution), HLR-018 (Continue Execution).
+
+*   <a id="LLR-RSP-18"></a>**LLR-RSP-18** — The `hw_bp_clear_all(ctx)` helper shall iterate `ctx->hw_bp_addr[0..1]` and, for every slot not equal to the empty sentinel (`0xFFFFFFFF`), call `updi_ocd_clear_hw_bp()` and reset the slot. It shall be called by `on_detach` for the `D` packet to guarantee the silicon comparators are released before the target is resumed.
+    *Trace:* HLR-016 (Breakpoints), HLR-019 (RSP Capability Negotiation and Lifecycle).
 
 ## 5. src/elf_parser.c — ELF Binary Parser
 

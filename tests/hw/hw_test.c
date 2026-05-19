@@ -541,6 +541,10 @@ static int tcp_connect_retry(int port, int retries_ms)
     return -1;
 }
 
+/* Single-shot select-then-read with millisecond timeout.  Retained for
+ * future cases that need a one-byte probe; D2/D3 use read_rsp_packet()
+ * instead so they drain the full server reply.                          */
+__attribute__((unused))
 static ssize_t read_with_timeout(int fd, void *buf, size_t cap, int timeout_ms)
 {
     fd_set r;
@@ -551,6 +555,62 @@ static ssize_t read_with_timeout(int fd, void *buf, size_t cap, int timeout_ms)
     return read(fd, buf, cap);
 }
 
+/* Read bytes from fd into buf until a full RSP packet ('$' ... '#' XX XX)
+ * has been seen, the buffer fills, or timeout_ms elapses with no further
+ * progress.  Returns the number of bytes accumulated (0 on timeout-with-
+ * nothing, >0 otherwise).
+ *
+ * Unlike read_with_timeout(), this drains all bytes that the server has
+ * queued — necessary because select() may wake on the lone '+' ack that
+ * precedes the packet, and a single read() would consume only the ack.  */
+static ssize_t read_rsp_packet(int fd, char *buf, size_t cap, int timeout_ms)
+{
+    size_t got = 0;
+    int    have_dollar = 0;
+    int    have_hash = 0;
+    size_t after_hash = 0;
+    double t0 = now_ms();
+    while (got + 1 < cap) {
+        int remain = timeout_ms - (int)(now_ms() - t0);
+        if (remain <= 0) break;
+        fd_set r;
+        FD_ZERO(&r); FD_SET(fd, &r);
+        struct timeval tv = { remain / 1000, (remain % 1000) * 1000 };
+        int sel = select(fd + 1, &r, NULL, NULL, &tv);
+        if (sel <= 0) break;
+        ssize_t n = read(fd, buf + got, cap - 1 - got);
+        if (n <= 0) break;
+        for (ssize_t i = 0; i < n; ++i) {
+            char c = buf[got + (size_t)i];
+            if (!have_dollar) {
+                if (c == '$') have_dollar = 1;
+            } else if (!have_hash) {
+                if (c == '#') have_hash = 1;
+            } else {
+                ++after_hash;
+            }
+        }
+        got += (size_t)n;
+        if (have_dollar && have_hash && after_hash >= 2) break;
+    }
+    buf[got] = 0;
+    return (ssize_t)got;
+}
+
+/* Best-effort drain of any pending bytes on the socket (non-blocking). */
+static void drain_socket(int fd)
+{
+    char tmp[256];
+    for (;;) {
+        fd_set r;
+        FD_ZERO(&r); FD_SET(fd, &r);
+        struct timeval tv = { 0, 10 * 1000 };  /* 10 ms */
+        if (select(fd + 1, &r, NULL, NULL, &tv) <= 0) return;
+        ssize_t n = read(fd, tmp, sizeof tmp);
+        if (n <= 0) return;
+    }
+}
+
 static void run_groupD(const HwCfg *cfg)
 {
     char why[160];
@@ -558,12 +618,15 @@ static void run_groupD(const HwCfg *cfg)
     if (!cfg->with_rsp) {
         report_skip("D1", "RSP TCP accept",         "opt-in via --with-rsp");
         report_skip("D2", "RSP qSupported reply",   "opt-in via --with-rsp");
+        report_skip("D3", "RSP Ctrl-C interrupt",   "opt-in via --with-rsp");
         return;
     }
     if (!cfg->elf_path || access(cfg->elf_path, R_OK) != 0) {
         report_skip("D1", "RSP TCP accept",
                     "no readable --elf supplied (HW_TEST_ELF)");
         report_skip("D2", "RSP qSupported reply",
+                    "no readable --elf supplied (HW_TEST_ELF)");
+        report_skip("D3", "RSP Ctrl-C interrupt",
                     "no readable --elf supplied (HW_TEST_ELF)");
         return;
     }
@@ -599,6 +662,7 @@ static void run_groupD(const HwCfg *cfg)
         report_fail("D1", "RSP TCP accept", why);
         kill(child, SIGTERM); waitpid(child, NULL, 0);
         report_skip("D2", "RSP qSupported reply", "D1 failed");
+        report_skip("D3", "RSP Ctrl-C interrupt", "D1 failed");
         return;
     }
     report_pass("D1", "RSP TCP accept", now_ms() - t0);
@@ -610,19 +674,61 @@ static void run_groupD(const HwCfg *cfg)
         report_fail("D2", "RSP qSupported reply", "write failed");
     } else {
         char buf[512];
-        ssize_t n = read_with_timeout(sock, buf, sizeof buf - 1, 1500);
+        ssize_t n = read_rsp_packet(sock, buf, sizeof buf, 1500);
         if (n <= 0) {
             report_fail("D2", "RSP qSupported reply", "no reply within 1500 ms");
         } else {
-            buf[n] = 0;
             /* Expect at minimum a '$' framing the response.               */
-            if (memchr(buf, '$', n) != NULL)
+            if (memchr(buf, '$', (size_t)n) != NULL)
                 report_pass("D2", "RSP qSupported reply", now_ms() - t0);
             else
                 report_fail("D2", "RSP qSupported reply",
                             "no '$' in response");
         }
     }
+
+    /* D3: Ctrl-C async interrupt mid-continue.                            *
+     * Resume the CPU with '+$c#63', wait briefly so the OCD halt-poll     *
+     * loop in dh_continue is actually running, then inject a raw ETX      *
+     * (\x03) byte.  The server should halt the CPU and reply with a stop *
+     * packet using SIGINT (T02) rather than SIGTRAP (T05).                */
+    drain_socket(sock);   /* discard any bytes still queued from D2  */
+    t0 = now_ms();
+    static const char go[] = "+$c#63";   /* '+' acks the qSupported reply  */
+    if (write(sock, go, sizeof go - 1) != (ssize_t)(sizeof go - 1)) {
+        report_fail("D3", "RSP Ctrl-C interrupt", "write 'c' packet failed");
+    } else {
+        /* Give the CPU ~50 ms of run-time before interrupting so the     *
+         * test exercises the running-then-interrupted path (not the      *
+         * race where the halt poll fires before our \x03 arrives).       */
+        struct timespec ts = { 0, 50L * 1000L * 1000L };
+        nanosleep(&ts, NULL);
+
+        const char etx = '\x03';
+        if (write(sock, &etx, 1) != 1) {
+            report_fail("D3", "RSP Ctrl-C interrupt", "write ETX failed");
+        } else {
+            char buf[256];
+            ssize_t n = read_rsp_packet(sock, buf, sizeof buf, 1500);
+            if (n <= 0) {
+                report_fail("D3", "RSP Ctrl-C interrupt",
+                            "no stop packet within 1500 ms");
+            } else {
+                /* The server prefixes its reply with '+'; skip ahead to  *
+                 * the framing '$' and check the signal code.            */
+                const char *p = memchr(buf, '$', (size_t)n);
+                if (p && (n - (p - buf)) >= 4 && memcmp(p, "$T02", 4) == 0) {
+                    report_pass("D3", "RSP Ctrl-C interrupt", now_ms() - t0);
+                } else {
+                    snprintf(why, sizeof why,
+                             "expected $T02..., got %.*s",
+                             (int)(n > 40 ? 40 : (int)n), buf);
+                    report_fail("D3", "RSP Ctrl-C interrupt", why);
+                }
+            }
+        }
+    }
+
     close(sock);
     kill(child, SIGTERM);
     waitpid(child, NULL, 0);

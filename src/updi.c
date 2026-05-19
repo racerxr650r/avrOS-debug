@@ -3,6 +3,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <sys/select.h>
 #include <sys/time.h>
 #include <termios.h>
@@ -10,14 +11,23 @@
 #include <unistd.h>
 
 /* ── UPDI opcode constants (datasheet §35.3.3, Fig. 35-6) ─────────────── */
+#define UPDI_OP_LDS_24_8     0x08u   /* LDS  addr=24b, data= 8b               */
+#define UPDI_OP_STS_24_8     0x48u   /* STS  addr=24b, data= 8b               */
 #define UPDI_OP_ST_PTR_WORD  0x69u   /* ST  pointer-reg, addr size = word (16b) */
 #define UPDI_OP_ST_PTR_LONG  0x6Au   /* ST  pointer-reg, addr size = long (24b) */
 #define UPDI_OP_LD_PTR_INC   0x24u   /* LD  rd, *(ptr++)  size B = byte      */
 #define UPDI_OP_ST_PTR_INC   0x64u   /* ST  *(ptr++), rr  size B = byte      */
+#define UPDI_OP_ST_PTR_INC_W 0x65u   /* ST  *(ptr++), rr  size W = word      */
 #define UPDI_OP_REPEAT       0xA0u   /* REPEAT count      size B = byte      */
 #define UPDI_OP_LDCS_PREFIX  0x80u   /* LDCS cs : 0x80 | cs                  */
 #define UPDI_OP_STCS_PREFIX  0xC0u   /* STCS cs : 0xC0 | cs                  */
 #define UPDI_OP_KEY          0xE0u   /* KEY (64-bit key payload)             */
+
+/* CTRLA values used during bulk page-buffer programming (matches avrdude).  *
+ *   RSD_ON:  bit3 RSD=1 (Response Signature Disable) + GTVAL=6              *
+ *   RSD_OFF: bit3 RSD=0                              + GTVAL=6              */
+#define UPDI_CTRLA_RSD_ON    0x0Eu
+#define UPDI_CTRLA_RSD_OFF   0x06u
 
 /* ── ASI control / status bit positions (datasheet §35.5.9) ────────────── */
 #define ASI_SYS_STATUS_NVMPROG 0x08u /* bit 3 — NVM programming active       */
@@ -29,14 +39,17 @@
 #define ASI_RESET_REQ_RUN    0x00u   /* clear reset                          */
 #define ASI_RESET_REQ_RESET  0x59u   /* assert system reset                  */
 
-/* ── NVMCTRL register map / bits / sizing ──────────────────────────────── */
+/* ── NVMCTRL register map / bits / sizing (AVR-Dx, per Atmel.AVR-Dx_DFP) ── */
 #define NVMCTRL_CTRLA        0x1000u
 #define NVMCTRL_STATUS       0x1002u
-#define NVMCTRL_CMD_ERWP     0x03u   /* erase + write page                   */
-#define NVMCTRL_STATUS_BUSY  0x01u   /* bit 0 = BUSY                         */
-#define NVMCTRL_STATUS_WRERR 0x04u   /* bit 2 = WRERROR                      */
+#define NVMCTRL_CMD_NOCMD    0x00u   /* clear pending command                */
+#define NVMCTRL_CMD_FLWR     0x02u   /* program page buffer to FLASH         */
+#define NVMCTRL_CMD_FLPER    0x08u   /* erase one FLASH page                 */
+#define NVMCTRL_CMD_CHER     0x20u   /* chip erase (full FLASH)              */
+#define NVMCTRL_STATUS_FBUSY 0x01u   /* bit 0 = FLASH busy                   */
+#define NVMCTRL_STATUS_EEBUSY 0x02u  /* bit 1 = EEPROM busy                  */
 
-#define UPDI_FLASH_PAGE_SIZE 512u
+/* UPDI_FLASH_PAGE_SIZE is declared in updi.h */
 
 /* ── poll counts (each iteration = 1 ms via nanosleep) ─────────────────── */
 #define UPDI_NVMPROG_POLL_MAX    100   /* 100 ms */
@@ -163,6 +176,110 @@ static int updi_send_repeat(int fd, uint8_t count_m1)
 {
     uint8_t frame[3] = { UPDI_SYNCH, UPDI_OP_REPEAT, count_m1 };
     return updi_write_bytes(fd, frame, sizeof(frame));
+}
+
+/*
+ * Enter NVMPROG mode (datasheet §35.3.7.2 steps 2-7).
+ *
+ * Sends the 8-byte "NVMProg " KEY (LSB-first), pulses ASI_RESET_REQ to
+ * latch the key, then polls ASI_SYS_STATUS.NVMPROG (bit 3) until set.
+ *
+ * Holding the target in NVMPROG keeps the CPU halted, which is required
+ * any time the host needs reliable repeated memory accesses — otherwise
+ * a target running firmware that enters SLEEP (e.g. `_exit` → `cli; sleep`
+ * on a bare-metal fixture) will fail every UPDI read after the initial
+ * cold-start handshake.  Both avrdude's serialupdi and pymcuprog enter
+ * NVMPROG before any user-visible memory access for exactly this reason.
+ *
+ * Returns 0 on success, -1 on I/O error or timeout.
+ */
+static int updi_enter_nvmprog(int fd)
+{
+    static const uint8_t key_cmd[10] = {
+        UPDI_SYNCH, UPDI_OP_KEY,
+        /* "NVMProg ", LSB-first per datasheet §35.3.3.13 */
+        ' ', 'g', 'o', 'r', 'P', 'M', 'V', 'N'
+    };
+    struct timespec ts = { 0, 1000000L };   /* 1 ms */
+    int last_status = -1;
+
+    /* Idempotency guard.  Re-issuing the NVMPROG key while the chip is
+     * already in NVMPROG resets out of NVMPROG without re-latching the
+     * key (observed empirically: SYS_STATUS=0x82 sticks indefinitely).
+     * Avrdude only enters NVMPROG once per session for the same reason. */
+    {
+        int s = updi_ldcs(fd, ASI_SYS_STATUS);
+        if (s >= 0 && (s & ASI_SYS_STATUS_NVMPROG))
+            return 0;
+    }
+
+    if (updi_write_bytes(fd, key_cmd, sizeof(key_cmd)) < 0)
+        return -1;
+    if (updi_stcs(fd, ASI_RESET_REQ, ASI_RESET_REQ_RESET) < 0)
+        return -1;
+    if (updi_stcs(fd, ASI_RESET_REQ, ASI_RESET_REQ_RUN) < 0)
+        return -1;
+
+    for (int i = 0; i < UPDI_NVMPROG_POLL_MAX; i++) {
+        int s = updi_ldcs(fd, ASI_SYS_STATUS);
+        if (s < 0)
+            return -1;
+        last_status = s;
+        if (s & ASI_SYS_STATUS_NVMPROG)
+            return 0;
+        nanosleep(&ts, NULL);
+    }
+    fprintf(stderr,
+            "updi_enter_nvmprog: NVMPROG bit never set (last SYS_STATUS=0x%02x)\n",
+            last_status & 0xFF);
+    return -1;
+}
+
+/*
+ * LDS (24-bit address, 8-bit data): direct single-byte load from any
+ * 24-bit physical address.  Wire: SYNCH, 0x08, addr_lo, addr_mid, addr_hi.
+ * Target responds with one data byte.  Used for NVMCTRL / SIGROW access
+ * where avrdude's serialupdi uses LDS rather than ST_PTR+LD_PTR_INC.
+ */
+static int updi_lds8(int fd, uint32_t addr, uint8_t *out)
+{
+    uint8_t frame[5] = {
+        UPDI_SYNCH, UPDI_OP_LDS_24_8,
+        (uint8_t)( addr        & 0xFFu),
+        (uint8_t)((addr >>  8) & 0xFFu),
+        (uint8_t)((addr >> 16) & 0xFFu),
+    };
+    if (updi_write_bytes(fd, frame, sizeof(frame)) < 0)
+        return -1;
+    if (read(fd, out, 1) != (ssize_t)1)
+        return -1;
+    return 0;
+}
+
+/*
+ * STS (24-bit address, 8-bit data): direct single-byte store to any
+ * 24-bit physical address.  Wire: SYNCH, 0x48, addr_lo, addr_mid, addr_hi;
+ * target ACKs; then send data byte; target ACKs.  Used for NVMCTRL writes.
+ */
+static int updi_sts8(int fd, uint32_t addr, uint8_t val)
+{
+    uint8_t frame[5] = {
+        UPDI_SYNCH, UPDI_OP_STS_24_8,
+        (uint8_t)( addr        & 0xFFu),
+        (uint8_t)((addr >>  8) & 0xFFu),
+        (uint8_t)((addr >> 16) & 0xFFu),
+    };
+    uint8_t ack;
+
+    if (updi_write_bytes(fd, frame, sizeof(frame)) < 0)
+        return -1;
+    if (read(fd, &ack, 1) != (ssize_t)1 || ack != UPDI_ACK)
+        return -1;
+    if (updi_write_bytes(fd, &val, 1) < 0)
+        return -1;
+    if (read(fd, &ack, 1) != (ssize_t)1 || ack != UPDI_ACK)
+        return -1;
+    return 0;
 }
 
 /* ── public API ─────────────────────────────────────────────────────────── */
@@ -348,6 +465,26 @@ int updi_open(const char *device, int baud)
         if (rc < 0) continue;
 
         /*
+         * Issue a full system-reset pulse to clear any latched mode
+         * (NVMPROG, OCD, UROWPROG, etc.) from a prior session.  This
+         * matches avrdude's "device in reset status, trying to release
+         * it" recovery in -vvvv traces, except that we do it
+         * unconditionally — empirically the chip can be left with
+         * SYS_STATUS bit 7 set after an aborted debug session and
+         * refuses NVMPROG entry until reset is re-pulsed.
+         *
+         *   STCS 0x59 → ASI_RESET_REQ   ; assert reset
+         *   STCS 0x00 → ASI_RESET_REQ   ; release reset
+         *
+         * Both writes are harmless on a chip that is not already in
+         * reset.  See doc/reference/guesswork.md §ASI_RESET_REQ.
+         */
+        rc = updi_stcs(fd, ASI_RESET_REQ, ASI_RESET_REQ_RESET);
+        if (rc < 0) continue;
+        rc = updi_stcs(fd, ASI_RESET_REQ, 0x00u);
+        if (rc < 0) continue;
+
+        /*
          * Wake the target from UPDI SLEEP if necessary.  Reading the
          * 16-byte System Information Block (SYNCH + 0xE6, then 16
          * response bytes) is harmless on an awake target and reliably
@@ -374,6 +511,19 @@ int updi_open(const char *device, int baud)
             if (!ok) continue;
         }
 
+        /*
+         * Enter NVMPROG to halt the CPU.  This prevents target firmware
+         * that immediately enters SLEEP after `main()` returns (or any
+         * other power-management code path) from making subsequent UPDI
+         * memory reads time out.  We do this unconditionally because
+         * even an erased target benefits (its execution of 0xFFFF =
+         * undefined opcode is unpredictable) and the chip-erase /
+         * NVM-write paths re-issue the NVMPROG key anyway, which is
+         * idempotent.
+         */
+        if (updi_enter_nvmprog(fd) < 0)
+            continue;
+
         return fd;
     }
 
@@ -385,6 +535,21 @@ void updi_close(int fd)
 {
     if (fd < 0)
         return;
+    /* Avrdude-style clean exit (verified by -vvvv trace):
+     *
+     *   STCS 0x59 → ASI_RESET_REQ   ; assert system reset
+     *   STCS 0x00 → ASI_RESET_REQ   ; release — chip exits NVMPROG/OCD
+     *   STCS 0x0C → ASI_CTRLB       ; UPDIDIS + CCDETDIS (link teardown)
+     *
+     * The reset pulse clears any latched NVMPROG/OCD mode so the next
+     * --open does not see SYS_STATUS with stale bits set (notably the
+     * 0x82 we observed after a debug session, which blocked NVMPROG
+     * entry).  Errors are intentionally ignored — close() must succeed
+     * even if the target stopped responding.                          */
+    (void)updi_stcs(fd, ASI_RESET_REQ, ASI_RESET_REQ_RESET);
+    (void)updi_stcs(fd, ASI_RESET_REQ, ASI_RESET_REQ_RUN);
+    (void)updi_stcs(fd, ASI_CTRLB,
+                    (uint8_t)(ASI_CTRLB_CCDETDIS | 0x04u /* UPDIDIS */));
     tcdrain(fd);
     close(fd);
 }
@@ -479,97 +644,548 @@ int updi_mem_write(int fd, uint32_t addr, const uint8_t *buf, size_t len)
     return 0;
 }
 
-/* ── CPU halt / single-step / run: deferred to Phase 3 (OCD layer) ────── *
+/* ── CPU halt / single-step / run — OCD implementation ────────────────── *
  *                                                                         *
- * Datasheet §35.5 does not define halt/step/run bits in ASI register      *
- * space.  These operations live in the OCD register space which is        *
- * documented separately.  The API is retained so higher layers can link,  *
- * but every call returns -1 until the OCD layer is implemented.           */
+ * The AVR-Dx exposes CPU debug control via an On-Chip Debugger (OCD)      *
+ * peripheral that is NOT publicly documented by Microchip.  The register  *
+ * map used below is the community-reverse-engineered consensus captured   *
+ * in doc/reference/guesswork.md, which has been independently verified    *
+ * against open-source debuggers Bloom and pyavrdebug.                     *
+ *                                                                         *
+ * OCD lives in TWO addressing spaces:                                     *
+ *   • ASI CS-space @ 0x04/0x05/0x0D — accessed via LDCS/STCS              *
+ *     (link-layer, available without halting the CPU).                    *
+ *   • Memory-mapped @ 0x0F80+      — accessed via LDS/STS                 *
+ *     (peripheral block, valid only while CPU is halted).                 *
+ *                                                                         *
+ * Activation requires a separate key handshake ('OCD     ') analogous to  *
+ * the NVMPROG key.  After the key is latched and a system-reset pulse is  *
+ * issued, the chip enters OCD mode and (because SOR_DIS defaults to 0)    *
+ * halts at the reset vector with STOPPED set in ASI_OCD_STATUS.           */
 
-int updi_halt(int fd) { (void)fd; return -1; }
-int updi_run(int fd)  { (void)fd; return -1; }
-int updi_step(int fd) { (void)fd; return -1; }
-
-int updi_nvm_write_flash(int fd, uint32_t word_addr, const uint8_t *data,
-                         size_t len)
+/* Send the 8-byte OCD activation key.  LSB-first per UPDI §35.3.3.13;
+ * the bytes on the wire are the reverse of the ASCII string "OCD     ". */
+static int updi_send_ocd_key(int fd)
 {
     static const uint8_t key_cmd[10] = {
         UPDI_SYNCH, UPDI_OP_KEY,
-        'N', 'V', 'M', 'P', 'r', 'o', 'g', ' '    /* 8-byte NVM key */
+        /* "OCD     " reversed = "     DCO" */
+        ' ', ' ', ' ', ' ', ' ', 'D', 'C', 'O'
     };
-    struct timespec ts = { 0, 1000000L };
-    size_t          n_pages;
-    size_t          pg;
-    int             ready;
+    return updi_write_bytes(fd, key_cmd, sizeof(key_cmd));
+}
 
-    if ((word_addr % UPDI_FLASH_PAGE_SIZE) != 0u ||
-        len == 0u || (len % UPDI_FLASH_PAGE_SIZE) != 0u)
+/*
+ * Enter OCD (debug) mode.
+ *
+ *   1. KEY 'OCD     ' (LSB-first)
+ *   2. Pulse ASI_RESET_REQ: 0x59 → 0x00
+ *   3. Poll ASI_OCD_STATUS.STOPPED until set (CPU halted at reset vector)
+ *
+ * Once halted, the OCD memory-mapped registers at 0x0F80+ are accessible
+ * via standard LDS/STS, and CPU run/halt/step is driven from ASI CS 0x04.
+ *
+ * Returns 0 on success, -1 on I/O error or timeout.
+ */
+int updi_enter_debug(int fd)
+{
+    struct timespec ts = { 0, 1000000L };   /* 1 ms */
+    int last = -1;
+
+    if (updi_send_ocd_key(fd) < 0)
         return -1;
-
-    /* 1. Send NVMPROG KEY (datasheet §35.3.7.2 step 2) */
-    if (updi_write_bytes(fd, key_cmd, sizeof(key_cmd)) < 0)
-        return -1;
-
-    /* 2. Assert system reset, then clear it (steps 4-5) */
     if (updi_stcs(fd, ASI_RESET_REQ, ASI_RESET_REQ_RESET) < 0)
         return -1;
     if (updi_stcs(fd, ASI_RESET_REQ, ASI_RESET_REQ_RUN) < 0)
         return -1;
 
-    /* 3. Poll ASI_SYS_STATUS.NVMPROG (bit 3) until set (steps 6-7)        */
-    ready = 0;
-    for (int i = 0; i < UPDI_NVMPROG_POLL_MAX; i++) {
-        int s = updi_ldcs(fd, ASI_SYS_STATUS);
-        if (s < 0)
-            return -1;
-        if (s & ASI_SYS_STATUS_NVMPROG) {
-            ready = 1;
-            break;
-        }
+    for (int i = 0; i < 200; i++) {
+        int s = updi_ldcs(fd, ASI_OCD_STATUS);
+        if (s < 0) return -1;
+        last = s;
+        if (s & ASI_OCD_STATUS_STOPPED)
+            return 0;
         nanosleep(&ts, NULL);
     }
-    if (!ready)
-        return -1;
+    fprintf(stderr,
+            "updi_enter_debug: STOPPED bit never set (last ASI_OCD_STATUS=0x%02x)\n",
+            last & 0xFF);
+    return -1;
+}
 
-    /* 4. Erase + program each page (step 8) */
+int updi_halt(int fd)
+{
+    struct timespec ts = { 0, 500000L };    /* 0.5 ms */
+    if (updi_stcs(fd, ASI_OCD_CTRLA, ASI_OCD_CTRLA_STOP) < 0)
+        return -1;
+    for (int i = 0; i < 200; i++) {
+        int s = updi_ldcs(fd, ASI_OCD_STATUS);
+        if (s < 0) return -1;
+        if (s & ASI_OCD_STATUS_STOPPED)
+            return 0;
+        nanosleep(&ts, NULL);
+    }
+    return -1;
+}
+
+int updi_run(int fd)
+{
+    /* Writing RUN starts the CPU.  STOPPED clears immediately. */
+    return updi_stcs(fd, ASI_OCD_CTRLA, ASI_OCD_CTRLA_RUN);
+}
+
+int updi_step(int fd)
+{
+    /* Set OCD CTRL0.STEP, then RUN.  The CPU executes one instruction
+     * and re-asserts STOPPED.  Per guesswork.md the trick is reliable
+     * provided UPDICLKSEL is left at default (32 MHz). */
+    uint8_t c0 = 0;
+    if (updi_lds8(fd, OCD_CTRL0, &c0) < 0) return -1;
+    if (updi_sts8(fd, OCD_CTRL0, (uint8_t)(c0 | OCD_CTRL0_STEP)) < 0) return -1;
+    if (updi_stcs(fd, ASI_OCD_CTRLA, ASI_OCD_CTRLA_RUN) < 0) return -1;
+    /* Wait for halt. */
+    {
+        struct timespec ts = { 0, 200000L };  /* 0.2 ms */
+        for (int i = 0; i < 500; i++) {
+            int s = updi_ldcs(fd, ASI_OCD_STATUS);
+            if (s < 0) return -1;
+            if (s & ASI_OCD_STATUS_STOPPED) return 0;
+            nanosleep(&ts, NULL);
+        }
+    }
+    return -1;
+}
+
+int updi_ocd_poll_halted(int fd, int timeout_ms)
+{
+    struct timespec ts = { 0, 1000000L };   /* 1 ms */
+    int budget = (timeout_ms <= 0) ? 1 : timeout_ms;
+    for (int i = 0; i < budget; i++) {
+        int s = updi_ldcs(fd, ASI_OCD_STATUS);
+        if (s < 0) return -1;
+        if (s & ASI_OCD_STATUS_STOPPED) return 0;
+        nanosleep(&ts, NULL);
+    }
+    return -1;   /* not halted within budget */
+}
+
+int updi_ocd_read_halt_status(int fd, uint8_t *st0, uint8_t *st1)
+{
+    if (st0 && updi_lds8(fd, OCD_STATUS0, st0) < 0) return -1;
+    if (st1 && updi_lds8(fd, OCD_STATUS1, st1) < 0) return -1;
+    return 0;
+}
+
+int updi_ocd_read_gpr(int fd, uint8_t n, uint8_t *val)
+{
+    if (n > 31u) return -1;
+    return updi_lds8(fd, OCD_REGFILE + n, val);
+}
+
+int updi_ocd_write_gpr(int fd, uint8_t n, uint8_t val)
+{
+    if (n > 31u) return -1;
+    return updi_sts8(fd, OCD_REGFILE + n, val);
+}
+
+int updi_ocd_read_pc(int fd, uint32_t *byte_addr)
+{
+    uint8_t lo = 0, hi = 0;
+    if (updi_lds8(fd, OCD_PC,     &lo) < 0) return -1;
+    if (updi_lds8(fd, OCD_PC + 1, &hi) < 0) return -1;
+    /* OCD.PC is a *word* address and reads PC+1 by silicon convention
+     * (see doc/reference/guesswork.md §"OCD.PC and PC").  Convert to a
+     * GDB byte address: (PC_word - 1) * 2.                              */
+    uint32_t pc_word = (uint32_t)lo | ((uint32_t)hi << 8);
+    if (pc_word == 0u) pc_word = 1u;       /* paranoia: never underflow */
+    *byte_addr = (pc_word - 1u) * 2u;
+    return 0;
+}
+
+int updi_ocd_write_pc(int fd, uint32_t byte_addr)
+{
+    /* Inverse of updi_ocd_read_pc(): store (byte_addr/2)+1 as a word
+     * address.  Beware: per guesswork, a fresh PC write makes the CPU
+     * "skip" exactly one instruction on the next step.  Callers that
+     * need precise positioning should use instruction injection.        */
+    uint32_t pc_word = (byte_addr >> 1u) + 1u;
+    if (updi_sts8(fd, OCD_PC,     (uint8_t)( pc_word        & 0xFFu)) < 0) return -1;
+    if (updi_sts8(fd, OCD_PC + 1, (uint8_t)((pc_word >> 8u) & 0xFFu)) < 0) return -1;
+    return 0;
+}
+
+int updi_ocd_read_sp(int fd, uint16_t *val)
+{
+    uint8_t lo = 0, hi = 0;
+    if (updi_lds8(fd, OCD_SP,     &lo) < 0) return -1;
+    if (updi_lds8(fd, OCD_SP + 1, &hi) < 0) return -1;
+    *val = (uint16_t)((uint16_t)lo | ((uint16_t)hi << 8));
+    return 0;
+}
+
+int updi_ocd_write_sp(int fd, uint16_t val)
+{
+    if (updi_sts8(fd, OCD_SP,     (uint8_t)( val        & 0xFFu)) < 0) return -1;
+    if (updi_sts8(fd, OCD_SP + 1, (uint8_t)((val >> 8u) & 0xFFu)) < 0) return -1;
+    return 0;
+}
+
+int updi_ocd_read_sreg (int fd, uint8_t *val) { return updi_lds8(fd, OCD_SREG, val); }
+int updi_ocd_write_sreg(int fd, uint8_t val)  { return updi_sts8(fd, OCD_SREG, val); }
+
+int updi_ocd_set_hw_bp(int fd, int idx, uint32_t byte_addr)
+{
+    uint32_t base;
+    uint8_t  enable_bit;
+    if (idx == 0)      { base = OCD_BP0A; enable_bit = OCD_CTRL1_BP0; }
+    else if (idx == 1) { base = OCD_BP1A; enable_bit = OCD_CTRL1_BP1; }
+    else return -1;
+
+    /* BPxA is a 17-bit byte-address field with bit 0 always 0
+     * (instruction-aligned).  Write 3 bytes; high byte holds bit 16. */
+    if (updi_sts8(fd, base,     (uint8_t)( byte_addr        & 0xFEu)) < 0) return -1;
+    if (updi_sts8(fd, base + 1, (uint8_t)((byte_addr >>  8) & 0xFFu)) < 0) return -1;
+    if (updi_sts8(fd, base + 2, (uint8_t)((byte_addr >> 16) & 0x01u)) < 0) return -1;
+
+    /* Enable the specific BP plus the global HWBP gate. */
+    {
+        uint8_t c0 = 0, c1 = 0;
+        if (updi_lds8(fd, OCD_CTRL0, &c0) < 0) return -1;
+        if (updi_lds8(fd, OCD_CTRL1, &c1) < 0) return -1;
+        if (updi_sts8(fd, OCD_CTRL1, (uint8_t)(c1 | enable_bit)) < 0) return -1;
+        if (updi_sts8(fd, OCD_CTRL0, (uint8_t)(c0 | OCD_CTRL0_HWBP)) < 0) return -1;
+    }
+    return 0;
+}
+
+int updi_ocd_clear_hw_bp(int fd, int idx)
+{
+    uint8_t enable_bit;
+    if (idx == 0)      enable_bit = OCD_CTRL1_BP0;
+    else if (idx == 1) enable_bit = OCD_CTRL1_BP1;
+    else return -1;
+
+    uint8_t c1 = 0;
+    if (updi_lds8(fd, OCD_CTRL1, &c1) < 0) return -1;
+    c1 = (uint8_t)(c1 & (uint8_t)~enable_bit);
+    if (updi_sts8(fd, OCD_CTRL1, c1) < 0) return -1;
+
+    /* If both BPs disabled, drop the global gate too. */
+    if ((c1 & (OCD_CTRL1_BP0 | OCD_CTRL1_BP1)) == 0u) {
+        uint8_t c0 = 0;
+        if (updi_lds8(fd, OCD_CTRL0, &c0) < 0) return -1;
+        c0 = (uint8_t)(c0 & (uint8_t)~OCD_CTRL0_HWBP);
+        if (updi_sts8(fd, OCD_CTRL0, c0) < 0) return -1;
+    }
+    return 0;
+}
+
+/* Poll NVMCTRL.STATUS until FBUSY clears or the budget is exhausted.
+ * AVR-Dx NVMSTATUS exposes only FBUSY (bit 0) and EEBUSY (bit 1); there
+ * is no write-error flag, so completion is detected purely by !FBUSY.
+ * Returns 0 on success, -1 on timeout / I/O error.                       */
+static int nvm_wait_not_busy(int fd, uint32_t page_addr, const char *phase)
+{
+    struct timespec ts = { 0, 1000000L };   /* 1 ms */
+    uint8_t last = 0xAAu;
+    for (int i = 0; i < 200; i++) {         /* up to 200 ms */
+        uint8_t nvm_st = 0;
+        if (updi_lds8(fd, NVMCTRL_STATUS, &nvm_st) < 0) {
+            fprintf(stderr,
+                    "nvm_write_flash: %s NVMSTATUS read failed @0x%06x\n",
+                    phase, (unsigned)page_addr);
+            return -1;
+        }
+        last = nvm_st;
+        if (!(nvm_st & NVMCTRL_STATUS_FBUSY))
+            return 0;
+        nanosleep(&ts, NULL);
+    }
+    fprintf(stderr,
+            "nvm_write_flash: %s FBUSY did not clear @0x%06x (last NVMSTATUS=0x%02x)\n",
+            phase, (unsigned)page_addr, last & 0xFF);
+    return -1;
+}
+
+/*
+ * Program one 512-byte FLASH page using the avrdude/pymcuprog sequence:
+ *
+ *   1. arm NVMCTRL.CTRLA = FLWR via direct STS
+ *   2. ST_PTR_LONG ← page_addr (24-bit)
+ *   3. STCS ASI_CTRLA = RSD_ON  (target stops ACKing individual stores)
+ *   4. REPEAT 0xFF             (256 word-stores follow)
+ *   5. ST *(ptr++), word        opcode (0x65) + 512 data bytes
+ *   6. STCS ASI_CTRLA = RSD_OFF (restore normal ACK protocol)
+ *
+ * Each word-store latches into the FLASH page buffer; the AVR-Dx NVM
+ * controller commits the buffer to FLASH automatically because FLWR was
+ * pre-armed in step 1.  Caller is responsible for waiting FBUSY=0 after.
+ */
+static int updi_write_page_bulk(int fd, uint32_t page_addr,
+                                const uint8_t *data)
+{
+    uint8_t st_word_frame[2] = { UPDI_SYNCH, UPDI_OP_ST_PTR_INC_W };
+    uint8_t echo[64];
+    size_t  total;
+
+    if (updi_sts8(fd, NVMCTRL_CTRLA, NVMCTRL_CMD_FLWR) < 0) {
+        fprintf(stderr, "updi_write_page_bulk: arm FLWR failed\n");
+        return -1;
+    }
+    if (updi_set_ptr(fd, page_addr) < 0) {
+        fprintf(stderr, "updi_write_page_bulk: set_ptr 0x%06x failed\n",
+                (unsigned)page_addr);
+        return -1;
+    }
+    if (updi_stcs(fd, ASI_CTRLA, UPDI_CTRLA_RSD_ON) < 0) {
+        fprintf(stderr, "updi_write_page_bulk: STCS RSD_ON failed\n");
+        return -1;
+    }
+    if (updi_send_repeat(fd, 0xFFu) < 0) {
+        fprintf(stderr, "updi_write_page_bulk: REPEAT failed\n");
+        goto restore;
+    }
+    if (updi_write_bytes(fd, st_word_frame, sizeof(st_word_frame)) < 0) {
+        fprintf(stderr, "updi_write_page_bulk: ST_PTR_INC_W failed\n");
+        goto restore;
+    }
+
+    /* Stream 512 data bytes; no ACK per byte (RSD enabled). */
+    if (write(fd, data, UPDI_FLASH_PAGE_SIZE) !=
+        (ssize_t)UPDI_FLASH_PAGE_SIZE) {
+        fprintf(stderr, "updi_write_page_bulk: page write short\n");
+        goto restore;
+    }
+    total = 0;
+    while (total < UPDI_FLASH_PAGE_SIZE) {
+        size_t want = UPDI_FLASH_PAGE_SIZE - total;
+        if (want > sizeof(echo)) want = sizeof(echo);
+        ssize_t got = read(fd, echo, want);
+        if (got <= 0) {
+            fprintf(stderr,
+                    "updi_write_page_bulk: echo read failed after %zu B\n",
+                    total);
+            goto restore;
+        }
+        total += (size_t)got;
+    }
+
+    if (updi_stcs(fd, ASI_CTRLA, UPDI_CTRLA_RSD_OFF) < 0) {
+        fprintf(stderr, "updi_write_page_bulk: STCS RSD_OFF failed\n");
+        return -1;
+    }
+    return 0;
+
+restore:
+    /* Best-effort restore — return -1 regardless. */
+    (void)updi_stcs(fd, ASI_CTRLA, UPDI_CTRLA_RSD_OFF);
+    return -1;
+}
+
+int updi_nvm_write_flash(int fd, uint32_t word_addr, const uint8_t *data,
+                         size_t len)
+{
+    size_t n_pages;
+    size_t pg;
+
+    if ((word_addr % UPDI_FLASH_PAGE_SIZE) != 0u ||
+        len == 0u || (len % UPDI_FLASH_PAGE_SIZE) != 0u) {
+        fprintf(stderr, "nvm_write_flash: bad align (addr=0x%06x len=%zu)\n",
+                (unsigned)word_addr, len);
+        return -1;
+    }
+
+    /* 1-3. Re-enter NVMPROG (idempotent: updi_open already did it).
+     *      Re-issuing the key + reset pulse ensures we are in a clean
+     *      programming state even if the caller did `--erase` first,
+     *      which leaves the chip in CHIPERASE state.                  */
+    if (updi_enter_nvmprog(fd) < 0) {
+        fprintf(stderr, "nvm_write_flash: failed to enter NVMPROG\n");
+        return -1;
+    }
+
+    /* 4. Program each page (matches avrdude/pymcuprog AVR-Dx sequence).
+     *    Caller is responsible for chip-erase (--erase) prior to load;
+     *    we do not issue per-page FLPER here because FLWR alone commits
+     *    pre-erased FLASH page buffers, and avrdude does the same.    */
     n_pages = len / UPDI_FLASH_PAGE_SIZE;
     for (pg = 0; pg < n_pages; pg++) {
         uint32_t       page_addr = word_addr +
                                    (uint32_t)(pg * UPDI_FLASH_PAGE_SIZE);
         const uint8_t *page_buf  = data + pg * UPDI_FLASH_PAGE_SIZE;
-        uint8_t        nvm_cmd   = NVMCTRL_CMD_ERWP;
-        int            busy_done = 0;
 
-        if (updi_mem_write(fd, page_addr, page_buf,
-                           UPDI_FLASH_PAGE_SIZE) < 0)
+        if (nvm_wait_not_busy(fd, page_addr, "pre-write") < 0)
             return -1;
-
-        if (updi_mem_write(fd, NVMCTRL_CTRLA, &nvm_cmd, 1u) < 0)
+        if (updi_write_page_bulk(fd, page_addr, page_buf) < 0) {
+            fprintf(stderr,
+                    "nvm_write_flash: page 0x%06x write failed\n",
+                    (unsigned)page_addr);
             return -1;
-
-        for (int i = 0; i < UPDI_PAGE_BUSY_POLL_MAX; i++) {
-            uint8_t nvm_st = 0;
-            if (updi_mem_read(fd, NVMCTRL_STATUS, &nvm_st, 1u) < 0)
-                return -1;
-            if (nvm_st & NVMCTRL_STATUS_WRERR)
-                return UPDI_ERR_WP;
-            if (!(nvm_st & NVMCTRL_STATUS_BUSY)) {
-                busy_done = 1;
-                break;
-            }
-            nanosleep(&ts, NULL);
         }
-        if (!busy_done)
+        if (nvm_wait_not_busy(fd, page_addr, "post-write") < 0)
             return -1;
     }
 
-    /* 5. Exit programming: reset + clear (datasheet §35.3.7.2 steps 9-10) */
-    if (updi_stcs(fd, ASI_RESET_REQ, ASI_RESET_REQ_RESET) < 0)
-        return -1;
-    if (updi_stcs(fd, ASI_RESET_REQ, ASI_RESET_REQ_RUN) < 0)
-        return -1;
-
+    /* 5. Stay in NVMPROG — the GDB server (or --device) needs the CPU
+     *    held halted for subsequent memory reads.  The caller invokes
+     *    `updi_close()` to release the chip on shutdown.              */
     return 0;
+}
+
+/*
+ * Erase a single 512-byte FLASH page (AVR-Dx NVMCTRL FLPER command).
+ * AVR-Dx datasheet §6 — FLPER is armed by writing 0x08 to NVMCTRL.CTRLA,
+ * then erase is triggered by any FLASH write within the target page.
+ * We use a single-byte STS of 0xFF as the trigger.
+ * `page_addr` must be the UPDI 24-bit FLASH-space address of the page
+ * (i.e. already includes UPDI_FLASH_BASE) and must be page-aligned.
+ */
+static int nvm_erase_page(int fd, uint32_t page_addr)
+{
+    if (updi_sts8(fd, NVMCTRL_CTRLA, NVMCTRL_CMD_FLPER) < 0) {
+        fprintf(stderr, "nvm_erase_page: arm FLPER failed @0x%06x\n",
+                (unsigned)page_addr);
+        return -1;
+    }
+    /* Trigger the erase by writing one byte into the target page. */
+    if (updi_sts8(fd, page_addr, 0xFFu) < 0) {
+        fprintf(stderr, "nvm_erase_page: trigger STS failed @0x%06x\n",
+                (unsigned)page_addr);
+        return -1;
+    }
+    if (nvm_wait_not_busy(fd, page_addr, "erase") < 0)
+        return -1;
+    if (updi_sts8(fd, NVMCTRL_CTRLA, NVMCTRL_CMD_NOCMD) < 0) {
+        fprintf(stderr, "nvm_erase_page: clear CMD failed @0x%06x\n",
+                (unsigned)page_addr);
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * updi_nvm_flash_patch: read-modify-write FLASH at byte granularity.
+ *
+ * For each FLASH page touched by [addr, addr+len), the current page is
+ * read into a 512-byte buffer, the affected bytes are overwritten, the
+ * page is erased (FLPER), and the patched buffer is written back via
+ * the bulk page programmer.  Used by the GDB RSP Z0/z0 handlers to
+ * plant and remove the AVR BREAK opcode (0x9598) for software
+ * breakpoints, where the write is typically 2 bytes at an arbitrary
+ * instruction address.
+ *
+ * `addr` must be a UPDI FLASH-space byte address (i.e. include
+ * UPDI_FLASH_BASE).  Length may be any non-zero value; the function
+ * spans page boundaries as needed.  The chip remains in NVMPROG on
+ * return.
+ */
+int updi_nvm_flash_patch(int fd, uint32_t addr, const uint8_t *data,
+                         size_t len)
+{
+    const uint32_t page_mask = UPDI_FLASH_PAGE_SIZE - 1u;
+    uint8_t  pgbuf[UPDI_FLASH_PAGE_SIZE];
+    uint32_t end;
+    uint32_t pa;
+
+    if (len == 0u) return 0;
+
+    if (updi_enter_nvmprog(fd) < 0) {
+        fprintf(stderr, "nvm_flash_patch: failed to enter NVMPROG\n");
+        return -1;
+    }
+
+    end = addr + (uint32_t)len;
+    for (pa = addr & ~page_mask; pa < end; pa += UPDI_FLASH_PAGE_SIZE) {
+        uint32_t pg_end = pa + UPDI_FLASH_PAGE_SIZE;
+        uint32_t lo     = (addr > pa)     ? addr : pa;
+        uint32_t hi     = (end  < pg_end) ? end  : pg_end;
+        size_t   i;
+
+        if (updi_mem_read(fd, pa, pgbuf, UPDI_FLASH_PAGE_SIZE) < 0) {
+            fprintf(stderr,
+                    "nvm_flash_patch: read page 0x%06x failed\n",
+                    (unsigned)pa);
+            return -1;
+        }
+        for (i = 0; i < (hi - lo); i++) {
+            pgbuf[(lo - pa) + i] = data[(lo - addr) + i];
+        }
+
+        if (nvm_wait_not_busy(fd, pa, "patch-pre") < 0) return -1;
+        if (nvm_erase_page(fd, pa) < 0) return -1;
+        if (updi_write_page_bulk(fd, pa, pgbuf) < 0) {
+            fprintf(stderr,
+                    "nvm_flash_patch: write page 0x%06x failed\n",
+                    (unsigned)pa);
+            return -1;
+        }
+        if (nvm_wait_not_busy(fd, pa, "patch-post") < 0) return -1;
+    }
+    return 0;
+}
+
+/*
+ * updi_chip_erase: send the CHIPERASE KEY ("NVMErase"), assert system
+ * reset, then poll ASI_SYS_STATUS until LOCKSTATUS (bit 1) clears.
+ *
+ * AVR-Dx datasheet §35.3.7.1 — required to unlock a locked device before
+ * NVMPROG can be entered.  DESTRUCTIVE: erases all FLASH and clears the
+ * lock fuse.
+ */
+int updi_chip_erase(int fd)
+{
+    static const uint8_t key_cmd[10] = {
+        UPDI_SYNCH, UPDI_OP_KEY,
+        /* 8-byte CHIPERASE key "NVMErase", transmitted LSB-first per
+         * datasheet §35.3.3.13 (UPDI KEY opcode). */
+        'e', 's', 'a', 'r', 'E', 'M', 'V', 'N'
+    };
+    struct timespec ts = { 0, 1000000L };   /* 1 ms */
+    int ks;
+
+    /* 1. Send CHIPERASE key */
+    if (updi_write_bytes(fd, key_cmd, sizeof(key_cmd)) < 0) {
+        fprintf(stderr, "chip_erase: key write failed\n");
+        return -1;
+    }
+
+    /* 2. Verify CHIPERASE bit latched in ASI_KEY_STATUS (bit 3) */
+    ks = updi_ldcs(fd, ASI_KEY_STATUS);
+    if (ks < 0) {
+        fprintf(stderr, "chip_erase: ldcs KEY_STATUS failed\n");
+        return -1;
+    }
+    if (!(ks & 0x08u)) {
+        fprintf(stderr,
+                "chip_erase: CHIPERASE key not latched (KEY_STATUS=0x%02x)\n",
+                ks & 0xFF);
+        return -1;
+    }
+
+    /* 3. Assert system reset, then clear it */
+    if (updi_stcs(fd, ASI_RESET_REQ, ASI_RESET_REQ_RESET) < 0) {
+        fprintf(stderr, "chip_erase: reset assert failed\n");
+        return -1;
+    }
+    if (updi_stcs(fd, ASI_RESET_REQ, ASI_RESET_REQ_RUN) < 0) {
+        fprintf(stderr, "chip_erase: reset clear failed\n");
+        return -1;
+    }
+
+    /* 4. Poll ASI_SYS_STATUS until LOCKSTATUS (bit 1) clears.
+     *    Worst-case chip-erase on AVR128DA is well under 1 s.            */
+    for (int i = 0; i < 2000; i++) {
+        int s = updi_ldcs(fd, ASI_SYS_STATUS);
+        if (s < 0) {
+            fprintf(stderr, "chip_erase: ldcs SYS_STATUS failed\n");
+            return -1;
+        }
+        if (!(s & 0x02u))
+            return 0;
+        nanosleep(&ts, NULL);
+    }
+    fprintf(stderr, "chip_erase: LOCKSTATUS did not clear within 2 s\n");
+    return -1;
 }
 
 int updi_console_poll(int fd, char *buf, size_t cap)

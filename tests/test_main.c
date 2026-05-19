@@ -45,7 +45,7 @@
 typedef enum {
     CALL_NONE = 0,
     CALL_UPDI_OPEN, CALL_UPDI_CLOSE, CALL_UPDI_CONSOLE_POLL,
-    CALL_UPDI_NVM,
+    CALL_UPDI_NVM, CALL_UPDI_ENTER_DEBUG,
     CALL_RSP_LISTEN, CALL_RSP_ACCEPT, CALL_RSP_CLOSE,
     CALL_RSP_RECV, CALL_RSP_DISPATCH,
     CALL_ELF_OPEN, CALL_ELF_TABLES, CALL_ELF_CLOSE,
@@ -63,6 +63,8 @@ static int mk_updi_open_calls;
 static int mk_updi_close_calls;
 static int mk_updi_nvm_ret;
 static int mk_updi_nvm_calls;
+static int mk_updi_enter_debug_ret;
+static int mk_updi_enter_debug_calls;
 
 static int mk_rsp_listen_ret;
 static int mk_rsp_listen_calls;
@@ -140,6 +142,20 @@ int __wrap_updi_nvm_write_flash(int fd, uint32_t a, const uint8_t *d, size_t n)
     LOG(CALL_UPDI_NVM);
     return mk_updi_nvm_ret;
 }
+
+int __wrap_updi_enter_debug(int fd);
+int __wrap_updi_enter_debug(int fd)
+{
+    (void)fd;
+    ++mk_updi_enter_debug_calls;
+    LOG(CALL_UPDI_ENTER_DEBUG);
+    return mk_updi_enter_debug_ret;
+}
+
+/* updi_chip_erase is not linked from updi.c (test_main builds against
+ * a wrap shim); provide a non-wrap stub so --erase paths link. */
+int updi_chip_erase(int fd);
+int updi_chip_erase(int fd) { (void)fd; return 0; }
 
 int __wrap_rsp_listen(uint16_t port);
 int __wrap_rsp_listen(uint16_t port)
@@ -267,6 +283,7 @@ void setUp(void)
     mk_updi_open_ret = 7;       mk_updi_open_calls = 0;
     mk_updi_close_calls = 0;
     mk_updi_nvm_ret = 0;        mk_updi_nvm_calls = 0;
+    mk_updi_enter_debug_ret = 0; mk_updi_enter_debug_calls = 0;
 
     mk_rsp_listen_ret = 8;      mk_rsp_listen_calls = 0;
     mk_rsp_accept_ret = 9;
@@ -435,6 +452,34 @@ static void test_main_rsp_listen_failure_closes_updi_and_returns_1(void)
     TEST_ASSERT_EQUAL_INT(1, mk_updi_close_calls);
 }
 
+/* LLR-MAIN-10 — updi_enter_debug is called after updi_open() and the
+ * optional --load step, and before rsp_listen().  A failure here is
+ * fatal: main() prints an error and exits 1 without opening the GDB
+ * listener.                                                          */
+static void main_calls_updi_enter_debug_after_updi_open_before_rsp_listen(void)
+{
+    uint32_t v[] = {0}, s[] = {0};
+    mk_elf_tmp_fd = build_min_elf(v, s, 1, &mk_elf_planted_ehdr);
+    mk_elf_have_ehdr = 1;
+    mk_updi_enter_debug_ret = -1;
+
+    char *argv[] = { (char*)"prog", (char*)"/dev/x", (char*)"a.elf" };
+    TEST_ASSERT_EQUAL_INT(1, app_main(3, argv));
+    TEST_ASSERT_EQUAL_INT(1, mk_updi_open_calls);
+    TEST_ASSERT_EQUAL_INT(1, mk_updi_enter_debug_calls);
+    TEST_ASSERT_EQUAL_INT(0, mk_rsp_listen_calls);
+    TEST_ASSERT_EQUAL_INT(1, mk_updi_close_calls);
+
+    /* Verify call order: UPDI_OPEN -> UPDI_ENTER_DEBUG (no RSP_LISTEN). */
+    int open_i = -1, enter_i = -1;
+    for (int i = 0; i < call_log_len; ++i) {
+        if (call_log[i] == CALL_UPDI_OPEN && open_i < 0) open_i = i;
+        if (call_log[i] == CALL_UPDI_ENTER_DEBUG && enter_i < 0) enter_i = i;
+    }
+    TEST_ASSERT_GREATER_OR_EQUAL(0, open_i);
+    TEST_ASSERT_GREATER_THAN(open_i, enter_i);
+}
+
 /* LLR-MAIN-04 */
 static void test_main_load_flag_writes_all_pt_load_segments_to_flash(void)
 {
@@ -549,6 +594,7 @@ int main(void)
     RUN_TEST(test_parse_args_missing_elf_file_exits_1);
     RUN_TEST(test_main_updi_open_failure_releases_resources_and_returns_1);
     RUN_TEST(test_main_rsp_listen_failure_closes_updi_and_returns_1);
+    RUN_TEST(main_calls_updi_enter_debug_after_updi_open_before_rsp_listen);
     RUN_TEST(test_main_load_flag_writes_all_pt_load_segments_to_flash);
     RUN_TEST(test_main_load_nvm_write_failure_prints_error_and_returns_1);
     RUN_TEST(test_event_loop_uses_single_select_no_pthread_create);

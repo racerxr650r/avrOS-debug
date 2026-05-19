@@ -190,7 +190,53 @@ via the UPDI NVM controller before opening the GDB listener. On success
 the program counter is left at the reset vector; in a separate terminal
 attach `avr-gdb` and issue `continue` to begin execution.
 
-### 5.3 Inspect avrOS runtime state from GDB
+### 5.3 Debugging an AVR-Dx target over UPDI/OCD
+
+The server uses the AVR-Dx on-chip debug (OCD) controller for run
+control and register access — entirely over the single-wire UPDI
+link, no dedicated debugger probe required.
+
+* **Server start-up.** Immediately after opening the serial port (and
+  performing `--load` if requested), the server transitions the target
+  into OCD debug mode and waits for GDB. The CPU is halted at the
+  reset vector, so the very first `continue` from GDB starts execution
+  from a clean state.
+
+* **Hardware breakpoints.** The AVR-Dx OCD provides exactly **two**
+  hardware breakpoint comparators. Both `break` (Z0) and `hbreak`
+  (Z1) requests from GDB are routed to these slots — flash patching
+  with the AVR `BREAK` opcode is *not* used, which avoids the
+  state-destroying NVMPROG round-trip on every breakpoint set.
+  Setting a third breakpoint while two are already armed returns
+  GDB error `E08`; remove one first.
+
+* **Run / step / continue.** `c`, `s`, `si`, and `ni` are all handled
+  by the OCD primitives (RUN, single-step, STOP). A halt is reported
+  back to GDB as signal `SIGTRAP` (`T05`).
+
+* **Asynchronous interrupt (Ctrl-C).** Pressing Ctrl-C in GDB while
+  the target is running issues an OCD STOP and reports `SIGINT`
+  (`T02`) back. The CPU halts on the next instruction boundary.
+
+* **Detach.** Issuing `detach` from GDB releases both HW comparators
+  in silicon and lets the CPU run free before closing the GDB
+  socket. A subsequent reconnect therefore starts from a clean
+  breakpoint slate.
+
+Example session:
+
+```
+(gdb) target remote :1234
+(gdb) break main
+(gdb) break my_isr_handler        # 2nd HW comparator used
+(gdb) break some_other_fn         # FAILS — E08 (no slots left)
+(gdb) continue
+^C                                 # halts target, prints SIGINT
+(gdb) step
+(gdb) detach                       # releases both comparators
+```
+
+### 5.4 Inspect avrOS runtime state from GDB
 
 `avr-updi-gdb` extends GDB with an `avros` monitor sub-command. Type at
 the `(gdb)` prompt:
@@ -201,7 +247,7 @@ the `(gdb)` prompt:
 (gdb) monitor avros mempool      # dump memory-pool free-block counts
 ```
 
-### 5.4 Verify the wiring with `--device`
+### 5.5 Verify the wiring with `--device`
 
 When a target refuses to attach the first question to answer is
 “does the UPDI link work at all?” The `--device` switch performs a

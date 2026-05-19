@@ -13,7 +13,7 @@
 > Delivery section as work progresses. Link phase names in the Status
 > table to their detailed descriptions in §8.
 
-**Status:** Phases 1–6 complete. Phase 7 (device-signature diagnostic mode) in progress.
+**Status:** Phases 0–7 complete. Phase 8 (non-FLASH NVM programming) planned.
 
 ## Status
 
@@ -26,6 +26,8 @@
 | [4](#phase-4--monitor--rsp) | `src/monitor.h/.c` + `src/gdb_rsp.h/.c` + 42 unit tests | 🔲 Not started |
 | [5](#phase-5--application-entry-point--integration) | `src/main.c` + 18 tests (14 unit + 4 integration) | 🔲 Not started |
 | [6](#phase-6--installation-targets--documentation) | `make install/uninstall/check-tools/bundle` + user manual + man page + 8 install tests | 🔲 Not started |
+| [7](#phase-7--device-signature-diagnostic-mode) | `--device` flag + `updi_read_device_info()` + family lookup + 6 tests | 🔲 Not started |
+| [8](#phase-8--non-flash-nvm-programming) | EEPROM / FUSE / USERROW / LOCKBIT programming from ELF segments | 🔲 Not started |
 
 ## 0. Required Tools for Development
 
@@ -572,6 +574,103 @@ UPDI status:     SYS_STATUS=0x82  KEY_STATUS=0x10  STATUSB=0x00
 NVM state:       idle, no programming key active
 ```
 
+---
+
+### Phase 8 — Non-FLASH NVM Programming
+
+**Motivation.** `--load` currently programs only the FLASH window. Any `.eeprom`, `.fuse`, `.lock`, or `.user_signatures` segment present in the ELF is either silently skipped (when its VMA falls above `sram_base`) or, worse, fed to `updi_nvm_write_flash()` with a non-FLASH address — neither result reaches the intended NVM. Phase 8 generalises `--load` to dispatch every programmable ELF segment to the correct NVMCTRL command path while leaving the existing FLASH path byte-for-byte unchanged.
+
+**Scope summary.**
+
+| ELF section | UPDI window (AVR-Dx) | NVMCTRL command | Granularity | New routine |
+| ----------- | -------------------- | --------------- | ----------- | ----------- |
+| `.text`, `.data` (LMA) | `0x800000`–`0x80FFFF`+ | `FLWR` (existing) | 512 B page | *(unchanged)* |
+| `.eeprom` | `0x814000`–`0x8143FF` | `EEERWR` / `EEBER` | 1 B / 1 B | `updi_nvm_write_eeprom()` |
+| `.user_signatures` (USERROW) | `0x810080`–`0x8100FF` | `EEERWR` | 1 B | `updi_nvm_write_userrow()` |
+| `.fuse` | `0x820000`–`0x82001F` | `EEERWR` (FUSES live in the EEPROM-mapped region on Dx) | 1 B | `updi_nvm_write_fuses()` |
+| `.lock` | `0x820040`–`0x820043` | `EEERWR` (chip-erase required first) | 1 B | `updi_nvm_write_lockbits()` |
+| `.signature` (SIGROW) | `0x811080`+ | *(read-only — skipped, never an error)* | — | — |
+
+Exact base addresses are part-specific; the dispatcher classifies segments by address window (not by ELF section name) so the same logic works across AVR-Dx variants.
+
+1. **`src/updi.h` / `src/updi.c`** — add four NVM routines mirroring `updi_nvm_write_flash()` semantics (re-enter NVMPROG, BUSY poll, leave CPU halted):
+   - `int updi_nvm_write_eeprom(int fd, uint32_t addr, const uint8_t *data, size_t len);` — emit NVMCTRL `EEERWR` command (`0x13`) and write `data` byte-by-byte; BUSY poll bounded at 20 ms per byte burst.
+   - `int updi_nvm_write_fuses(int fd, uint32_t addr, const uint8_t *data, size_t len);` — same NVM command sequence but with an explicit window guard: refuse any address outside `[UPDI_FUSES_BASE, UPDI_FUSES_BASE + UPDI_FUSES_SIZE)`.
+   - `int updi_nvm_write_userrow(int fd, uint32_t addr, const uint8_t *data, size_t len);` — same again with the USERROW window guard.
+   - `int updi_nvm_write_lockbits(int fd, uint32_t addr, const uint8_t *data, size_t len);` — same again; additionally checks `ASI_SYS_STATUS` for the post-chip-erase state and returns `UPDI_ERR_LOCKED` (new error code) if the precondition is not met.
+   - New constants in `src/updi.h`: `UPDI_EEPROM_BASE`, `UPDI_EEPROM_SIZE`, `UPDI_USERROW_BASE`, `UPDI_USERROW_SIZE`, `UPDI_FUSES_BASE`, `UPDI_FUSES_SIZE`, `UPDI_LOCK_BASE`, `UPDI_LOCK_SIZE`, `UPDI_SIGROW_BASE`, `UPDI_SIGROW_SIZE`, `UPDI_ERR_LOCKED -3`.
+   - Refactor the NVMPROG-entry + BUSY-poll boilerplate shared with `updi_nvm_write_flash()` into a private `nvm_eeprom_write_bytes()` helper so the four EEPROM-class writers stay short.
+
+2. **`src/main.c` `load_flash_segments()` → `load_segments()`.** Replace the current single-call dispatcher with a window classifier that routes each `PT_LOAD` segment to the correct NVM routine:
+   - `[UPDI_FLASH_BASE, UPDI_FLASH_BASE + flash_size)` → `updi_nvm_write_flash()` (existing path, byte-for-byte unchanged).
+   - `[UPDI_EEPROM_BASE, UPDI_EEPROM_BASE + UPDI_EEPROM_SIZE)` → `updi_nvm_write_eeprom()`.
+   - `[UPDI_USERROW_BASE, UPDI_USERROW_BASE + UPDI_USERROW_SIZE)` → `updi_nvm_write_userrow()`.
+   - `[UPDI_FUSES_BASE, UPDI_FUSES_BASE + UPDI_FUSES_SIZE)` → `updi_nvm_write_fuses()`.
+   - `[UPDI_LOCK_BASE, UPDI_LOCK_BASE + UPDI_LOCK_SIZE)` → `updi_nvm_write_lockbits()` (require `--erase`; reject with diagnostic otherwise).
+   - `[UPDI_SIGROW_BASE, UPDI_SIGROW_BASE + UPDI_SIGROW_SIZE)` → skipped with informational log line on `stdout` (`SIGROW segment ignored (read-only)`).
+   - SRAM segments (VMA in `[sram_base, sram_base + sram_size)`) → skipped (existing `.data` initialiser behaviour preserved).
+   - Any other address → hard error: print `error: segment vaddr 0x%06x not in any programmable NVM window` to `stderr` and return -1.
+   The current "vaddr ≥ sram_base ⇒ skip" filter is replaced by the explicit window classifier; the SRAM skip is now one branch among many rather than the default.
+
+3. **Lockbit safety guard.** `updi_nvm_write_lockbits()` shall refuse to write the AVR-Dx UPDIDIS pattern (the lock value that disables the UPDI link permanently from the host's perspective until the next chip-erase via the high-voltage UPDI sequence) unless an explicit new CLI flag `--allow-lock-updi` is present. Without the flag the function returns `UPDI_ERR_LOCKED` and `main.c` prints a single-line diagnostic naming the segment and exit code 1.
+
+4. **Post-load OCD re-entry.** Writing FUSES typically requires a CPU reset to take effect. After `load_segments()` completes, if any non-FLASH segment was written, `main.c` shall re-issue `updi_enter_debug()` before falling through to `rsp_listen()` so the OCD state is consistent.
+
+5. **TraceR doc updates** (next free IDs at edit time):
+   - SDD §3.x (main.c) — replace the `load_flash_segments()` paragraph with the multi-window dispatcher description and timing table additions.
+   - SDD §4.x (updi.c) — extend the function-interface block with the four new entry points and the new constants; add EEPROM / FUSE / USERROW BUSY-timeout rows to the timing table.
+   - **HLR-046 "Non-FLASH NVM Programming"** — new HLR enumerating which ELF section windows are programmed and the required NVMCTRL commands.
+   - **HLR-047 "Lockbit Programming Safety Interlock"** — new HLR requiring `--allow-lock-updi` for lockbit writes that disable UPDI access.
+   - **HLR-004 "ELF Flash Load Option"** — broadened to "ELF Load Option" with explicit list of programmable section windows.
+   - **HLR-009 "FLASH Programming"** — wording generalised to retain FLASH as one NVM kind among several.
+   - New LLRs (illustrative): `LLR-UPDI-NN..NN+3` for the four NVM routines + window guards; `LLR-MAIN-NN` for the `load_segments()` window-classifier dispatcher and SIGROW-skip behaviour.
+
+6. **`tests/test_updi.c`** — per new NVM routine, add:
+   - Success path — correct UPDI byte sequence (NVMPROG re-entry, EEERWR command, page burst, BUSY poll exit).
+   - BUSY-timeout failure → return -1.
+   - Out-of-window address → return -1 without driving any UPDI traffic.
+   - For `updi_nvm_write_lockbits()` additionally: missing-chip-erase precondition → `UPDI_ERR_LOCKED`; UPDIDIS pattern without `--allow-lock-updi` → `UPDI_ERR_LOCKED`.
+
+7. **`tests/test_main.c`** — extend with dispatcher tests:
+   - Synthetic ELF whose `PT_LOAD` segments cover all five programmable windows → each `__wrap_updi_nvm_write_*` invoked exactly once with the correct address and payload length.
+   - SIGROW-window segment → no NVM routine invoked; informational line printed on `stdout`.
+   - Unknown-window segment → exit code 1, diagnostic on `stderr`, no NVM routine invoked.
+   - Lockbit segment without `--erase` → exit code 1, diagnostic.
+   - Post-load OCD re-entry: when any non-FLASH segment is written, `__wrap_updi_enter_debug` invocation count increases by one before `rsp_listen()` is called.
+
+8. **`tests/fixtures/`** — add a small linker script (`tests/fixtures/all_nvm.ld`) and source (`tests/fixtures/all_nvm.c`) producing `tests/fixtures/all_nvm.elf` containing `.text`, `.data`, `.eeprom`, `.user_signatures`, `.fuse`, and `.lock` sections at their canonical AVR-Dx LMAs. Makefile rule mirrors the existing avros fixture build.
+
+9. **Makefile** — `TEST_WRAP_test_updi` adds no new wraps (the new NVM routines are the units under test). `TEST_WRAP_test_main` adds `updi_nvm_write_eeprom`, `updi_nvm_write_userrow`, `updi_nvm_write_fuses`, `updi_nvm_write_lockbits`.
+
+10. **CLI surface.** Add `--allow-lock-updi` to `parse_args()`. Help text and synopsis updated accordingly:
+
+    ```
+    avr-updi-gdb [--port port] [--baud baud] [--erase] [--load] [--allow-lock-updi]
+                 <serial-device> <elf-file>
+    ```
+
+11. **Documentation updates.**
+    - `doc/UserManual.md` §5.2 "Flash and debug from cold" — enumerate non-FLASH sections programmed by `--load`; document the `--erase` requirement for lockbit segments; add a fuse-byte example.
+    - `doc/UserManual.md` — new subsection "Programming fuses, EEPROM, and lockbits" describing the section→window mapping, the `--allow-lock-updi` interlock, and recovery from a UPDIDIS-locked target.
+    - `doc/avr-updi-gdb.1` — add `--allow-lock-updi` under OPTIONS; expand `--load` description with the section list.
+    - `README.md` — replace the FLASH-only sentence with "programs FLASH, EEPROM, fuses, USERROW, and lockbits".
+
+**Acceptance:**
+- `make test` runs all suites including the extended `test_updi` and `test_main`; new tests pass.
+- `python3 tools/lint_project.py` reports 0 errors, 0 warnings after Project.xml carries HLR-046, HLR-047, and the new LLRs.
+- `build/avr-updi-gdb --erase --load /dev/ttyUSB0 build/fixtures/all_nvm.elf` against real hardware programs every section and exits 0; reading the target back with `--device` shows the expected fuse / lock bytes.
+- `build/avr-updi-gdb --load /dev/ttyUSB0 build/fixtures/all_nvm.elf` (no `--erase`) against a chip with a `.lock` segment exits 1 with a diagnostic naming the missing `--erase`.
+
+**Out of scope (explicit, deferred to a later phase):**
+- Reading EEPROM / USERROW back for verification after a load.
+- GDB `M`-packet runtime writes to non-FLASH NVM (the existing FLASH/data-space split in `dh_write_mem` is preserved; runtime fuse writes are a separate, dangerous feature).
+- AVR Tiny / Mega-0 / EA family NVM support — the EEERWR command code and fuse base differ; out of scope per HLR-006 (AVR-Dx only).
+
+**Risks.**
+- **Lockbit programming is irreversible without a high-voltage UPDI re-enable** if the user locks UPDI out. The `--allow-lock-updi` interlock is the primary mitigation; the user manual must call this out prominently.
+- **AVR-Dx variant address-window differences.** AVR DA / DB / DD have the same EEPROM / USERROW / FUSE / LOCK base addresses but differ in EEPROM size. The window-size constants in `src/updi.h` must use the smallest common size and reject over-large segments rather than silently truncating.
+- **Post-write OCD state.** Some NVM commands leave the CPU in an indeterminate state. The post-load `updi_enter_debug()` re-issue (item 4) is the chosen mitigation; tests must verify it fires on every non-FLASH path.
+
 ## 9. Risks & Open Questions
 
 *   **Half-duplex echo cancellation in UPDI tests.** Every byte transmitted over the UPDI UART is echoed back on the RX line by the hardware. PTY pairs do not auto-echo, so the PTY test harness must explicitly write back the echo bytes before injecting each simulated AVR response. If this is omitted, UPDI functions will block waiting to drain echoes that never arrive, causing PTY tests to time out even though the production logic is correct.
@@ -596,6 +695,7 @@ T-shirt sizes relative to Phase 0.
 | 5 | Application Entry Point + Integration | L — `main.c` itself is thin; integration test harness (fork/PTY/TCP) is the dominant effort |
 | 6 | Installation Targets + Documentation | S/M — Makefile targets are ~30 lines each; RPM spec and `.deb` control boilerplate add moderate complexity; Homebrew formula is straightforward Ruby; most effort is writing user manual and man page prose |
 | 7 | Device-Signature Diagnostic Mode | S — one new UPDI helper, one new CLI flag, a family-name lookup table, a PTY-driven test file; touches only `main.c` and `updi.c`, no protocol changes |
+| 8 | Non-FLASH NVM Programming | M — four new `updi_nvm_write_*` routines mirroring the existing FLASH path, a window-classifier dispatcher in `main.c`, one new CLI flag (`--allow-lock-updi`), and a multi-section ELF fixture; touches `updi.c`, `main.c`, and the test build only |
 
 ## 11. Out-of-Scope Follow-ups
 

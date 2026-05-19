@@ -425,19 +425,23 @@ static void updi_mem_write_returns_minus1_on_updi_nak(void)
     TEST_ASSERT_EQUAL_INT(-1, rc);
 }
 
-/* Test 17/18/19/20: halt/run/step are deferred to Phase 3 (OCD layer).
- * The API exists as stubs returning -1. */
-static void updi_halt_returns_minus1_stub_until_ocd_layer(void)
+/* Test 17/18/19: halt/run/step now drive the AVR-Dx OCD STOP/RUN/STEP
+ * primitives.  With a bare PTY (no scripted echo), the LDCS poll for
+ * STOPPED never satisfies, so each call must return -1.  This proves
+ * the OCD-aware error path is reachable and bounded.                */
+static void updi_halt_returns_minus1_when_target_never_acknowledges_stopped(void)
 {
     open_pty_fixture();
     TEST_ASSERT_EQUAL_INT(-1, updi_halt(g_slave_fd));
 }
-static void updi_run_returns_minus1_stub_until_ocd_layer(void)
+static void updi_run_returns_minus1_on_stcs_link_failure(void)
 {
     open_pty_fixture();
+    /* Close master so STCS has nowhere to land → -1. */
+    close(g_master_fd); g_master_fd = -1;
     TEST_ASSERT_EQUAL_INT(-1, updi_run(g_slave_fd));
 }
-static void updi_step_returns_minus1_stub_until_ocd_layer(void)
+static void updi_step_returns_minus1_when_target_never_acknowledges_stopped(void)
 {
     open_pty_fixture();
     TEST_ASSERT_EQUAL_INT(-1, updi_step(g_slave_fd));
@@ -847,9 +851,9 @@ int main(void)
     RUN_TEST(updi_mem_read_returns_minus1_on_select_timeout);
     RUN_TEST(updi_mem_write_returns_0_on_success);
     RUN_TEST(updi_mem_write_returns_minus1_on_updi_nak);
-    RUN_TEST(updi_halt_returns_minus1_stub_until_ocd_layer);
-    RUN_TEST(updi_run_returns_minus1_stub_until_ocd_layer);
-    RUN_TEST(updi_step_returns_minus1_stub_until_ocd_layer);
+    RUN_TEST(updi_halt_returns_minus1_when_target_never_acknowledges_stopped);
+    RUN_TEST(updi_run_returns_minus1_on_stcs_link_failure);
+    RUN_TEST(updi_step_returns_minus1_when_target_never_acknowledges_stopped);
     RUN_TEST(updi_console_poll_returns_pending_bytes_without_halting);
 
     /* Phase D */

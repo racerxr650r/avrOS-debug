@@ -11,13 +11,10 @@
 #include "fsm_mapper.h"
 
 #define RSP_PACKET_MAX      2048
-#define RSP_MAX_BREAKPOINTS 16
-
-/* AVR BREAK opcode (little-endian word written into FLASH for software bps) */
-#define AVR_BREAK_OPCODE    0x9598u
-
-/* Stop-reason: SIGTRAP (signal 5) is what GDB expects after halt/step. */
-#define RSP_STOP_SIGTRAP    "T05"
+/* AVR-Dx OCD provides exactly two hardware breakpoint comparators
+ * (BP0, BP1).  Both Z0 (software) and Z1 (hardware) GDB requests are
+ * routed to the same two slots — see src/gdb_rsp.c dh_insert_bp.    */
+#define RSP_MAX_BREAKPOINTS 2
 
 struct RspHandlers;
 
@@ -30,6 +27,12 @@ typedef struct {
     int                      *g_thread_p;   /* selected thread for g/G/P */
     int                      *c_thread_p;   /* selected thread for c/s */
     volatile sig_atomic_t    *quit_p;       /* k packet sets *quit_p = 1 */
+    /* Shadow of the two AVR-Dx OCD hardware-breakpoint comparators.
+     * Holds the GDB byte address currently installed in BP0/BP1, or
+     * 0xFFFFFFFF for an empty slot.  Owned by gdb_rsp.c; main zeroes
+     * it (designated initialiser leaves both = 0, then handler init
+     * marks them empty on first use).                                */
+    uint32_t                  hw_bp_addr[2];
 } RspContext;
 
 /* Each handler returns 0 on success or -1 on error. The handler is
