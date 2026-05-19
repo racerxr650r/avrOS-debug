@@ -146,12 +146,14 @@ This variable is checked at the top of each `event_loop()` iteration and is also
 
 #### 3.2.2 Command-Line Arguments
 
-`avr-updi-gdb [--port <port>] [--baud <baud>] [--load] <serial-device> <elf-file>`
+`avr-updi-gdb [--port <port>] [--baud <baud>] [--erase] [--load] [--allow-lock-updi] <serial-device> <elf-file>`
 `avr-updi-gdb --device [--baud <baud>] <serial-device> [elf-file]`
 
 *   `--port <port>` — TCP port for the GDB listener (default: `1234`).
 *   `--baud <baud>` — UART baud rate (default: `115200`).
-*   `--load` — flash the ELF binary to the target before attaching. Mutually exclusive with `--device`.
+*   `--erase` — issue a UPDI chip-erase before any `--load` step; required when the ELF contains a LOCK segment.
+*   `--load` — program every `PT_LOAD` segment of the ELF to the matching NVM kind (FLASH, EEPROM, USERROW, FUSES, LOCK). SIGROW segments are skipped (read-only). Mutually exclusive with `--device`.
+*   `--allow-lock-updi` — when set, `--load` is allowed to write LOCK byte patterns that would disable the UPDI interface (`UPDIDIS`); without this flag only the 4-byte unlock pattern `0x5CC5C55C` is accepted.
 *   `--device` — one-shot diagnostic mode: open the UPDI link, read the target SIGROW and ASI status, print a verbose human-readable report to `stdout`, and exit without binding the GDB listener. `<elf-file>` is optional in this mode. Mutually exclusive with `--load`.
 *   `<serial-device>` — path to the UART device (e.g. `/dev/ttyUSB0`).
 *   `<elf-file>` — path to the AVR ELF binary.
@@ -387,6 +389,10 @@ UPDI CS-space OCD registers (accessed via LDCS/STCS):
 *   **`int updi_ocd_write_pc(int fd, uint32_t byte_addr)`** — Convert a GDB byte address back to the word-aligned PC+1 form and write OCD_PC via UPDI STS.
 *   **`int updi_ocd_set_hw_bp(int fd, uint8_t idx, uint32_t byte_addr)`** — Program hardware-breakpoint comparator idx (0 or 1) to a GDB byte address: write the 3-byte LE address to OCD_BP0A/OCD_BP1A via UPDI STS, set the matching OCD_CTRL1_BP0/OCD_CTRL1_BP1 enable bit, and set the global OCD_CTRL0_HWBP enable bit.
 *   **`int updi_ocd_clear_hw_bp(int fd, uint8_t idx)`** — Disable hardware-breakpoint comparator idx by clearing the matching OCD_CTRL1_BP0/OCD_CTRL1_BP1 bit via UPDI LDS/STS read-modify-write on OCD_CTRL1.
+*   **`int updi_nvm_write_eeprom(int fd, uint32_t addr, const uint8_t *data, size_t len)`** — Program EEPROM (UPDI window 0x814000–0x8143FF) byte-by-byte using NVMCTRL command EEERWR (0x13), polling NVMSTATUS.EEBUSY (bit 1) between bytes. Window-checks addr/len; returns -1 on out-of-window or BUSY timeout.
+*   **`int updi_nvm_write_userrow(int fd, uint32_t addr, const uint8_t *data, size_t len)`** — Program USERROW (UPDI window 0x810080–0x8100FF, 128 B) using the same EEERWR + EEBUSY-poll sequence as updi_nvm_write_eeprom.
+*   **`int updi_nvm_write_fuses(int fd, uint32_t addr, const uint8_t *data, size_t len)`** — Program FUSES (UPDI window 0x820000–0x82001F, 32 B) using the same EEERWR + EEBUSY-poll sequence as updi_nvm_write_eeprom.
+*   **`int updi_nvm_write_lockbits(int fd, uint32_t addr, const uint8_t *data, size_t len, bool allow_updi_disable)`** — Program LOCK (UPDI window 0x820040–0x820043, 4 B). Returns UPDI_ERR_LOCKED (-3) if ASI_SYS_STATUS.LOCKSTATUS is asserted, or if !allow_updi_disable and the 4-byte little-endian payload is not the unlock pattern UPDI_LOCK_UNLOCKED (0x5CC5C55C). Otherwise programs via EEERWR + EEBUSY poll.
 *   **`int updi_nvm_write_flash(int fd, uint32_t word_addr, const uint8_t *data, size_t len)`**
     *   Purpose: Erase and program one or more FLASH pages starting at word_addr using the UPDI NVM controller write-page sequence.
     *   Pre-condition: Target CPU is halted (`updi_halt()` has been called); `word_addr` is aligned to a FLASH page boundary; `len` is a non-zero multiple of the target FLASH page size (512 bytes for AVR DA/DB).

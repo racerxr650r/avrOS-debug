@@ -7,7 +7,9 @@ avr-updi-gdb \- UPDI-to-GDB debug stub with avrOS FSM awareness
 .IR port ]
 .RB [ \-\-baud
 .IR baud ]
+.RB [ \-\-erase ]
 .RB [ \-\-load ]
+.RB [ \-\-allow\-lock\-updi ]
 .I serial-device
 .I elf-file
 .br
@@ -54,10 +56,46 @@ layer. Defaults to
 .BR 115200 .
 .TP
 .B \-\-load
-Before entering the event loop, program
+Before entering the event loop, program every
+.B PT_LOAD
+segment of
 .I elf-file
-into target FLASH via the UPDI NVM controller. On any write failure
-the process exits 1 without opening the GDB listener.
+to the matching AVR-Dx NVM kind via the UPDI NVM controller. Segments
+are classified by their virtual address against the unified UPDI
+address windows: FLASH
+.RB ( 0x800000 \(en 0x80FFFF ),
+USERROW
+.RB ( 0x810080 \(en 0x8100FF ),
+EEPROM
+.RB ( 0x814000 \(en 0x8143FF ),
+FUSES
+.RB ( 0x820000 \(en 0x82001F ),
+and LOCK
+.RB ( 0x820040 \(en 0x820043 ).
+SIGROW segments are skipped (factory-programmed, read-only).
+Segments outside every programmable window cause
+.B \-\-load
+to fail with a diagnostic. On any write failure the process exits 1
+without opening the GDB listener.
+.TP
+.B \-\-erase
+Issue a UPDI chip-erase before any
+.B \-\-load
+step. Required when the ELF contains a LOCK segment, because the
+silicon requires a chip-erase to clear
+.B LOCKSTATUS
+before lockbits can be re-programmed.
+.TP
+.B \-\-allow\-lock\-updi
+Allow
+.B \-\-load
+to write LOCK byte patterns that would assert
+.B UPDIDIS
+and permanently disable the UPDI debug interface. Without this flag
+only the 4-byte unlock pattern
+.B 0x5CC5C55C
+is accepted as a LOCK payload, protecting against accidental UPDI
+lock-out.
 .TP
 .B \-\-device
 One-shot diagnostic. Open UPDI, read the SIGROW signature, revision,

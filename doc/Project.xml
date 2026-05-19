@@ -142,12 +142,14 @@ extern volatile sig_atomic_t g_quit;  /* set to 1 by SIGINT/SIGTERM handler */
 ```
 
 This variable is checked at the top of each `event_loop()` iteration and is also accessible to any module that needs to detect a shutdown-in-progress condition.]]></interface>
-          <interface title="Command-Line Arguments"><![CDATA[`avr-updi-gdb [--port <port>] [--baud <baud>] [--load] <serial-device> <elf-file>`
+          <interface title="Command-Line Arguments"><![CDATA[`avr-updi-gdb [--port <port>] [--baud <baud>] [--erase] [--load] [--allow-lock-updi] <serial-device> <elf-file>`
 `avr-updi-gdb --device [--baud <baud>] <serial-device> [elf-file]`
 
 *   `--port <port>` — TCP port for the GDB listener (default: `1234`).
 *   `--baud <baud>` — UART baud rate (default: `115200`).
-*   `--load` — flash the ELF binary to the target before attaching. Mutually exclusive with `--device`.
+*   `--erase` — issue a UPDI chip-erase before any `--load` step; required when the ELF contains a LOCK segment.
+*   `--load` — program every `PT_LOAD` segment of the ELF to the matching NVM kind (FLASH, EEPROM, USERROW, FUSES, LOCK). SIGROW segments are skipped (read-only). Mutually exclusive with `--device`.
+*   `--allow-lock-updi` — when set, `--load` is allowed to write LOCK byte patterns that would disable the UPDI interface (`UPDIDIS`); without this flag only the 4-byte unlock pattern `0x5CC5C55C` is accepted.
 *   `--device` — one-shot diagnostic mode: open the UPDI link, read the target SIGROW and ASI status, print a verbose human-readable report to `stdout`, and exit without binding the GDB listener. `<elf-file>` is optional in this mode. Mutually exclusive with `--load`.
 *   `<serial-device>` — path to the UART device (e.g. `/dev/ttyUSB0`).
 *   `<elf-file>` — path to the AVR ELF binary.]]></interface>
@@ -380,6 +382,14 @@ UPDI CS-space OCD registers (accessed via LDCS/STCS):
                     summary="Program hardware-breakpoint comparator idx (0 or 1) to a GDB byte address: write the 3-byte LE address to OCD_BP0A/OCD_BP1A via UPDI STS, set the matching OCD_CTRL1_BP0/OCD_CTRL1_BP1 enable bit, and set the global OCD_CTRL0_HWBP enable bit."/>
           <function signature="int updi_ocd_clear_hw_bp(int fd, uint8_t idx)"
                     summary="Disable hardware-breakpoint comparator idx by clearing the matching OCD_CTRL1_BP0/OCD_CTRL1_BP1 bit via UPDI LDS/STS read-modify-write on OCD_CTRL1."/>
+          <function signature="int updi_nvm_write_eeprom(int fd, uint32_t addr, const uint8_t *data, size_t len)"
+                    summary="Program EEPROM (UPDI window 0x814000–0x8143FF) byte-by-byte using NVMCTRL command EEERWR (0x13), polling NVMSTATUS.EEBUSY (bit 1) between bytes. Window-checks addr/len; returns -1 on out-of-window or BUSY timeout."/>
+          <function signature="int updi_nvm_write_userrow(int fd, uint32_t addr, const uint8_t *data, size_t len)"
+                    summary="Program USERROW (UPDI window 0x810080–0x8100FF, 128 B) using the same EEERWR + EEBUSY-poll sequence as updi_nvm_write_eeprom."/>
+          <function signature="int updi_nvm_write_fuses(int fd, uint32_t addr, const uint8_t *data, size_t len)"
+                    summary="Program FUSES (UPDI window 0x820000–0x82001F, 32 B) using the same EEERWR + EEBUSY-poll sequence as updi_nvm_write_eeprom."/>
+          <function signature="int updi_nvm_write_lockbits(int fd, uint32_t addr, const uint8_t *data, size_t len, bool allow_updi_disable)"
+                    summary="Program LOCK (UPDI window 0x820040–0x820043, 4 B). Returns UPDI_ERR_LOCKED (-3) if ASI_SYS_STATUS.LOCKSTATUS is asserted, or if !allow_updi_disable and the 4-byte little-endian payload is not the unlock pattern UPDI_LOCK_UNLOCKED (0x5CC5C55C). Otherwise programs via EEERWR + EEBUSY poll."/>
           <function signature="int updi_nvm_write_flash(int fd, uint32_t word_addr, const uint8_t *data, size_t len)">
             <purpose>Erase and program one or more FLASH pages starting at word_addr using the UPDI NVM controller write-page sequence.</purpose>
             <pre><![CDATA[Target CPU is halted (`updi_halt()` has been called); `word_addr` is aligned to a FLASH page boundary; `len` is a non-zero multiple of the target FLASH page size (512 bytes for AVR DA/DB).]]></pre>
@@ -1154,8 +1164,8 @@ Errors are propagated upward through the module stack without retrying:
         </traces>
       </hlr>
 
-      <hlr id="HLR-004" name="ELF Flash Load Option">
-        <text><![CDATA[When the `--load` flag is provided, the application shall erase and program the target FLASH with the content of the specified ELF binary via UPDI NVM write sequences before entering the GDB listener loop.]]></text>
+      <hlr id="HLR-004" name="ELF Load Option">
+        <text><![CDATA[When the `--load` flag is provided, the application shall classify every `PT_LOAD` segment of the supplied ELF binary by virtual address against the AVR-Dx unified UPDI address windows (FLASH, EEPROM, USERROW, FUSES, LOCK, SIGROW) and dispatch each segment to the matching UPDI NVM write routine before entering the GDB listener loop. Segments whose virtual addresses fall outside every programmable window shall cause `--load` to fail with a diagnostic; SIGROW segments shall be silently skipped (signature row is read-only); SRAM-resident segments shall be skipped without programming.]]></text>
         <traces>
           <trace target="SDD" ref="3.2.2"/>
           <trace target="SDD" ref="4.3.1"/>
@@ -1202,7 +1212,7 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-009" name="FLASH Programming">
-        <text><![CDATA[The application shall erase and program pages of the target FLASH using the UPDI NVM controller write sequence, enabling both the `--load` startup option and software breakpoint insertion.]]></text>
+        <text><![CDATA[The application shall erase and program pages of the target FLASH using the UPDI NVM controller write-page sequence (NVMCTRL command `ERWP` = `0x03`, page-aligned address, 512-byte pages padded with `0xFF`, per-page `FBUSY` poll on `NVMSTATUS` bit 0). FLASH programming is one of several NVM kinds dispatched by `--load`; see HLR-046 for the EEPROM/USERROW/FUSES/LOCK kinds and HLR-047 for the lockbit safety interlock. FLASH programming also underpins software breakpoint insertion.]]></text>
         <traces>
           <trace target="SDD" ref="4.3.1"/>
         </traces>
@@ -1492,6 +1502,30 @@ Errors are propagated upward through the module stack without retrying:
     <section number="10" title="Hardware Integration Testing">
       <intro><![CDATA[Requirements in this section govern the on-target hardware integration test harness (`tests/hw/hw_test.c`). These tests link against the project's UPDI driver and exercise live AVR-Dx silicon over a serial UPDI link. They are manual-only and are explicitly excluded from `make test` so that unit-test execution remains hardware-independent and CI-safe.]]></intro>
 
+      <hlr id="HLR-046" name="Non-FLASH NVM Programming">
+        <text><![CDATA[The application shall program the target's EEPROM, USERROW, FUSES, and (subject to HLR-047) LOCK memories from ELF `PT_LOAD` segments whose virtual addresses fall in the corresponding UPDI unified-address windows of the runtime-selected device (see HLR-048). For the AVR-DA reference target the windows are EEPROM `0x814000`–`0x8143FF` (512 B), USERROW `0x810080`–`0x8100FF` (32 B), FUSES `0x820000`–`0x82001F` (32 B), and LOCK `0x820040`–`0x820043` (4 B). The AVR-DB family shares the AVR-DA layout. The AVR-DD family widens USERROW to 128 B (`0x810080`–`0x8100FF` window, 128-byte page) and shrinks EEPROM to 256 B (`0x814000`–`0x8140FF`). The AVR-DU and AVR-SD families relocate USERROW to `0x811200`–`0x8113FF` (512 B) and likewise expose 256 B of EEPROM at `0x814000`–`0x8140FF`. FUSES and LOCK occupy the same windows on all five families. Each NVM kind shall use the byte-granular NVMCTRL command `EEERWR` (`0x13`) — erase-and-write per byte — and shall poll `NVMSTATUS.EEBUSY` (bit 1) clear between bytes. Segments whose virtual addresses fall in the SIGROW window (`0x811080`–`0x8110FF` on AVR-DA/DB/DD, `0x811080`–`0x8113FF` on AVR-DU/SD) shall be silently skipped because SIGROW is factory-programmed and read-only. Segments outside every programmable window for the selected device shall be rejected with a diagnostic. After all non-FLASH writes complete, the application shall re-enter OCD mode (`updi_enter_debug`) so the subsequent RSP session has a halted, OCD-addressable CPU. The AVR-EA and AVR-EB families are out of scope for this requirement because they use the incompatible NVMCTRLv3 controller (different command opcodes — FLPERW `0x05`, EEPERW `0x15`).]]></text>
+        <traces>
+          <trace target="SDD" ref="3.2.2"/>
+          <trace target="SDD" ref="4.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-048" name="Multi-Family Runtime Device Dispatch">
+        <text><![CDATA[The application shall maintain a compile-time table of supported AVR Dx/Du/Sd device families (AVR-DA, AVR-DB, AVR-DD, AVR-DU, AVR-SD) where each entry records the family name, the base address and size of every programmable NVM window (EEPROM, USERROW, FUSES, LOCK), the SIGROW base address, and a boolean flag indicating whether the family has been hardware-validated on real silicon. On startup, after `updi_open()` and before any NVM operation, the application shall select an active device descriptor by one of two paths: (a) if the user supplied `--force-device=<family>` on the command line, the named entry shall be selected by case-insensitive match and a warning shall be emitted on `stderr` when the entry's `hw_tested` flag is false; (b) otherwise the application shall read the 3-byte SIGROW DEVICEID0..2 triplet at the AVR-DA/DB/DD canonical address (`0x1100`) and look it up against the table's autodetect signatures, failing with a diagnostic that names all five supported families and the `--force-device` option when DEVICEID0 is not `0x1E` or the signature is unrecognised. The AVR-DU and AVR-SD families place SIGROW at `0x1080` rather than `0x1100`, so they cannot be auto-detected from the AVR-DA probe address and shall always be selected via `--force-device`. Once selected, all subsequent NVM read/write call sites and the ELF-VMA window classifier in `load_segments()` shall consult the runtime-selected descriptor for window bases and sizes; no hard-coded address constant shall be used for the per-family fields. AVR-DA is the only family currently validated against live silicon; AVR-DB/DD/DU/SD entries are declared from the published datasheet memory maps and are marked untested-on-silicon. The diagnostic device mode (`--device`) shall tolerate unknown silicon — when no `--force-device` override is supplied it shall not invoke the autodetect probe so the report can still display raw SIGROW bytes for triage.]]></text>
+        <traces>
+          <trace target="SDD" ref="3.2.2"/>
+          <trace target="SDD" ref="4.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-047" name="Lockbit Programming Safety Interlock">
+        <text><![CDATA[Writing the LOCK byte (UPDI window `0x820040`–`0x820043`) shall be subject to two mandatory safety interlocks. First, the application shall refuse to program the LOCK window unless `--erase` was also supplied on the command line, because the silicon requires a chip-erase to clear `LOCKSTATUS` before lockbits can be re-programmed and partial writes brick the part. Second, the application shall refuse any 4-byte LOCK payload other than the unlock pattern `0x5CC5C55C` (little-endian) unless the operator additionally supplies `--allow-lock-updi`, because every other 4-byte value risks setting the `UPDIDIS` lockbit which permanently disables the UPDI debug interface. When `LOCKSTATUS` (`ASI_SYS_STATUS` bit 1) is asserted at the time of the LOCK write, the application shall abort with the new error code `UPDI_ERR_LOCKED` (-3). With both interlocks satisfied (`--erase` present, payload is the unlock pattern OR `--allow-lock-updi` present), the application shall write the LOCK byte(s) using the same EEPROM `EEERWR` sequence as the other non-FLASH windows.]]></text>
+        <traces>
+          <trace target="SDD" ref="3.2.2"/>
+          <trace target="SDD" ref="4.3.1"/>
+        </traces>
+      </hlr>
+
       <hlr id="HLR-045" name="On-Target Hardware Integration Test Harness">
         <text><![CDATA[The project shall provide a standalone, manual-only on-target hardware integration test harness, separate from the unit-test suite, that validates the UPDI driver, device-info report, SRAM and FLASH memory access, and the GDB RSP server against live AVR-Dx silicon. The harness shall be organised into four opt-in groups: Group A (read-only link and device-info probes), Group B (non-destructive SRAM round-trips with size and address-mode variants), Group C (destructive FLASH erase/write/verify, gated by an explicit confirmation variable), and Group D (RSP server spawn-and-probe over TCP, gated by an opt-in variable). The harness shall be configurable via environment variables and command-line flags (serial port, expected device ID, SRAM probe address, FLASH page address, RSP TCP port, verbosity), and shall accept an explicit `--addr-24bit` switch to validate 24-bit UPDI addressing on parts whose FLASH lies above 64 KiB. The Makefile shall expose dedicated targets `hw-test` (Groups A+B), `hw-test-nvm` (Groups A+B+C), `hw-test-rsp` (Groups A+B+D), and `hw-test-all` (all groups); none of these targets shall ever be invoked by `make test`.]]></text>
         <traces>
@@ -1583,6 +1617,23 @@ Errors are propagated upward through the module stack without retrying:
         <text><![CDATA[Before entering `event_loop()`, `main()` shall call `updi_enter_debug(cfg.updi_fd)`, after `updi_open()` and any optional `updi_nvm_write_flash()` (`--load`) steps and before `rsp_listen()`. A non-zero return shall be treated as a fatal initialisation failure and shall trigger the LLR-MAIN-07 teardown with exit code 1. This arms AVR-Dx OCD mode for the lifetime of the server so that all RSP `g`/`G`/`P`/`s`/`c`/`Z0`/`Z1` operations have a halted, OCD-addressable CPU register file available on first use.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-010" name="Execution Control"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MAIN-11">
+        <text><![CDATA[When `cfg.load_flash` is true, `load_segments()` shall walk every `PT_LOAD` segment of the open ELF context and classify it by its UPDI virtual address (after folding ELF VMAs below `UPDI_FLASH_BASE` into the FLASH window via `vaddr | 0x800000`). SRAM-resident segments shall be skipped silently. The classifier shall obtain its EEPROM, USERROW, FUSES, LOCK, and SIGROW window bases and sizes from the runtime-selected device descriptor (`updi_get_device()`, see LLR-UPDI-27); no per-family address shall be hard-coded in the classifier. SIGROW segments shall be skipped with a `"SIGROW segment @0x%06x ignored (read-only)"` notice on `stdout`. FLASH segments (everything below the selected device's USERROW base in the UPDI space) shall be padded with `0xFF` to a 512-byte page boundary and dispatched to `updi_nvm_write_flash()` — the established Phase 2/3 path is unchanged. EEPROM, USERROW, and FUSES segments shall be dispatched verbatim (no padding) to `updi_nvm_write_eeprom()`, `updi_nvm_write_userrow()`, and `updi_nvm_write_fuses()` respectively. LOCK segments (`[dev->lock_base, dev->lock_base + dev->lock_size)`) shall additionally require `cfg.erase_chip` to be true (else the function shall return -1 with a diagnostic naming the missing `--erase` flag) and shall be dispatched to `updi_nvm_write_lockbits(..., cfg.allow_lock_updi)`. Any segment whose UPDI address is in none of these windows shall cause `load_segments()` to return -1 with `"error: segment vaddr 0x%06x not in any programmable NVM window"` on `stderr`. The `--allow-lock-updi` CLI flag shall set `cfg.allow_lock_updi` and is forwarded to `updi_nvm_write_lockbits()` unchanged.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-004" name="ELF Load Option"/>
+          <trace target="HLR" ref="HLR-046" name="Non-FLASH NVM Programming"/>
+          <trace target="HLR" ref="HLR-047" name="Lockbit Programming Safety Interlock"/>
+          <trace target="HLR" ref="HLR-048" name="Multi-Family Runtime Device Dispatch"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MAIN-12">
+        <text><![CDATA[`parse_args()` shall recognise the option `--force-device=<family>` (case-insensitive value) and store the value in `cfg.force_device` (default `NULL`). The `--help` / `usage()` output shall list the option along with the five supported family names (`AVR-DA`, `AVR-DB`, `AVR-DD`, `AVR-DU`, `AVR-SD`). In normal startup (`app_main()`), after `updi_open()` succeeds, the application shall call `updi_select_device(cfg.updi_fd, cfg.force_device)` and shall treat a non-zero return as a fatal initialisation failure, exiting via the LLR-MAIN-07 teardown with exit code 1. In diagnostic mode (`run_device_mode()`, `--device`), `updi_select_device()` shall be called only when `cfg.force_device` is non-NULL and non-empty, so that unknown silicon can still be probed and its raw SIGROW bytes reported.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-048" name="Multi-Family Runtime Device Dispatch"/>
         </traces>
       </llr>
     </function>
@@ -1744,10 +1795,47 @@ Errors are propagated upward through the module stack without retrying:
         </traces>
       </llr>
 
+      <llr id="LLR-UPDI-23">
+        <text><![CDATA[`updi_nvm_write_eeprom(fd, addr, data, len)` shall write `len` bytes from `data` to the EEPROM window `[UPDI_EEPROM_BASE, UPDI_EEPROM_BASE + UPDI_EEPROM_SIZE)` (`0x814000`–`0x8143FF`). The function shall reject zero-length writes, an `addr` below the window, or `addr + len` past the window end with -1 and without issuing any UPDI traffic. It shall enter NVM programming mode via the standard NVMPROG KEY + reset pulse + `ASI_SYS_STATUS.NVMPROG` poll, then for each byte: (1) `STS NVMCTRL_CTRLA = EEERWR` (`0x13`); (2) `STS addr+i = data[i]`; (3) poll `NVMSTATUS.EEBUSY` (bit 1) clear up to 200 ms. After the final byte it shall write `NVMCTRL_CTRLA = NOCMD` to release the controller. Returns 0 on success, -1 on UPDI failure or BUSY timeout.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-046" name="Non-FLASH NVM Programming"/>
+          <trace target="HLR" ref="HLR-037" name="UPDI Operation Timeout Bounds"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-UPDI-24">
+        <text><![CDATA[`updi_nvm_write_userrow(fd, addr, data, len)` shall write the USERROW window `[UPDI_USERROW_BASE, UPDI_USERROW_BASE + UPDI_USERROW_SIZE)` (`0x810080`–`0x8100FF`, 128 bytes) using the identical NVMPROG + `EEERWR` per-byte sequence as LLR-UPDI-23, with `EEBUSY` polling between bytes. Out-of-window addresses or oversize writes shall return -1 without UPDI traffic. Returns 0 on success, -1 on failure.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-046" name="Non-FLASH NVM Programming"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-UPDI-25">
+        <text><![CDATA[`updi_nvm_write_fuses(fd, addr, data, len)` shall write the FUSES window `[UPDI_FUSES_BASE, UPDI_FUSES_BASE + UPDI_FUSES_SIZE)` (`0x820000`–`0x82001F`, 32 bytes) using the same NVMPROG + `EEERWR` per-byte sequence with `EEBUSY` polling. Out-of-window addresses or oversize writes shall return -1 without UPDI traffic. Returns 0 on success, -1 on failure.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-046" name="Non-FLASH NVM Programming"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-UPDI-26">
+        <text><![CDATA[`updi_nvm_write_lockbits(fd, addr, data, len, allow_updi_disable)` shall write the LOCK window `[UPDI_LOCK_BASE, UPDI_LOCK_BASE + UPDI_LOCK_SIZE)` (`0x820040`–`0x820043`, 4 bytes) using the same NVMPROG + `EEERWR` per-byte + `EEBUSY` poll sequence. Two safety interlocks gate the write: (a) it shall LDCS-read `ASI_SYS_STATUS` and return `UPDI_ERR_LOCKED` (-3) if `LOCKSTATUS` (bit 1, mask `0x02`) is asserted — the device must already have been chip-erased to clear LOCKSTATUS; (b) when `allow_updi_disable` is false and `len == 4`, it shall reject any payload whose little-endian 4-byte value is not the unlock pattern `UPDI_LOCK_UNLOCKED` (`0x5CC5C55C`), returning `UPDI_ERR_LOCKED` — this prevents accidentally setting bit patterns that would assert `UPDIDIS` and permanently disable the UPDI interface. Out-of-window addresses shall return -1 without UPDI traffic. Returns 0 on success, -1 on UPDI failure or BUSY timeout, `UPDI_ERR_LOCKED` on safety-interlock rejection.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-047" name="Lockbit Programming Safety Interlock"/>
+        </traces>
+      </llr>
+
       <llr id="LLR-UPDI-22">
         <text><![CDATA[`updi_ocd_clear_hw_bp(fd, idx)` shall disable hardware breakpoint comparator `idx` (0 or 1) by clearing the matching `OCD_CTRL1_BP0` / `OCD_CTRL1_BP1` enable bit via UPDI LDS/STS read-modify-write on `OCD_CTRL1` (`0x0F89`). The function shall not clear the global `OCD_CTRL0_HWBP` bit (the other comparator may still be armed). Returns 0 on success, -1 on UPDI failure or invalid `idx`.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-016" name="Breakpoints"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-UPDI-27">
+        <text><![CDATA[The UPDI module shall publish a `UpdiDeviceMap` struct (family name; USERROW base/size; EEPROM base/size; FUSES base/size; LOCK base/size; SIGROW base; `hw_tested` flag) and a static `g_device_table[]` with one entry per supported family populated from the published datasheet memory maps: AVR-DA (USERROW `0x1080`/32 B, EEPROM `0x1400`/512 B, SIGROW `0x1100`, hw-tested), AVR-DB (identical to DA, untested), AVR-DD (USERROW `0x1080`/128 B, EEPROM `0x1400`/256 B, SIGROW `0x1100`, untested), AVR-DU (USERROW `0x1200`/512 B, EEPROM `0x1400`/256 B, SIGROW `0x1080`, untested), AVR-SD (identical to AVR-DU, untested). FUSES `0x1050`/16 B and LOCK `0x1040`/4 B are identical across all five families. The module shall expose two entry points: (a) `int updi_select_device(int fd, const char *force_family)` — when `force_family` is non-NULL and non-empty, find the entry whose `family` matches `force_family` case-insensitively and set the module's `g_device` pointer to it (emitting a `stderr` warning when `hw_tested` is false); otherwise read SIGROW DEVICEID0..2 at the canonical address `0x1100` and look up the matching autodetect signature for AVR-DA/DB, returning -1 with a diagnostic that lists all five families and the `--force-device` option when DEVICEID0 is not `0x1E` or the signature is unknown; (b) `const UpdiDeviceMap *updi_get_device(void)` — return the current `g_device` pointer (defaulting to the AVR-DA entry so callers that bypass `updi_select_device()` still see the historical AVR-DA constants). All four NVM writer functions (`updi_nvm_write_eeprom`, `updi_nvm_write_userrow`, `updi_nvm_write_fuses`, `updi_nvm_write_lockbits`) shall obtain their window base and size from `updi_get_device()` rather than the compile-time `UPDI_*_BASE/_SIZE` macros. The USERROW writer shall use a stack buffer of size `UPDI_USERROW_ROW_LEN_MAX` (512 B, sized for AVR-DU/SD) and the actual row length from `dev->userrow_size`. Returns 0 on success, -1 on autodetect failure or unknown family name.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-048" name="Multi-Family Runtime Device Dispatch"/>
+          <trace target="HLR" ref="HLR-046" name="Non-FLASH NVM Programming"/>
         </traces>
       </llr>
     </function>
@@ -2163,7 +2251,7 @@ Errors are propagated upward through the module stack without retrying:
     <!-- ============================================================ -->
     <!-- src/main.c unit tests                                        -->
     <!-- ============================================================ -->
-    <file path="tests/test_main.c" role="unit" count="15">
+    <file path="tests/test_main.c" role="unit" count="25">
       <header><![CDATA[Unit tests for `src/main.c`: argument parsing, event loop, signal handling, and resource teardown. Uses `fork()`/`waitpid()` to test `exit()` paths and a mock UPDI/RSP layer to exercise the event loop without real hardware.]]></header>
 
       <test name="parse_args_valid_positional_args_populate_config">
@@ -2240,12 +2328,62 @@ Errors are propagated upward through the module stack without retrying:
         <purpose><![CDATA[Run `main()` with mocked `updi_open()`, `updi_enter_debug()`, and `rsp_listen()` recording call order. Verify (a) `updi_enter_debug()` is called exactly once after `updi_open()` succeeds and before `rsp_listen()`, and (b) when `updi_enter_debug()` returns non-zero, `main()` invokes the LLR-MAIN-07 teardown sequence and exits with code 1 without calling `rsp_listen()`.]]></purpose>
         <traces><trace target="LLR" ref="LLR-MAIN-10"/></traces>
       </test>
+
+      <test name="parse_args_allow_lock_updi_sets_flag">
+        <purpose><![CDATA[Call `parse_args()` with `--allow-lock-updi` present in argv and verify that the returned `AppConfig.allow_lock_updi` is `true`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-11"/></traces>
+      </test>
+
+      <test name="parse_args_force_device_captures_family">
+        <purpose><![CDATA[Call `parse_args()` with `--force-device=AVR-DD` in argv and verify that `AppConfig.force_device` points to the string `"AVR-DD"`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-12"/></traces>
+      </test>
+
+      <test name="parse_args_force_device_default_is_null">
+        <purpose><![CDATA[Call `parse_args()` with no `--force-device` flag and verify that `AppConfig.force_device` defaults to `NULL` (autodetect path will be used).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-12"/></traces>
+      </test>
+
+      <test name="load_segments_dispatches_eeprom_segment_to_eeprom_writer">
+        <purpose><![CDATA[Build a one-segment ELF at vaddr `0x814000` size 8 and run `app_main(... --load ...)`. Verify wrapped `updi_nvm_write_eeprom` is called exactly once with `addr=0x814000` and `len=8`, while no other NVM writer is called.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-11"/></traces>
+      </test>
+
+      <test name="load_segments_dispatches_fuses_segment_to_fuses_writer">
+        <purpose><![CDATA[Build a one-segment ELF at vaddr `0x820004` size 2 and run `app_main(... --load ...)`. Verify wrapped `updi_nvm_write_fuses` is called exactly once with `addr=0x820004` and `len=2`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-11"/></traces>
+      </test>
+
+      <test name="load_segments_dispatches_userrow_segment_to_userrow_writer">
+        <purpose><![CDATA[Build a one-segment ELF at vaddr `0x810080` size 16 and run `app_main(... --load ...)`. Verify wrapped `updi_nvm_write_userrow` is called exactly once with `addr=0x810080`. Regression test ensuring the classifier does not mis-route USERROW into the FLASH branch (the USERROW VMA lies between `UPDI_FLASH_BASE` and `UPDI_EEPROM_BASE`).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-11"/></traces>
+      </test>
+
+      <test name="load_segments_lock_requires_erase_else_exit_1">
+        <purpose><![CDATA[Build a LOCK segment at vaddr `0x820040` size 4 and run `app_main(... --load ...)` WITHOUT `--erase`. Verify `app_main` returns 1 and that `updi_nvm_write_lockbits` was never called.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-11"/></traces>
+      </test>
+
+      <test name="load_segments_lock_with_erase_dispatches_to_lockbits_writer">
+        <purpose><![CDATA[Build a LOCK segment at vaddr `0x820040` size 4 and run `app_main(... --erase --load ...)`. Verify wrapped `updi_chip_erase` was called exactly once, then wrapped `updi_nvm_write_lockbits` was called exactly once with `addr=0x820040` and the recorded `allow_updi_disable` flag matching `cfg.allow_lock_updi` (false in this case).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-11"/></traces>
+      </test>
+
+      <test name="load_segments_sigrow_segment_is_skipped">
+        <purpose><![CDATA[Build a SIGROW segment at vaddr `0x811080` size 4 and run `app_main(... --load ...)`. Verify NONE of the FLASH/EEPROM/USERROW/FUSES/LOCK writers were called and `app_main` returns 0.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-11"/></traces>
+      </test>
+
+      <test name="load_segments_unknown_window_returns_minus1">
+        <purpose><![CDATA[Build a segment at vaddr `0x830000` (outside every programmable UPDI window) and run `app_main(... --load ...)`. Verify `app_main` returns 1 (load failure) and that no NVM writer was called.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-11"/></traces>
+      </test>
     </file>
 
     <!-- ============================================================ -->
     <!-- src/updi.c unit tests                                        -->
     <!-- ============================================================ -->
-    <file path="tests/test_updi.c" role="unit" count="33">
+    <file path="tests/test_updi.c" role="unit" count="42">
       <header><![CDATA[Unit tests for `src/updi.c`: UART configuration, BREAK/SYNCH/LDCS link initialisation, three-frame block memory read/write, NVM flash programming, OCD-mode entry, OCD execution-control primitives (halt/run/step + poll_halted), OCD register-file access (GPR/SREG/SP/PC) and hardware-breakpoint comparator programming, and console polling. A loopback PTY pair substitutes for real UART hardware; a `--wrap=select` linker shim lets tests inject `select()` timeouts.]]></header>
 
       <test name="updi_open_sets_8e2_raw_half_duplex_via_termios">
@@ -2416,6 +2554,51 @@ Errors are propagated upward through the module stack without retrying:
       <test name="updi_console_poll_returns_0_when_output_buffer_empty">
         <purpose><![CDATA[With no data pending on the master end, verify that `updi_console_poll()` returns 0 in a non-blocking manner.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-12"/></traces>
+      </test>
+
+      <test name="updi_nvm_write_eeprom_rejects_addr_below_window">
+        <purpose><![CDATA[Call `updi_nvm_write_eeprom(fd, UPDI_EEPROM_BASE - 1, data, 1)` and verify the function returns -1 without transmitting any bytes on the UPDI line (drain the master end and assert zero bytes captured). Confirms the EEPROM window guard rejects out-of-window addresses before any NVM activity.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-23"/></traces>
+      </test>
+
+      <test name="updi_nvm_write_eeprom_rejects_addr_above_window">
+        <purpose><![CDATA[Call `updi_nvm_write_eeprom(fd, UPDI_EEPROM_BASE + UPDI_EEPROM_SIZE - 1, data, 2)` and verify the function returns -1: the second byte (at `UPDI_EEPROM_BASE + UPDI_EEPROM_SIZE`) lies past the EEPROM window.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-23"/></traces>
+      </test>
+
+      <test name="updi_nvm_write_fuses_rejects_len_exceeds_window">
+        <purpose><![CDATA[Call `updi_nvm_write_fuses(fd, UPDI_FUSES_BASE, data, UPDI_FUSES_SIZE + 1)` and verify the function returns -1: the payload extends one byte past the FUSES window.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-25"/></traces>
+      </test>
+
+      <test name="updi_nvm_write_userrow_rejects_zero_length">
+        <purpose><![CDATA[Call `updi_nvm_write_userrow(fd, UPDI_USERROW_BASE, NULL, 0)` and verify the function returns -1 without UPDI traffic.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-24"/></traces>
+      </test>
+
+      <test name="updi_nvm_write_lockbits_returns_locked_when_lockstatus_set">
+        <purpose><![CDATA[Pre-stuff the LDCS ASI_SYS_STATUS response with `0x02` (LOCKSTATUS asserted) and call `updi_nvm_write_lockbits(fd, UPDI_LOCK_BASE, unlock_pattern, 4, allow=true)`. Verify the function returns `UPDI_ERR_LOCKED` (-3) — even with the unlock pattern and `allow_updi_disable=true`, a locked device cannot be written.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-26"/></traces>
+      </test>
+
+      <test name="updi_nvm_write_lockbits_refuses_updidis_value_without_flag">
+        <purpose><![CDATA[Pre-stuff the LDCS ASI_SYS_STATUS response with `0x00` (LOCKSTATUS clear, post-erase state) and call `updi_nvm_write_lockbits(fd, UPDI_LOCK_BASE, {0,0,0,0}, 4, allow=false)`. Verify the function returns `UPDI_ERR_LOCKED`: only the `UPDI_LOCK_UNLOCKED` (`0x5CC5C55C`) 4-byte pattern is accepted without `--allow-lock-updi`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-26"/></traces>
+      </test>
+
+      <test name="updi_get_device_default_is_avrda">
+        <purpose><![CDATA[Call `updi_get_device()` before any `updi_select_device()` invocation and verify the returned descriptor names AVR-DA, exposes the historical `UPDI_USERROW_BASE`/`UPDI_USERROW_SIZE` and `UPDI_EEPROM_BASE`/`UPDI_EEPROM_SIZE` constants, and has `hw_tested == true`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-27"/></traces>
+      </test>
+
+      <test name="updi_select_device_force_avrdd_sets_active_descriptor">
+        <purpose><![CDATA[Call `updi_select_device(-1, "avr-dd")` (case-insensitive force path, no UPDI traffic). Verify the function returns 0, `updi_get_device()` now returns the AVR-DD descriptor (`userrow_size == 128`, `hw_tested == false`), then restore the AVR-DA default for subsequent tests.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-27"/></traces>
+      </test>
+
+      <test name="updi_select_device_unknown_family_returns_minus1">
+        <purpose><![CDATA[Call `updi_select_device(-1, "AVR-XYZ")` and verify the function returns -1 (unknown family name) without modifying the active descriptor.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-27"/></traces>
       </test>
     </file>
 

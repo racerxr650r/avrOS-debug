@@ -46,6 +46,9 @@ typedef enum {
     CALL_NONE = 0,
     CALL_UPDI_OPEN, CALL_UPDI_CLOSE, CALL_UPDI_CONSOLE_POLL,
     CALL_UPDI_NVM, CALL_UPDI_ENTER_DEBUG,
+    CALL_UPDI_NVM_EEPROM, CALL_UPDI_NVM_USERROW,
+    CALL_UPDI_NVM_FUSES,  CALL_UPDI_NVM_LOCKBITS,
+    CALL_UPDI_CHIP_ERASE,
     CALL_RSP_LISTEN, CALL_RSP_ACCEPT, CALL_RSP_CLOSE,
     CALL_RSP_RECV, CALL_RSP_DISPATCH,
     CALL_ELF_OPEN, CALL_ELF_TABLES, CALL_ELF_CLOSE,
@@ -65,6 +68,19 @@ static int mk_updi_nvm_ret;
 static int mk_updi_nvm_calls;
 static int mk_updi_enter_debug_ret;
 static int mk_updi_enter_debug_calls;
+
+/* Phase 8: non-FLASH NVM wrap state.  Each wrap records the count, the
+ * last (addr, len) pair seen, and a configurable return value.        */
+static int      mk_updi_eeprom_ret,   mk_updi_eeprom_calls;
+static uint32_t mk_updi_eeprom_addr;  static size_t mk_updi_eeprom_len;
+static int      mk_updi_userrow_ret,  mk_updi_userrow_calls;
+static uint32_t mk_updi_userrow_addr; static size_t mk_updi_userrow_len;
+static int      mk_updi_fuses_ret,    mk_updi_fuses_calls;
+static uint32_t mk_updi_fuses_addr;   static size_t mk_updi_fuses_len;
+static int      mk_updi_lockbits_ret, mk_updi_lockbits_calls;
+static uint32_t mk_updi_lockbits_addr; static size_t mk_updi_lockbits_len;
+static bool     mk_updi_lockbits_allow_last;
+static int      mk_updi_chip_erase_ret, mk_updi_chip_erase_calls;
 
 static int mk_rsp_listen_ret;
 static int mk_rsp_listen_calls;
@@ -152,10 +168,84 @@ int __wrap_updi_enter_debug(int fd)
     return mk_updi_enter_debug_ret;
 }
 
-/* updi_chip_erase is not linked from updi.c (test_main builds against
- * a wrap shim); provide a non-wrap stub so --erase paths link. */
-int updi_chip_erase(int fd);
-int updi_chip_erase(int fd) { (void)fd; return 0; }
+/* updi_chip_erase is now wrapped so tests can observe --erase order. */
+int __wrap_updi_chip_erase(int fd);
+int __wrap_updi_chip_erase(int fd)
+{
+    (void)fd;
+    mk_updi_chip_erase_calls++;
+    LOG(CALL_UPDI_CHIP_ERASE);
+    return mk_updi_chip_erase_ret;
+}
+
+/* HLR-046: per-family memory map.  Tests run against the compile-time
+ * AVR-DA defaults already encoded in the UPDI_*_BASE/_SIZE macros, so
+ * `__wrap_updi_select_device()` is a no-op success stub and
+ * `__wrap_updi_get_device()` hands back a static AVR-DA descriptor.   */
+int __wrap_updi_select_device(int fd, const char *force);
+int __wrap_updi_select_device(int fd, const char *force)
+{
+    (void)fd; (void)force;
+    return 0;
+}
+
+const UpdiDeviceMap *__wrap_updi_get_device(void);
+const UpdiDeviceMap *__wrap_updi_get_device(void)
+{
+    static const UpdiDeviceMap mk_avrda = {
+        "AVR-DA",
+        UPDI_USERROW_BASE, UPDI_USERROW_SIZE,
+        UPDI_EEPROM_BASE,  UPDI_EEPROM_SIZE,
+        UPDI_FUSES_BASE,   UPDI_FUSES_SIZE,
+        UPDI_LOCK_BASE,    UPDI_LOCK_SIZE,
+        UPDI_SIGROW_BASE,
+        true
+    };
+    return &mk_avrda;
+}
+
+int __wrap_updi_nvm_write_eeprom(int fd, uint32_t a, const uint8_t *d, size_t n);
+int __wrap_updi_nvm_write_eeprom(int fd, uint32_t a, const uint8_t *d, size_t n)
+{
+    (void)fd; (void)d;
+    mk_updi_eeprom_calls++;
+    mk_updi_eeprom_addr = a; mk_updi_eeprom_len = n;
+    LOG(CALL_UPDI_NVM_EEPROM);
+    return mk_updi_eeprom_ret;
+}
+
+int __wrap_updi_nvm_write_userrow(int fd, uint32_t a, const uint8_t *d, size_t n);
+int __wrap_updi_nvm_write_userrow(int fd, uint32_t a, const uint8_t *d, size_t n)
+{
+    (void)fd; (void)d;
+    mk_updi_userrow_calls++;
+    mk_updi_userrow_addr = a; mk_updi_userrow_len = n;
+    LOG(CALL_UPDI_NVM_USERROW);
+    return mk_updi_userrow_ret;
+}
+
+int __wrap_updi_nvm_write_fuses(int fd, uint32_t a, const uint8_t *d, size_t n);
+int __wrap_updi_nvm_write_fuses(int fd, uint32_t a, const uint8_t *d, size_t n)
+{
+    (void)fd; (void)d;
+    mk_updi_fuses_calls++;
+    mk_updi_fuses_addr = a; mk_updi_fuses_len = n;
+    LOG(CALL_UPDI_NVM_FUSES);
+    return mk_updi_fuses_ret;
+}
+
+int __wrap_updi_nvm_write_lockbits(int fd, uint32_t a, const uint8_t *d,
+                                   size_t n, bool allow);
+int __wrap_updi_nvm_write_lockbits(int fd, uint32_t a, const uint8_t *d,
+                                   size_t n, bool allow)
+{
+    (void)fd; (void)d;
+    mk_updi_lockbits_calls++;
+    mk_updi_lockbits_addr = a; mk_updi_lockbits_len = n;
+    mk_updi_lockbits_allow_last = allow;
+    LOG(CALL_UPDI_NVM_LOCKBITS);
+    return mk_updi_lockbits_ret;
+}
 
 int __wrap_rsp_listen(uint16_t port);
 int __wrap_rsp_listen(uint16_t port)
@@ -284,6 +374,17 @@ void setUp(void)
     mk_updi_close_calls = 0;
     mk_updi_nvm_ret = 0;        mk_updi_nvm_calls = 0;
     mk_updi_enter_debug_ret = 0; mk_updi_enter_debug_calls = 0;
+
+    mk_updi_eeprom_ret   = 0; mk_updi_eeprom_calls   = 0;
+    mk_updi_userrow_ret  = 0; mk_updi_userrow_calls  = 0;
+    mk_updi_fuses_ret    = 0; mk_updi_fuses_calls    = 0;
+    mk_updi_lockbits_ret = 0; mk_updi_lockbits_calls = 0;
+    mk_updi_lockbits_allow_last = false;
+    mk_updi_chip_erase_ret = 0; mk_updi_chip_erase_calls = 0;
+    mk_updi_eeprom_addr = mk_updi_userrow_addr =
+        mk_updi_fuses_addr = mk_updi_lockbits_addr = 0;
+    mk_updi_eeprom_len = mk_updi_userrow_len =
+        mk_updi_fuses_len = mk_updi_lockbits_len = 0;
 
     mk_rsp_listen_ret = 8;      mk_rsp_listen_calls = 0;
     mk_rsp_accept_ret = 9;
@@ -583,6 +684,132 @@ static void test_main_cleanup_closes_gdb_elf_updi_in_order(void)
     TEST_ASSERT_TRUE(i_updi > i_elf);
 }
 
+/* ── Phase 8 — load_segments() window classifier tests (LLR-MAIN-11) ── */
+
+/* LLR-MAIN-11: parse_args() recognises --allow-lock-updi. */
+static void test_parse_args_allow_lock_updi_sets_flag(void)
+{
+    char *argv[] = { (char*)"prog", (char*)"--allow-lock-updi",
+                     (char*)"/dev/x", (char*)"a.elf" };
+    AppConfig cfg;
+    parse_args(4, argv, &cfg);
+    TEST_ASSERT_TRUE(cfg.allow_lock_updi);
+}
+
+/* LLR-MAIN-12: parse_args() captures --force-device=<family> value. */
+static void test_parse_args_force_device_captures_family(void)
+{
+    char *argv[] = { (char*)"prog", (char*)"--force-device=AVR-DD",
+                     (char*)"/dev/x", (char*)"a.elf" };
+    AppConfig cfg;
+    parse_args(4, argv, &cfg);
+    TEST_ASSERT_NOT_NULL(cfg.force_device);
+    TEST_ASSERT_EQUAL_STRING("AVR-DD", cfg.force_device);
+}
+
+/* LLR-MAIN-12: parse_args() defaults force_device to NULL. */
+static void test_parse_args_force_device_default_is_null(void)
+{
+    char *argv[] = { (char*)"prog", (char*)"/dev/x", (char*)"a.elf" };
+    AppConfig cfg;
+    parse_args(3, argv, &cfg);
+    TEST_ASSERT_NULL(cfg.force_device);
+}
+
+/* Shared driver: build an ELF with one PT_LOAD at `vma` of size `sz`,
+ * run app_main with --load (+ optional extra argv tokens), return rc. */
+static int run_load_with_one_segment(uint32_t vma, uint32_t sz,
+                                     const char *extra_flag)
+{
+    uint32_t v[1] = { vma };
+    uint32_t s[1] = { sz  };
+    mk_elf_tmp_fd = build_min_elf(v, s, 1, &mk_elf_planted_ehdr);
+    mk_elf_have_ehdr = 1;
+    mk_elf_planted_sram = 0xFFFFFFFFu;  /* none of our test VMAs collide */
+
+    if (extra_flag) {
+        char *argv[] = { (char*)"prog", (char*)"--load", (char*)extra_flag,
+                         (char*)"/dev/x", (char*)"a.elf" };
+        return app_main(5, argv);
+    }
+    char *argv[] = { (char*)"prog", (char*)"--load",
+                     (char*)"/dev/x", (char*)"a.elf" };
+    return app_main(4, argv);
+}
+
+/* LLR-MAIN-11: EEPROM segment (avr-libc VMA 0x810000) → translated to
+ * UPDI_EEPROM_BASE and dispatched to updi_nvm_write_eeprom. */
+static void test_load_segments_dispatches_eeprom_segment_to_eeprom_writer(void)
+{
+    TEST_ASSERT_EQUAL_INT(0,
+        run_load_with_one_segment(ELF_VMA_EEPROM, 8u, NULL));
+    TEST_ASSERT_EQUAL_INT(1, mk_updi_eeprom_calls);
+    TEST_ASSERT_EQUAL_HEX32(UPDI_EEPROM_BASE, mk_updi_eeprom_addr);
+    TEST_ASSERT_EQUAL_size_t(8u, mk_updi_eeprom_len);
+    TEST_ASSERT_EQUAL_INT(0, mk_updi_nvm_calls);
+}
+
+/* LLR-MAIN-11: FUSES segment (avr-libc VMA 0x820000+4) → translated to
+ * UPDI_FUSES_BASE+4 and dispatched to updi_nvm_write_fuses. */
+static void test_load_segments_dispatches_fuses_segment_to_fuses_writer(void)
+{
+    TEST_ASSERT_EQUAL_INT(0,
+        run_load_with_one_segment(ELF_VMA_FUSES + 4u, 2u, NULL));
+    TEST_ASSERT_EQUAL_INT(1, mk_updi_fuses_calls);
+    TEST_ASSERT_EQUAL_HEX32(UPDI_FUSES_BASE + 4u, mk_updi_fuses_addr);
+    TEST_ASSERT_EQUAL_size_t(2u, mk_updi_fuses_len);
+}
+
+/* LLR-MAIN-11: USERROW segment (avr-libc VMA 0x850000) → translated to
+ * UPDI_USERROW_BASE and dispatched to updi_nvm_write_userrow. */
+static void test_load_segments_dispatches_userrow_segment_to_userrow_writer(void)
+{
+    TEST_ASSERT_EQUAL_INT(0,
+        run_load_with_one_segment(ELF_VMA_USERROW, 16u, NULL));
+    TEST_ASSERT_EQUAL_INT(1, mk_updi_userrow_calls);
+    TEST_ASSERT_EQUAL_HEX32(UPDI_USERROW_BASE, mk_updi_userrow_addr);
+}
+
+/* LLR-MAIN-11: LOCK segment without --erase → app_main returns 1. */
+static void test_load_segments_lock_requires_erase_else_exit_1(void)
+{
+    TEST_ASSERT_EQUAL_INT(1,
+        run_load_with_one_segment(ELF_VMA_LOCK, 4u, NULL));
+    TEST_ASSERT_EQUAL_INT(0, mk_updi_lockbits_calls);
+}
+
+/* LLR-MAIN-11: LOCK segment (avr-libc VMA 0x830000) with --erase →
+ * translated to UPDI_LOCK_BASE and dispatched to updi_nvm_write_lockbits. */
+static void test_load_segments_lock_with_erase_dispatches_to_lockbits_writer(void)
+{
+    TEST_ASSERT_EQUAL_INT(0,
+        run_load_with_one_segment(ELF_VMA_LOCK, 4u, "--erase"));
+    TEST_ASSERT_EQUAL_INT(1, mk_updi_chip_erase_calls);
+    TEST_ASSERT_EQUAL_INT(1, mk_updi_lockbits_calls);
+    TEST_ASSERT_EQUAL_HEX32(UPDI_LOCK_BASE, mk_updi_lockbits_addr);
+    TEST_ASSERT_FALSE(mk_updi_lockbits_allow_last);
+}
+
+/* LLR-MAIN-11: SIGROW segment (avr-libc VMA 0x840000) is skipped
+ * (no NVM writer called). */
+static void test_load_segments_sigrow_segment_is_skipped(void)
+{
+    TEST_ASSERT_EQUAL_INT(0,
+        run_load_with_one_segment(ELF_VMA_SIGROW, 4u, NULL));
+    TEST_ASSERT_EQUAL_INT(0, mk_updi_nvm_calls);
+    TEST_ASSERT_EQUAL_INT(0, mk_updi_eeprom_calls);
+    TEST_ASSERT_EQUAL_INT(0, mk_updi_lockbits_calls);
+}
+
+/* LLR-MAIN-11: Unknown ELF VMA band → load_segments returns -1 → app_main 1. */
+static void test_load_segments_unknown_window_returns_minus1(void)
+{
+    /* 0x900000 is outside every recognised ELF VMA band. */
+    TEST_ASSERT_EQUAL_INT(1,
+        run_load_with_one_segment(0x900000u, 4u, NULL));
+    TEST_ASSERT_EQUAL_INT(0, mk_updi_nvm_calls);
+}
+
 /* ── Runner ──────────────────────────────────────────────────────────── */
 int main(void)
 {
@@ -602,5 +829,15 @@ int main(void)
     RUN_TEST(test_sigint_handler_sets_g_quit_to_1);
     RUN_TEST(test_event_loop_exits_immediately_when_g_quit_is_1);
     RUN_TEST(test_main_cleanup_closes_gdb_elf_updi_in_order);
+    RUN_TEST(test_parse_args_allow_lock_updi_sets_flag);
+    RUN_TEST(test_parse_args_force_device_captures_family);
+    RUN_TEST(test_parse_args_force_device_default_is_null);
+    RUN_TEST(test_load_segments_dispatches_eeprom_segment_to_eeprom_writer);
+    RUN_TEST(test_load_segments_dispatches_fuses_segment_to_fuses_writer);
+    RUN_TEST(test_load_segments_dispatches_userrow_segment_to_userrow_writer);
+    RUN_TEST(test_load_segments_lock_requires_erase_else_exit_1);
+    RUN_TEST(test_load_segments_lock_with_erase_dispatches_to_lockbits_writer);
+    RUN_TEST(test_load_segments_sigrow_segment_is_skipped);
+    RUN_TEST(test_load_segments_unknown_window_returns_minus1);
     return UNITY_END();
 }

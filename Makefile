@@ -157,7 +157,8 @@ DFP_FLAGS  := $(if $(wildcard $(DFP)/gcc/dev/$(AVR_MCU)),\
 AVR_CFLAGS := -mmcu=$(AVR_MCU) $(DFP_FLAGS) -Os -g
 FIXTURE_SRCS   := $(FIXTUREDIR)/avros_full.c \
                   $(FIXTUREDIR)/avros_partial.c \
-                  $(FIXTUREDIR)/avros_break.c
+                  $(FIXTUREDIR)/avros_break.c \
+                  $(FIXTUREDIR)/all_nvm.c
 FIXTURE_ELFS   := $(patsubst $(FIXTUREDIR)/%.c,$(FIXBINDIR)/%.elf,$(FIXTURE_SRCS))
 # not_avr.elf is a plain i386 ELF — built with the host gcc targeting ELF
 NOT_AVR_SRC    := $(FIXTUREDIR)/not_avr.c
@@ -211,7 +212,11 @@ TEST_EXTRA_LDFLAGS_test_rsp :=
 # static parse_args() / event_loop() / load_flash_segments() helpers.
 TEST_SRCS_test_main := $(TESTDIR)/test_main.c
 TEST_WRAP_test_main  := updi_open updi_close updi_console_poll \
-                        updi_nvm_write_flash updi_enter_debug \
+                        updi_select_device updi_get_device \
+                        updi_nvm_write_flash \
+                        updi_nvm_write_eeprom updi_nvm_write_userrow \
+                        updi_nvm_write_fuses updi_nvm_write_lockbits \
+                        updi_chip_erase updi_enter_debug \
                         rsp_listen rsp_accept rsp_close \
                         rsp_recv_packet rsp_dispatch \
                         rsp_default_handlers \
@@ -442,6 +447,7 @@ HW_SRAM_ADDR         ?=
 HW_FLASH_PAGE_ADDR   ?=
 HW_ADDR_24BIT        ?=
 HW_TEST_ELF          ?=
+HW_TEST_NVM_ELF      ?=
 HW_RSP_PORT          ?=
 HW_VERBOSE           ?=
 HW_TEST_NVM_CONFIRM  ?=
@@ -458,6 +464,7 @@ HW_ENV       = HW_PORT='$(HW_PORT)' \
                HW_FLASH_PAGE_ADDR='$(HW_FLASH_PAGE_ADDR)' \
                HW_ADDR_24BIT='$(HW_ADDR_24BIT)' \
                HW_TEST_ELF='$(HW_TEST_ELF)' \
+               HW_TEST_NVM_ELF='$(HW_TEST_NVM_ELF)' \
                HW_RSP_PORT='$(HW_RSP_PORT)' \
                HW_VERBOSE='$(HW_VERBOSE)'
 
@@ -470,15 +477,18 @@ $(HW_TEST_BIN): $(HW_TEST_SRC) $(BUILDDIR)/updi.o
 hw-test: $(HW_TEST_BIN)
 	$(Q)$(HW_ENV) $(HW_TEST_BIN)
 
-# Destructive: programs the last FLASH page (HW_FLASH_PAGE_ADDR).
+# Destructive: programs the last FLASH page (HW_FLASH_PAGE_ADDR) and the
+# EEPROM + USERROW windows (Phase-8 Group E, from the all_nvm.elf fixture).
 # Requires explicit HW_TEST_NVM_CONFIRM=YES to fire.
-hw-test-nvm: $(HW_TEST_BIN)
+hw-test-nvm: $(HW_TEST_BIN) $(FIXBINDIR)/all_nvm.elf
 	@if [ "$(HW_TEST_NVM_CONFIRM)" != "YES" ]; then \
 	    echo "hw-test-nvm: refused — set HW_TEST_NVM_CONFIRM=YES to confirm"; \
-	    echo "             (this will erase + rewrite FLASH page at $(if $(HW_FLASH_PAGE_ADDR),$(HW_FLASH_PAGE_ADDR),0x7E00))"; \
+	    echo "             (this will erase + rewrite FLASH page at $(if $(HW_FLASH_PAGE_ADDR),$(HW_FLASH_PAGE_ADDR),0x7E00),"; \
+	    echo "              and overwrite EEPROM @0x814000 + USERROW @0x810080 from all_nvm.elf)"; \
 	    exit 1; \
 	fi
-	$(Q)$(HW_ENV) $(HW_TEST_BIN) --with-nvm
+	$(Q)$(HW_ENV) HW_TEST_NVM_ELF='$(if $(HW_TEST_NVM_ELF),$(HW_TEST_NVM_ELF),$(FIXBINDIR)/all_nvm.elf)' \
+	    $(HW_TEST_BIN) --with-nvm
 
 # Spawns the RSP server as a child, probes TCP. Requires HW_TEST_ELF.
 hw-test-rsp: $(HW_TEST_BIN) all

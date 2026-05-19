@@ -831,6 +831,128 @@ static void updi_open_returns_minus1_after_3_consecutive_link_failures(void)
     TEST_ASSERT_EQUAL_INT(-1, sut_fd);
 }
 
+/* ══════════════════════════════════════════════════════════════════════ */
+/*  Phase 8 — non-FLASH NVM programming (LLR-UPDI-16..19)                 */
+/* ══════════════════════════════════════════════════════════════════════ */
+
+/* LLR-UPDI-16: EEPROM writer rejects an address below UPDI_EEPROM_BASE
+ * without issuing any UPDI traffic. */
+static void updi_nvm_write_eeprom_rejects_addr_below_window(void)
+{
+    uint8_t data[1] = { 0xA5 };
+    open_pty_fixture();
+    int rc = updi_nvm_write_eeprom(g_slave_fd, UPDI_EEPROM_BASE - 1u,
+                                   data, sizeof data);
+    TEST_ASSERT_EQUAL_INT(-1, rc);
+
+    /* No bytes should have been transmitted. */
+    uint8_t cap[16];
+    size_t n = drain_master(g_master_fd, cap, sizeof cap);
+    TEST_ASSERT_EQUAL_size_t(0u, n);
+}
+
+/* LLR-UPDI-16: EEPROM writer rejects (addr+len) past UPDI_EEPROM_SIZE. */
+static void updi_nvm_write_eeprom_rejects_addr_above_window(void)
+{
+    uint8_t data[2] = { 0xA5, 0x5A };
+    open_pty_fixture();
+    int rc = updi_nvm_write_eeprom(
+        g_slave_fd, UPDI_EEPROM_BASE + UPDI_EEPROM_SIZE - 1u,
+        data, sizeof data);
+    TEST_ASSERT_EQUAL_INT(-1, rc);
+}
+
+/* LLR-UPDI-17: FUSES writer rejects len that exceeds the 32-byte window. */
+static void updi_nvm_write_fuses_rejects_len_exceeds_window(void)
+{
+    uint8_t data[UPDI_FUSES_SIZE + 1];
+    memset(data, 0xFF, sizeof data);
+    open_pty_fixture();
+    int rc = updi_nvm_write_fuses(g_slave_fd, UPDI_FUSES_BASE,
+                                  data, sizeof data);
+    TEST_ASSERT_EQUAL_INT(-1, rc);
+}
+
+/* LLR-UPDI-18: USERROW writer rejects zero-length write. */
+static void updi_nvm_write_userrow_rejects_zero_length(void)
+{
+    open_pty_fixture();
+    int rc = updi_nvm_write_userrow(g_slave_fd, UPDI_USERROW_BASE, NULL, 0);
+    TEST_ASSERT_EQUAL_INT(-1, rc);
+}
+
+/* LLR-UPDI-19: lockbits writer returns UPDI_ERR_LOCKED when LOCKSTATUS
+ * (ASI_SYS_STATUS bit 1) is asserted — even with the unlock pattern. */
+static void updi_nvm_write_lockbits_returns_locked_when_lockstatus_set(void)
+{
+    /* LDCS ASI_SYS_STATUS = 0x02 → LOCKSTATUS asserted.  Each LDCS frame
+     * is SYNCH + opcode (2 echo bytes) followed by 1 status byte. */
+    uint8_t  lockstatus_set = 0x02;
+    uint8_t  data[4] = { 0x5C, 0xC5, 0xC5, 0x5C };  /* unlock pattern */
+
+    open_pty_fixture();
+    prestuff_fill(g_master_fd, 0x00, 2);
+    prestuff(g_master_fd, &lockstatus_set, 1);
+
+    int rc = updi_nvm_write_lockbits(g_slave_fd, UPDI_LOCK_BASE,
+                                     data, sizeof data, true);
+    TEST_ASSERT_EQUAL_INT(UPDI_ERR_LOCKED, rc);
+}
+
+/* LLR-UPDI-19: lockbits writer returns UPDI_ERR_LOCKED when the payload
+ * is NOT the UPDI-unlock pattern and allow_updi_disable=false. */
+static void updi_nvm_write_lockbits_refuses_updidis_value_without_flag(void)
+{
+    /* LDCS ASI_SYS_STATUS = 0x00 → post-erase / unlocked. */
+    uint8_t  lockstatus_clr = 0x00;
+    uint8_t  data[4] = { 0x00, 0x00, 0x00, 0x00 };  /* would disable UPDI */
+
+    open_pty_fixture();
+    prestuff_fill(g_master_fd, 0x00, 2);
+    prestuff(g_master_fd, &lockstatus_clr, 1);
+
+    int rc = updi_nvm_write_lockbits(g_slave_fd, UPDI_LOCK_BASE,
+                                     data, sizeof data, false);
+    TEST_ASSERT_EQUAL_INT(UPDI_ERR_LOCKED, rc);
+}
+
+/* LLR-UPDI-27: updi_get_device() defaults to AVR-DA before any
+ * updi_select_device() call (preserves historical compile-time defaults). */
+static void updi_get_device_default_is_avrda(void)
+{
+    const UpdiDeviceMap *dev = updi_get_device();
+    TEST_ASSERT_NOT_NULL(dev);
+    TEST_ASSERT_EQUAL_STRING("AVR-DA", dev->family);
+    TEST_ASSERT_EQUAL_HEX32(UPDI_USERROW_BASE, dev->userrow_base);
+    TEST_ASSERT_EQUAL_UINT32(UPDI_USERROW_SIZE, dev->userrow_size);
+    TEST_ASSERT_EQUAL_HEX32(UPDI_EEPROM_BASE,  dev->eeprom_base);
+    TEST_ASSERT_EQUAL_UINT32(UPDI_EEPROM_SIZE, dev->eeprom_size);
+    TEST_ASSERT_TRUE(dev->hw_tested);
+}
+
+/* LLR-UPDI-27: --force-device=<name> selects the matching table entry
+ * case-insensitively without any UPDI traffic. */
+static void updi_select_device_force_avrdd_sets_active_descriptor(void)
+{
+    /* Use fd=-1: forced path must not touch the wire. */
+    int rc = updi_select_device(-1, "avr-dd");
+    TEST_ASSERT_EQUAL_INT(0, rc);
+    const UpdiDeviceMap *dev = updi_get_device();
+    TEST_ASSERT_EQUAL_STRING("AVR-DD", dev->family);
+    TEST_ASSERT_EQUAL_UINT32(128u, dev->userrow_size);
+    TEST_ASSERT_FALSE(dev->hw_tested);
+
+    /* Restore AVR-DA default for subsequent tests. */
+    (void)updi_select_device(-1, "AVR-DA");
+}
+
+/* LLR-UPDI-27: --force-device with an unknown family name returns -1. */
+static void updi_select_device_unknown_family_returns_minus1(void)
+{
+    int rc = updi_select_device(-1, "AVR-XYZ");
+    TEST_ASSERT_EQUAL_INT(-1, rc);
+}
+
 /* ── Test runner ─────────────────────────────────────────────────────── */
 
 int main(void)
@@ -867,6 +989,19 @@ int main(void)
     RUN_TEST(updi_open_restores_session_baud_after_break);
     RUN_TEST(updi_open_retries_cold_start_3_times_on_no_ack);
     RUN_TEST(updi_open_returns_minus1_after_3_consecutive_link_failures);
+
+    /* Phase 8 — non-FLASH NVM */
+    RUN_TEST(updi_nvm_write_eeprom_rejects_addr_below_window);
+    RUN_TEST(updi_nvm_write_eeprom_rejects_addr_above_window);
+    RUN_TEST(updi_nvm_write_fuses_rejects_len_exceeds_window);
+    RUN_TEST(updi_nvm_write_userrow_rejects_zero_length);
+    RUN_TEST(updi_nvm_write_lockbits_returns_locked_when_lockstatus_set);
+    RUN_TEST(updi_nvm_write_lockbits_refuses_updidis_value_without_flag);
+
+    /* Phase 9 — multi-family runtime device dispatch (LLR-UPDI-27) */
+    RUN_TEST(updi_get_device_default_is_avrda);
+    RUN_TEST(updi_select_device_force_avrdd_sets_active_descriptor);
+    RUN_TEST(updi_select_device_unknown_family_returns_minus1);
 
     return UNITY_END();
 }

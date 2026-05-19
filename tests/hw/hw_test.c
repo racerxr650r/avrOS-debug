@@ -9,11 +9,13 @@
  *     build/hw_test [--port DEV] [--device-id "HH HH HH"]
  *                   [--flash-page ADDR] [--sram-addr ADDR] [--addr-24bit ADDR]
  *                   [--with-nvm] [--with-rsp]
+ *                   [--nvm-elf PATH]
  *                   [--elf PATH] [--rsp-port N]
  *                   [DEV]
  *
  * Defaults come from environment variables HW_PORT, HW_DEVICE_ID,
- * HW_FLASH_PAGE_ADDR, HW_SRAM_ADDR, HW_ADDR_24BIT, HW_TEST_ELF, HW_RSP_PORT.
+ * HW_FLASH_PAGE_ADDR, HW_SRAM_ADDR, HW_ADDR_24BIT, HW_TEST_ELF,
+ * HW_TEST_NVM_ELF, HW_RSP_PORT.
  * If the first positional argument is supplied it overrides --port / $HW_PORT.
  *
  * Exit code: 0 if every non-skipped case passed, 1 otherwise.
@@ -41,6 +43,7 @@
 #include <unistd.h>
 
 #include "updi.h"
+#include "elf.h"
 
 #define DEF_PORT            "/dev/ttyAMA2"
 #define DEF_FLASH_PAGE      0x7E00u   /* last page of 32 KiB AVR128DA28 */
@@ -51,6 +54,15 @@
                                        * if the running app uses this region. */
 #define DEF_RSP_PORT        1234
 #define DEF_BAUD            225000
+#define DEF_NVM_ELF         "build/fixtures/all_nvm.elf"
+
+/* Phase-8 fixture payload metadata. The fixture (tests/fixtures/all_nvm.c)
+ * places 16 bytes in .eeprom and 16 bytes in .user_signatures. Group E
+ * extracts them at runtime via the ELF section header table and writes
+ * them to the matching UPDI windows on real silicon. */
+#define E_EEPROM_OFF        0x00u   /* offset into UPDI EEPROM window  */
+#define E_USERROW_OFF       0x00u   /* offset into UPDI USERROW window */
+#define E_PAYLOAD_LEN       16u
 
 /* ── Configuration ───────────────────────────────────────────────────── */
 typedef struct {
@@ -63,6 +75,7 @@ typedef struct {
     uint32_t    addr_24bit;     /* 0 = skip B3 */
     bool        with_nvm;
     bool        with_rsp;
+    const char *nvm_elf;        /* fixture ELF for Group E NVM payloads      */
     const char *elf_path;       /* required for RSP server child              */
     int         rsp_port;
     int         verbose;        /* 0 = quiet, 1 = per-step, 2 = +full hex     */
@@ -519,6 +532,188 @@ static void run_groupC(const HwCfg *cfg, int fd)
 }
 
 /* ──────────────────────────────────────────────────────────────────── *
+ *  ELF section extractor (used by Group E)                             *
+ * ──────────────────────────────────────────────────────────────────── *
+ * Returns 0 on success and copies section payload into *buf (capacity
+ * *plen on entry; updated to actual size on success). Returns -1 if
+ * the section is missing, the ELF is malformed, or the section exceeds
+ * the supplied buffer. No allocation. */
+static int read_elf_section(const char *path, const char *name,
+                            uint8_t *buf, size_t *plen)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    Elf32_Ehdr ehdr;
+    if (fread(&ehdr, sizeof ehdr, 1, f) != 1)              { fclose(f); return -1; }
+    if (memcmp(ehdr.e_ident, "\x7f""ELF", 4) != 0)         { fclose(f); return -1; }
+    if (ehdr.e_shoff == 0 || ehdr.e_shnum == 0)            { fclose(f); return -1; }
+    if (ehdr.e_shstrndx >= ehdr.e_shnum)                   { fclose(f); return -1; }
+    if (ehdr.e_shentsize < sizeof(Elf32_Shdr))             { fclose(f); return -1; }
+
+    /* Load the section-name string table. */
+    Elf32_Shdr shstr;
+    if (fseek(f, (long)(ehdr.e_shoff + (off_t)ehdr.e_shstrndx * ehdr.e_shentsize),
+              SEEK_SET) != 0)                              { fclose(f); return -1; }
+    if (fread(&shstr, sizeof shstr, 1, f) != 1)            { fclose(f); return -1; }
+    if (shstr.sh_size == 0 || shstr.sh_size > 65536u)      { fclose(f); return -1; }
+
+    char *names = malloc(shstr.sh_size);
+    if (!names)                                            { fclose(f); return -1; }
+    if (fseek(f, (long)shstr.sh_offset, SEEK_SET) != 0 ||
+        fread(names, 1, shstr.sh_size, f) != shstr.sh_size) {
+        free(names); fclose(f); return -1;
+    }
+
+    /* Walk section headers, find the requested name. */
+    Elf32_Shdr sh;
+    int found = 0;
+    for (uint16_t i = 0; i < ehdr.e_shnum; i++) {
+        if (fseek(f, (long)(ehdr.e_shoff + (off_t)i * ehdr.e_shentsize),
+                  SEEK_SET) != 0) break;
+        if (fread(&sh, sizeof sh, 1, f) != 1) break;
+        if (sh.sh_name >= shstr.sh_size) continue;
+        if (strcmp(names + sh.sh_name, name) != 0) continue;
+        if (sh.sh_size > *plen) { free(names); fclose(f); return -1; }
+        if (fseek(f, (long)sh.sh_offset, SEEK_SET) != 0) break;
+        if (fread(buf, 1, sh.sh_size, f) != sh.sh_size)  break;
+        *plen = sh.sh_size;
+        found = 1;
+        break;
+    }
+    free(names);
+    fclose(f);
+    return found ? 0 : -1;
+}
+
+/* ──────────────────────────────────────────────────────────────────── *
+ *  Group E — Non-FLASH NVM windows (Phase 8, --with-nvm, DESTRUCTIVE)  *
+ * ──────────────────────────────────────────────────────────────────── *
+ * Verifies the per-window NVM writers added in Phase 8:
+ *   E1  EEPROM:   updi_nvm_write_eeprom   + read-back via updi_mem_read
+ *   E2  USERROW:  updi_nvm_write_userrow  + read-back via updi_mem_read
+ *   E3  LOCKBITS safety interlock — refuses non-unlock pattern without
+ *       --allow-lock-updi opt-in (non-destructive: returns before writing).
+ *
+ * Payload bytes for E1/E2 come from the all_nvm.elf fixture so the
+ * same toolchain (avr-gcc) that a real user runs produces the bytes
+ * exercised against silicon. */
+static void run_groupE(const HwCfg *cfg, int fd)
+{
+    char why[200];
+    double t0;
+
+    if (!cfg->with_nvm) {
+        report_skip("E1", "EEPROM write + read-back",
+                    "opt-in via --with-nvm (DESTRUCTIVE)");
+        report_skip("E2", "USERROW write + read-back",
+                    "opt-in via --with-nvm (DESTRUCTIVE)");
+        report_skip("E3", "LOCKBITS safety interlock",
+                    "opt-in via --with-nvm");
+        return;
+    }
+
+    const char *elf = cfg->nvm_elf ? cfg->nvm_elf : DEF_NVM_ELF;
+    if (access(elf, R_OK) != 0) {
+        snprintf(why, sizeof why, "fixture ELF '%s' not readable "
+                 "(run `make build/fixtures/all_nvm.elf`)", elf);
+        report_fail("E1", "EEPROM write + read-back", why);
+        report_skip("E2", "USERROW write + read-back", "E1 prerequisite failed");
+        report_skip("E3", "LOCKBITS safety interlock", "E1 prerequisite failed");
+        return;
+    }
+
+    uint8_t want_eeprom[E_PAYLOAD_LEN], got_eeprom[E_PAYLOAD_LEN];
+    uint8_t want_userrow[E_PAYLOAD_LEN], got_userrow[E_PAYLOAD_LEN];
+    size_t  n;
+
+    /* E1: EEPROM ------------------------------------------------------ */
+    n = sizeof want_eeprom;
+    if (read_elf_section(elf, ".eeprom", want_eeprom, &n) != 0 ||
+        n != E_PAYLOAD_LEN) {
+        snprintf(why, sizeof why,
+                 ".eeprom section not found or wrong size in %s", elf);
+        report_fail("E1", "EEPROM write + read-back", why);
+    } else {
+        t0 = now_ms();
+        int rc = updi_nvm_write_eeprom(fd, UPDI_EEPROM_BASE + E_EEPROM_OFF,
+                                       want_eeprom, E_PAYLOAD_LEN);
+        if (rc != 0) {
+            snprintf(why, sizeof why,
+                     "updi_nvm_write_eeprom returned %d", rc);
+            report_fail("E1", "EEPROM write + read-back", why);
+        } else {
+            rc = updi_mem_read(fd, UPDI_EEPROM_BASE + E_EEPROM_OFF,
+                               got_eeprom, E_PAYLOAD_LEN);
+            if (rc != 0) {
+                snprintf(why, sizeof why,
+                         "updi_mem_read(@0x%05X) returned %d",
+                         (unsigned)(UPDI_EEPROM_BASE + E_EEPROM_OFF), rc);
+                report_fail("E1", "EEPROM write + read-back", why);
+            } else if (memcmp(want_eeprom, got_eeprom, E_PAYLOAD_LEN) != 0) {
+                dump_diff(want_eeprom, got_eeprom, E_PAYLOAD_LEN, 16);
+                report_fail("E1", "EEPROM write + read-back",
+                            "read-back mismatch");
+            } else {
+                report_pass("E1", "EEPROM write + read-back", now_ms() - t0);
+            }
+        }
+    }
+
+    /* E2: USERROW ----------------------------------------------------- */
+    n = sizeof want_userrow;
+    if (read_elf_section(elf, ".user_signatures", want_userrow, &n) != 0 ||
+        n != E_PAYLOAD_LEN) {
+        snprintf(why, sizeof why,
+                 ".user_signatures section not found or wrong size in %s",
+                 elf);
+        report_fail("E2", "USERROW write + read-back", why);
+    } else {
+        t0 = now_ms();
+        int rc = updi_nvm_write_userrow(fd, UPDI_USERROW_BASE + E_USERROW_OFF,
+                                        want_userrow, E_PAYLOAD_LEN);
+        if (rc != 0) {
+            snprintf(why, sizeof why,
+                     "updi_nvm_write_userrow returned %d", rc);
+            report_fail("E2", "USERROW write + read-back", why);
+        } else {
+            rc = updi_mem_read(fd, UPDI_USERROW_BASE + E_USERROW_OFF,
+                               got_userrow, E_PAYLOAD_LEN);
+            if (rc != 0) {
+                snprintf(why, sizeof why,
+                         "updi_mem_read(@0x%05X) returned %d",
+                         (unsigned)(UPDI_USERROW_BASE + E_USERROW_OFF), rc);
+                report_fail("E2", "USERROW write + read-back", why);
+            } else if (memcmp(want_userrow, got_userrow, E_PAYLOAD_LEN) != 0) {
+                dump_diff(want_userrow, got_userrow, E_PAYLOAD_LEN, 16);
+                report_fail("E2", "USERROW write + read-back",
+                            "read-back mismatch");
+            } else {
+                report_pass("E2", "USERROW write + read-back", now_ms() - t0);
+            }
+        }
+    }
+
+    /* E3: LOCKBITS safety interlock (non-destructive) ----------------- *
+     * Pass a non-unlock pattern with allow_updi_disable=false. The writer
+     * MUST refuse with a non-zero return code (UPDI_ERR_LOCKED) before
+     * issuing any NVMCTRL command, leaving the LOCK window untouched. */
+    {
+        static const uint8_t danger[4] = { 0xFF, 0xFF, 0xFF, 0xFF };
+        t0 = now_ms();
+        int rc = updi_nvm_write_lockbits(fd, UPDI_LOCK_BASE,
+                                         danger, sizeof danger,
+                                         false /* allow_updi_disable */);
+        if (rc == 0) {
+            report_fail("E3", "LOCKBITS safety interlock",
+                        "writer returned 0 — UPDI may have been disabled!");
+        } else {
+            report_pass("E3", "LOCKBITS safety interlock", now_ms() - t0);
+        }
+    }
+}
+
+/* ──────────────────────────────────────────────────────────────────── *
  *  Group D — RSP server smoke (--with-rsp)                             *
  * ──────────────────────────────────────────────────────────────────── */
 
@@ -744,6 +939,7 @@ static void usage(const char *prog)
         "usage: %s [--port DEV] [--device-id \"HH HH HH\"]\n"
         "          [--flash-page ADDR] [--sram-addr ADDR] [--addr-24bit ADDR]\n"
         "          [--with-nvm] [--with-rsp]\n"
+        "          [--nvm-elf PATH]\n"
         "          [--elf PATH] [--rsp-port N]\n"
         "          [-v | --verbose] [-vv]\n"
         "          [DEV]\n"
@@ -782,6 +978,7 @@ int main(int argc, char *argv[])
     cfg.sram_addr  = env_u32("HW_SRAM_ADDR",       DEF_SRAM_ADDR);
     cfg.addr_24bit = env_u32("HW_ADDR_24BIT", 0);
     cfg.elf_path   = getenv("HW_TEST_ELF");
+    cfg.nvm_elf    = getenv("HW_TEST_NVM_ELF");
     cfg.rsp_port   = env_int("HW_RSP_PORT", DEF_RSP_PORT);
     cfg.verbose    = env_int("HW_VERBOSE", 0);
 
@@ -806,6 +1003,7 @@ int main(int argc, char *argv[])
             cfg.addr_24bit = (uint32_t)strtoul(argv[++i], NULL, 0);
         else if (!strcmp(a, "--with-nvm"))   cfg.with_nvm = true;
         else if (!strcmp(a, "--with-rsp"))   cfg.with_rsp = true;
+        else if (!strcmp(a, "--nvm-elf")     && i+1 < argc) cfg.nvm_elf = argv[++i];
         else if (!strcmp(a, "--elf")         && i+1 < argc) cfg.elf_path = argv[++i];
         else if (!strcmp(a, "--rsp-port")    && i+1 < argc)
             cfg.rsp_port = (int)strtol(argv[++i], NULL, 0);
@@ -847,6 +1045,7 @@ int main(int argc, char *argv[])
     (void)run_groupA(&cfg, fd, &info);
     if (fd >= 0) run_groupB(&cfg, fd);
     if (fd >= 0) run_groupC(&cfg, fd);
+    if (fd >= 0) run_groupE(&cfg, fd);
     if (fd >= 0) updi_close(fd);    /* free the UART before spawning RSP server */
     run_groupD(&cfg);
 

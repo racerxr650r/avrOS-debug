@@ -133,7 +133,7 @@ CP210x) or `/dev/ttyACM0` (CDC ACM). On macOS the path is
 ## 4. Command-Line Invocation
 
 ```
-avr-updi-gdb [--port <port>] [--baud <baud>] [--load] <serial-device> <elf-file>
+avr-updi-gdb [--port <port>] [--baud <baud>] [--erase] [--load] [--allow-lock-updi] <serial-device> <elf-file>
 avr-updi-gdb --device [--baud <baud>] <serial-device> [elf-file]
 ```
 
@@ -143,7 +143,9 @@ avr-updi-gdb --device [--baud <baud>] <serial-device> [elf-file]
 | ------ | ---- | ------- | ----------- |
 | `--port <port>` | uint16_t | `1234` | TCP port to listen on for the `avr-gdb` client. Range: `1 ≤ port ≤ 65535`. |
 | `--baud <baud>` | int | `115200` | UART baud rate to the UPDI adapter. Must be a positive integer accepted by the host `termios` layer. |
-| `--load` | flag | unset | Before entering the event loop, program the supplied ELF into target FLASH via the UPDI NVM controller. |
+| `--load` | flag | unset | Before entering the event loop, program every `PT_LOAD` segment of the supplied ELF to the matching AVR-Dx NVM kind (FLASH, EEPROM, USERROW, FUSES, LOCK) via the UPDI NVM controller. Segments are classified by virtual address against the unified UPDI windows; SIGROW segments are skipped (read-only); segments outside every programmable window cause `--load` to fail. |
+| `--erase` | flag | unset | Issue a UPDI chip-erase before any `--load` step. Required when the ELF contains a LOCK segment (lockbits can only be re-programmed after a chip-erase clears `LOCKSTATUS`). |
+| `--allow-lock-updi` | flag | unset | Allow `--load` to write LOCK byte patterns that would assert `UPDIDIS` and permanently disable the UPDI debug interface. Without this flag only the 4-byte unlock pattern `0x5CC5C55C` is accepted; every other LOCK value is rejected. |
 | `--device` | flag | unset | One-shot diagnostic: open UPDI, read the SIGROW signature + serial number and ASI status bytes, print a human-readable report to stdout and exit. No TCP listener is opened, no ELF is loaded, the target CPU is not halted. Mutually exclusive with `--load`. Makes `<elf-file>` optional. |
 
 ### Operands
@@ -185,10 +187,49 @@ avr-updi-gdb --load --port 1234 --baud 115200 \
              /dev/ttyUSB0 build/firmware.elf
 ```
 
-`--load` programs the ELF's `.text` and `.data` segments into the target
-via the UPDI NVM controller before opening the GDB listener. On success
-the program counter is left at the reset vector; in a separate terminal
-attach `avr-gdb` and issue `continue` to begin execution.
+`--load` programs every `PT_LOAD` segment of the ELF into its matching
+AVR-Dx non-volatile memory:
+
+| ELF section / address window | UPDI window | NVM kind | NVMCTRL command |
+| ---------------------------- | ----------- | -------- | --------------- |
+| `.text`, `.data`, `.rodata` (≤ `0x810080`) | `0x800000`–`0x80FFFF` | FLASH    | `ERWP` (`0x03`), 512-byte pages padded with `0xFF` |
+| `.user_signatures`            | `0x810080`–`0x8100FF` | USERROW  | `EEERWR` (`0x13`) per byte |
+| `.eeprom`                     | `0x814000`–`0x8143FF` | EEPROM   | `EEERWR` per byte |
+| `.fuse`                       | `0x820000`–`0x82001F` | FUSES    | `EEERWR` per byte |
+| `.lock`                       | `0x820040`–`0x820043` | LOCK     | `EEERWR` per byte (requires `--erase`) |
+| SIGROW (`.sig`)               | `0x811080`–`0x8110FF` | —        | skipped (read-only) |
+
+On success the program counter is left at the reset vector; in a
+separate terminal attach `avr-gdb` and issue `continue` to begin
+execution.
+
+### 5.2.1 Programming fuses, EEPROM, USERROW, and lockbits
+
+The AVR-Dx toolchain emits each non-FLASH region into a dedicated ELF
+section. Add the matching attributes in your firmware sources:
+
+```c
+#include <avr/io.h>
+
+__attribute__((section(".fuse")))   const uint8_t fuses[]   = { /* ... */ };
+__attribute__((section(".eeprom"))) const uint8_t eedata[] = { /* ... */ };
+__attribute__((section(".user_signatures"))) const uint8_t userrow[] = { /* ... */ };
+```
+
+`--load` then programs each section into its window in a single
+invocation. Programming the `.lock` section additionally requires
+`--erase` (silicon must observe a chip-erase before lockbits can be
+rewritten) and — for any LOCK value other than the unlock pattern
+`0x5CC5C55C` — also requires `--allow-lock-updi`.
+
+#### UPDI lock-out and recovery
+
+Writing a LOCK pattern that asserts the `UPDIDIS` bit permanently
+disables the UPDI debug interface on that part. The server refuses
+such payloads by default. If you intentionally want to ship a part
+with UPDI disabled, pass `--allow-lock-updi`. A part that has had
+`UPDIDIS` asserted can no longer be debugged or re-programmed by this
+tool; recovery requires a high-voltage UPDI programmer.
 
 ### 5.3 Debugging an AVR-Dx target over UPDI/OCD
 
