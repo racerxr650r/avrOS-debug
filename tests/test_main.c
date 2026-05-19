@@ -231,6 +231,23 @@ uint32_t __wrap_updi_crc32(const uint8_t *buf, size_t len)
     return mk_updi_crc32_value;
 }
 
+/* Phase 9: updi_format_fuses() is referenced from run_device_mode() in
+ * src/main.c (which test_main.c #includes).  Wrap it with a trivial
+ * NUL-terminating stub so coverage builds (--coverage -O0 -fno-inline,
+ * which keep dead code) link cleanly.  No current test exercises
+ * run_device_mode(), so the stub is never invoked. */
+int __wrap_updi_format_fuses(char *out, size_t cap,
+                             const uint8_t *raw,  size_t raw_len,
+                             const uint8_t *lock, size_t lock_len);
+int __wrap_updi_format_fuses(char *out, size_t cap,
+                             const uint8_t *raw,  size_t raw_len,
+                             const uint8_t *lock, size_t lock_len)
+{
+    (void)raw; (void)raw_len; (void)lock; (void)lock_len;
+    if (out && cap > 0) out[0] = '\0';
+    return 0;
+}
+
 /* HLR-046: per-family memory map.  Tests run against the compile-time
  * AVR-DA defaults already encoded in the UPDI_*_BASE/_SIZE macros, so
  * `__wrap_updi_select_device()` is a no-op success stub and
