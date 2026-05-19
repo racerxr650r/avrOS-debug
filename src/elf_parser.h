@@ -11,6 +11,12 @@
 #include "elf.h"
 #endif
 
+/* Maximum length of the lowercase AVR device-name string extracted
+ * from the `.note.gnu.avr.deviceinfo` ELF note (e.g. "avr128da28").
+ * 16 bytes covers every Microchip AVR-Dx/Du/Sd/Ea/Eb part name with
+ * room for a trailing NUL.                                            */
+#define ELF_DEVICE_NAME_MAX  16u
+
 typedef struct {
     int         fd;
     Elf32_Ehdr  ehdr;
@@ -22,6 +28,12 @@ typedef struct {
     uint32_t    flash_size;
     uint32_t    sram_base;
     uint32_t    sram_size;
+    /* Lowercase device-name string copied from the
+     * `.note.gnu.avr.deviceinfo` ELF note descriptor (e.g.
+     * "avr128da28").  Empty string when the note is absent — every
+     * consumer must treat an empty string as "ELF carries no device
+     * identification".                                               */
+    char        device_name[ELF_DEVICE_NAME_MAX];
 } ElfContext;
 
 typedef struct {

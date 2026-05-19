@@ -13,6 +13,83 @@
 
 #include "elf_parser.h"
 
+/* ── deviceinfo note parser (internal) ─────────────────────────────────
+ * Microchip's avr-gcc + device-pack toolchain emits a per-binary ELF
+ * note named `.note.gnu.avr.deviceinfo` carrying the exact lowercase
+ * device-name string (e.g. "avr128da28", "avr64dd32") that was passed
+ * to `-mmcu`.  The note is a standard ELF note with:
+ *
+ *   namesz = 4, descsz ≈ 0x2d, type = 1, name = "AVR\0"
+ *
+ * followed by a Microchip-specific descriptor.  The descriptor's exact
+ * field layout has drifted across binutils versions (binutils 2.27,
+ * 2.30, Microchip's downstream fork), so this parser uses a robust
+ * heuristic instead of an exact struct decode: it scans the descriptor
+ * bytes for the first NUL-terminated ASCII run that begins with "avr"
+ * followed by a digit.  This survives format drift while still
+ * matching every Microchip device-pack-generated ELF in the wild.
+ *
+ * On match, copies up to ELF_DEVICE_NAME_MAX-1 bytes into
+ * `ctx->device_name` and NUL-terminates.  On any failure (note
+ * absent, malformed, no "avr<digit>" string in the descriptor) the
+ * field is left as the empty string the caller already cleared.    */
+static void elf_scan_deviceinfo_note(int fd, const Elf32_Ehdr *ehdr,
+                                     ElfContext *ctx)
+{
+    /* Hard cap so a malformed ELF can't blow the stack. */
+    static const size_t kMaxNoteBytes = 4096u;
+
+    for (int i = 0; i < (int)ehdr->e_shnum; i++) {
+        Elf32_Shdr shdr;
+        off_t off = (off_t)ehdr->e_shoff
+                  + (off_t)(i * (int)sizeof(Elf32_Shdr));
+        if (lseek(fd, off, SEEK_SET) < 0)              continue;
+        if (read(fd, &shdr, sizeof shdr) !=
+                (ssize_t)sizeof shdr)                  continue;
+        if (shdr.sh_type != SHT_NOTE)                  continue;
+        if (shdr.sh_size < 12u || shdr.sh_size > kMaxNoteBytes) continue;
+
+        uint8_t buf[4096];
+        if (lseek(fd, (off_t)shdr.sh_offset, SEEK_SET) < 0)        continue;
+        if (read(fd, buf, shdr.sh_size) != (ssize_t)shdr.sh_size)  continue;
+
+        /* Standard ELF note prologue: namesz, descsz, type (LE u32) */
+        uint32_t namesz = (uint32_t)buf[0] | ((uint32_t)buf[1] << 8)
+                        | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
+        uint32_t ntype  = (uint32_t)buf[8] | ((uint32_t)buf[9] << 8)
+                        | ((uint32_t)buf[10] << 16) | ((uint32_t)buf[11] << 24);
+        if (ntype != 1u || namesz != 4u)               continue;
+        /* 12 = sizeof(namesz)+sizeof(descsz)+sizeof(type) */
+        if (shdr.sh_size < 12u + namesz)               continue;
+        if (memcmp(buf + 12, "AVR", 4) != 0)           continue;  /* incl. NUL */
+
+        /* Descriptor begins after name, 4-byte aligned.  namesz==4 so
+         * the descriptor starts at offset 16 unconditionally.        */
+        const size_t desc_off = 16u;
+        if (desc_off >= shdr.sh_size)                  continue;
+
+        /* Heuristic: scan the descriptor for "avr<digit>…" terminated by
+         * NUL.  Every Microchip part-name string begins with lowercase
+         * "avr" followed immediately by ASCII digits ("avr128da28",
+         * "avr64dd32", "avr32sd20").                                   */
+        for (size_t k = desc_off; k + 4u < shdr.sh_size; k++) {
+            if (buf[k] != 'a' || buf[k+1] != 'v' || buf[k+2] != 'r')
+                continue;
+            if (buf[k+3] < '0' || buf[k+3] > '9')
+                continue;
+            size_t j = 0;
+            while (k + j < shdr.sh_size
+                   && buf[k+j] >= 0x20 && buf[k+j] < 0x7F
+                   && j + 1u < sizeof ctx->device_name) {
+                ctx->device_name[j] = (char)buf[k+j];
+                j++;
+            }
+            ctx->device_name[j] = '\0';
+            return;
+        }
+    }
+}
+
 /* ── elf_open ────────────────────────────────────────────────────────────── */
 int elf_open(const char *path, ElfContext *ctx)
 {
@@ -25,6 +102,7 @@ int elf_open(const char *path, ElfContext *ctx)
     ctx->flash_size  = 0;
     ctx->sram_base   = 0;
     ctx->sram_size   = 0;
+    ctx->device_name[0] = '\0';
 
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
@@ -89,6 +167,12 @@ int elf_open(const char *path, ElfContext *ctx)
             load_idx++;
         }
     }
+
+    /* Best-effort: extract the device name from the
+     * `.note.gnu.avr.deviceinfo` ELF note.  Leaves device_name empty
+     * when absent or malformed — main.c falls back to SIGROW autodetect
+     * in that case.                                                   */
+    elf_scan_deviceinfo_note(fd, &ehdr, ctx);
 
     /* Find the SHT_SYMTAB section */
     Elf32_Shdr symtab_shdr;

@@ -125,6 +125,54 @@ static const UpdiDeviceMap g_device_table[] = {
  * `updi_open()`) see the historical AVR-DA addresses.                  */
 static const UpdiDeviceMap *g_device = &g_device_table[0];
 
+/* Part-name prefix → family map.  Each ELF deviceinfo string begins
+ * with "avr" + digits + family-letters (e.g. "avr128da28" → "da", thus
+ * AVR-DA).  The match is performed by scanning the part-name past the
+ * leading "avr<digits>" run and comparing the next two lowercase
+ * letters to each row's `letters` field.                              */
+static const struct {
+    const char letters[3];   /* e.g. "da", "db", "dd", "du", "sd"     */
+    const char *family;      /* table family string                    */
+} g_partname_prefix[] = {
+    { "da", "AVR-DA" },
+    { "db", "AVR-DB" },
+    { "dd", "AVR-DD" },
+    { "du", "AVR-DU" },
+    { "sd", "AVR-SD" },
+};
+
+const char *updi_family_from_partname(const char *partname)
+{
+    if (partname == NULL || partname[0] == '\0')
+        return NULL;
+    /* Expect lowercase "avr" prefix. */
+    if (partname[0] != 'a' || partname[1] != 'v' || partname[2] != 'r')
+        return NULL;
+    /* Skip one or more ASCII digits (the flash-size field, e.g. 128). */
+    size_t i = 3;
+    if (partname[i] < '0' || partname[i] > '9')
+        return NULL;
+    while (partname[i] >= '0' && partname[i] <= '9')
+        i++;
+    /* Need at least two family-letters after the digits. */
+    if (partname[i] == '\0' || partname[i + 1] == '\0')
+        return NULL;
+    char a = partname[i];
+    char b = partname[i + 1];
+    /* Normalise to lowercase. */
+    if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+    if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+    for (size_t j = 0;
+         j < sizeof(g_partname_prefix) / sizeof(g_partname_prefix[0]);
+         j++) {
+        if (g_partname_prefix[j].letters[0] == a
+            && g_partname_prefix[j].letters[1] == b) {
+            return g_partname_prefix[j].family;
+        }
+    }
+    return NULL;
+}
+
 const UpdiDeviceMap *updi_get_device(void)
 {
     return g_device;

@@ -581,13 +581,46 @@ int MAIN_NAME(int argc, char *argv[])
         goto teardown;
     }
 
-    /* HLR-046: identify the per-family memory map before any NVM
-     * write touches USERROW / EEPROM / FUSES / LOCK windows.  Failure
-     * here is fatal because load_segments() needs the map to translate
-     * ELF VMA bands to silicon addresses.                              */
+    /* HLR-046 / LLR-MAIN-13: identify the per-family memory map
+     * before any NVM write touches USERROW/EEPROM/FUSES/LOCK windows.
+     * Precedence:
+     *   1. --force-device=<family>  — user override, no autodetect.
+     *   2. SIGROW autodetect        — runs whenever --force-device is
+     *      not set, regardless of whether the ELF carries deviceinfo.
+     * The ELF `.note.gnu.avr.deviceinfo` part-name is NOT used to
+     * select the family; using it as a selection input would defeat
+     * the mismatch check below (we'd be comparing the ELF family
+     * against the family we just told the UPDI layer to be).  Instead
+     * the ELF-derived family acts purely as an assertion: SIGROW
+     * autodetect runs unbiased, then the result is cross-checked
+     * against the ELF.                                                */
+    const char *elf_family =
+        updi_family_from_partname(elf_ctx.device_name);
     if (updi_select_device(cfg.updi_fd, cfg.force_device) < 0) {
         exit_code = 1;
         goto teardown;
+    }
+
+    /* LLR-MAIN-13: ELF↔silicon family mismatch guard.  When the ELF
+     * names a known family and the user did NOT supply --force-device,
+     * the family that updi_select_device() ended up on must match the
+     * ELF-declared family.  Mismatch would let load_segments() write
+     * EEPROM/USERROW/FUSE/LOCK at the wrong bases/sizes for the silicon
+     * actually attached, which silently corrupts non-FLASH NVM.  The
+     * --force-device escape hatch lets the user override on purpose.  */
+    if (elf_family != NULL
+        && (cfg.force_device == NULL || cfg.force_device[0] == '\0')) {
+        const char *active = updi_get_device()->family;
+        if (active == NULL || strcmp(active, elf_family) != 0) {
+            fprintf(stderr,
+                    "error: ELF was built for %s (family %s) but target "
+                    "reports %s (use --force-device=%s to override)\n",
+                    elf_ctx.device_name, elf_family,
+                    (active != NULL ? active : "?"),
+                    (active != NULL ? active : elf_family));
+            exit_code = 1;
+            goto teardown;
+        }
     }
 
     /* LLR-MAIN-04: optional flash load before listener. */

@@ -93,6 +93,14 @@ static int  mk_elf_open_ret;
 static int  mk_elf_open_calls;
 static int  mk_elf_close_calls;
 static int  mk_elf_tmp_fd;
+static char mk_elf_planted_device_name[16];
+
+/* Captured arguments / family-selection state for the
+ * `__wrap_updi_select_device()` / `__wrap_updi_get_device()` stubs. */
+static int  mk_updi_select_calls;
+static char mk_updi_select_force[16];
+static int  mk_updi_select_ret;
+static const char *mk_updi_get_device_family;
 static uint32_t mk_elf_planted_sram;
 static Elf32_Ehdr mk_elf_planted_ehdr;
 static int  mk_elf_have_ehdr;
@@ -185,14 +193,23 @@ int __wrap_updi_chip_erase(int fd)
 int __wrap_updi_select_device(int fd, const char *force);
 int __wrap_updi_select_device(int fd, const char *force)
 {
-    (void)fd; (void)force;
-    return 0;
+    (void)fd;
+    mk_updi_select_calls++;
+    if (force != NULL) {
+        size_t n = strlen(force);
+        if (n >= sizeof mk_updi_select_force) n = sizeof mk_updi_select_force - 1;
+        memcpy(mk_updi_select_force, force, n);
+        mk_updi_select_force[n] = '\0';
+    } else {
+        mk_updi_select_force[0] = '\0';
+    }
+    return mk_updi_select_ret;
 }
 
 const UpdiDeviceMap *__wrap_updi_get_device(void);
 const UpdiDeviceMap *__wrap_updi_get_device(void)
 {
-    static const UpdiDeviceMap mk_avrda = {
+    static UpdiDeviceMap mk_active = {
         "AVR-DA",
         UPDI_USERROW_BASE, UPDI_USERROW_SIZE,
         UPDI_EEPROM_BASE,  UPDI_EEPROM_SIZE,
@@ -201,7 +218,37 @@ const UpdiDeviceMap *__wrap_updi_get_device(void)
         UPDI_SIGROW_BASE,
         true
     };
-    return &mk_avrda;
+    mk_active.family = (mk_updi_get_device_family != NULL)
+                      ? mk_updi_get_device_family
+                      : "AVR-DA";
+    return &mk_active;
+}
+
+/* updi.c is NOT linked into test_main (we wrap select/get_device and
+ * provide stubs for the NVM writers).  main.c calls
+ * updi_family_from_partname() directly — not via a wrap — so we have
+ * to satisfy the linker here with a stub that mirrors the real
+ * classifier's published behaviour: "avr<digits>da*" → AVR-DA,
+ * "avr<digits>db*" → AVR-DB, "avr<digits>dd*" → AVR-DD, etc.  Empty
+ * or unrecognised input returns NULL so the SIGROW autodetect path
+ * runs.                                                              */
+const char *updi_family_from_partname(const char *partname);
+const char *updi_family_from_partname(const char *partname)
+{
+    if (partname == NULL || partname[0] == '\0') return NULL;
+    if (partname[0] != 'a' || partname[1] != 'v' || partname[2] != 'r')
+        return NULL;
+    size_t i = 3;
+    if (partname[i] < '0' || partname[i] > '9') return NULL;
+    while (partname[i] >= '0' && partname[i] <= '9') i++;
+    if (partname[i] == '\0' || partname[i+1] == '\0') return NULL;
+    char a = partname[i], b = partname[i+1];
+    if (a == 'd' && b == 'a') return "AVR-DA";
+    if (a == 'd' && b == 'b') return "AVR-DB";
+    if (a == 'd' && b == 'd') return "AVR-DD";
+    if (a == 'd' && b == 'u') return "AVR-DU";
+    if (a == 's' && b == 'd') return "AVR-SD";
+    return NULL;
 }
 
 int __wrap_updi_nvm_write_eeprom(int fd, uint32_t a, const uint8_t *d, size_t n);
@@ -308,6 +355,13 @@ int __wrap_elf_open(const char *path, ElfContext *ctx)
     ctx->fd = mk_elf_tmp_fd;
     if (mk_elf_have_ehdr) ctx->ehdr = mk_elf_planted_ehdr;
     ctx->sram_base = mk_elf_planted_sram;
+    /* Plant the ELF-derived device-name string so the autoselect/
+     * mismatch logic in app_main() can be unit-tested without a real
+     * `.note.gnu.avr.deviceinfo` section in the synthetic ELF.       */
+    size_t dn = strlen(mk_elf_planted_device_name);
+    if (dn >= sizeof ctx->device_name) dn = sizeof ctx->device_name - 1;
+    memcpy(ctx->device_name, mk_elf_planted_device_name, dn);
+    ctx->device_name[dn] = '\0';
     return mk_elf_open_ret;
 }
 
@@ -397,6 +451,11 @@ void setUp(void)
     mk_elf_planted_sram = 0;
     mk_elf_have_ehdr = 0;
     memset(&mk_elf_planted_ehdr, 0, sizeof mk_elf_planted_ehdr);
+    mk_elf_planted_device_name[0] = '\0';
+    mk_updi_select_calls = 0;
+    mk_updi_select_force[0] = '\0';
+    mk_updi_select_ret = 0;
+    mk_updi_get_device_family = "AVR-DA";
 
     mk_select_ret = -1;
     mk_select_errno = EINTR;
@@ -810,6 +869,87 @@ static void test_load_segments_unknown_window_returns_minus1(void)
     TEST_ASSERT_EQUAL_INT(0, mk_updi_nvm_calls);
 }
 
+/* ── LLR-MAIN-13: ELF deviceinfo autoselect + mismatch guard ─────── */
+
+/* LLR-MAIN-13: When the ELF carries a deviceinfo note but the user did
+ * NOT supply --force-device, main() shall pass the empty force argument
+ * (== NULL) to updi_select_device() so SIGROW autodetect determines the
+ * actual silicon family.  The ELF-derived family is then used only for
+ * the mismatch check — it is NOT used as a selection input (doing so
+ * would defeat the mismatch check by comparing the ELF family against
+ * itself). */
+static void test_main_autoselects_family_from_elf_deviceinfo(void)
+{
+    uint32_t v[] = {0}, s[] = {0};
+    mk_elf_tmp_fd = build_min_elf(v, s, 1, &mk_elf_planted_ehdr);
+    mk_elf_have_ehdr = 1;
+    /* ELF says "avr64dd32" → family AVR-DD. */
+    strcpy(mk_elf_planted_device_name, "avr64dd32");
+    mk_updi_get_device_family = "AVR-DD";  /* silicon agrees → no abort */
+
+    char *argv[] = { (char*)"prog", (char*)"/dev/x", (char*)"a.elf" };
+    TEST_ASSERT_EQUAL_INT(0, app_main(3, argv));
+
+    TEST_ASSERT_EQUAL_INT(1, mk_updi_select_calls);
+    /* No --force-device supplied → wrap normalises NULL to "". */
+    TEST_ASSERT_EQUAL_STRING("", mk_updi_select_force);
+}
+
+/* LLR-MAIN-13: --force-device takes precedence over the ELF
+ * deviceinfo-derived family. */
+static void test_main_force_device_overrides_elf_deviceinfo(void)
+{
+    uint32_t v[] = {0}, s[] = {0};
+    mk_elf_tmp_fd = build_min_elf(v, s, 1, &mk_elf_planted_ehdr);
+    mk_elf_have_ehdr = 1;
+    strcpy(mk_elf_planted_device_name, "avr64dd32");  /* would map to AVR-DD */
+    mk_updi_get_device_family = "AVR-DA";  /* user is forcing onto AVR-DA */
+
+    char *argv[] = { (char*)"prog",
+                     (char*)"--force-device=AVR-DA",
+                     (char*)"/dev/x", (char*)"a.elf" };
+    TEST_ASSERT_EQUAL_INT(0, app_main(4, argv));
+
+    TEST_ASSERT_EQUAL_INT(1, mk_updi_select_calls);
+    TEST_ASSERT_EQUAL_STRING("AVR-DA", mk_updi_select_force);
+}
+
+/* LLR-MAIN-13: ELF says one family, silicon reports a different one,
+ * and --force-device is NOT set → app_main aborts with rc=1 before
+ * rsp_listen() is invoked. */
+static void test_main_aborts_on_elf_vs_silicon_family_mismatch(void)
+{
+    uint32_t v[] = {0}, s[] = {0};
+    mk_elf_tmp_fd = build_min_elf(v, s, 1, &mk_elf_planted_ehdr);
+    mk_elf_have_ehdr = 1;
+    strcpy(mk_elf_planted_device_name, "avr64dd32");  /* AVR-DD */
+    mk_updi_get_device_family = "AVR-DA";              /* silicon disagrees */
+
+    char *argv[] = { (char*)"prog", (char*)"/dev/x", (char*)"a.elf" };
+    TEST_ASSERT_EQUAL_INT(1, app_main(3, argv));
+
+    /* updi_select_device must have been called (we got the mismatch
+     * verdict from the post-select check), but rsp_listen must not. */
+    TEST_ASSERT_EQUAL_INT(1, mk_updi_select_calls);
+    TEST_ASSERT_EQUAL_INT(0, mk_rsp_listen_calls);
+}
+
+/* LLR-MAIN-13: ELF has no deviceinfo (empty string) → main passes
+ * NULL to updi_select_device() so the SIGROW autodetect path runs. */
+static void test_main_passes_null_to_select_when_elf_lacks_deviceinfo(void)
+{
+    uint32_t v[] = {0}, s[] = {0};
+    mk_elf_tmp_fd = build_min_elf(v, s, 1, &mk_elf_planted_ehdr);
+    mk_elf_have_ehdr = 1;
+    mk_elf_planted_device_name[0] = '\0';
+
+    char *argv[] = { (char*)"prog", (char*)"/dev/x", (char*)"a.elf" };
+    TEST_ASSERT_EQUAL_INT(0, app_main(3, argv));
+
+    TEST_ASSERT_EQUAL_INT(1, mk_updi_select_calls);
+    TEST_ASSERT_EQUAL_STRING("", mk_updi_select_force);
+}
+
 /* ── Runner ──────────────────────────────────────────────────────────── */
 int main(void)
 {
@@ -839,5 +979,9 @@ int main(void)
     RUN_TEST(test_load_segments_lock_with_erase_dispatches_to_lockbits_writer);
     RUN_TEST(test_load_segments_sigrow_segment_is_skipped);
     RUN_TEST(test_load_segments_unknown_window_returns_minus1);
+    RUN_TEST(test_main_autoselects_family_from_elf_deviceinfo);
+    RUN_TEST(test_main_force_device_overrides_elf_deviceinfo);
+    RUN_TEST(test_main_aborts_on_elf_vs_silicon_family_mismatch);
+    RUN_TEST(test_main_passes_null_to_select_when_elf_lacks_deviceinfo);
     return UNITY_END();
 }

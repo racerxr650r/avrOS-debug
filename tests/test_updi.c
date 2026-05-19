@@ -953,6 +953,34 @@ static void updi_select_device_unknown_family_returns_minus1(void)
     TEST_ASSERT_EQUAL_INT(-1, rc);
 }
 
+/* LLR-UPDI-28: updi_family_from_partname() table-driven mapping.
+ * Covers every prefix in g_partname_prefix[] plus rejection cases. */
+static void updi_family_from_partname_maps_all_known_prefixes(void)
+{
+    TEST_ASSERT_EQUAL_STRING("AVR-DA",
+        updi_family_from_partname("avr128da28"));
+    TEST_ASSERT_EQUAL_STRING("AVR-DB",
+        updi_family_from_partname("avr128db48"));
+    TEST_ASSERT_EQUAL_STRING("AVR-DD",
+        updi_family_from_partname("avr64dd32"));
+    TEST_ASSERT_EQUAL_STRING("AVR-DU",
+        updi_family_from_partname("avr32du28"));
+    TEST_ASSERT_EQUAL_STRING("AVR-SD",
+        updi_family_from_partname("avr32sd20"));
+}
+
+static void updi_family_from_partname_rejects_invalid_inputs(void)
+{
+    TEST_ASSERT_NULL(updi_family_from_partname(NULL));
+    TEST_ASSERT_NULL(updi_family_from_partname(""));
+    TEST_ASSERT_NULL(updi_family_from_partname("not-an-avr"));
+    /* Unknown family letters → NULL (so main.c falls back to autodetect). */
+    TEST_ASSERT_NULL(updi_family_from_partname("avr32ea48"));
+    TEST_ASSERT_NULL(updi_family_from_partname("avr16eb14"));
+    /* Missing digits between "avr" and letters → NULL. */
+    TEST_ASSERT_NULL(updi_family_from_partname("avrda28"));
+}
+
 /* ── Test runner ─────────────────────────────────────────────────────── */
 
 int main(void)
@@ -1002,6 +1030,8 @@ int main(void)
     RUN_TEST(updi_get_device_default_is_avrda);
     RUN_TEST(updi_select_device_force_avrdd_sets_active_descriptor);
     RUN_TEST(updi_select_device_unknown_family_returns_minus1);
+    RUN_TEST(updi_family_from_partname_maps_all_known_prefixes);
+    RUN_TEST(updi_family_from_partname_rejects_invalid_inputs);
 
     return UNITY_END();
 }

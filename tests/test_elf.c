@@ -393,6 +393,71 @@ void test_elf_open_sets_flash_base_and_sram_base_from_pt_load_segments(void)
     elf_close(&ctx);
 }
 
+/* ── Test: deviceinfo note → device_name populated ─────────────────── */
+void test_elf_open_extracts_device_name_from_deviceinfo_note(void)
+{
+    ElfContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    TEST_ASSERT_EQUAL_INT(0, elf_open(FIXTURE_FULL, &ctx));
+    /* All AVR fixtures are built for AVR128DA28. */
+    TEST_ASSERT_EQUAL_STRING("avr128da28", ctx.device_name);
+    elf_close(&ctx);
+}
+
+/* ── Test: absent deviceinfo note → device_name stays empty ────────── */
+void test_elf_open_leaves_device_name_empty_when_note_absent(void)
+{
+    /* Build a synthetic ELF32 AVR header with PT_LOAD + SYMTAB but no
+     * .note.gnu.avr.deviceinfo section; assert ctx.device_name stays
+     * the empty string we expect on missing-note inputs.              */
+    char tmppath[] = "/tmp/aod_no_note_XXXXXX";
+    int fd = mkstemp(tmppath);
+    TEST_ASSERT_NOT_EQUAL(-1, fd);
+    close(fd);
+    /* Reuse the avros_full fixture but defeat the note: copy the file,
+     * then zero its SHT_NOTE bytes so the scan can't find "avr…".     */
+    int rfd = open(FIXTURE_FULL, O_RDONLY);
+    TEST_ASSERT_NOT_EQUAL(-1, rfd);
+    int wfd = open(tmppath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    TEST_ASSERT_NOT_EQUAL(-1, wfd);
+    char io[4096];
+    ssize_t n;
+    while ((n = read(rfd, io, sizeof io)) > 0) {
+        TEST_ASSERT_EQUAL_INT(n, write(wfd, io, (size_t)n));
+    }
+    close(rfd);
+    close(wfd);
+    /* Overwrite any 'a','v','r' triplet in the file with zeros — this
+     * is overkill but reliably defeats the heuristic in
+     * elf_scan_deviceinfo_note() without needing to locate the note. */
+    int xfd = open(tmppath, O_RDWR);
+    TEST_ASSERT_NOT_EQUAL(-1, xfd);
+    off_t sz = lseek(xfd, 0, SEEK_END);
+    TEST_ASSERT_GREATER_THAN(0, (long)sz);
+    lseek(xfd, 0, SEEK_SET);
+    char *all = malloc((size_t)sz);
+    TEST_ASSERT_NOT_NULL(all);
+    TEST_ASSERT_EQUAL_INT((ssize_t)sz, read(xfd, all, (size_t)sz));
+    for (off_t i = 0; i + 3 < sz; i++) {
+        if (all[i] == 'a' && all[i+1] == 'v' && all[i+2] == 'r'
+            && all[i+3] >= '0' && all[i+3] <= '9') {
+            all[i] = all[i+1] = all[i+2] = 0;
+        }
+    }
+    lseek(xfd, 0, SEEK_SET);
+    TEST_ASSERT_EQUAL_INT((ssize_t)sz, write(xfd, all, (size_t)sz));
+    free(all);
+    close(xfd);
+
+    ElfContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    int r = elf_open(tmppath, &ctx);
+    unlink(tmppath);
+    TEST_ASSERT_EQUAL_INT(0, r);
+    TEST_ASSERT_EQUAL_STRING("", ctx.device_name);
+    elf_close(&ctx);
+}
+
 /* ── Test runner ─────────────────────────────────────────────────────── */
 int main(void)
 {
@@ -411,5 +476,7 @@ int main(void)
     RUN_TEST(test_elf_close_frees_symtab_strtab_and_closes_fd);
     RUN_TEST(test_elf_close_safe_on_partially_initialised_context);
     RUN_TEST(test_elf_open_sets_flash_base_and_sram_base_from_pt_load_segments);
+    RUN_TEST(test_elf_open_extracts_device_name_from_deviceinfo_note);
+    RUN_TEST(test_elf_open_leaves_device_name_empty_when_note_absent);
     return UNITY_END();
 }
