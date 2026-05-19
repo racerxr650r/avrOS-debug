@@ -1636,6 +1636,14 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="HLR" ref="HLR-048" name="Multi-Family Runtime Device Dispatch"/>
         </traces>
       </llr>
+
+      <llr id="LLR-MAIN-13">
+        <text><![CDATA[`app_main()` shall select the per-family device map between `elf_open()` and the first NVM access by calling `updi_select_device(cfg.updi_fd, cfg.force_device)` exactly once, where `cfg.force_device` is either the user-supplied `--force-device=<family>` string or `NULL`. When `cfg.force_device` is `NULL`, `updi_select_device()` shall determine the active family by SIGROW autodetect (LLR-UPDI-27). The ELF `.note.gnu.avr.deviceinfo` part-name shall NOT be used as a selection input; using it would defeat the mismatch check below by comparing the ELF family against the family the application just told the UPDI layer to be. After `updi_select_device()` returns 0, when `elf_ctx.device_name` is a recognised Microchip part-name (`updi_family_from_partname()` returns non-NULL) AND the user did NOT supply `--force-device`, the application shall verify that `updi_get_device()->family` matches the ELF-derived family string; on mismatch the application shall print `"error: ELF was built for <partname> (family <X>) but target reports <Y> (use --force-device=<Y> to override)"` to `stderr`, exit via the LLR-MAIN-07 teardown with code 1, and shall not call `updi_enter_debug()`, `load_segments()`, or `rsp_listen()`. The `--force-device=<family>` option is the documented escape hatch when the user knowingly wants to debug an ELF against a different silicon family (e.g. a generic AVR-DA build run on AVR-DB hardware) or when SIGROW autodetect cannot identify the part (AVR-DU/AVR-SD relocate SIGROW to a different base).]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-046" name="Non-FLASH NVM Programming"/>
+          <trace target="HLR" ref="HLR-048" name="Multi-Family Runtime Device Dispatch"/>
+        </traces>
+      </llr>
     </function>
 
     <function number="3" title="src/updi.c — UPDI Physical Layer" name="updi" source="src/updi.c">
@@ -1838,6 +1846,13 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="HLR" ref="HLR-046" name="Non-FLASH NVM Programming"/>
         </traces>
       </llr>
+
+      <llr id="LLR-UPDI-28">
+        <text><![CDATA[The UPDI module shall publish `const char *updi_family_from_partname(const char *partname)`, a table-driven classifier that maps a lowercase Microchip AVR part-name string (the form emitted by the ELF `.note.gnu.avr.deviceinfo` note, e.g. `"avr128da28"`, `"avr64dd32"`, `"avr32sd20"`) onto one of the five family strings already published by `g_device_table[]`. The classifier shall accept the prefix `"avr"` followed by one or more ASCII digits (the flash-size field), followed by exactly two lowercase family-letters: `da`→`AVR-DA`, `db`→`AVR-DB`, `dd`→`AVR-DD`, `du`→`AVR-DU`, `sd`→`AVR-SD`. Any other input — `NULL`, the empty string, a string not beginning with `"avr<digit>"`, or a family-letter pair not in the table (notably `ea`/`eb`, which are the unsupported NVMCTRL v3 families) — shall return `NULL`, signalling the caller that the ELF carries no usable family identification and the SIGROW autodetect fallback in `updi_select_device()` must run. The classifier is intentionally co-located with `g_device_table[]` so that adding a new family requires updating both in the same commit.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-048" name="Multi-Family Runtime Device Dispatch"/>
+        </traces>
+      </llr>
     </function>
 
     <function number="4" title="src/gdb_rsp.c — GDB Remote Serial Protocol Server" name="rsp" source="src/gdb_rsp.c">
@@ -2035,6 +2050,14 @@ Errors are propagated upward through the module stack without retrying:
         <traces>
           <trace target="HLR" ref="HLR-021" name="ELF Binary Parsing"/>
           <trace target="HLR" ref="HLR-022" name="Harvard Architecture Address Mapping"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-ELF-09">
+        <text><![CDATA[`elf_open()` shall best-effort extract the lowercase Microchip part-name string from the `.note.gnu.avr.deviceinfo` ELF note emitted by avr-gcc + Microchip device packs (binutils ≥ 2.27). The parser shall walk every section of type `SHT_NOTE`, validate the standard ELF note prologue (`namesz = 4`, `type = 1`, `name = "AVR\0"`), then scan the descriptor bytes for the first NUL-terminated ASCII run starting with `"avr"` followed immediately by an ASCII digit. Up to `ELF_DEVICE_NAME_MAX - 1` (15) bytes shall be copied into the new `ElfContext.device_name` field and NUL-terminated. The note-format heuristic — scanning for `"avr<digit>…"` rather than decoding the descriptor's full struct — is intentional, so the parser survives binutils version drift in the descriptor layout. When the note is absent, malformed, or contains no recognised part-name, `device_name` shall remain the empty string the entry path cleared (`ctx->device_name[0] = '\0'`), which `app_main()` (LLR-MAIN-13) treats as "ELF carries no device identification" and which `updi_family_from_partname()` (LLR-UPDI-28) maps to `NULL`. This LLR shall not cause `elf_open()` to fail on any input that already passes the ELF32/EM_AVR validation in LLR-ELF-01.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-021" name="ELF Binary Parsing"/>
+          <trace target="HLR" ref="HLR-048" name="Multi-Family Runtime Device Dispatch"/>
         </traces>
       </llr>
     </function>
@@ -2251,7 +2274,7 @@ Errors are propagated upward through the module stack without retrying:
     <!-- ============================================================ -->
     <!-- src/main.c unit tests                                        -->
     <!-- ============================================================ -->
-    <file path="tests/test_main.c" role="unit" count="25">
+    <file path="tests/test_main.c" role="unit" count="29">
       <header><![CDATA[Unit tests for `src/main.c`: argument parsing, event loop, signal handling, and resource teardown. Uses `fork()`/`waitpid()` to test `exit()` paths and a mock UPDI/RSP layer to exercise the event loop without real hardware.]]></header>
 
       <test name="parse_args_valid_positional_args_populate_config">
@@ -2378,12 +2401,32 @@ Errors are propagated upward through the module stack without retrying:
         <purpose><![CDATA[Build a segment at vaddr `0x830000` (outside every programmable UPDI window) and run `app_main(... --load ...)`. Verify `app_main` returns 1 (load failure) and that no NVM writer was called.]]></purpose>
         <traces><trace target="LLR" ref="LLR-MAIN-11"/></traces>
       </test>
+
+      <test name="main_autoselects_family_from_elf_deviceinfo">
+        <purpose><![CDATA[Plant `mk_elf_planted_device_name = "avr64dd32"` (deviceinfo string for an AVR-DD part) and `mk_updi_get_device_family = "AVR-DD"` (silicon agrees). Run `app_main()` without `--force-device`. Verify that the wrapped `updi_select_device()` was called exactly once with `force_family == ""` (the wrap normalises `NULL` to `""`), confirming that the ELF deviceinfo is NOT used as a selection input — SIGROW autodetect runs unbiased — and that `app_main()` returns 0 because the autodetected family agrees with the ELF (no mismatch).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-13"/></traces>
+      </test>
+
+      <test name="main_force_device_overrides_elf_deviceinfo">
+        <purpose><![CDATA[Plant `mk_elf_planted_device_name = "avr64dd32"` (would map to AVR-DD) but also pass `--force-device=AVR-DA`. Verify that the wrapped `updi_select_device()` was called with `force_family == "AVR-DA"` and that `app_main()` returned 0, demonstrating the documented precedence `--force-device > deviceinfo`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-13"/></traces>
+      </test>
+
+      <test name="main_aborts_on_elf_vs_silicon_family_mismatch">
+        <purpose><![CDATA[Plant `mk_elf_planted_device_name = "avr64dd32"` (AVR-DD) and override `mk_updi_get_device_family = "AVR-DA"` so the post-select check sees a family mismatch. Run `app_main()` with no `--force-device`. Verify that `app_main()` returns 1, that the wrapped `updi_select_device()` ran exactly once, and that the wrapped `rsp_listen()` was NOT invoked — i.e. the application aborted before opening the GDB listener.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-13"/></traces>
+      </test>
+
+      <test name="main_passes_null_to_select_when_elf_lacks_deviceinfo">
+        <purpose><![CDATA[Leave `mk_elf_planted_device_name` empty (`\0`), run `app_main()` with no `--force-device`. Verify the wrapped `updi_select_device()` was called once and that the captured `force_family` argument was the empty string (the wrap normalises `NULL` to `""`), confirming that `app_main()` falls through to the SIGROW autodetect path when the ELF carries no deviceinfo note.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-13"/></traces>
+      </test>
     </file>
 
     <!-- ============================================================ -->
     <!-- src/updi.c unit tests                                        -->
     <!-- ============================================================ -->
-    <file path="tests/test_updi.c" role="unit" count="42">
+    <file path="tests/test_updi.c" role="unit" count="44">
       <header><![CDATA[Unit tests for `src/updi.c`: UART configuration, BREAK/SYNCH/LDCS link initialisation, three-frame block memory read/write, NVM flash programming, OCD-mode entry, OCD execution-control primitives (halt/run/step + poll_halted), OCD register-file access (GPR/SREG/SP/PC) and hardware-breakpoint comparator programming, and console polling. A loopback PTY pair substitutes for real UART hardware; a `--wrap=select` linker shim lets tests inject `select()` timeouts.]]></header>
 
       <test name="updi_open_sets_8e2_raw_half_duplex_via_termios">
@@ -2600,6 +2643,16 @@ Errors are propagated upward through the module stack without retrying:
         <purpose><![CDATA[Call `updi_select_device(-1, "AVR-XYZ")` and verify the function returns -1 (unknown family name) without modifying the active descriptor.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-27"/></traces>
       </test>
+
+      <test name="updi_family_from_partname_maps_all_known_prefixes">
+        <purpose><![CDATA[Call `updi_family_from_partname()` once per supported family with a representative lowercase part-name (`"avr128da28"`, `"avr128db48"`, `"avr64dd32"`, `"avr32du28"`, `"avr32sd20"`) and verify the returned string equals the matching `g_device_table[]` family literal (`"AVR-DA"`, `"AVR-DB"`, `"AVR-DD"`, `"AVR-DU"`, `"AVR-SD"`).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-28"/></traces>
+      </test>
+
+      <test name="updi_family_from_partname_rejects_invalid_inputs">
+        <purpose><![CDATA[Verify `updi_family_from_partname()` returns `NULL` for `NULL`, the empty string, strings not beginning with `"avr"` (`"not-an-avr"`), the unsupported NVMCTRL v3 families (`"avr32ea48"`, `"avr16eb14"`), and inputs missing the digit run between `"avr"` and the family-letters (`"avrda28"`). NULL signals "no usable identification" to `app_main()` (LLR-MAIN-13).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-28"/></traces>
+      </test>
     </file>
 
     <!-- ============================================================ -->
@@ -2787,7 +2840,7 @@ Errors are propagated upward through the module stack without retrying:
     <!-- ============================================================ -->
     <!-- src/elf_parser.c unit tests                                  -->
     <!-- ============================================================ -->
-    <file path="tests/test_elf.c" role="unit" count="14">
+    <file path="tests/test_elf.c" role="unit" count="16">
       <header><![CDATA[Unit tests for `src/elf_parser.c`: ELF validation, symbol table loading, avrOS sentinel symbol discovery, Harvard address conversion, fail-safe degradation, and context cleanup. Fixture ELF binaries are generated by a helper script in `tests/fixtures/`.]]></header>
 
       <test name="elf_open_accepts_valid_avr_elf32_binary">
@@ -2858,6 +2911,16 @@ Errors are propagated upward through the module stack without retrying:
       <test name="elf_open_sets_flash_base_and_sram_base_from_pt_load_segments">
         <purpose><![CDATA[After a successful `elf_open()` on the full fixture, verify that `ctx.flash_base` equals the VMA of the first `PT_LOAD` segment (0x00000000 for the fixture) and `ctx.sram_base` equals the VMA of the second `PT_LOAD` segment (0x00804000 for the AVR128DA28 fixture).]]></purpose>
         <traces><trace target="LLR" ref="LLR-ELF-08"/></traces>
+      </test>
+
+      <test name="elf_open_extracts_device_name_from_deviceinfo_note">
+        <purpose><![CDATA[After `elf_open()` on every AVR fixture (all built for AVR128DA28), verify `ctx.device_name` equals `"avr128da28"` — the lowercase part-name string extracted from the `.note.gnu.avr.deviceinfo` ELF note descriptor.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-09"/></traces>
+      </test>
+
+      <test name="elf_open_leaves_device_name_empty_when_note_absent">
+        <purpose><![CDATA[Copy the full fixture to a temp path and zero every `"avr<digit>"` ASCII triplet in the file so the deviceinfo heuristic finds nothing, then `elf_open()` the rewritten ELF and verify `elf_open()` still returns 0 and that `ctx.device_name` is the empty string. This proves the parser's note-extraction step is non-fatal on inputs that lack the note.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-09"/></traces>
       </test>
     </file>
 

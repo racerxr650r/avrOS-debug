@@ -259,4 +259,20 @@ const UpdiDeviceMap *updi_get_device(void);
  *     supported.                                                       */
 int  updi_select_device(int fd, const char *force_family);
 
+/* ── Part-name → family classifier ────────────────────────────────────
+ * Maps a lowercase device-name string (e.g. "avr128da28", "avr64dd32",
+ * obtained from the ELF's `.note.gnu.avr.deviceinfo` note) onto the
+ * canonical family string used by `g_device_table[]` ("AVR-DA",
+ * "AVR-DB", "AVR-DD", "AVR-DU", "AVR-SD").  The classifier lives in
+ * `updi.c` because it is logically part of the device-table layer:
+ * adding a new family must update both the table and this mapping
+ * together.
+ *
+ * Returns the family string (statically allocated) on a match, or
+ * NULL when `partname` is NULL, empty, or does not match any known
+ * Microchip AVR-Dx/Du/Sd naming pattern.  The caller (main.c) treats
+ * NULL as "ELF carries no usable device identification" and falls
+ * back to SIGROW autodetect.                                          */
+const char *updi_family_from_partname(const char *partname);
+
 #endif /* AOD_UPDI_H */

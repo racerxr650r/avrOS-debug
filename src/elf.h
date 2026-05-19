@@ -36,6 +36,7 @@ typedef uint32_t Elf32_Addr;
 /* ── Section-header type ─────────────────────────────────────────────────── */
 #define SHT_SYMTAB  2           /* Symbol table */
 #define SHT_STRTAB  3           /* String table */
+#define SHT_NOTE    7           /* Note section */
 
 /* ── Special section index ───────────────────────────────────────────────── */
 #define SHN_UNDEF   0           /* Undefined / not present */

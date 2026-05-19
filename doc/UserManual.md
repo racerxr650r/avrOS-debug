@@ -133,8 +133,8 @@ CP210x) or `/dev/ttyACM0` (CDC ACM). On macOS the path is
 ## 4. Command-Line Invocation
 
 ```
-avr-updi-gdb [--port <port>] [--baud <baud>] [--erase] [--load] [--allow-lock-updi] <serial-device> <elf-file>
-avr-updi-gdb --device [--baud <baud>] <serial-device> [elf-file]
+avr-updi-gdb [--port <port>] [--baud <baud>] [--erase] [--load] [--allow-lock-updi] [--force-device <family>] <serial-device> <elf-file>
+avr-updi-gdb --device [--baud <baud>] [--force-device <family>] <serial-device> [elf-file]
 ```
 
 ### Options
@@ -147,6 +147,24 @@ avr-updi-gdb --device [--baud <baud>] <serial-device> [elf-file]
 | `--erase` | flag | unset | Issue a UPDI chip-erase before any `--load` step. Required when the ELF contains a LOCK segment (lockbits can only be re-programmed after a chip-erase clears `LOCKSTATUS`). |
 | `--allow-lock-updi` | flag | unset | Allow `--load` to write LOCK byte patterns that would assert `UPDIDIS` and permanently disable the UPDI debug interface. Without this flag only the 4-byte unlock pattern `0x5CC5C55C` is accepted; every other LOCK value is rejected. |
 | `--device` | flag | unset | One-shot diagnostic: open UPDI, read the SIGROW signature + serial number and ASI status bytes, print a human-readable report to stdout and exit. No TCP listener is opened, no ELF is loaded, the target CPU is not halted. Mutually exclusive with `--load`. Makes `<elf-file>` optional. |
+| `--force-device <family>` | string | unset | Override automatic family detection. Accepts one of `AVR-DA`, `AVR-DB`, `AVR-DD`, `AVR-DU`, `AVR-SD` (case-insensitive). When set, this string is passed verbatim to the UPDI device-table selector and suppresses the ELF-vs-silicon family mismatch check (see §4.1 below). Use this when you knowingly want to debug an ELF against a different silicon family. |
+
+### 4.1 Device Family Selection
+
+`avr-updi-gdb` chooses which AVR-Dx family memory map (USERROW / EEPROM / FUSES / LOCK / SIGROW window sizes and bases) to apply by the following precedence:
+
+1. **`--force-device <family>`** — when supplied and non-empty, the named family is selected unconditionally. The ELF-vs-silicon family mismatch check is skipped (this is the documented escape hatch).
+2. **SIGROW autodetect** — when `--force-device` is not used, the UPDI module reads SIGROW DEVICEID0..2 from the target and matches against the AVR-DA/DB signature table.
+
+The ELF `.note.gnu.avr.deviceinfo` part-name string (e.g. `avr128da28`, `avr64dd32`, `avr32sd20`) is **not** used as a selection input — using it would defeat the mismatch check below by comparing the ELF family against the family the application just told the UPDI layer to be. Instead the ELF-derived family is used purely as an assertion against the autodetected silicon.
+
+After a family has been selected, when the ELF *did* carry a recognised part-name note and `--force-device` was *not* used, `avr-updi-gdb` verifies that the family derived from the ELF matches the autodetected silicon family. On mismatch it prints
+
+```
+error: ELF was built for <partname> (family <X>) but target reports <Y> (use --force-device=<Y> to override)
+```
+
+to `stderr`, releases all resources, and exits with code 1 *without* opening the GDB listener or programming any NVM. To proceed anyway, re-run with `--force-device=<Y>`.
 
 ### Operands
 

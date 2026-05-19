@@ -160,6 +160,18 @@ FIXTURE_SRCS   := $(FIXTUREDIR)/avros_full.c \
                   $(FIXTUREDIR)/avros_break.c \
                   $(FIXTUREDIR)/all_nvm.c
 FIXTURE_ELFS   := $(patsubst $(FIXTUREDIR)/%.c,$(FIXBINDIR)/%.elf,$(FIXTURE_SRCS))
+
+# LLR-MAIN-13 hardware fixture — built with -mmcu=avr64dd32 so the ELF
+# carries an `.note.gnu.avr.deviceinfo` string of "avr64dd32" (family
+# AVR-DD) while the bench board is AVR128DA28.  Used to exercise the
+# ELF-vs-silicon family mismatch abort on real hardware.  Built into
+# its own variable so the per-MCU override does not leak into the
+# pattern rule used by every other AVR fixture.
+WRONG_FAMILY_MCU := avr64dd32
+WRONG_FAMILY_DFP := $(if $(wildcard $(DFP)/gcc/dev/$(WRONG_FAMILY_MCU)),\
+                         -B $(DFP)/gcc/dev/$(WRONG_FAMILY_MCU) -I$(DFP)/include,)
+WRONG_FAMILY_SRC := $(FIXTUREDIR)/wrong_family.c
+WRONG_FAMILY_ELF := $(FIXBINDIR)/wrong_family.elf
 # not_avr.elf is a plain i386 ELF — built with the host gcc targeting ELF
 NOT_AVR_SRC    := $(FIXTUREDIR)/not_avr.c
 NOT_AVR_ELF    := $(FIXBINDIR)/not_avr.elf
@@ -283,6 +295,15 @@ $(FIXBINDIR)/%.elf: $(FIXTUREDIR)/%.c
 	$(Q)$(AVR_CC) $(AVR_CFLAGS) -o $@ $<
 	@echo "  AVR-CC  $<"
 
+# LLR-MAIN-13 mismatch fixture: built with -mmcu=avr64dd32 so the ELF's
+# `.note.gnu.avr.deviceinfo` reports "avr64dd32" (family AVR-DD).
+# Explicit recipe overrides the generic pattern rule above.
+$(WRONG_FAMILY_ELF): $(WRONG_FAMILY_SRC)
+	@mkdir -p $(FIXBINDIR)
+	$(Q)$(AVR_CC) -mmcu=$(WRONG_FAMILY_MCU) $(WRONG_FAMILY_DFP) -Os -g \
+	    -o $@ $<
+	@echo "  AVR-CC  $<  (mcu=$(WRONG_FAMILY_MCU))"
+
 $(NOT_AVR_ELF): $(NOT_AVR_SRC)
 	@mkdir -p $(FIXBINDIR)
 	$(Q)$(CC) -m32 -o $@ $< 2>/dev/null || \
@@ -330,7 +351,7 @@ test: fixtures $(addprefix $(TESTBINDIR)/,$(TEST_NAMES))
 
 # ── fixtures target ───────────────────────────────────────────────────────────
 .PHONY: fixtures
-fixtures: $(FIXTURE_ELFS) $(NOT_AVR_ELF)
+fixtures: $(FIXTURE_ELFS) $(NOT_AVR_ELF) $(WRONG_FAMILY_ELF)
 
 # ── test-ci target ────────────────────────────────────────────────────────────
 # Like 'test' but writes each suite's output to build/test-results/<name>.txt

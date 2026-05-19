@@ -15,7 +15,7 @@ Snapshot: **115 test(s)** across
 
 ### 3.1. [tests/test_main.c](../tests/test_main.c)
 
-Role: **unit**. **25 test(s).**
+Role: **unit**. **29 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -44,10 +44,14 @@ Role: **unit**. **25 test(s).**
 | 23 | <a id="load_segments_lock_with_erase_dispatches_to_lockbits_writer"></a>`load_segments_lock_with_erase_dispatches_to_lockbits_writer` | `LLR-MAIN-11` | Build a LOCK segment at vaddr `0x820040` size 4 and run `app_main(... --erase --load ...)`. Verify wrapped `updi_chip_erase` was called exactly once, then wrapped `updi_nvm_write_lockbits` was called exactly once with `addr=0x820040` and the recorded `allow_updi_disable` flag matching `cfg.allow_lock_updi` (false in this case). |
 | 24 | <a id="load_segments_sigrow_segment_is_skipped"></a>`load_segments_sigrow_segment_is_skipped` | `LLR-MAIN-11` | Build a SIGROW segment at vaddr `0x811080` size 4 and run `app_main(... --load ...)`. Verify NONE of the FLASH/EEPROM/USERROW/FUSES/LOCK writers were called and `app_main` returns 0. |
 | 25 | <a id="load_segments_unknown_window_returns_minus1"></a>`load_segments_unknown_window_returns_minus1` | `LLR-MAIN-11` | Build a segment at vaddr `0x830000` (outside every programmable UPDI window) and run `app_main(... --load ...)`. Verify `app_main` returns 1 (load failure) and that no NVM writer was called. |
+| 26 | <a id="main_autoselects_family_from_elf_deviceinfo"></a>`main_autoselects_family_from_elf_deviceinfo` | `LLR-MAIN-13` | Plant `mk_elf_planted_device_name = "avr64dd32"` (deviceinfo string for an AVR-DD part) and `mk_updi_get_device_family = "AVR-DD"` (silicon agrees). Run `app_main()` without `--force-device`. Verify that the wrapped `updi_select_device()` was called exactly once with `force_family == ""` (the wrap normalises `NULL` to `""`), confirming that the ELF deviceinfo is NOT used as a selection input — SIGROW autodetect runs unbiased — and that `app_main()` returns 0 because the autodetected family agrees with the ELF (no mismatch). |
+| 27 | <a id="main_force_device_overrides_elf_deviceinfo"></a>`main_force_device_overrides_elf_deviceinfo` | `LLR-MAIN-13` | Plant `mk_elf_planted_device_name = "avr64dd32"` (would map to AVR-DD) but also pass `--force-device=AVR-DA`. Verify that the wrapped `updi_select_device()` was called with `force_family == "AVR-DA"` and that `app_main()` returned 0, demonstrating the documented precedence `--force-device > deviceinfo`. |
+| 28 | <a id="main_aborts_on_elf_vs_silicon_family_mismatch"></a>`main_aborts_on_elf_vs_silicon_family_mismatch` | `LLR-MAIN-13` | Plant `mk_elf_planted_device_name = "avr64dd32"` (AVR-DD) and override `mk_updi_get_device_family = "AVR-DA"` so the post-select check sees a family mismatch. Run `app_main()` with no `--force-device`. Verify that `app_main()` returns 1, that the wrapped `updi_select_device()` ran exactly once, and that the wrapped `rsp_listen()` was NOT invoked — i.e. the application aborted before opening the GDB listener. |
+| 29 | <a id="main_passes_null_to_select_when_elf_lacks_deviceinfo"></a>`main_passes_null_to_select_when_elf_lacks_deviceinfo` | `LLR-MAIN-13` | Leave `mk_elf_planted_device_name` empty (`\0`), run `app_main()` with no `--force-device`. Verify the wrapped `updi_select_device()` was called once and that the captured `force_family` argument was the empty string (the wrap normalises `NULL` to `""`), confirming that `app_main()` falls through to the SIGROW autodetect path when the ELF carries no deviceinfo note. |
 
 ### 3.2. [tests/test_updi.c](../tests/test_updi.c)
 
-Role: **unit**. **42 test(s).**
+Role: **unit**. **44 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -94,6 +98,8 @@ Role: **unit**. **42 test(s).**
 | 41 | <a id="updi_get_device_default_is_avrda"></a>`updi_get_device_default_is_avrda` | `LLR-UPDI-27` | Call `updi_get_device()` before any `updi_select_device()` invocation and verify the returned descriptor names AVR-DA, exposes the historical `UPDI_USERROW_BASE`/`UPDI_USERROW_SIZE` and `UPDI_EEPROM_BASE`/`UPDI_EEPROM_SIZE` constants, and has `hw_tested == true`. |
 | 42 | <a id="updi_select_device_force_avrdd_sets_active_descriptor"></a>`updi_select_device_force_avrdd_sets_active_descriptor` | `LLR-UPDI-27` | Call `updi_select_device(-1, "avr-dd")` (case-insensitive force path, no UPDI traffic). Verify the function returns 0, `updi_get_device()` now returns the AVR-DD descriptor (`userrow_size == 128`, `hw_tested == false`), then restore the AVR-DA default for subsequent tests. |
 | 43 | <a id="updi_select_device_unknown_family_returns_minus1"></a>`updi_select_device_unknown_family_returns_minus1` | `LLR-UPDI-27` | Call `updi_select_device(-1, "AVR-XYZ")` and verify the function returns -1 (unknown family name) without modifying the active descriptor. |
+| 44 | <a id="updi_family_from_partname_maps_all_known_prefixes"></a>`updi_family_from_partname_maps_all_known_prefixes` | `LLR-UPDI-28` | Call `updi_family_from_partname()` once per supported family with a representative lowercase part-name (`"avr128da28"`, `"avr128db48"`, `"avr64dd32"`, `"avr32du28"`, `"avr32sd20"`) and verify the returned string equals the matching `g_device_table[]` family literal (`"AVR-DA"`, `"AVR-DB"`, `"AVR-DD"`, `"AVR-DU"`, `"AVR-SD"`). |
+| 45 | <a id="updi_family_from_partname_rejects_invalid_inputs"></a>`updi_family_from_partname_rejects_invalid_inputs` | `LLR-UPDI-28` | Verify `updi_family_from_partname()` returns `NULL` for `NULL`, the empty string, strings not beginning with `"avr"` (`"not-an-avr"`), the unsupported NVMCTRL v3 families (`"avr32ea48"`, `"avr16eb14"`), and inputs missing the digit run between `"avr"` and the family-letters (`"avrda28"`). NULL signals "no usable identification" to `app_main()` (LLR-MAIN-13). |
 
 ### 3.3. [tests/test_rsp.c](../tests/test_rsp.c)
 
@@ -139,7 +145,7 @@ Role: **unit**. **33 test(s).**
 
 ### 3.4. [tests/test_elf.c](../tests/test_elf.c)
 
-Role: **unit**. **14 test(s).**
+Role: **unit**. **16 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -157,6 +163,8 @@ Role: **unit**. **14 test(s).**
 | 12 | <a id="elf_close_frees_symtab_strtab_and_closes_fd"></a>`elf_close_frees_symtab_strtab_and_closes_fd` | `LLR-ELF-06` | After a successful `elf_open()`, call `elf_close()` and verify that the file descriptor is closed and no memory is leaked (checked via Valgrind or AddressSanitizer). |
 | 13 | <a id="elf_close_safe_on_partially_initialised_context"></a>`elf_close_safe_on_partially_initialised_context` | `LLR-ELF-06` | Construct an `ElfContext` with `symtab = NULL`, `strtab` allocated, and `fd = -1`, call `elf_close()`, and verify no crash or double-free occurs. |
 | 14 | <a id="elf_open_sets_flash_base_and_sram_base_from_pt_load_segments"></a>`elf_open_sets_flash_base_and_sram_base_from_pt_load_segments` | `LLR-ELF-08` | After a successful `elf_open()` on the full fixture, verify that `ctx.flash_base` equals the VMA of the first `PT_LOAD` segment (0x00000000 for the fixture) and `ctx.sram_base` equals the VMA of the second `PT_LOAD` segment (0x00804000 for the AVR128DA28 fixture). |
+| 15 | <a id="elf_open_extracts_device_name_from_deviceinfo_note"></a>`elf_open_extracts_device_name_from_deviceinfo_note` | `LLR-ELF-09` | After `elf_open()` on every AVR fixture (all built for AVR128DA28), verify `ctx.device_name` equals `"avr128da28"` — the lowercase part-name string extracted from the `.note.gnu.avr.deviceinfo` ELF note descriptor. |
+| 16 | <a id="elf_open_leaves_device_name_empty_when_note_absent"></a>`elf_open_leaves_device_name_empty_when_note_absent` | `LLR-ELF-09` | Copy the full fixture to a temp path and zero every `"avr<digit>"` ASCII triplet in the file so the deviceinfo heuristic finds nothing, then `elf_open()` the rewritten ELF and verify `elf_open()` still returns 0 and that `ctx.device_name` is the empty string. This proves the parser's note-extraction step is non-fatal on inputs that lack the note. |
 
 ### 3.5. [tests/test_fsm.c](../tests/test_fsm.c)
 
@@ -279,6 +287,7 @@ verified by code review — see
 | `LLR-MAIN-10` | `main` | `HLR-010` | `main_calls_updi_enter_debug_after_updi_open_before_rsp_listen` |
 | `LLR-MAIN-11` | `main` | `HLR-004`, `HLR-046`, `HLR-047`, `HLR-048` | `parse_args_allow_lock_updi_sets_flag`, `load_segments_dispatches_eeprom_segment_to_eeprom_writer`, `load_segments_dispatches_fuses_segment_to_fuses_writer`, `load_segments_dispatches_userrow_segment_to_userrow_writer`, `load_segments_lock_requires_erase_else_exit_1`, `load_segments_lock_with_erase_dispatches_to_lockbits_writer`, `load_segments_sigrow_segment_is_skipped`, `load_segments_unknown_window_returns_minus1` |
 | `LLR-MAIN-12` | `main` | `HLR-048` | `parse_args_force_device_captures_family`, `parse_args_force_device_default_is_null` |
+| `LLR-MAIN-13` | `main` | `HLR-046`, `HLR-048` | `main_autoselects_family_from_elf_deviceinfo`, `main_force_device_overrides_elf_deviceinfo`, `main_aborts_on_elf_vs_silicon_family_mismatch`, `main_passes_null_to_select_when_elf_lacks_deviceinfo` |
 | `LLR-UPDI-01` | `updi` | `HLR-006` | `updi_open_sets_8e2_raw_half_duplex_via_termios`, `updi_open_returns_minus1_on_device_open_failure` |
 | `LLR-UPDI-02` | `updi` | `HLR-006`, `HLR-036` | `updi_open_asserts_wake_byte_then_stcs_ctrlb`, `updi_open_restores_session_baud_after_break` |
 | `LLR-UPDI-03` | `updi` | `HLR-036` | `updi_open_issues_stcs_ctrla_and_ldcs_statusa`, `updi_open_retries_cold_start_3_times_on_no_ack`, `updi_open_returns_minus1_after_3_consecutive_link_failures` |
@@ -306,6 +315,7 @@ verified by code review — see
 | `LLR-UPDI-26` | `updi` | `HLR-047` | `updi_nvm_write_lockbits_returns_locked_when_lockstatus_set`, `updi_nvm_write_lockbits_refuses_updidis_value_without_flag` |
 | `LLR-UPDI-22` | `updi` | `HLR-016` | `updi_ocd_clear_hw_bp_clears_only_target_slot` |
 | `LLR-UPDI-27` | `updi` | `HLR-048`, `HLR-046` | `updi_get_device_default_is_avrda`, `updi_select_device_force_avrdd_sets_active_descriptor`, `updi_select_device_unknown_family_returns_minus1` |
+| `LLR-UPDI-28` | `updi` | `HLR-048` | `updi_family_from_partname_maps_all_known_prefixes`, `updi_family_from_partname_rejects_invalid_inputs` |
 | `LLR-RSP-01` | `rsp` | `HLR-003`, `HLR-038` | `rsp_listen_sets_so_reuseaddr_before_bind`, `rsp_accept_sets_tcp_nodelay_on_client_socket` |
 | `LLR-RSP-02` | `rsp` | `HLR-013` | `rsp_recv_packet_discards_leading_ack_nak_bytes`, `rsp_recv_packet_sends_plus_on_valid_checksum`, `rsp_recv_packet_sends_minus_and_returns_minus1_on_bad_checksum` |
 | `LLR-RSP-03` | `rsp` | `HLR-014`, `HLR-026` | `on_read_regs_g_returns_78_char_hex_string`, `on_read_regs_g_places_pc_little_endian_at_positions_70_77`, `on_read_regs_non_active_thread_uses_fsm_register_frame` |
@@ -332,6 +342,7 @@ verified by code review — see
 | `LLR-ELF-06` | `elf` | `HLR-040` | `elf_close_frees_symtab_strtab_and_closes_fd`, `elf_close_safe_on_partially_initialised_context` |
 | `LLR-ELF-07` | `elf` | `HLR-033` | `build_compiles_clean_on_linux_with_c99_and_posix` |
 | `LLR-ELF-08` | `elf` | `HLR-021`, `HLR-022` | `elf_open_sets_flash_base_and_sram_base_from_pt_load_segments` |
+| `LLR-ELF-09` | `elf` | `HLR-021`, `HLR-048` | `elf_open_extracts_device_name_from_deviceinfo_note`, `elf_open_leaves_device_name_empty_when_note_absent` |
 | `LLR-FSM-01` | `fsm` | `HLR-024` | `fsm_build_thread_list_reads_fsm_table_from_flash_via_updi`, `fsm_build_thread_list_returns_minus1_on_updi_failure` |
 | `LLR-FSM-02` | `fsm` | `HLR-024` | `fsm_build_thread_list_assigns_1_based_thread_ids_in_order`, `fsm_build_thread_list_thread_ids_stable_across_calls` |
 | `LLR-FSM-03` | `fsm` | `HLR-025` | `fsm_build_thread_list_sets_active_thread_from_current_fsm_ptr`, `fsm_build_thread_list_sets_active_id_0_when_no_entry_matches` |
