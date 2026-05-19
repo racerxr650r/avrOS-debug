@@ -1,6 +1,6 @@
-# avr-updi-gdb — User Manual
+# avrOSdb — User Manual
 
-`avr-updi-gdb` is a host-side GDB Remote Serial Protocol (RSP) server that
+`avrOSdb` is a host-side GDB Remote Serial Protocol (RSP) server that
 bridges `avr-gdb` to AVR DA/DB targets over the UPDI single-wire debug
 interface. It adds first-class awareness of [avrOS](https://github.com/racerxr650r/avrOS)
 cooperative FSM tasks, exposing each registered FSM as a GDB virtual thread.
@@ -12,15 +12,15 @@ worked examples, and integration with VS Code's built-in debugger UI.
 
 ## 1. Prerequisites
 
-The following host tools are required to build and use `avr-updi-gdb`:
+The following host tools are required to build and use `avrOSdb`:
 
 | Tool | Minimum version | Purpose |
 | ---- | --------------- | ------- |
-| `gcc` (or `clang`) | gcc ≥ 4.8 / clang ≥ 3.4 | C99 host compiler for `avr-updi-gdb` and the unit tests |
+| `gcc` (or `clang`) | gcc ≥ 4.8 / clang ≥ 3.4 | C99 host compiler for `avrOSdb` and the unit tests |
 | `make` | ≥ 3.81 | Build orchestration (`all`, `test`, `install`, `bundle`) |
 | `avr-gcc` | ≥ 12.0 | AVR cross-compiler (only needed when compiling firmware or test fixtures) |
 | `avr-binutils` | matching `avr-gcc` | Provides `avr-nm`, used to verify ELF symbols |
-| `avr-gdb` | ≥ 12.0 | The GDB client that connects to `avr-updi-gdb` |
+| `avr-gdb` | ≥ 12.0 | The GDB client that connects to `avrOSdb` |
 
 Optional tools:
 
@@ -49,7 +49,7 @@ missing tool when any required dependency is absent.
 From the repository root:
 
 ```bash
-make             # builds build/avr-updi-gdb
+make             # builds build/avrOSdb
 make test        # builds and runs all unit + integration tests
 make install     # installs binary + man page under $(PREFIX)
 ```
@@ -82,9 +82,9 @@ To produce native distribution packages under `dist/`:
 
 ```bash
 make bundle VERSION=0.1.0
-# dist/avr-updi-gdb_0.1.0_amd64.deb
-# dist/avr-updi-gdb-0.1.0-1.x86_64.rpm
-# dist/avr-updi-gdb.rb         (Homebrew formula)
+# dist/avrOSdb_0.1.0_amd64.deb
+# dist/avrOSdb-0.1.0-1.x86_64.rpm
+# dist/avrOSdb.rb         (Homebrew formula)
 ```
 
 `bundle-deb`, `bundle-rpm`, and `bundle-brew` may be built individually.
@@ -133,9 +133,9 @@ CP210x) or `/dev/ttyACM0` (CDC ACM). On macOS the path is
 ## 4. Command-Line Invocation
 
 ```
-avr-updi-gdb [--port <port>] [--baud <baud>] [--erase] [--load] [--no-verify] [--allow-lock-updi] [--force-device <family>] <serial-device> <elf-file>
-avr-updi-gdb --prog [--baud <baud>] [--erase] [--no-verify] [--allow-lock-updi] [--force-device <family>] <serial-device> <elf-file>
-avr-updi-gdb --device [--baud <baud>] [--no-autobaud] [--force-device <family>] <serial-device> [elf-file]
+avrOSdb [--port <port>] [--baud <baud>] [--erase] [--load] [--no-verify] [--allow-lock-updi] [--force-device <family>] <serial-device> <elf-file>
+avrOSdb --prog [--baud <baud>] [--erase] [--no-verify] [--allow-lock-updi] [--force-device <family>] <serial-device> <elf-file>
+avrOSdb --device [--baud <baud>] [--no-autobaud] [--force-device <family>] <serial-device> [elf-file]
 ```
 
 ### Options
@@ -163,14 +163,14 @@ avr-updi-gdb --device [--baud <baud>] [--no-autobaud] [--force-device <family>] 
 
 ### 4.2 Device Family Selection
 
-`avr-updi-gdb` chooses which AVR-Dx family memory map (USERROW / EEPROM / FUSES / LOCK / SIGROW window sizes and bases) to apply by the following precedence:
+`avrOSdb` chooses which AVR-Dx family memory map (USERROW / EEPROM / FUSES / LOCK / SIGROW window sizes and bases) to apply by the following precedence:
 
 1. **`--force-device <family>`** — when supplied and non-empty, the named family is selected unconditionally. The ELF-vs-silicon family mismatch check is skipped (this is the documented escape hatch).
 2. **SIGROW autodetect** — when `--force-device` is not used, the UPDI module reads SIGROW DEVICEID0..2 from the target and matches against the AVR-DA/DB signature table.
 
 The ELF `.note.gnu.avr.deviceinfo` part-name string (e.g. `avr128da28`, `avr64dd32`, `avr32sd20`) is **not** used as a selection input — using it would defeat the mismatch check below by comparing the ELF family against the family the application just told the UPDI layer to be. Instead the ELF-derived family is used purely as an assertion against the autodetected silicon.
 
-After a family has been selected, when the ELF *did* carry a recognised part-name note and `--force-device` was *not* used, `avr-updi-gdb` verifies that the family derived from the ELF matches the autodetected silicon family. On mismatch it prints
+After a family has been selected, when the ELF *did* carry a recognised part-name note and `--force-device` was *not* used, `avrOSdb` verifies that the family derived from the ELF matches the autodetected silicon family. On mismatch it prints
 
 ```
 error: ELF was built for <partname> (family <X>) but target reports <Y> (use --force-device=<Y> to override)
@@ -200,7 +200,7 @@ to `stderr`, releases all resources, and exits with code 1 *without* opening the
 
 ```bash
 # Terminal 1 — start the stub
-avr-updi-gdb /dev/ttyUSB0 build/firmware.elf
+avrOSdb /dev/ttyUSB0 build/firmware.elf
 
 # Terminal 2 — connect with avr-gdb
 avr-gdb build/firmware.elf
@@ -213,7 +213,7 @@ avr-gdb build/firmware.elf
 ### 5.2 Flash and debug from cold
 
 ```bash
-avr-updi-gdb --load --port 1234 --baud 115200 \
+avrOSdb --load --port 1234 --baud 115200 \
              /dev/ttyUSB0 build/firmware.elf
 ```
 
@@ -309,7 +309,7 @@ Example session:
 
 ### 5.4 Inspect avrOS runtime state from GDB
 
-`avr-updi-gdb` extends GDB with an `avros` monitor sub-command. Type at
+`avrOSdb` extends GDB with an `avros` monitor sub-command. Type at
 the `(gdb)` prompt:
 
 ```
@@ -326,7 +326,7 @@ non-destructive read of the SIGROW signature and ASI status registers,
 prints a one-shot report, and exits without starting a GDB listener.
 
 ```bash
-avr-updi-gdb --device /dev/ttyUSB0
+avrOSdb --device /dev/ttyUSB0
 ```
 
 Sample output:
@@ -357,7 +357,7 @@ console.
 
 ## 6. VS Code Integration
 
-`avr-updi-gdb` speaks standard GDB RSP, so VS Code's built-in
+`avrOSdb` speaks standard GDB RSP, so VS Code's built-in
 `cppdbg` debug adapter connects to it as a remote target. Two pieces
 are required:
 
@@ -372,7 +372,7 @@ Add the following to `.vscode/launch.json` in your firmware project:
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Debug AVR via avr-updi-gdb",
+            "name": "Debug AVR via avrOSdb",
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/build/firmware.elf",
@@ -392,11 +392,11 @@ Add the following to `.vscode/launch.json` in your firmware project:
 
 Recommended workflow:
 
-1. Start `avr-updi-gdb` in an integrated terminal:
+1. Start `avrOSdb` in an integrated terminal:
    ```bash
-   avr-updi-gdb --load /dev/ttyUSB0 build/firmware.elf
+   avrOSdb --load /dev/ttyUSB0 build/firmware.elf
    ```
-2. Press **F5** to launch the `Debug AVR via avr-updi-gdb` configuration.
+2. Press **F5** to launch the `Debug AVR via avrOSdb` configuration.
    VS Code spawns `avr-gdb`, which connects to `localhost:1234` and
    downloads symbols.
 3. Set breakpoints in the editor margin; the **Call Stack** view shows
@@ -417,7 +417,7 @@ launch script already manages the stub.
 
 | Symptom | Likely cause | Resolution |
 | ------- | ------------ | ---------- |
-| `avr-updi-gdb` exits immediately with "permission denied" on `/dev/ttyUSB0` | User not in `dialout` group | `sudo usermod -a -G dialout $USER`; log out and back in. |
+| `avrOSdb` exits immediately with "permission denied" on `/dev/ttyUSB0` | User not in `dialout` group | `sudo usermod -a -G dialout $USER`; log out and back in. |
 | GDB shows wrong PC for an FSM | Stale FSM cache | Run `monitor avros events` or step once — the cache is invalidated automatically on every `continue`/`step`. |
 | `--load` returns exit code 1 immediately | NVM write-protect fuse engaged | Clear the WP fuse with an external programmer; re-attempt. |
 | No threads visible in GDB | ELF lacks avrOS sentinel symbols | Verify the firmware links against avrOS and that `__avros_fsm_table_start`/`_end` are present via `avr-nm`. |
@@ -430,6 +430,6 @@ launch script already manages the stub.
 - [`avrdude`(1)](https://github.com/avrdudes/avrdude) — non-debug UPDI flashing.
 - [avrOS](https://github.com/racerxr650r/avrOS) — the cooperative-FSM
   runtime whose tasks become GDB virtual threads.
-- `doc/avr-updi-gdb.1` — Unix man page (installed by `make install`).
+- `doc/avrOSdb.1` — Unix man page (installed by `make install`).
 - [doc/PVD.md](PVD.md), [doc/SDD.md](SDD.md) — product vision and
   software design document.

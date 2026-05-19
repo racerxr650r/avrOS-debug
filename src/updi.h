@@ -239,6 +239,18 @@ int  updi_probe_baud(const char *serial_device,
 extern const int updi_baud_ladder[];
 extern const size_t updi_baud_ladder_count;
 
+/* ── NVM write progress callback ──────────────────────────────────────
+ * Optional hook installed by the CLI to render a unified progress bar
+ * across all segments.  When set, updi_nvm_write_flash() invokes the
+ * callback after every successful FLASH-page commit with the just-
+ * written page's UPDI address and the number of bytes programmed in
+ * the current call so far (cumulative within that updi_nvm_write_flash
+ * invocation).  Set to NULL (the default) to disable.               */
+typedef void (*UpdiNvmProgressCb)(uint32_t page_addr,
+                                  size_t done, size_t total,
+                                  void *user);
+void updi_set_nvm_progress(UpdiNvmProgressCb cb, void *user);
+
 /* ── Phase 9 — fuse pretty-printer (HLR-PHASE9-FUSES, LLR-UPDI-32) ───
  * Format the raw fuse bytes for the currently-selected device family
  * (per `updi_get_device()`) into a human-readable multi-line buffer

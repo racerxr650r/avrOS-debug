@@ -47,7 +47,7 @@ static void test_build_compiles_clean_on_linux_with_c99_and_posix(void)
 /* HLR-034 — runtime depends only on libc / loader / vDSO */
 static void test_runtime_links_only_libc_no_heavyweight_deps(void)
 {
-    FILE *fp = popen("ldd build/avr-updi-gdb", "r");
+    FILE *fp = popen("ldd build/avrOSdb", "r");
     TEST_ASSERT_NOT_NULL(fp);
     char line[512];
     int bad = 0;

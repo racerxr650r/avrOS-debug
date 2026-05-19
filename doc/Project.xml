@@ -30,7 +30,7 @@
     <audience>embedded application developers and toolchain integrators</audience>
 
     <scope>
-      <intro>describes the design of the source modules that implement the avr-updi-gdb server</intro>
+      <intro>describes the design of the source modules that implement the avrOSdb server</intro>
       <file path="src/main.c">Entry point, CLI argument parsing, and the top-level select()-based event loop.</file>
       <file path="src/updi.c">UPDI physical layer: UART serial management, UPDI protocol framing, NVM flash programming, and UPDI console bridge.</file>
       <file path="src/gdb_rsp.c">GDB Remote Serial Protocol server: packet codec, command dispatch, and session lifecycle management.</file>
@@ -39,19 +39,19 @@
       <file path="src/monitor.c">Custom monitor command handler: implements the `avros events` and `avros queues` sub-commands via non-intrusive UPDI reads.</file>
       <file path="Makefile">Build orchestration: compile, test, install, uninstall, check-tools, and bundle (Debian .deb, Red Hat .rpm, Homebrew formula) targets.</file>
       <file path="tests/hw/hw_test.c">On-target hardware integration test harness: links against `src/updi.c` and exercises the live UPDI silicon, device-info report, SRAM round-trips, NVM page programming, and the RSP server's TCP path. Manual-only — never wired into `make test`.</file>
-      <file path="doc/avr-updi-gdb.1">Unix man page: reference documentation for the avr-updi-gdb command.</file>
+      <file path="doc/avrOSdb.1">Unix man page: reference documentation for the avrOSdb command.</file>
       <outro><![CDATA[It does not cover the build system, IDE adapter layers (Cortex-Debug, Zed DAP), or Windows support, all of which are out of scope for the initial release (see `doc/PVD.md §7.2`).]]></outro>
     </scope>
 
     <overview>
-      <para><![CDATA[`avr-updi-gdb` is a POSIX C99 GDB stub that bridges the UPDI debug interface of modern AVR microcontrollers (DA/DB families) to standard IDEs over the GDB Remote Serial Protocol (RSP). A developer launches the stub, points it at a serial device and an ELF binary, and connects any GDB-compatible front-end — VS Code with Cortex-Debug, Zed with its DAP adapter, or bare `avr-gdb` — using the standard `target extended-remote` command.]]></para>
+      <para><![CDATA[`avrOSdb` is a POSIX C99 GDB stub that bridges the UPDI debug interface of modern AVR microcontrollers (DA/DB families) to standard IDEs over the GDB Remote Serial Protocol (RSP). A developer launches the stub, points it at a serial device and an ELF binary, and connects any GDB-compatible front-end — VS Code with Cortex-Debug, Zed with its DAP adapter, or bare `avr-gdb` — using the standard `target extended-remote` command.]]></para>
       <para><![CDATA[The server connects to the target via a TTL-level UART serial adapter with a 1 kΩ resistor on the UPDI line. No external JTAG programmer or proprietary debugger hardware is required — only a USB-to-serial adapter or direct Raspberry Pi UART pins.]]></para>
-      <para><![CDATA[Unlike conventional GDB stubs that expose a flat memory model, `avr-updi-gdb` provides native avrOS state-machine awareness. At attach time it parses the supplied ELF binary to locate the avrOS FSM registration tables in FLASH, then presents each registered finite state machine as a standard GDB virtual thread. The currently executing FSM appears as the active thread; all suspended FSMs appear as additional threads, each with a synthetic register frame whose PC points to the FSM's current state function pointer.]]></para>
-      <para><![CDATA[The project ships with a `make install` target that installs the compiled binary to `$(PREFIX)/bin/` and the accompanying Unix man page to `$(PREFIX)/share/man/man1/`. A `make check-tools` target validates that all required build tools (`gcc`, `make`, `avr-gcc`, `avr-binutils`) are present on the host before any compilation is attempted. A `make bundle` target produces native distribution packages for three platforms: a Debian binary package (`.deb`), a Red Hat RPM package (`.rpm`), and a Homebrew formula (`dist/avr-updi-gdb.rb`) for macOS. All output artefacts are written under the `dist/` directory. These targets ensure the project can be built, deployed, and distributed by a developer from a single `make` command sequence with no manual file copying.]]></para>
+      <para><![CDATA[Unlike conventional GDB stubs that expose a flat memory model, `avrOSdb` provides native avrOS state-machine awareness. At attach time it parses the supplied ELF binary to locate the avrOS FSM registration tables in FLASH, then presents each registered finite state machine as a standard GDB virtual thread. The currently executing FSM appears as the active thread; all suspended FSMs appear as additional threads, each with a synthetic register frame whose PC points to the FSM's current state function pointer.]]></para>
+      <para><![CDATA[The project ships with a `make install` target that installs the compiled binary to `$(PREFIX)/bin/` and the accompanying Unix man page to `$(PREFIX)/share/man/man1/`. A `make check-tools` target validates that all required build tools (`gcc`, `make`, `avr-gcc`, `avr-binutils`) are present on the host before any compilation is attempted. A `make bundle` target produces native distribution packages for three platforms: a Debian binary package (`.deb`), a Red Hat RPM package (`.rpm`), and a Homebrew formula (`dist/avrOSdb.rb`) for macOS. All output artefacts are written under the `dist/` directory. These targets ensure the project can be built, deployed, and distributed by a developer from a single `make` command sequence with no manual file copying.]]></para>
       <para><![CDATA[**Planned — Phase 9 — CI-Grade Loader & Link Diagnostics (not yet implemented).** A forthcoming iteration extends the programmer and the `--device` diagnostic mode with the following capabilities so the tool can be trusted as a CI build/flash step and used as a first-line link-health probe. Tracked in GitHub issue #28; not yet bound to HLRs/LLRs.
 
 * **Read-back verify after `--load`.** After every successful NVM write, re-read the affected pages via UPDI and compare against the ELF payload. Mismatching pages shall be reported by `(window, page-aligned address, expected-CRC, actual-CRC)`, the application shall exit with a distinct non-zero exit code (`2`, reserved for verify failure as opposed to `1` for I/O failure), and shall not enter debug or open the GDB listener. Verify shall cover FLASH, EEPROM, USERROW, and FUSES windows; LOCK is excluded because lockbits become read-only post-write.
-* **`--prog` program-and-exit mode.** A new mutually-exclusive operating mode that programs the supplied ELF into NVM, verifies it (as above), and exits — no GDB listener is opened, no `updi_enter_debug()` is issued, the UPDI link is dropped cleanly with the target left running. Mode shall print, to `stdout`, the negotiated `baud=<N>` line at start-up and a single-line ANSI-aware progress bar (`[#####.....] 53%  page 27/51 erasing|writing|verifying <window>`) that updates in place when `stdout` is a TTY and degrades to one line per phase transition when piped. Intended use is `avr-updi-gdb --prog /dev/ttyUSB0 firmware.elf` from a CI script or a Makefile `flash:` target.
+* **`--prog` program-and-exit mode.** A new mutually-exclusive operating mode that programs the supplied ELF into NVM, verifies it (as above), and exits — no GDB listener is opened, no `updi_enter_debug()` is issued, the UPDI link is dropped cleanly with the target left running. Mode shall print, to `stdout`, the negotiated `baud=<N>` line at start-up and a single-line ANSI-aware progress bar (`[#####.....] 53%  page 27/51 erasing|writing|verifying <window>`) that updates in place when `stdout` is a TTY and degrades to one line per phase transition when piped. Intended use is `avrOSdb --prog /dev/ttyUSB0 firmware.elf` from a CI script or a Makefile `flash:` target.
 * **Fuses pretty-printer (`--device` mode).** Extend the existing `--device` SIGROW/REVID dump (LLR-MAIN-08, LLR-UPDI-26) to read all FUSE bytes, then decode each bit-field against the per-family fuse table (BODCFG, OSCCFG, SYSCFG0/1, CODESIZE, BOOTSIZE, …) using human-readable enum names rather than raw hex. Lock byte is decoded with the same scheme. Output format mirrors avrdude's `-Tu` so existing tooling can consume it.
 * **Auto-baud / link-quality probe (`--device` mode).** Replace the hard-coded 115200 baud with a probe that walks a candidate ladder (`230400, 200000, 150000, 115200, 57600, 38400, 19200`), at each step opening the link, issuing a small fixed UPDI transaction sequence (LDCS, NVMCTRL STATUS read × N), and recording the byte error / retry rate. The highest rate with zero retries over the sample window becomes the reported negotiated baud. Result is printed as `baud=<N> errors=<K>/<total>` per candidate and the chosen rate is highlighted. Probe is read-only; no NVM, fuses, or system-reset paths are touched.
 
@@ -77,7 +77,7 @@ Phase 9 work shall reuse the existing layered architecture (§2.1): the NVM read
     </references>
 
     <architecture>
-      <intro><![CDATA[`avr-updi-gdb` is a single-process C99 application. Responsibilities are divided into six source modules arranged in protocol layers: an entry-point and event-loop layer, a hardware layer (UPDI), a network layer (GDB RSP), and three application-layer modules (ELF parser, FSM mapper, monitor handler).
+      <intro><![CDATA[`avrOSdb` is a single-process C99 application. Responsibilities are divided into six source modules arranged in protocol layers: an entry-point and event-loop layer, a hardware layer (UPDI), a network layer (GDB RSP), and three application-layer modules (ELF parser, FSM mapper, monitor handler).
 
 **Concurrency model:** The application is entirely single-threaded. All I/O multiplexing is performed by a single `select()` call inside `event_loop()`. No POSIX threads (`pthreads`) are used at any point. All module entry points are called synchronously and must return before the next I/O event can be processed. Long-blocking operations (e.g., NVM flash write, UPDI link initialisation) are therefore only permitted at startup or in response to explicit GDB commands, never in the event-loop hot path.
 
@@ -135,7 +135,7 @@ A companion **on-target hardware integration harness** (`tests/hw/hw_test.c`) su
 
     <modules>
       <module path="src/main.c">
-        <purpose><![CDATA[is the entry point for the `avr-updi-gdb` executable, providing CLI argument parsing, resource initialization, and the top-level `select()`-based event loop that multiplexes the GDB client socket and the UPDI serial device.]]></purpose>
+        <purpose><![CDATA[is the entry point for the `avrOSdb` executable, providing CLI argument parsing, resource initialization, and the top-level `select()`-based event loop that multiplexes the GDB client socket and the UPDI serial device.]]></purpose>
         <responsibility><![CDATA[Define `main()` and parse command-line arguments into an `AppConfig` struct.]]></responsibility>
         <responsibility>Open the UART serial device and pass the file descriptor to the UPDI layer.</responsibility>
         <responsibility>Create the GDB listener socket and pass it to the RSP layer.</responsibility>
@@ -150,8 +150,8 @@ extern volatile sig_atomic_t g_quit;  /* set to 1 by SIGINT/SIGTERM handler */
 ```
 
 This variable is checked at the top of each `event_loop()` iteration and is also accessible to any module that needs to detect a shutdown-in-progress condition.]]></interface>
-          <interface title="Command-Line Arguments"><![CDATA[`avr-updi-gdb [--port <port>] [--baud <baud>] [--erase] [--load] [--allow-lock-updi] <serial-device> <elf-file>`
-`avr-updi-gdb --device [--baud <baud>] <serial-device> [elf-file]`
+          <interface title="Command-Line Arguments"><![CDATA[`avrOSdb [--port <port>] [--baud <baud>] [--erase] [--load] [--allow-lock-updi] <serial-device> <elf-file>`
+`avrOSdb --device [--baud <baud>] <serial-device> [elf-file]`
 
 *   `--port <port>` — TCP port for the GDB listener (default: `1234`).
 *   `--baud <baud>` — UART baud rate (default: `115200`).
@@ -1057,7 +1057,7 @@ Debug builds add `-fsanitize=address,undefined` for runtime error detection.
 
 | Target | Description |
 | ------ | ----------- |
-| `all` | Build the `avr-updi-gdb` binary (default). |
+| `all` | Build the `avrOSdb` binary (default). |
 | `clean` | Remove build artefacts. |
 | `test` | Build and run the unit test suite. |
 | `install` | Copy the binary to `$(PREFIX)/bin` (default `/usr/local/bin`). |
@@ -1147,7 +1147,7 @@ Errors are propagated upward through the module stack without retrying:
   <hlrs>
 
     <section number="1" title="System Startup and Command-Line Interface">
-      <intro><![CDATA[Requirements in this section govern how `avr-updi-gdb` is invoked, how it initialises its resources, and how quickly it becomes ready for a GDB connection.]]></intro>
+      <intro><![CDATA[Requirements in this section govern how `avrOSdb` is invoked, how it initialises its resources, and how quickly it becomes ready for a GDB connection.]]></intro>
 
       <hlr id="HLR-001" name="CLI Argument Parsing">
         <text><![CDATA[The application shall accept the following command-line arguments: a required positional `<serial-device>` path, a required positional `<elf-file>` path, an optional `--port <port>` TCP port (default `1234`), an optional `--baud <baud>` UART baud rate (default `115200`), and an optional `--load` flag. Any unrecognised argument shall cause the application to print a usage message to `stderr` and exit with a non-zero status.]]></text>
@@ -1473,21 +1473,21 @@ Errors are propagated upward through the module stack without retrying:
       <intro><![CDATA[Requirements in this section govern the Makefile installation targets and the user-facing documentation deliverables that accompany the compiled binary.]]></intro>
 
       <hlr id="HLR-041" name="Makefile Install and Uninstall Targets">
-        <text><![CDATA[The Makefile shall provide `install` and `uninstall` targets that accept a `PREFIX` variable (defaulting to `/usr/local`). The `install` target shall copy the compiled `avr-updi-gdb` binary to `$(PREFIX)/bin/` and the man page to `$(PREFIX)/share/man/man1/`. The `uninstall` target shall remove exactly those files. A `check-tools` target shall verify that all required host tools (`gcc`, `make`, `avr-gcc`, `avr-nm`) are available before any build step, printing a diagnostic and exiting non-zero if any required tool is absent.]]></text>
+        <text><![CDATA[The Makefile shall provide `install` and `uninstall` targets that accept a `PREFIX` variable (defaulting to `/usr/local`). The `install` target shall copy the compiled `avrOSdb` binary to `$(PREFIX)/bin/` and the man page to `$(PREFIX)/share/man/man1/`. The `uninstall` target shall remove exactly those files. A `check-tools` target shall verify that all required host tools (`gcc`, `make`, `avr-gcc`, `avr-nm`) are available before any build step, printing a diagnostic and exiting non-zero if any required tool is absent.]]></text>
         <traces>
           <trace target="SDD" ref="2.2"/>
         </traces>
       </hlr>
 
       <hlr id="HLR-042" name="User Manual and Unix Man Page">
-        <text><![CDATA[The project shall provide a user manual (`doc/UserManual.md`) and a Unix man page (`doc/avr-updi-gdb.1`). The man page shall be parseable by the standard `man` utility and shall document the command synopsis, all options, operands, exit codes, and at least one usage example. The `doc/UserManual.md` shall document prerequisites, build instructions, usage, CLI options, and connection wiring for the UPDI adapter.]]></text>
+        <text><![CDATA[The project shall provide a user manual (`doc/UserManual.md`) and a Unix man page (`doc/avrOSdb.1`). The man page shall be parseable by the standard `man` utility and shall document the command synopsis, all options, operands, exit codes, and at least one usage example. The `doc/UserManual.md` shall document prerequisites, build instructions, usage, CLI options, and connection wiring for the UPDI adapter.]]></text>
         <traces>
           <trace target="SDD" ref="2.2"/>
         </traces>
       </hlr>
 
       <hlr id="HLR-043" name="Distribution Package Bundle">
-        <text><![CDATA[The Makefile shall provide a `bundle` target that produces native distribution packages for three target platforms: a Debian binary package (`dist/avr-updi-gdb_$(VERSION)_amd64.deb`) for Debian/Ubuntu Linux, an RPM binary package (`dist/avr-updi-gdb-$(VERSION)-1.x86_64.rpm`) for Red Hat/Fedora Linux, and a Homebrew formula (`dist/avr-updi-gdb.rb`) for macOS. Each package shall include the `avr-updi-gdb` binary and the man page. All output artefacts shall be written under the `dist/` directory. A `VERSION` variable (defaulting to the value extracted from `git describe`) shall parameterise every package version string.]]></text>
+        <text><![CDATA[The Makefile shall provide a `bundle` target that produces native distribution packages for three target platforms: a Debian binary package (`dist/avrOSdb_$(VERSION)_amd64.deb`) for Debian/Ubuntu Linux, an RPM binary package (`dist/avrOSdb-$(VERSION)-1.x86_64.rpm`) for Red Hat/Fedora Linux, and a Homebrew formula (`dist/avrOSdb.rb`) for macOS. Each package shall include the `avrOSdb` binary and the man page. All output artefacts shall be written under the `dist/` directory. A `VERSION` variable (defaulting to the value extracted from `git describe`) shall parameterise every package version string.]]></text>
         <traces>
           <trace target="SDD" ref="2.2"/>
         </traces>
@@ -1557,7 +1557,7 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-050" name="Program-and-Exit Mode">
-        <text><![CDATA[The application shall provide a new operating mode, activated by the `--prog` command-line flag and mutually exclusive with both `--device` and `--load`, that programs the supplied ELF into NVM, verifies the write per HLR-049, and exits — no GDB TCP listener shall be bound, no `updi_enter_debug()` shall be issued, and the target shall be left running with the UPDI link closed cleanly. On start-up the mode shall emit a single `baud=<N>` line on `stdout` reporting the negotiated UART rate. During programming the mode shall render an in-place single-line progress indicator (`[####....] %% page N/M phase window`) when `stdout` is a TTY (detected by `isatty(STDOUT_FILENO)`), and shall degrade to one line per page (or per phase transition) when `stdout` is piped or redirected. On verify success the mode shall print `verify: OK` and exit with status 0; on verify failure it shall exit with status `UPDI_EXIT_VERIFY_FAIL` (`2`); on any I/O or NVM failure it shall exit with status 1. Intended use is `avr-updi-gdb --prog <serial-device> <elf-file>` from a CI script or a Makefile `flash:` target.]]></text>
+        <text><![CDATA[The application shall provide a new operating mode, activated by the `--prog` command-line flag and mutually exclusive with both `--device` and `--load`, that programs the supplied ELF into NVM, verifies the write per HLR-049, and exits — no GDB TCP listener shall be bound, no `updi_enter_debug()` shall be issued, and the target shall be left running with the UPDI link closed cleanly. On start-up the mode shall emit a single `baud=<N>` line on `stdout` reporting the negotiated UART rate. During programming the mode shall render an in-place single-line progress indicator (`[####....] %% page N/M phase window`) when `stdout` is a TTY (detected by `isatty(STDOUT_FILENO)`), and shall degrade to one line per page (or per phase transition) when `stdout` is piped or redirected. On verify success the mode shall print `verify: OK` and exit with status 0; on verify failure it shall exit with status `UPDI_EXIT_VERIFY_FAIL` (`2`); on any I/O or NVM failure it shall exit with status 1. Intended use is `avrOSdb --prog <serial-device> <elf-file>` from a CI script or a Makefile `flash:` target.]]></text>
         <traces>
           <trace target="SDD" ref="2.1"/>
           <trace target="SDD" ref="3.2.2"/>
@@ -1587,7 +1587,7 @@ Errors are propagated upward through the module stack without retrying:
   <!-- Low-Level Requirements (see tools/Developers_Guide.md §6). -->
   <llrs>
     <function number="1" title="Introduction" name="intro">
-      <intro><![CDATA[Each LLR ID follows the pattern `LLR-XXX-NN`, where `XXX` is a module code and `NN` is a zero-padded two-digit sequence number. Module codes: `MAIN` (`src/main.c`), `UPDI` (`src/updi.c`), `RSP` (`src/gdb_rsp.c`), `ELF` (`src/elf_parser.c`), `FSM` (`src/fsm_mapper.c`), `MON` (`src/monitor.c`), `INST` (`Makefile`, `doc/avr-updi-gdb.1`, `doc/UserManual.md`), `HWTEST` (`tests/hw/hw_test.c`). IDs are permanent contracts and may not be renumbered or reused once allocated.]]></intro>
+      <intro><![CDATA[Each LLR ID follows the pattern `LLR-XXX-NN`, where `XXX` is a module code and `NN` is a zero-padded two-digit sequence number. Module codes: `MAIN` (`src/main.c`), `UPDI` (`src/updi.c`), `RSP` (`src/gdb_rsp.c`), `ELF` (`src/elf_parser.c`), `FSM` (`src/fsm_mapper.c`), `MON` (`src/monitor.c`), `INST` (`Makefile`, `doc/avrOSdb.1`, `doc/UserManual.md`), `HWTEST` (`tests/hw/hw_test.c`). IDs are permanent contracts and may not be renumbered or reused once allocated.]]></intro>
     </function>
 
     <function number="2" title="src/main.c — Entry Point and Event Loop" name="main" source="src/main.c">
@@ -2267,7 +2267,7 @@ Errors are propagated upward through the module stack without retrying:
     </function>
 
     <function number="8" title="Makefile and Documentation" name="inst">
-      <intro><![CDATA[Requirements for the Makefile installation targets (`install`, `uninstall`, `check-tools`, `bundle`) and the documentation deliverables (`doc/UserManual.md`, `doc/avr-updi-gdb.1`). Bundle artefacts are written to `dist/`.]]></intro>
+      <intro><![CDATA[Requirements for the Makefile installation targets (`install`, `uninstall`, `check-tools`, `bundle`) and the documentation deliverables (`doc/UserManual.md`, `doc/avrOSdb.1`). Bundle artefacts are written to `dist/`.]]></intro>
 
       <llr id="LLR-INST-01">
         <text><![CDATA[The Makefile shall provide a `check-tools` target that tests for the presence of every required host tool: `gcc` (or `cc`), `make`, `avr-gcc`, and `avr-nm`. For each absent tool the target shall print a diagnostic message to `stderr` naming the missing tool and then exit with status 1. The target shall exit with status 0 only when all required tools are found.]]></text>
@@ -2277,14 +2277,14 @@ Errors are propagated upward through the module stack without retrying:
       </llr>
 
       <llr id="LLR-INST-02">
-        <text><![CDATA[The Makefile `install` target shall accept a `PREFIX` variable (default `/usr/local`) and install: the compiled `avr-updi-gdb` binary to `$(PREFIX)/bin/avr-updi-gdb` and the man page `doc/avr-updi-gdb.1` to `$(PREFIX)/share/man/man1/avr-updi-gdb.1`. The target shall create any missing intermediate directories using `install -d`. The binary shall be installed with mode 0755 and the man page with mode 0644.]]></text>
+        <text><![CDATA[The Makefile `install` target shall accept a `PREFIX` variable (default `/usr/local`) and install: the compiled `avrOSdb` binary to `$(PREFIX)/bin/avrOSdb` and the man page `doc/avrOSdb.1` to `$(PREFIX)/share/man/man1/avrOSdb.1`. The target shall create any missing intermediate directories using `install -d`. The binary shall be installed with mode 0755 and the man page with mode 0644.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-041" name="Makefile Install and Uninstall Targets"/>
         </traces>
       </llr>
 
       <llr id="LLR-INST-03">
-        <text><![CDATA[The Makefile `uninstall` target shall remove `$(PREFIX)/bin/avr-updi-gdb` and `$(PREFIX)/share/man/man1/avr-updi-gdb.1` using `rm -f`. The target shall be idempotent: running it when the files are already absent shall exit with status 0 without error.]]></text>
+        <text><![CDATA[The Makefile `uninstall` target shall remove `$(PREFIX)/bin/avrOSdb` and `$(PREFIX)/share/man/man1/avrOSdb.1` using `rm -f`. The target shall be idempotent: running it when the files are already absent shall exit with status 0 without error.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-041" name="Makefile Install and Uninstall Targets"/>
         </traces>
@@ -2298,28 +2298,28 @@ Errors are propagated upward through the module stack without retrying:
       </llr>
 
       <llr id="LLR-INST-05">
-        <text><![CDATA[The project shall include a Unix man page at `doc/avr-updi-gdb.1` in `groff`/`troff` format. The man page shall contain at minimum: NAME, SYNOPSIS, DESCRIPTION, OPTIONS (one entry per CLI flag), OPERANDS, EXIT STATUS, EXAMPLES, and SEE ALSO sections. The man page shall be parseable by `man -l doc/avr-updi-gdb.1` without error or warning on Linux.]]></text>
+        <text><![CDATA[The project shall include a Unix man page at `doc/avrOSdb.1` in `groff`/`troff` format. The man page shall contain at minimum: NAME, SYNOPSIS, DESCRIPTION, OPTIONS (one entry per CLI flag), OPERANDS, EXIT STATUS, EXAMPLES, and SEE ALSO sections. The man page shall be parseable by `man -l doc/avrOSdb.1` without error or warning on Linux.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-042" name="User Manual and Unix Man Page"/>
         </traces>
       </llr>
 
       <llr id="LLR-INST-06">
-        <text><![CDATA[The Makefile `bundle` target shall produce a Debian binary package at `dist/avr-updi-gdb_$(VERSION)_amd64.deb` using `dpkg-deb --build`. The package staging tree shall install the binary to `usr/bin/avr-updi-gdb` (mode 0755) and the man page to `usr/share/man/man1/avr-updi-gdb.1` (mode 0644). The `DEBIAN/control` file shall declare at minimum: `Package: avr-updi-gdb`, `Version`, `Architecture: amd64`, `Maintainer`, and `Description` fields.]]></text>
+        <text><![CDATA[The Makefile `bundle` target shall produce a Debian binary package at `dist/avrOSdb_$(VERSION)_amd64.deb` using `dpkg-deb --build`. The package staging tree shall install the binary to `usr/bin/avrOSdb` (mode 0755) and the man page to `usr/share/man/man1/avrOSdb.1` (mode 0644). The `DEBIAN/control` file shall declare at minimum: `Package: avrOSdb`, `Version`, `Architecture: amd64`, `Maintainer`, and `Description` fields.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-043" name="Distribution Package Bundle"/>
         </traces>
       </llr>
 
       <llr id="LLR-INST-07">
-        <text><![CDATA[The Makefile `bundle` target shall produce an RPM binary package at `dist/avr-updi-gdb-$(VERSION)-1.x86_64.rpm` using `rpmbuild`. A `.spec` file shall be generated in the build tree containing at minimum: `Name`, `Version`, `Release: 1`, `Summary`, `License`, `%description`, `%install`, and `%files` sections. The `%files` section shall list `/usr/bin/avr-updi-gdb` and `/usr/share/man/man1/avr-updi-gdb.1`.]]></text>
+        <text><![CDATA[The Makefile `bundle` target shall produce an RPM binary package at `dist/avrOSdb-$(VERSION)-1.x86_64.rpm` using `rpmbuild`. A `.spec` file shall be generated in the build tree containing at minimum: `Name`, `Version`, `Release: 1`, `Summary`, `License`, `%description`, `%install`, and `%files` sections. The `%files` section shall list `/usr/bin/avrOSdb` and `/usr/share/man/man1/avrOSdb.1`.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-043" name="Distribution Package Bundle"/>
         </traces>
       </llr>
 
       <llr id="LLR-INST-08">
-        <text><![CDATA[The Makefile `bundle` target shall produce a Homebrew formula at `dist/avr-updi-gdb.rb`. The formula shall be a valid Ruby file usable with `brew install --formula dist/avr-updi-gdb.rb`. It shall define at minimum: `desc`, `homepage`, `url`, `sha256`, `version`, `license`, and an `install` block that places the binary using `bin.install` and the man page using `man1.install`.]]></text>
+        <text><![CDATA[The Makefile `bundle` target shall produce a Homebrew formula at `dist/avrOSdb.rb`. The formula shall be a valid Ruby file usable with `brew install --formula dist/avrOSdb.rb`. It shall define at minimum: `desc`, `homepage`, `url`, `sha256`, `version`, `license`, and an `install` block that places the binary using `bin.install` and the man page using `man1.install`.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-043" name="Distribution Package Bundle"/>
         </traces>
@@ -2327,7 +2327,7 @@ Errors are propagated upward through the module stack without retrying:
     </function>
 
     <function number="9" title="tests/hw/hw_test.c — On-Target Hardware Integration Test Harness" name="hwtest" source="tests/hw/hw_test.c">
-      <intro><![CDATA[Requirements for the manual-only on-target hardware integration test program. The harness links against `src/updi.c` (and, for Group D, spawns the production `build/avr-updi-gdb` binary via `fork`/`execl`) and runs against live AVR-Dx silicon connected via a UART/UPDI adapter.]]></intro>
+      <intro><![CDATA[Requirements for the manual-only on-target hardware integration test program. The harness links against `src/updi.c` (and, for Group D, spawns the production `build/avrOSdb` binary via `fork`/`execl`) and runs against live AVR-Dx silicon connected via a UART/UPDI adapter.]]></intro>
 
       <llr id="LLR-HWTEST-01">
         <text><![CDATA[`tests/hw/hw_test.c` shall accept its configuration from environment variables and from long-form command-line options. Recognised settings: `HW_PORT` / `--port` (serial device path; default `/dev/ttyUSB0`), `HW_DEVICE_ID` / `--device-id` (expected 24-bit SIGROW signature as a hex literal; default `0x1E970A` for AVR128DA48), `HW_SRAM_ADDR` / `--sram-addr` (16-bit SRAM probe address; default `0x7000`), `HW_FLASH_PAGE_ADDR` / `--flash-page` (FLASH page-aligned address used by Group C; default `0x1FE00`), `HW_RSP_PORT` / `--rsp-port` (TCP port for Group D; default `1234`), `HW_TEST_ELF` / `--elf` (optional ELF binary passed to the spawned RSP server in Group D), `HW_ADDR_24BIT` / `--addr-24bit` (boolean; when true, FLASH access uses the 24-bit UPDI addressing path), and `HW_VERBOSE` / `--verbose` (boolean; enables per-byte tracing). CLI flags shall override the corresponding environment values.]]></text>
@@ -2361,7 +2361,7 @@ Errors are propagated upward through the module stack without retrying:
       </llr>
 
       <llr id="LLR-HWTEST-05">
-        <text><![CDATA[Group D (RSP server spawn-and-probe) shall execute only when the environment variable `HW_TEST_RSP=YES` is set; otherwise the group shall be reported as skipped. When enabled, Group D shall `fork` and `execl` the production `build/avr-updi-gdb` binary with the configured serial port and optional `HW_TEST_ELF`, wait briefly for the server's TCP listener to bind on `HW_RSP_PORT`, then perform: **D1** connect a TCP client to `127.0.0.1:HW_RSP_PORT` and verify the connection is accepted; **D2** send an RSP `qSupported` packet (`$qSupported#37`) and verify a non-empty, properly-framed RSP reply is received. The harness shall terminate the spawned server cleanly (SIGTERM + `waitpid`) on completion or on test failure.]]></text>
+        <text><![CDATA[Group D (RSP server spawn-and-probe) shall execute only when the environment variable `HW_TEST_RSP=YES` is set; otherwise the group shall be reported as skipped. When enabled, Group D shall `fork` and `execl` the production `build/avrOSdb` binary with the configured serial port and optional `HW_TEST_ELF`, wait briefly for the server's TCP listener to bind on `HW_RSP_PORT`, then perform: **D1** connect a TCP client to `127.0.0.1:HW_RSP_PORT` and verify the connection is accepted; **D2** send an RSP `qSupported` packet (`$qSupported#37`) and verify a non-empty, properly-framed RSP reply is received. The harness shall terminate the spawned server cleanly (SIGTERM + `waitpid`) on completion or on test failure.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-045" name="On-Target Hardware Integration Test Harness"/>
           <trace target="HLR" ref="HLR-014" name="GDB RSP TCP Listener"/>
@@ -2376,7 +2376,7 @@ Errors are propagated upward through the module stack without retrying:
       </llr>
 
       <llr id="LLR-HWTEST-07">
-        <text><![CDATA[Group F (Phase 9 link diagnostics) shall execute three on-target checks: **F1** call `updi_probe_baud(cfg->port, 8, visitor, NULL)`, record each rung's `{baud, errors, samples}`, and PASS if the chosen rate is ≥ 19200 baud (the slowest rung in the ladder); **F2** with the harness UPDI fd re-opened at the configured baud, read the FUSES window and the 4-byte LOCK window via `updi_nvm_read()`, format them via `updi_format_fuses()` into a 2 KiB buffer, and PASS if the output contains the literal substrings `WDTCFG`, `OSCCFG`, `SYSCFG0`, and `Lock:`; **F3** (destructive, gated by `HW_TEST_NVM_CONFIRM=YES`) fork the production `build/avr-updi-gdb --prog --erase --baud <N> <port> <elf>` against the bench ELF, capture the child's stdout/stderr, and PASS if `WEXITSTATUS == 0` AND the captured output contains the literal `verify: OK`. F1 needs the harness UPDI fd closed before running (so the probe can open its own fd at each rung); the harness shall close fd before F1, re-open at `cfg->baud` for F2, then close again before F3.]]></text>
+        <text><![CDATA[Group F (Phase 9 link diagnostics) shall execute three on-target checks: **F1** call `updi_probe_baud(cfg->port, 8, visitor, NULL)`, record each rung's `{baud, errors, samples}`, and PASS if the chosen rate is ≥ 19200 baud (the slowest rung in the ladder); **F2** with the harness UPDI fd re-opened at the configured baud, read the FUSES window and the 4-byte LOCK window via `updi_nvm_read()`, format them via `updi_format_fuses()` into a 2 KiB buffer, and PASS if the output contains the literal substrings `WDTCFG`, `OSCCFG`, `SYSCFG0`, and `Lock:`; **F3** (destructive, gated by `HW_TEST_NVM_CONFIRM=YES`) fork the production `build/avrOSdb --prog --erase --baud <N> <port> <elf>` against the bench ELF, capture the child's stdout/stderr, and PASS if `WEXITSTATUS == 0` AND the captured output contains the literal `verify: OK`. F1 needs the harness UPDI fd closed before running (so the probe can open its own fd at each rung); the harness shall close fd before F1, re-open at `cfg->baud` for F2, then close again before F3.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-045" name="On-Target Hardware Integration Test Harness"/>
           <trace target="HLR" ref="HLR-049" name="Read-Back Verify After Load"/>
@@ -3200,7 +3200,7 @@ Errors are propagated upward through the module stack without retrying:
       <header><![CDATA[Integration tests validating system-level properties not covered by per-LLR unit tests: server startup latency (HLR-005), RSP protocol purity (HLR-020), and build portability (HLR-033, HLR-034).]]></header>
 
       <test name="integration_server_ready_within_2_seconds_of_client_connect">
-        <purpose><![CDATA[Launch `avr-updi-gdb` against a loopback UPDI stub and a fixture ELF, connect a GDB client, and measure the elapsed time from TCP accept to the first valid RSP response. Assert the elapsed time is less than 2.0 seconds.]]></purpose>
+        <purpose><![CDATA[Launch `avrOSdb` against a loopback UPDI stub and a fixture ELF, connect a GDB client, and measure the elapsed time from TCP accept to the first valid RSP response. Assert the elapsed time is less than 2.0 seconds.]]></purpose>
         <traces><trace target="HLR" ref="HLR-005"/></traces>
       </test>
 
@@ -3218,7 +3218,7 @@ Errors are propagated upward through the module stack without retrying:
       </test>
 
       <test name="runtime_links_only_libc_no_heavyweight_deps">
-        <purpose><![CDATA[Run `ldd avr-updi-gdb` on the linked binary and verify that the only shared-library dependency is `libc.so`. Assert that no Java runtime, Python interpreter, Electron libraries, or other non-POSIX dependencies appear.]]></purpose>
+        <purpose><![CDATA[Run `ldd avrOSdb` on the linked binary and verify that the only shared-library dependency is `libc.so`. Assert that no Java runtime, Python interpreter, Electron libraries, or other non-POSIX dependencies appear.]]></purpose>
         <traces><trace target="HLR" ref="HLR-034"/></traces>
       </test>
     </file>
@@ -3235,17 +3235,17 @@ Errors are propagated upward through the module stack without retrying:
       </test>
 
       <test name="make_install_places_binary_at_prefix_bin">
-        <purpose><![CDATA[Run `make install PREFIX=/tmp/aod_test_$$` (using a temporary directory as the prefix) and verify that the file `$(PREFIX)/bin/avr-updi-gdb` exists and is executable after the target completes.]]></purpose>
+        <purpose><![CDATA[Run `make install PREFIX=/tmp/aod_test_$$` (using a temporary directory as the prefix) and verify that the file `$(PREFIX)/bin/avrOSdb` exists and is executable after the target completes.]]></purpose>
         <traces><trace target="LLR" ref="LLR-INST-02"/></traces>
       </test>
 
       <test name="make_install_places_man_page_at_prefix_man1">
-        <purpose><![CDATA[After `make install PREFIX=...`, verify that the file `$(PREFIX)/share/man/man1/avr-updi-gdb.1` exists and that `man -l` parses it without error.]]></purpose>
+        <purpose><![CDATA[After `make install PREFIX=...`, verify that the file `$(PREFIX)/share/man/man1/avrOSdb.1` exists and that `man -l` parses it without error.]]></purpose>
         <traces><trace target="LLR" ref="LLR-INST-02"/><trace target="LLR" ref="LLR-INST-05"/></traces>
       </test>
 
       <test name="make_uninstall_removes_all_installed_files">
-        <purpose><![CDATA[After `make install PREFIX=...`, run `make uninstall PREFIX=...` and verify that both `$(PREFIX)/bin/avr-updi-gdb` and `$(PREFIX)/share/man/man1/avr-updi-gdb.1` no longer exist.]]></purpose>
+        <purpose><![CDATA[After `make install PREFIX=...`, run `make uninstall PREFIX=...` and verify that both `$(PREFIX)/bin/avrOSdb` and `$(PREFIX)/share/man/man1/avrOSdb.1` no longer exist.]]></purpose>
         <traces><trace target="LLR" ref="LLR-INST-03"/></traces>
       </test>
 
@@ -3255,17 +3255,17 @@ Errors are propagated upward through the module stack without retrying:
       </test>
 
       <test name="make_bundle_produces_deb_package">
-        <purpose><![CDATA[Run `make bundle VERSION=0.1.0` and verify that `dist/avr-updi-gdb_0.1.0_amd64.deb` exists, that `dpkg-deb --info` exits 0, and that `dpkg-deb --contents` lists both `./usr/bin/avr-updi-gdb` and `./usr/share/man/man1/avr-updi-gdb.1`.]]></purpose>
+        <purpose><![CDATA[Run `make bundle VERSION=0.1.0` and verify that `dist/avrOSdb_0.1.0_amd64.deb` exists, that `dpkg-deb --info` exits 0, and that `dpkg-deb --contents` lists both `./usr/bin/avrOSdb` and `./usr/share/man/man1/avrOSdb.1`.]]></purpose>
         <traces><trace target="LLR" ref="LLR-INST-06"/></traces>
       </test>
 
       <test name="make_bundle_produces_rpm_package">
-        <purpose><![CDATA[Run `make bundle VERSION=0.1.0` and verify that `dist/avr-updi-gdb-0.1.0-1.x86_64.rpm` exists and that `rpm -qp --list` exits 0 and lists both `/usr/bin/avr-updi-gdb` and `/usr/share/man/man1/avr-updi-gdb.1`.]]></purpose>
+        <purpose><![CDATA[Run `make bundle VERSION=0.1.0` and verify that `dist/avrOSdb-0.1.0-1.x86_64.rpm` exists and that `rpm -qp --list` exits 0 and lists both `/usr/bin/avrOSdb` and `/usr/share/man/man1/avrOSdb.1`.]]></purpose>
         <traces><trace target="LLR" ref="LLR-INST-07"/></traces>
       </test>
 
       <test name="make_bundle_produces_homebrew_formula">
-        <purpose><![CDATA[Run `make bundle VERSION=0.1.0` and verify that `dist/avr-updi-gdb.rb` exists, is valid Ruby syntax (parseable by `ruby -c`), and contains the required fields: `desc`, `url`, `sha256`, `version`, and an `install` block.]]></purpose>
+        <purpose><![CDATA[Run `make bundle VERSION=0.1.0` and verify that `dist/avrOSdb.rb` exists, is valid Ruby syntax (parseable by `ruby -c`), and contains the required fields: `desc`, `url`, `sha256`, `version`, and an `install` block.]]></purpose>
         <traces><trace target="LLR" ref="LLR-INST-08"/></traces>
       </test>
     </file>
@@ -3277,7 +3277,7 @@ Errors are propagated upward through the module stack without retrying:
       <header><![CDATA[Unit and harness-level tests covering the `--device` one-shot diagnostic mode: argument parsing, mutual exclusion with `--load`, `updi_read_device_info()` success and failure paths over a PTY, the human-readable report format, and verification that the diagnostic path bypasses the GDB listener.]]></header>
 
       <test name="parse_args_accepts_device_flag_without_elf_operand">
-        <purpose><![CDATA[Invoke `parse_args()` with `argv = {"avr-updi-gdb", "--device", "/dev/ttyUSB0"}` and assert `cfg.device_info == true`, `cfg.serial_device == "/dev/ttyUSB0"`, `cfg.elf_path == NULL`, and `parse_args()` returns without exiting.]]></purpose>
+        <purpose><![CDATA[Invoke `parse_args()` with `argv = {"avrOSdb", "--device", "/dev/ttyUSB0"}` and assert `cfg.device_info == true`, `cfg.serial_device == "/dev/ttyUSB0"`, `cfg.elf_path == NULL`, and `parse_args()` returns without exiting.]]></purpose>
         <traces><trace target="LLR" ref="LLR-MAIN-08"/></traces>
       </test>
 
@@ -3394,7 +3394,7 @@ Errors are propagated upward through the module stack without retrying:
       </test>
 
       <test name="D1_rsp_server_accepts_tcp_connection">
-        <purpose><![CDATA[When `HW_TEST_RSP=YES`, `fork`+`execl` the production `build/avr-updi-gdb` against the configured serial port; open a TCP client to `127.0.0.1:HW_RSP_PORT` and assert the connect succeeds within a bounded timeout. Skipped otherwise.]]></purpose>
+        <purpose><![CDATA[When `HW_TEST_RSP=YES`, `fork`+`execl` the production `build/avrOSdb` against the configured serial port; open a TCP client to `127.0.0.1:HW_RSP_PORT` and assert the connect succeeds within a bounded timeout. Skipped otherwise.]]></purpose>
         <traces><trace target="LLR" ref="LLR-HWTEST-05"/></traces>
       </test>
 
@@ -3419,7 +3419,7 @@ Errors are propagated upward through the module stack without retrying:
       </test>
 
       <test name="F3_prog_mode_end_to_end_with_verify">
-        <purpose><![CDATA[Destructive — gated by `HW_TEST_NVM_CONFIRM=YES`. With the harness UPDI fd closed, `fork` and `execl` the production `build/avr-updi-gdb --prog --erase --baud <N> <port> <elf>` against the bench ELF (`build/fixtures/all_nvm.elf` by default, which intentionally avoids FUSES/LOCK windows so the bench stays in a known state). Capture the child's stdout+stderr through an 8 KiB buffer. PASS if `WEXITSTATUS == 0` AND the captured output contains the literal `verify: OK`. Validates `--prog` end-to-end including chip-erase, FLASH/EEPROM/USERROW programming, and read-back verify against live silicon.]]></purpose>
+        <purpose><![CDATA[Destructive — gated by `HW_TEST_NVM_CONFIRM=YES`. With the harness UPDI fd closed, `fork` and `execl` the production `build/avrOSdb --prog --erase --baud <N> <port> <elf>` against the bench ELF (`build/fixtures/all_nvm.elf` by default, which intentionally avoids FUSES/LOCK windows so the bench stays in a known state). Capture the child's stdout+stderr through an 8 KiB buffer. PASS if `WEXITSTATUS == 0` AND the captured output contains the literal `verify: OK`. Validates `--prog` end-to-end including chip-erase, FLASH/EEPROM/USERROW programming, and read-back verify against live silicon.]]></purpose>
         <traces><trace target="LLR" ref="LLR-HWTEST-07"/><trace target="LLR" ref="LLR-MAIN-15"/><trace target="LLR" ref="LLR-MAIN-16"/></traces>
       </test>
     </file>
