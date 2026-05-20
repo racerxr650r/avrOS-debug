@@ -9,10 +9,14 @@ A UPDI-based GDB server that brings native avrOS state-machine awareness to stan
 ## Key Features
 
 - **UPDI protocol bridging** — full physical-layer communication with AVR DA/DB targets over serial + 1kΩ resistor
-- **On-chip debug (OCD) run control** — run, halt, single-step, and register access are performed through the AVR-Dx OCD controller over UPDI; no flash patching of the `BREAK` opcode, so NVM state is preserved across debug sessions
-- **Hardware breakpoints** — both `break` (Z0) and `hbreak` (Z1) requests from GDB are routed to the two on-silicon comparators; a third simultaneous breakpoint is reported back as `E08`
+- **On-chip debug (OCD) run control** — run, halt, single-step, and register access are performed through the AVR-Dx OCD controller over UPDI; no flash patching of the `BREAK` opcode is needed for run-control, so NVM state is preserved across debug sessions
+- **Software breakpoints by default** — plain `Z0` packets install true SW breakpoints by patching the AVR `BREAK` opcode (`0x9598`) into FLASH via the NVM controller, with the original opcode shadowed for clean removal; up to 64 SW breakpoints can be live at once. Switch back to the legacy 2-slot HW comparator semantics with `monitor bp-mode hw-only`. `Z1` (`hbreak`) always uses a HW comparator.
+- **Data watchpoints** — `watch` / `rwatch` / `awatch` (`Z2` / `Z3` / `Z4`) are wired to the OCD DABP comparator
+- **GDB `load` over the wire** — `vFlashErase` / `vFlashWrite` / `vFlashDone` are advertised in `qSupported`, so `(gdb) load` reflashes the running target without re-launching the server
+- **Process control** — `(gdb) run`, `start`, and `kill` map to `vRun` / `vAttach` / `vKill` for a fresh reset + halt-at-entry flow
+- **avarice-compatible monitor verbs** — `monitor info`, `monitor flush`, `monitor reset`, `monitor halt`, `monitor erase` / `monitor chip-erase` (requires `--allow-erase`), and `monitor bp-mode {sw,hw-only}`
 - **Asynchronous interrupt** — Ctrl-C in GDB halts a running target via OCD STOP and reports `SIGINT` (`T02`)
-- **Clean detach** — `detach` releases both HW comparators in silicon and lets the CPU run free before closing the socket
+- **Clean detach** — `detach` releases all HW comparators in silicon and lets the CPU run free before closing the socket
 - **NVM programming** — `--load` programs every `PT_LOAD` segment of the ELF to the correct AVR-Dx NVM kind: FLASH (`.text`/`.data`), EEPROM, USERROW, FUSES, and LOCK. SIGROW segments are skipped (read-only). `--erase` performs a chip-erase prior to load, and is required when programming LOCK; `--allow-lock-updi` is required to write any LOCK pattern other than the unlock value `0x5CC5C55C` (every other 4-byte pattern risks permanently disabling UPDI).
 - **Link diagnostics** — `--device` performs a one-shot, non-destructive read of SIGROW signature and ASI status registers and exits without starting a listener
 - **Automatic family detection** — selects the correct AVR-Dx family memory map (USERROW / EEPROM / FUSES / LOCK / SIGROW windows) by SIGROW DEVICEID autodetect, then cross-checks against the lowercase part-name string in the `.note.gnu.avr.deviceinfo` ELF note (when avr-gcc + Microchip device packs embedded one) and aborts before any NVM write on ELF-vs-silicon mismatch. Pass `--force-device=<AVR-DA|AVR-DB|AVR-DD|AVR-DU|AVR-SD>` to override the autodetect and suppress the mismatch check.

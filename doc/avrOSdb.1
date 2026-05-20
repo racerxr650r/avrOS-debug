@@ -115,6 +115,18 @@ only the 4-byte unlock pattern
 is accepted as a LOCK payload, protecting against accidental UPDI
 lock-out.
 .TP
+.B \-\-allow\-erase
+Permit the GDB-side
+.B monitor erase
+and
+.B monitor chip-erase
+verbs to issue a UPDI chip-erase on the running target. Without this
+flag both verbs return
+.B E11
+and leave the silicon untouched. Independent of the boot-time
+.B \-\-erase
+flag.
+.TP
 .B \-\-device
 One-shot diagnostic. Open UPDI, run an auto-baud link-quality probe
 (suppressed by
@@ -284,6 +296,24 @@ Verify the UPDI link without starting a GDB listener:
 avrOSdb \-\-device /dev/ttyUSB0
 .EE
 .RE
+.PP
+Allow GDB to chip-erase the running target via
+.BR "monitor erase" :
+.PP
+.RS
+.EX
+avrOSdb \-\-allow\-erase /dev/ttyUSB0 firmware.elf
+.EE
+.RE
+.PP
+From GDB the Phase-10 surface offers
+.BR "load" " (vFlashErase/Write/Done),"
+.BR "watch" / "rwatch" / "awatch" " (Z2/Z3/Z4 data watchpoints),"
+.BR "run" / "kill" " (vRun/vKill), and software breakpoints via"
+.BR Z0 " (FLASH"
+.B BREAK
+opcode by default, switchable via
+.BR "monitor bp-mode" ).
 .SH SEE ALSO
 .BR avr-gdb (1),
 .BR avrdude (1),

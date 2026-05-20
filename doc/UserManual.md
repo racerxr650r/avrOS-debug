@@ -133,7 +133,7 @@ CP210x) or `/dev/ttyACM0` (CDC ACM). On macOS the path is
 ## 4. Command-Line Invocation
 
 ```
-avrOSdb [--port <port>] [--baud <baud>] [--erase] [--load] [--no-verify] [--allow-lock-updi] [--force-device <family>] <serial-device> <elf-file>
+avrOSdb [--port <port>] [--baud <baud>] [--erase] [--load] [--no-verify] [--allow-lock-updi] [--allow-erase] [--force-device <family>] <serial-device> <elf-file>
 avrOSdb --prog [--baud <baud>] [--erase] [--no-verify] [--allow-lock-updi] [--force-device <family>] <serial-device> <elf-file>
 avrOSdb --device [--baud <baud>] [--no-autobaud] [--force-device <family>] <serial-device> [elf-file]
 ```
@@ -150,6 +150,7 @@ avrOSdb --device [--baud <baud>] [--no-autobaud] [--force-device <family>] <seri
 | `--no-verify` | flag | unset | Suppress the read-back verify pass that normally follows `--load` or `--prog`. Use sparingly — verify is the only mechanism that detects partial or silently-corrupted writes. |
 | `--no-autobaud` | flag | unset | (Used with `--device` only.) Suppress the link-quality auto-baud probe and use the rate supplied via `--baud` (or its default) unchanged. |
 | `--allow-lock-updi` | flag | unset | Allow `--load` to write LOCK byte patterns that would assert `UPDIDIS` and permanently disable the UPDI debug interface. Without this flag only the 4-byte unlock pattern `0x5CC5C55C` is accepted; every other LOCK value is rejected. |
+| `--allow-erase` | flag | unset | Permit the GDB-side `monitor erase` and `monitor chip-erase` verbs to issue a UPDI chip-erase on the running target. Without this flag both verbs return an error code (`E11`) and leave the silicon untouched. Has no effect on the boot-time `--erase` flag. (HLR-055.) |
 | `--device` | flag | unset | One-shot diagnostic: open UPDI, run an auto-baud link-quality probe (unless `--no-autobaud`), read the SIGROW signature + serial number, ASI status bytes, FUSES, and LOCK byte, print a human-readable report (including the per-rung baud table and a decoded fuse listing) to stdout, then exit. No TCP listener is opened, no ELF is loaded, the target CPU is not halted. Mutually exclusive with `--load` and `--prog`. Makes `<elf-file>` optional. |
 | `--force-device <family>` | string | unset | Override automatic family detection. Accepts one of `AVR-DA`, `AVR-DB`, `AVR-DD`, `AVR-DU`, `AVR-SD` (case-insensitive). When set, this string is passed verbatim to the UPDI device-table selector and suppresses the ELF-vs-silicon family mismatch check (see §4.1 below). Use this when you knowingly want to debug an ELF against a different silicon family. |
 
@@ -352,6 +353,82 @@ operand is optional in this mode.
 
 Output is delivered as RSP `O`-packets and printed directly in the GDB
 console.
+
+---
+
+### 5.6 Phase-10 GDB protocol surface (avarice parity)
+
+`avrOSdb` implements the GDB Remote Serial Protocol packets needed by
+modern `avr-gdb` builds, giving feature parity with `avarice` for the
+common day-to-day operations.
+
+#### Flashing from inside GDB (`load`)
+
+`vFlashErase` / `vFlashWrite` / `vFlashDone` are advertised in
+`qSupported`, so `(gdb) load` writes the current symbol file straight
+into FLASH via the running server — no need to restart with `--load`:
+
+```
+(gdb) target remote :1234
+(gdb) load
+Loading section .text, size 0x1c80 lma 0x0
+...
+Start address 0x0000, load size 7424
+(gdb) monitor reset
+(gdb) continue
+```
+
+#### Software breakpoints by default (`Z0`)
+
+Plain `Z0,<addr>,2` packets install **true software breakpoints** —
+the original FLASH word is read out, the AVR `BREAK` opcode
+(`0x9598`, little-endian) is patched in via the NVM controller, and
+the originals are kept in an in-memory shadow so `z0` can restore
+them. CPU state (R0–R31, SREG, SP, PC) is snapshotted across the
+NVMPROG transition. Up to 64 SW breakpoints may be live at once.
+
+The legacy “Z0 aliases to one of the two OCD hardware comparators”
+behaviour is still available — switch with:
+
+```
+(gdb) monitor bp-mode hw-only    # Z0 → HW comparator (2 slots)
+(gdb) monitor bp-mode sw         # Z0 → FLASH BREAK   (default, 64 slots)
+```
+
+`Z1` always uses an OCD hardware comparator regardless of mode.
+
+#### Data-access watchpoints (`Z2/Z3/Z4`)
+
+Watchpoints on SRAM are wired to the OCD DABP comparator:
+
+```
+(gdb) watch  myvar      # Z2 — write
+(gdb) rwatch myvar      # Z3 — read
+(gdb) awatch myvar      # Z4 — read/write
+```
+
+#### Process control (`vRun` / `vAttach` / `vKill`)
+
+`(gdb) run`, `(gdb) start`, and `(gdb) kill` are supported — `vRun;`
+re-applies the ELF, resets the CPU, and halts at entry; `vAttach`
+returns the current PC; `vKill` detaches cleanly.
+
+#### avarice-compatible monitor verbs
+
+In addition to the `monitor avros …` family (§5.4):
+
+```
+(gdb) monitor info          # device-info report
+(gdb) monitor flush         # discard any pending NVM transaction
+(gdb) monitor reset         # UPDI reset, halt at entry
+(gdb) monitor halt          # UPDI halt
+(gdb) monitor erase         # full chip-erase (requires --allow-erase)
+(gdb) monitor chip-erase    # alias for monitor erase
+(gdb) monitor bp-mode sw    # see SW breakpoints above
+```
+
+`monitor erase` and `monitor chip-erase` will refuse with an `E11`
+error code unless the server was started with `--allow-erase`.
 
 ---
 
