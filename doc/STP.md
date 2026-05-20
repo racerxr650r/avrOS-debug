@@ -109,7 +109,7 @@ Role: **unit**. **47 test(s).**
 
 ### 3.3. [tests/test_rsp.c](../tests/test_rsp.c)
 
-Role: **unit**. **39 test(s).**
+Role: **unit**. **44 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -154,6 +154,10 @@ Role: **unit**. **39 test(s).**
 | 39 | <a id="T_packet_returns_OK_for_live_thread"></a>`T_packet_returns_OK_for_live_thread` | `LLR-RSP-21` | Populate `ctx->fsm->threads[]` with GDB ids 1 and 3, dispatch `T3`, and verify the reply is `OK`. |
 | 40 | <a id="T_packet_returns_E01_for_unknown_thread"></a>`T_packet_returns_E01_for_unknown_thread` | `LLR-RSP-21` | Populate `ctx->fsm->threads[]` with only GDB id 1, dispatch `T2a` (tid 42), and verify the reply is `E01`. |
 | 41 | <a id="R_packet_invalidates_fsm_runs_and_emits_stop"></a>`R_packet_invalidates_fsm_runs_and_emits_stop` | `LLR-RSP-22` | Dispatch `R00` and verify that `fsm_invalidate()` is called, `updi_run()` is called exactly once (via the delegated `c`), the thread list is rebuilt on halt, and a `T05` stop packet is emitted on the wire. |
+| 42 | <a id="vRun_invalidates_fsm_runs_and_emits_stop"></a>`vRun_invalidates_fsm_runs_and_emits_stop` | `LLR-RSP-23` | Dispatch `vRun;;arg1` (empty filename, ignored arg) and verify the same side-effects as `R00`: `fsm_invalidate()` called, `updi_run()` called once, thread list rebuilt, and a `T05` stop reply emitted. |
+| 43 | <a id="vAttach_halts_target_and_emits_stop_reply"></a>`vAttach_halts_target_and_emits_stop_reply` | `LLR-RSP-24` | Dispatch `vAttach;1` and verify that `updi_run()` and `updi_step()` are NOT called, that `fsm_invalidate()` and `fsm_build_thread_list()` are called, and that the reply is a `T05` stop packet containing a `thread:<hex>;` suffix. |
+| 44 | <a id="vKill_sets_quit_and_replies_ok"></a>`vKill_sets_quit_and_replies_ok` | `LLR-RSP-25` | Dispatch `vKill;1` and verify that the context's `*quit_p` flag is raised and the reply is the literal `OK`. |
+| 45 | <a id="qSupported_advertises_multiprocess_vRun_vAttach_vKill"></a>`qSupported_advertises_multiprocess_vRun_vAttach_vKill` | `LLR-RSP-26` | Dispatch `qSupported:multiprocess+` and verify the reply contains the substrings `multiprocess+`, `vRun+`, `vAttach+`, and `vKill+`, and does NOT contain `multiprocess-`. |
 
 ### 3.4. [tests/test_elf.c](../tests/test_elf.c)
 
@@ -361,6 +365,10 @@ verified by code review — see
 | `LLR-RSP-20` | `rsp` | `HLR-059` | `qOffsets_returns_text_data_bss_all_zero` |
 | `LLR-RSP-21` | `rsp` | `HLR-059` | `T_packet_returns_OK_for_live_thread`, `T_packet_returns_E01_for_unknown_thread` |
 | `LLR-RSP-22` | `rsp` | `HLR-059` | `R_packet_invalidates_fsm_runs_and_emits_stop` |
+| `LLR-RSP-23` | `rsp` | `HLR-058` | `vRun_invalidates_fsm_runs_and_emits_stop` |
+| `LLR-RSP-24` | `rsp` | `HLR-058` | `vAttach_halts_target_and_emits_stop_reply` |
+| `LLR-RSP-25` | `rsp` | `HLR-058` | `vKill_sets_quit_and_replies_ok` |
+| `LLR-RSP-26` | `rsp` | `HLR-058` | `qSupported_advertises_multiprocess_vRun_vAttach_vKill` |
 | `LLR-ELF-01` | `elf` | `HLR-021` | `elf_open_accepts_valid_avr_elf32_binary`, `elf_open_returns_minus1_on_invalid_elf_magic`, `elf_open_returns_minus1_on_wrong_machine_type` |
 | `LLR-ELF-02` | `elf` | `HLR-021`, `HLR-040` | `elf_open_loads_symtab_and_strtab_into_heap_buffers`, `elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure` |
 | `LLR-ELF-03` | `elf` | `HLR-021` | `elf_find_avros_tables_performs_single_linear_scan`, `elf_find_avros_tables_populates_all_7_avros_sentinel_fields` |

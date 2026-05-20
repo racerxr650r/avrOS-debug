@@ -125,7 +125,7 @@ catalogue is in [STP.md §3](STP.md#3-test-catalogue).
 | [`HLR-054`](HLRs.md#HLR-054) | True Software Breakpoints via Flash BREAK Opcode | — | **(no test)** |
 | [`HLR-055`](HLRs.md#HLR-055) | avarice-Compatible Monitor Commands | — | **(no test)** |
 | [`HLR-056`](HLRs.md#HLR-056) | Hardware Data Watchpoints | — | **(no test)** |
-| [`HLR-058`](HLRs.md#HLR-058) | Extended-Remote Lifecycle Packets | — | **(no test)** |
+| [`HLR-058`](HLRs.md#HLR-058) | Extended-Remote Lifecycle Packets | [`LLR-RSP-23`](LLRs.md#LLR-RSP-23), [`LLR-RSP-24`](LLRs.md#LLR-RSP-24), [`LLR-RSP-25`](LLRs.md#LLR-RSP-25), [`LLR-RSP-26`](LLRs.md#LLR-RSP-26) | [`qSupported_advertises_multiprocess_vRun_vAttach_vKill`](STP.md#qSupported_advertises_multiprocess_vRun_vAttach_vKill), [`vAttach_halts_target_and_emits_stop_reply`](STP.md#vAttach_halts_target_and_emits_stop_reply), [`vKill_sets_quit_and_replies_ok`](STP.md#vKill_sets_quit_and_replies_ok), [`vRun_invalidates_fsm_runs_and_emits_stop`](STP.md#vRun_invalidates_fsm_runs_and_emits_stop) |
 | [`HLR-059`](HLRs.md#HLR-059) | Protocol Cleanup — qC, qOffsets, T, R | [`LLR-RSP-19`](LLRs.md#LLR-RSP-19), [`LLR-RSP-20`](LLRs.md#LLR-RSP-20), [`LLR-RSP-21`](LLRs.md#LLR-RSP-21), [`LLR-RSP-22`](LLRs.md#LLR-RSP-22) | [`qC_returns_QC0_when_no_c_thread_selected`](STP.md#qC_returns_QC0_when_no_c_thread_selected), [`qC_returns_selected_c_thread_in_hex`](STP.md#qC_returns_selected_c_thread_in_hex), [`qOffsets_returns_text_data_bss_all_zero`](STP.md#qOffsets_returns_text_data_bss_all_zero), [`R_packet_invalidates_fsm_runs_and_emits_stop`](STP.md#R_packet_invalidates_fsm_runs_and_emits_stop), [`T_packet_returns_E01_for_unknown_thread`](STP.md#T_packet_returns_E01_for_unknown_thread), [`T_packet_returns_OK_for_live_thread`](STP.md#T_packet_returns_OK_for_live_thread) |
 
 ## 3. HLR Section Coverage Summary
@@ -146,7 +146,7 @@ locating areas of the spec that may need additional tests.
 | §9 Diagnostics and Bring-up | 1 | 4 | 13 | — |
 | §10 Hardware Integration Testing | 4 | 17 | 49 | — |
 | §11 CI-Grade Loader and Link Diagnostics | 4 | 9 | 9 | — |
-| §12 GDB Protocol Completion (avarice Feature Parity) | 6 | 4 | 6 | [`HLR-053`](HLRs.md#HLR-053), [`HLR-054`](HLRs.md#HLR-054), [`HLR-055`](HLRs.md#HLR-055), [`HLR-056`](HLRs.md#HLR-056), [`HLR-058`](HLRs.md#HLR-058) |
+| §12 GDB Protocol Completion (avarice Feature Parity) | 6 | 8 | 10 | [`HLR-053`](HLRs.md#HLR-053), [`HLR-054`](HLRs.md#HLR-054), [`HLR-055`](HLRs.md#HLR-055), [`HLR-056`](HLRs.md#HLR-056) |
 
 ## 4. LLR Coverage
 
@@ -229,6 +229,10 @@ with **(no test)**; see
 | [`LLR-RSP-20`](LLRs.md#LLR-RSP-20) | `rsp` | [`HLR-059`](HLRs.md#HLR-059) | [`qOffsets_returns_text_data_bss_all_zero`](STP.md#qOffsets_returns_text_data_bss_all_zero) |
 | [`LLR-RSP-21`](LLRs.md#LLR-RSP-21) | `rsp` | [`HLR-059`](HLRs.md#HLR-059) | [`T_packet_returns_E01_for_unknown_thread`](STP.md#T_packet_returns_E01_for_unknown_thread), [`T_packet_returns_OK_for_live_thread`](STP.md#T_packet_returns_OK_for_live_thread) |
 | [`LLR-RSP-22`](LLRs.md#LLR-RSP-22) | `rsp` | [`HLR-059`](HLRs.md#HLR-059) | [`R_packet_invalidates_fsm_runs_and_emits_stop`](STP.md#R_packet_invalidates_fsm_runs_and_emits_stop) |
+| [`LLR-RSP-23`](LLRs.md#LLR-RSP-23) | `rsp` | [`HLR-058`](HLRs.md#HLR-058) | [`vRun_invalidates_fsm_runs_and_emits_stop`](STP.md#vRun_invalidates_fsm_runs_and_emits_stop) |
+| [`LLR-RSP-24`](LLRs.md#LLR-RSP-24) | `rsp` | [`HLR-058`](HLRs.md#HLR-058) | [`vAttach_halts_target_and_emits_stop_reply`](STP.md#vAttach_halts_target_and_emits_stop_reply) |
+| [`LLR-RSP-25`](LLRs.md#LLR-RSP-25) | `rsp` | [`HLR-058`](HLRs.md#HLR-058) | [`vKill_sets_quit_and_replies_ok`](STP.md#vKill_sets_quit_and_replies_ok) |
+| [`LLR-RSP-26`](LLRs.md#LLR-RSP-26) | `rsp` | [`HLR-058`](HLRs.md#HLR-058) | [`qSupported_advertises_multiprocess_vRun_vAttach_vKill`](STP.md#qSupported_advertises_multiprocess_vRun_vAttach_vKill) |
 | [`LLR-ELF-01`](LLRs.md#LLR-ELF-01) | `elf` | [`HLR-021`](HLRs.md#HLR-021) | [`elf_open_accepts_valid_avr_elf32_binary`](STP.md#elf_open_accepts_valid_avr_elf32_binary), [`elf_open_returns_minus1_on_invalid_elf_magic`](STP.md#elf_open_returns_minus1_on_invalid_elf_magic), [`elf_open_returns_minus1_on_wrong_machine_type`](STP.md#elf_open_returns_minus1_on_wrong_machine_type) |
 | [`LLR-ELF-02`](LLRs.md#LLR-ELF-02) | `elf` | [`HLR-021`](HLRs.md#HLR-021), [`HLR-040`](HLRs.md#HLR-040) | [`elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure`](STP.md#elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure), [`elf_open_loads_symtab_and_strtab_into_heap_buffers`](STP.md#elf_open_loads_symtab_and_strtab_into_heap_buffers) |
 | [`LLR-ELF-03`](LLRs.md#LLR-ELF-03) | `elf` | [`HLR-021`](HLRs.md#HLR-021) | [`elf_find_avros_tables_performs_single_linear_scan`](STP.md#elf_find_avros_tables_performs_single_linear_scan), [`elf_find_avros_tables_populates_all_7_avros_sentinel_fields`](STP.md#elf_find_avros_tables_populates_all_7_avros_sentinel_fields) |
@@ -418,6 +422,7 @@ the [Software Test Plan](STP.md) catalogue.
 | [tests/test_rsp.c](../tests/test_rsp.c) | [`qC_returns_QC0_when_no_c_thread_selected`](STP.md#qC_returns_QC0_when_no_c_thread_selected) | [`LLR-RSP-19`](LLRs.md#LLR-RSP-19) | — |
 | [tests/test_rsp.c](../tests/test_rsp.c) | [`qC_returns_selected_c_thread_in_hex`](STP.md#qC_returns_selected_c_thread_in_hex) | [`LLR-RSP-19`](LLRs.md#LLR-RSP-19) | — |
 | [tests/test_rsp.c](../tests/test_rsp.c) | [`qOffsets_returns_text_data_bss_all_zero`](STP.md#qOffsets_returns_text_data_bss_all_zero) | [`LLR-RSP-20`](LLRs.md#LLR-RSP-20) | — |
+| [tests/test_rsp.c](../tests/test_rsp.c) | [`qSupported_advertises_multiprocess_vRun_vAttach_vKill`](STP.md#qSupported_advertises_multiprocess_vRun_vAttach_vKill) | [`LLR-RSP-26`](LLRs.md#LLR-RSP-26) | — |
 | [tests/test_rsp.c](../tests/test_rsp.c) | [`rsp_accept_sets_tcp_nodelay_on_client_socket`](STP.md#rsp_accept_sets_tcp_nodelay_on_client_socket) | [`LLR-RSP-01`](LLRs.md#LLR-RSP-01) | — |
 | [tests/test_rsp.c](../tests/test_rsp.c) | [`rsp_dispatch_qattached_returns_1_no_target_access`](STP.md#rsp_dispatch_qattached_returns_1_no_target_access) | [`LLR-RSP-12`](LLRs.md#LLR-RSP-12) | — |
 | [tests/test_rsp.c](../tests/test_rsp.c) | [`rsp_dispatch_qsupported_returns_feature_string_no_target_access`](STP.md#rsp_dispatch_qsupported_returns_feature_string_no_target_access) | [`LLR-RSP-12`](LLRs.md#LLR-RSP-12) | — |
@@ -425,6 +430,9 @@ the [Software Test Plan](STP.md) catalogue.
 | [tests/test_rsp.c](../tests/test_rsp.c) | [`rsp_recv_packet_discards_leading_ack_nak_bytes`](STP.md#rsp_recv_packet_discards_leading_ack_nak_bytes) | [`LLR-RSP-02`](LLRs.md#LLR-RSP-02) | — |
 | [tests/test_rsp.c](../tests/test_rsp.c) | [`rsp_recv_packet_sends_minus_and_returns_minus1_on_bad_checksum`](STP.md#rsp_recv_packet_sends_minus_and_returns_minus1_on_bad_checksum) | [`LLR-RSP-02`](LLRs.md#LLR-RSP-02) | — |
 | [tests/test_rsp.c](../tests/test_rsp.c) | [`rsp_recv_packet_sends_plus_on_valid_checksum`](STP.md#rsp_recv_packet_sends_plus_on_valid_checksum) | [`LLR-RSP-02`](LLRs.md#LLR-RSP-02) | — |
+| [tests/test_rsp.c](../tests/test_rsp.c) | [`vAttach_halts_target_and_emits_stop_reply`](STP.md#vAttach_halts_target_and_emits_stop_reply) | [`LLR-RSP-24`](LLRs.md#LLR-RSP-24) | — |
+| [tests/test_rsp.c](../tests/test_rsp.c) | [`vKill_sets_quit_and_replies_ok`](STP.md#vKill_sets_quit_and_replies_ok) | [`LLR-RSP-25`](LLRs.md#LLR-RSP-25) | — |
+| [tests/test_rsp.c](../tests/test_rsp.c) | [`vRun_invalidates_fsm_runs_and_emits_stop`](STP.md#vRun_invalidates_fsm_runs_and_emits_stop) | [`LLR-RSP-23`](LLRs.md#LLR-RSP-23) | — |
 | [tests/test_updi.c](../tests/test_updi.c) | [`updi_console_poll_returns_0_when_output_buffer_empty`](STP.md#updi_console_poll_returns_0_when_output_buffer_empty) | [`LLR-UPDI-12`](LLRs.md#LLR-UPDI-12) | — |
 | [tests/test_updi.c](../tests/test_updi.c) | [`updi_console_poll_returns_pending_bytes_without_halting`](STP.md#updi_console_poll_returns_pending_bytes_without_halting) | [`LLR-UPDI-11`](LLRs.md#LLR-UPDI-11), [`LLR-UPDI-12`](LLRs.md#LLR-UPDI-12) | — |
 | [tests/test_updi.c](../tests/test_updi.c) | [`updi_crc32_matches_known_vector_for_123456789`](STP.md#updi_crc32_matches_known_vector_for_123456789) | [`LLR-UPDI-30`](LLRs.md#LLR-UPDI-30) | — |
@@ -498,7 +506,6 @@ LLR-bound test in their implementation chain.
 | [`HLR-054`](HLRs.md#HLR-054) | True Software Breakpoints via Flash BREAK Opcode |
 | [`HLR-055`](HLRs.md#HLR-055) | avarice-Compatible Monitor Commands |
 | [`HLR-056`](HLRs.md#HLR-056) | Hardware Data Watchpoints |
-| [`HLR-058`](HLRs.md#HLR-058) | Extended-Remote Lifecycle Packets |
 
 ---
 

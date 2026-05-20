@@ -59,6 +59,9 @@ typedef struct RspHandlers {
     RspHandlerFn on_query_offsets;  /* qOffsets                       */
     RspHandlerFn on_thread_alive;   /* T<tid>                         */
     RspHandlerFn on_restart;        /* R<XX>                          */
+    RspHandlerFn on_vrun;           /* vRun;<args>                    */
+    RspHandlerFn on_vattach;        /* vAttach;<pid>                  */
+    RspHandlerFn on_vkill;          /* vKill;<pid>                    */
     void        *ctx;
 } RspHandlers;
 

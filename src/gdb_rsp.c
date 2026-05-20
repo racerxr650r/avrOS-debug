@@ -837,6 +837,49 @@ static int dh_restart(int fd, const char *pkt, void *vctx)
     return dh_continue(fd, "c", vctx);
 }
 
+/* HLR-058 (LLR-RSP-23): vRun;[<filename>][;<arg>...] — extended-remote
+ * start-new-program.  avr-updi-gdb has no filesystem on the target and
+ * the program is already in FLASH, so all arguments are ignored.  The
+ * behaviour is identical to R<XX>: reset the AVR, invalidate the FSM
+ * cache, then continue and emit a stop reply when the target halts.    */
+static int dh_vrun(int fd, const char *pkt, void *vctx)
+{
+    (void)pkt;
+    RspContext *ctx = (RspContext *)vctx;
+
+    if (updi_enter_debug(ctx->updi_fd) < 0) return reply_err(fd, "E01");
+    fsm_invalidate(ctx->fsm);
+    return dh_continue(fd, "c", vctx);
+}
+
+/* HLR-058 (LLR-RSP-24): vAttach;<pid> — extended-remote attach.  The
+ * single-process AVR target has no real pid namespace, so the <pid>
+ * field is ignored.  Drop into OCD (halts a running target, no-op for
+ * an already-halted target), invalidate the FSM cache, rebuild the
+ * thread list, and emit a SIGTRAP stop reply so GDB knows the target
+ * is now halted and ready for register/memory queries.                 */
+static int dh_vattach(int fd, const char *pkt, void *vctx)
+{
+    (void)pkt;
+    RspContext *ctx = (RspContext *)vctx;
+
+    if (updi_enter_debug(ctx->updi_fd) < 0) return reply_err(fd, "E01");
+    fsm_invalidate(ctx->fsm);
+    (void)fsm_build_thread_list(ctx->fsm, ctx->idx, ctx->updi_fd);
+    return dh_halt_reason(fd, "?", vctx);
+}
+
+/* HLR-058 (LLR-RSP-25): vKill[;<pid>] — extended-remote kill.  Reply
+ * "OK" and set the quit flag so the main loop terminates after the
+ * current packet, mirroring the legacy `k` packet path.                */
+static int dh_vkill(int fd, const char *pkt, void *vctx)
+{
+    (void)pkt;
+    RspContext *ctx = (RspContext *)vctx;
+    if (ctx->quit_p) *ctx->quit_p = 1;
+    return reply_ok(fd);
+}
+
 void rsp_default_handlers(RspHandlers *h, RspContext *ctx)
 {
     /* Mark both HW BP comparators empty.  Caller may have memset()
@@ -863,6 +906,9 @@ void rsp_default_handlers(RspHandlers *h, RspContext *ctx)
     h->on_query_offsets= dh_query_offsets;
     h->on_thread_alive = dh_thread_alive;
     h->on_restart      = dh_restart;
+    h->on_vrun         = dh_vrun;
+    h->on_vattach      = dh_vattach;
+    h->on_vkill        = dh_vkill;
     h->ctx             = ctx;
 }
 
@@ -881,7 +927,8 @@ int rsp_dispatch(int fd, const char *packet, RspHandlers *h)
     /* ── Inline-handled (no target access) ─────────────────────────── */
     if (strncmp(packet, "qSupported", 10) == 0) {
         return rsp_send_packet(fd,
-            "PacketSize=800;QStartNoAckMode+;multiprocess-;vContSupported+");
+            "PacketSize=800;QStartNoAckMode+;multiprocess+;vContSupported+"
+            ";vRun+;vAttach+;vKill+");
     }
     if (strncmp(packet, "qAttached", 9) == 0) {
         return rsp_send_packet(fd, "1");
@@ -898,6 +945,19 @@ int rsp_dispatch(int fd, const char *packet, RspHandlers *h)
     }
     if (strncmp(packet, "vCont;s", 7) == 0) {
         return call_handler(h->on_step, fd, packet, h->ctx);
+    }
+    if (strncmp(packet, "vRun", 4) == 0 &&
+        (packet[4] == '\0' || packet[4] == ';')) {
+        return call_handler(h->on_vrun, fd, packet, h->ctx);
+    }
+    if (strncmp(packet, "vAttach", 7) == 0 &&
+        (packet[7] == '\0' || packet[7] == ';' || packet[7] == '?')) {
+        if (packet[7] == '?') return reply_ok(fd);   /* vAttach? probe */
+        return call_handler(h->on_vattach, fd, packet, h->ctx);
+    }
+    if (strncmp(packet, "vKill", 5) == 0 &&
+        (packet[5] == '\0' || packet[5] == ';')) {
+        return call_handler(h->on_vkill, fd, packet, h->ctx);
     }
 
     /* ── Dispatch by leading character ────────────────────────────── */

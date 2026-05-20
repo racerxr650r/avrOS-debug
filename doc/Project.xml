@@ -2201,6 +2201,34 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="HLR" ref="HLR-059" name="Protocol Cleanup — qC, qOffsets, T, R"/>
         </traces>
       </llr>
+
+      <llr id="LLR-RSP-23">
+        <text><![CDATA[The `dh_vrun()` default handler (`vRun;[<filename>][;<arg>...]`) shall implement extended-remote start-new-program by ignoring the filename and argument list (the target program is already in FLASH and there is no host-side filesystem), then performing the same three-step sequence as `dh_restart()`: `updi_enter_debug()` (reply `E01` on failure), `fsm_invalidate()`, and delegate to `dh_continue()` with `c`. The resulting stop-reply packet is emitted to GDB on the next halt.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-058" name="Extended-remote — multiprocess+, vRun, vAttach, vKill"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-24">
+        <text><![CDATA[The `dh_vattach()` default handler (`vAttach;<pid>`) shall implement extended-remote attach by ignoring `<pid>` (the AVR target has no process namespace), then: (1) calling `updi_enter_debug()` to halt the running target and re-enter OCD, replying `E01` on UPDI failure; (2) calling `fsm_invalidate()` and `fsm_build_thread_list()` so virtual-thread state is fresh; and (3) delegating to `dh_halt_reason()` to emit a SIGTRAP stop reply containing the active `thread:<hex>;` so GDB knows the target is halted and ready for register and memory queries.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-058" name="Extended-remote — multiprocess+, vRun, vAttach, vKill"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-25">
+        <text><![CDATA[The `dh_vkill()` default handler (`vKill[;<pid>]`) shall implement extended-remote kill by ignoring `<pid>`, setting `*ctx->quit_p = 1` so the main loop terminates after the current packet, and replying `OK`. This mirrors the behaviour of the legacy `k` packet path so a GDB session that uses either form releases the debugger identically.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-058" name="Extended-remote — multiprocess+, vRun, vAttach, vKill"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-26">
+        <text><![CDATA[The inline `qSupported` reply shall be the literal string `PacketSize=800;QStartNoAckMode+;multiprocess+;vContSupported+;vRun+;vAttach+;vKill+`. The `multiprocess+` feature is advertised even though the AVR target supports only a single process — it informs GDB that the server understands `<pid>.<tid>` thread-id syntax and accepts the extended-remote `v*` packets. `vRun+`, `vAttach+`, and `vKill+` advertise the corresponding handlers added by HLR-058. The inbound `vAttach?` capability probe shall be answered with `OK`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-058" name="Extended-remote — multiprocess+, vRun, vAttach, vKill"/>
+        </traces>
+      </llr>
     </function>
 
     <function number="5" title="src/elf_parser.c — ELF Binary Parser" name="elf" source="src/elf_parser.c">
@@ -2910,7 +2938,7 @@ Errors are propagated upward through the module stack without retrying:
     <!-- ============================================================ -->
     <!-- src/gdb_rsp.c unit tests                                     -->
     <!-- ============================================================ -->
-    <file path="tests/test_rsp.c" role="unit" count="39">
+    <file path="tests/test_rsp.c" role="unit" count="44">
       <header><![CDATA[Unit tests for `src/gdb_rsp.c`: socket configuration, RSP packet framing, register and memory handlers, hardware-breakpoint comparator management, OCD-based execution control, async Ctrl-C interrupt, detach cleanup, session lifecycle packets, and monitor relay. Uses a `socketpair()` as a drop-in socket substitute and replaces every `updi_*`, `fsm_*`, and `monitor_dispatch` call site with `ld --wrap` mocks so all tests run without real silicon.]]></header>
 
       <test name="rsp_listen_sets_so_reuseaddr_before_bind">
@@ -3116,6 +3144,26 @@ Errors are propagated upward through the module stack without retrying:
       <test name="R_packet_invalidates_fsm_runs_and_emits_stop">
         <purpose><![CDATA[Dispatch `R00` and verify that `fsm_invalidate()` is called, `updi_run()` is called exactly once (via the delegated `c`), the thread list is rebuilt on halt, and a `T05` stop packet is emitted on the wire.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-22"/></traces>
+      </test>
+
+      <test name="vRun_invalidates_fsm_runs_and_emits_stop">
+        <purpose><![CDATA[Dispatch `vRun;;arg1` (empty filename, ignored arg) and verify the same side-effects as `R00`: `fsm_invalidate()` called, `updi_run()` called once, thread list rebuilt, and a `T05` stop reply emitted.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-23"/></traces>
+      </test>
+
+      <test name="vAttach_halts_target_and_emits_stop_reply">
+        <purpose><![CDATA[Dispatch `vAttach;1` and verify that `updi_run()` and `updi_step()` are NOT called, that `fsm_invalidate()` and `fsm_build_thread_list()` are called, and that the reply is a `T05` stop packet containing a `thread:<hex>;` suffix.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-24"/></traces>
+      </test>
+
+      <test name="vKill_sets_quit_and_replies_ok">
+        <purpose><![CDATA[Dispatch `vKill;1` and verify that the context's `*quit_p` flag is raised and the reply is the literal `OK`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-25"/></traces>
+      </test>
+
+      <test name="qSupported_advertises_multiprocess_vRun_vAttach_vKill">
+        <purpose><![CDATA[Dispatch `qSupported:multiprocess+` and verify the reply contains the substrings `multiprocess+`, `vRun+`, `vAttach+`, and `vKill+`, and does NOT contain `multiprocess-`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-26"/></traces>
       </test>
     </file>
 

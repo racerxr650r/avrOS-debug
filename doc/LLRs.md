@@ -233,6 +233,18 @@ Requirements for RSP packet framing, dispatch, GDB packet handlers, session life
 *   <a id="LLR-RSP-22"></a>**LLR-RSP-22** — The `dh_restart()` default handler (`R<XX>`) shall implement the extended-remote restart semantics by: (1) calling `updi_enter_debug()` to pulse `ASI_RESET_REQ` and re-enter OCD halted at the reset vector, replying `E01` and returning if the UPDI primitive fails; (2) calling `fsm_invalidate()` to drop the stale virtual-thread cache; and (3) delegating to `dh_continue()` with a synthetic `c` packet so the target resumes, the thread list is rebuilt on the next halt, and the resulting stop-reply packet is emitted to GDB. The `<XX>` byte of the inbound packet shall be ignored per the GDB protocol.
     *Trace:* HLR-059 (Protocol Cleanup — qC, qOffsets, T, R).
 
+*   <a id="LLR-RSP-23"></a>**LLR-RSP-23** — The `dh_vrun()` default handler (`vRun;[<filename>][;<arg>...]`) shall implement extended-remote start-new-program by ignoring the filename and argument list (the target program is already in FLASH and there is no host-side filesystem), then performing the same three-step sequence as `dh_restart()`: `updi_enter_debug()` (reply `E01` on failure), `fsm_invalidate()`, and delegate to `dh_continue()` with `c`. The resulting stop-reply packet is emitted to GDB on the next halt.
+    *Trace:* HLR-058 (Extended-remote — multiprocess+, vRun, vAttach, vKill).
+
+*   <a id="LLR-RSP-24"></a>**LLR-RSP-24** — The `dh_vattach()` default handler (`vAttach;<pid>`) shall implement extended-remote attach by ignoring `<pid>` (the AVR target has no process namespace), then: (1) calling `updi_enter_debug()` to halt the running target and re-enter OCD, replying `E01` on UPDI failure; (2) calling `fsm_invalidate()` and `fsm_build_thread_list()` so virtual-thread state is fresh; and (3) delegating to `dh_halt_reason()` to emit a SIGTRAP stop reply containing the active `thread:<hex>;` so GDB knows the target is halted and ready for register and memory queries.
+    *Trace:* HLR-058 (Extended-remote — multiprocess+, vRun, vAttach, vKill).
+
+*   <a id="LLR-RSP-25"></a>**LLR-RSP-25** — The `dh_vkill()` default handler (`vKill[;<pid>]`) shall implement extended-remote kill by ignoring `<pid>`, setting `*ctx->quit_p = 1` so the main loop terminates after the current packet, and replying `OK`. This mirrors the behaviour of the legacy `k` packet path so a GDB session that uses either form releases the debugger identically.
+    *Trace:* HLR-058 (Extended-remote — multiprocess+, vRun, vAttach, vKill).
+
+*   <a id="LLR-RSP-26"></a>**LLR-RSP-26** — The inline `qSupported` reply shall be the literal string `PacketSize=800;QStartNoAckMode+;multiprocess+;vContSupported+;vRun+;vAttach+;vKill+`. The `multiprocess+` feature is advertised even though the AVR target supports only a single process — it informs GDB that the server understands `<pid>.<tid>` thread-id syntax and accepts the extended-remote `v*` packets. `vRun+`, `vAttach+`, and `vKill+` advertise the corresponding handlers added by HLR-058. The inbound `vAttach?` capability probe shall be answered with `OK`.
+    *Trace:* HLR-058 (Extended-remote — multiprocess+, vRun, vAttach, vKill).
+
 ## 5. src/elf_parser.c — ELF Binary Parser
 
 Requirements for `elf_open()`, `elf_close()`, `elf_find_avros_tables()`, and `elf_flash_addr()`.

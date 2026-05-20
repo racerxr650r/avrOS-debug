@@ -979,6 +979,76 @@ static void R_packet_invalidates_fsm_runs_and_emits_stop(void)
     TEST_ASSERT_EQUAL(0, strncmp(payload, "T05", 3));
 }
 
+/* ── LLR-RSP-23: vRun;… ─────────────────────────────────────────────── */
+
+static void vRun_invalidates_fsm_runs_and_emits_stop(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    mock_ocd_poll_default = 0;   /* halt on first poll */
+
+    /* vRun with empty filename and one arg, both ignored. */
+    rsp_dispatch(sock_pair[1], "vRun;;arg1", &h);
+
+    TEST_ASSERT_GREATER_THAN(0, mock_invalidate_calls);
+    TEST_ASSERT_EQUAL(1, mock_run_calls);
+    TEST_ASSERT_GREATER_THAN(0, mock_build_calls);
+    char stream[128]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[128];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL(0, strncmp(payload, "T05", 3));
+}
+
+/* ── LLR-RSP-24: vAttach;<pid> ──────────────────────────────────────── */
+
+static void vAttach_halts_target_and_emits_stop_reply(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    rsp_dispatch(sock_pair[1], "vAttach;1", &h);
+
+    /* enter_debug + invalidate + build_thread_list; no run/step. */
+    TEST_ASSERT_EQUAL(0, mock_run_calls);
+    TEST_ASSERT_EQUAL(0, mock_step_calls);
+    TEST_ASSERT_GREATER_THAN(0, mock_invalidate_calls);
+    TEST_ASSERT_GREATER_THAN(0, mock_build_calls);
+    char stream[128]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[128];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    /* T05 stop reply with thread suffix. */
+    TEST_ASSERT_EQUAL(0, strncmp(payload, "T05", 3));
+    TEST_ASSERT_NOT_NULL(strstr(payload, "thread:"));
+}
+
+/* ── LLR-RSP-25: vKill;<pid> ────────────────────────────────────────── */
+
+static void vKill_sets_quit_and_replies_ok(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    TEST_ASSERT_EQUAL(0, g_quit_var);
+    rsp_dispatch(sock_pair[1], "vKill;1", &h);
+
+    TEST_ASSERT_EQUAL(1, (int)g_quit_var);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("OK", payload);
+}
+
+/* ── LLR-RSP-26: qSupported advertises multiprocess+ and v-features ── */
+
+static void qSupported_advertises_multiprocess_vRun_vAttach_vKill(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    rsp_dispatch(sock_pair[1], "qSupported:multiprocess+", &h);
+    char stream[256]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[256];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_NOT_NULL(strstr(payload, "multiprocess+"));
+    TEST_ASSERT_NOT_NULL(strstr(payload, "vRun+"));
+    TEST_ASSERT_NOT_NULL(strstr(payload, "vAttach+"));
+    TEST_ASSERT_NOT_NULL(strstr(payload, "vKill+"));
+    TEST_ASSERT_NULL(strstr(payload, "multiprocess-"));
+}
+
 /* ── Runner ─────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -1025,5 +1095,9 @@ int main(void)
     RUN_TEST(T_packet_returns_OK_for_live_thread);
     RUN_TEST(T_packet_returns_E01_for_unknown_thread);
     RUN_TEST(R_packet_invalidates_fsm_runs_and_emits_stop);
+    RUN_TEST(vRun_invalidates_fsm_runs_and_emits_stop);
+    RUN_TEST(vAttach_halts_target_and_emits_stop_reply);
+    RUN_TEST(vKill_sets_quit_and_replies_ok);
+    RUN_TEST(qSupported_advertises_multiprocess_vRun_vAttach_vKill);
     return UNITY_END();
 }
