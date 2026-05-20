@@ -293,7 +293,7 @@ Role: **unit**. **6 test(s).**
 
 ### 3.10. [tests/hw/hw_test.c](../tests/hw/hw_test.c)
 
-Role: **hardware**. **22 test(s).**
+Role: **hardware**. **29 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -316,9 +316,16 @@ Role: **hardware**. **22 test(s).**
 | 17 | <a id="D1_rsp_server_accepts_tcp_connection"></a>`D1_rsp_server_accepts_tcp_connection` | `LLR-HWTEST-05` | When `HW_TEST_RSP=YES`, `fork`+`execl` the production `build/avrOSdb` against the configured serial port; open a TCP client to `127.0.0.1:HW_RSP_PORT` and assert the connect succeeds within a bounded timeout. Skipped otherwise. |
 | 18 | <a id="D2_rsp_qsupported_round_trip"></a>`D2_rsp_qsupported_round_trip` | `LLR-HWTEST-05` | Send an RSP `$qSupported#37` packet to the spawned server and assert a non-empty, properly-framed RSP reply is received. Skipped unless `HW_TEST_RSP=YES`. On completion the harness shall terminate the spawned server cleanly via SIGTERM + `waitpid`. |
 | 19 | <a id="D3_rsp_ctrl_c_interrupt_returns_T02"></a>`D3_rsp_ctrl_c_interrupt_returns_T02` | `LLR-RSP-11`, `LLR-UPDI-08`, `LLR-HWTEST-05` | With the spawned server running and a connected TCP client, dispatch a `c` (continue) RSP packet, wait long enough for the loop to enter its poll/select state, then send a single `0x03` byte (GDB Ctrl-C async-interrupt) on the same TCP connection. Assert that the server replies with a stop-reason packet whose signal field is `T02` (SIGINT) and that the live target is observably halted afterwards (via a subsequent `g` packet succeeding). Skipped unless `HW_TEST_RSP=YES`. Exercises the production async-interrupt path end-to-end through real silicon, validating both LLR-RSP-11 (Ctrl-C path) and LLR-UPDI-08 (`updi_halt()`). |
-| 20 | <a id="F1_autobaud_picks_reliable_rung"></a>`F1_autobaud_picks_reliable_rung` | `LLR-HWTEST-07`, `LLR-UPDI-31` | Close the harness UPDI fd, then call `updi_probe_baud(cfg->port, 8, visitor, NULL)`. The visitor records each rung's `{baud, errors, samples}` triple for the log. PASS if the returned baud is ≥ 19200 (the slowest rung in the ladder) — proving the probe walked the ladder, observed at least one zero-error rung on live silicon, and returned the highest-rate working candidate. Exercises the full read-only probe path end-to-end. |
-| 21 | <a id="F2_fuse_pretty_print_round_trip"></a>`F2_fuse_pretty_print_round_trip` | `LLR-HWTEST-07`, `LLR-UPDI-29`, `LLR-UPDI-32` | With the harness UPDI fd re-opened at `cfg->baud`, read the FUSES window and the 4-byte LOCK window via `updi_nvm_read()`, then call `updi_format_fuses()` into a 2 KiB stack buffer. PASS if the formatted output contains the literal substrings `WDTCFG`, `OSCCFG`, `SYSCFG0`, and `Lock:` — confirming the per-family fuse decode table fired and the lock-byte trailer was emitted. |
-| 22 | <a id="F3_prog_mode_end_to_end_with_verify"></a>`F3_prog_mode_end_to_end_with_verify` | `LLR-HWTEST-07`, `LLR-MAIN-15`, `LLR-MAIN-16` | Destructive — gated by `HW_TEST_NVM_CONFIRM=YES`. With the harness UPDI fd closed, `fork` and `execl` the production `build/avrOSdb --prog --erase --baud <N> <port> <elf>` against the bench ELF (`build/fixtures/all_nvm.elf` by default, which intentionally avoids FUSES/LOCK windows so the bench stays in a known state). Capture the child's stdout+stderr through an 8 KiB buffer. PASS if `WEXITSTATUS == 0` AND the captured output contains the literal `verify: OK`. Validates `--prog` end-to-end including chip-erase, FLASH/EEPROM/USERROW programming, and read-back verify against live silicon. |
+| 20 | <a id="D4_rsp_qC_current_thread"></a>`D4_rsp_qC_current_thread` | `LLR-HWTEST-08`, `LLR-RSP-21` | Send a framed `qC` packet over the same TCP socket used by D1–D3 and assert the reply payload begins with the two-character prefix `QC` followed by a thread id. Validates HLR-059's qC handler against live silicon. |
+| 21 | <a id="D5_rsp_qOffsets_section_bases"></a>`D5_rsp_qOffsets_section_bases` | `LLR-HWTEST-08`, `LLR-RSP-22` | Send `qOffsets` and assert the reply payload begins with the literal `Text=` (the avrOSdb stub always reports `Text=0;Data=0;Bss=0` because the firmware image is linked at fixed addresses). Validates HLR-059's qOffsets handler against live silicon. |
+| 22 | <a id="D6_rsp_monitor_info_verb"></a>`D6_rsp_monitor_info_verb` | `LLR-HWTEST-08`, `LLR-MON-01` | Send `qRcmd,696e666f` (the hex-encoded ASCII string `info`) and assert the reply payload is non-empty and does not begin with `E` (i.e. is not an `Exx` error code). Validates HLR-055's `monitor info` verb wiring against live silicon. |
+| 23 | <a id="D7_rsp_Z2_z2_sram_watchpoint_round_trip"></a>`D7_rsp_Z2_z2_sram_watchpoint_round_trip` | `LLR-HWTEST-08`, `LLR-RSP-26` | Send `Z2,<sram_addr|0x800000>,1` (set 1-byte data-access watchpoint on the configured SRAM scratch address) followed by `z2,<sram_addr|0x800000>,1`. Assert both replies are `OK`. Validates HLR-056's DABP set+clear path end-to-end against live silicon. |
+| 24 | <a id="D8_rsp_vRun_reload_returns_Tstop"></a>`D8_rsp_vRun_reload_returns_Tstop` | `LLR-HWTEST-08`, `LLR-RSP-18` | Send `vRun;` and assert the reply payload begins with `T` (any stop signal — typically `T05` SIGTRAP after run-to-main). Validates HLR-058's vRun handler — full reload + reset + halt-at-entry — against live silicon. |
+| 25 | <a id="D9_rsp_vFlashErase_vFlashDone_smoke"></a>`D9_rsp_vFlashErase_vFlashDone_smoke` | `LLR-HWTEST-08`, `LLR-RSP-32`, `LLR-RSP-34` | Destructive — opt-in via `--with-nvm`. Send `vFlashErase:<flash_page>,200` and assert reply is `OK`; then send `vFlashDone` and assert reply is `OK`. Erases one 512-byte FLASH page on live silicon; the subsequent vFlashDone flushes an all-0xFF buffer (the cleared state) which is a valid no-op. Validates HLR-053's vFlash* state machine end-to-end. |
+| 26 | <a id="D10_rsp_Z0_z0_sw_bp_flash_break_round_trip"></a>`D10_rsp_Z0_z0_sw_bp_flash_break_round_trip` | `LLR-HWTEST-08`, `LLR-RSP-36`, `LLR-RSP-37`, `LLR-RSP-38` | Destructive — opt-in via `--with-nvm` AND must run after D9 so the FLASH page baseline is 0xFF. Send `Z0,<flash_page>,2` and assert reply is `OK`; then `m<flash_page>,2` and assert the 4-character hex payload equals `9895` (AVR `BREAK` opcode `0x9598` little-endian); then `z0,<flash_page>,2` and assert reply is `OK`. Validates HLR-054's full SW-BP install/restore loop — FLASH patch with BREAK, read-back, and restore of original opcode — against live silicon. |
+| 27 | <a id="F1_autobaud_picks_reliable_rung"></a>`F1_autobaud_picks_reliable_rung` | `LLR-HWTEST-07`, `LLR-UPDI-31` | Close the harness UPDI fd, then call `updi_probe_baud(cfg->port, 8, visitor, NULL)`. The visitor records each rung's `{baud, errors, samples}` triple for the log. PASS if the returned baud is ≥ 19200 (the slowest rung in the ladder) — proving the probe walked the ladder, observed at least one zero-error rung on live silicon, and returned the highest-rate working candidate. Exercises the full read-only probe path end-to-end. |
+| 28 | <a id="F2_fuse_pretty_print_round_trip"></a>`F2_fuse_pretty_print_round_trip` | `LLR-HWTEST-07`, `LLR-UPDI-29`, `LLR-UPDI-32` | With the harness UPDI fd re-opened at `cfg->baud`, read the FUSES window and the 4-byte LOCK window via `updi_nvm_read()`, then call `updi_format_fuses()` into a 2 KiB stack buffer. PASS if the formatted output contains the literal substrings `WDTCFG`, `OSCCFG`, `SYSCFG0`, and `Lock:` — confirming the per-family fuse decode table fired and the lock-byte trailer was emitted. |
+| 29 | <a id="F3_prog_mode_end_to_end_with_verify"></a>`F3_prog_mode_end_to_end_with_verify` | `LLR-HWTEST-07`, `LLR-MAIN-15`, `LLR-MAIN-16` | Destructive — gated by `HW_TEST_NVM_CONFIRM=YES`. With the harness UPDI fd closed, `fork` and `execl` the production `build/avrOSdb --prog --erase --baud <N> <port> <elf>` against the bench ELF (`build/fixtures/all_nvm.elf` by default, which intentionally avoids FUSES/LOCK windows so the bench stays in a known state). Capture the child's stdout+stderr through an 8 KiB buffer. PASS if `WEXITSTATUS == 0` AND the captured output contains the literal `verify: OK`. Validates `--prog` end-to-end including chip-erase, FLASH/EEPROM/USERROW programming, and read-back verify against live silicon. |
 
 ## 4. LLR Coverage Matrix
 
@@ -396,27 +403,27 @@ verified by code review — see
 | `LLR-RSP-15` | `rsp` | `HLR-029`, `HLR-030` | `on_monitor_qRcmd_passes_hex_body_to_monitor_dispatch`, `on_monitor_returns_ok_when_monitor_dispatch_succeeds`, `on_monitor_sends_o_packet_error_on_updi_failure` |
 | `LLR-RSP-16` | `rsp` | `HLR-025` | `H_packet_stores_thread_id_for_register_operations`, `H_packet_minus1_and_0_both_map_to_active_fsm_thread` |
 | `LLR-RSP-17` | `rsp` | `HLR-017`, `HLR-018` | `on_halt_reason_returns_T02_when_extbrk_set` |
-| `LLR-RSP-18` | `rsp` | `HLR-016`, `HLR-019` | `on_detach_clears_hw_bps_before_run` |
+| `LLR-RSP-18` | `rsp` | `HLR-016`, `HLR-019` | `on_detach_clears_hw_bps_before_run`, `D8_rsp_vRun_reload_returns_Tstop` |
 | `LLR-RSP-19` | `rsp` | `HLR-059` | `qC_returns_QC0_when_no_c_thread_selected`, `qC_returns_selected_c_thread_in_hex` |
 | `LLR-RSP-20` | `rsp` | `HLR-059` | `qOffsets_returns_text_data_bss_all_zero` |
-| `LLR-RSP-21` | `rsp` | `HLR-059` | `T_packet_returns_OK_for_live_thread`, `T_packet_returns_E01_for_unknown_thread` |
-| `LLR-RSP-22` | `rsp` | `HLR-059` | `R_packet_invalidates_fsm_runs_and_emits_stop` |
+| `LLR-RSP-21` | `rsp` | `HLR-059` | `T_packet_returns_OK_for_live_thread`, `T_packet_returns_E01_for_unknown_thread`, `D4_rsp_qC_current_thread` |
+| `LLR-RSP-22` | `rsp` | `HLR-059` | `R_packet_invalidates_fsm_runs_and_emits_stop`, `D5_rsp_qOffsets_section_bases` |
 | `LLR-RSP-23` | `rsp` | `HLR-058` | `vRun_invalidates_fsm_runs_and_emits_stop` |
 | `LLR-RSP-24` | `rsp` | `HLR-058` | `vAttach_halts_target_and_emits_stop_reply` |
 | `LLR-RSP-25` | `rsp` | `HLR-058` | `vKill_sets_quit_and_replies_ok` |
-| `LLR-RSP-26` | `rsp` | `HLR-058` | `qSupported_advertises_multiprocess_vRun_vAttach_vKill` |
+| `LLR-RSP-26` | `rsp` | `HLR-058` | `qSupported_advertises_multiprocess_vRun_vAttach_vKill`, `D7_rsp_Z2_z2_sram_watchpoint_round_trip` |
 | `LLR-RSP-27` | `rsp` | `HLR-056` | `Z2_write_watchpoint_calls_updi_ocd_set_data_bp_with_kind_w` |
 | `LLR-RSP-28` | `rsp` | `HLR-056` | `z2_remove_calls_clear_and_clears_shadow` |
 | `LLR-RSP-29` | `rsp` | `HLR-056` | `Z2_write_watchpoint_calls_updi_ocd_set_data_bp_with_kind_w`, `Z3_read_watchpoint_uses_kind_r`, `Z4_access_watchpoint_uses_kind_a`, `Z2_returns_E08_when_both_wp_slots_full` |
 | `LLR-RSP-30` | `rsp` | `HLR-056` | `z2_remove_calls_clear_and_clears_shadow`, `detach_clears_data_watchpoints_in_silicon` |
 | `LLR-RSP-31` | `rsp` | `HLR-056` | `halt_with_DABP0_bit_appends_watch_suffix` |
-| `LLR-RSP-32` | `rsp` | `HLR-053` | `vFlashErase_allocates_buffer_and_replies_ok_for_flash_range`, `vFlashErase_E22_for_data_space_address` |
+| `LLR-RSP-32` | `rsp` | `HLR-053` | `vFlashErase_allocates_buffer_and_replies_ok_for_flash_range`, `vFlashErase_E22_for_data_space_address`, `D9_rsp_vFlashErase_vFlashDone_smoke` |
 | `LLR-RSP-33` | `rsp` | `HLR-053` | `vFlashWrite_copies_payload_into_buffer_at_offset`, `vFlashWrite_decodes_0x7D_xor_0x20_binary_escape` |
-| `LLR-RSP-34` | `rsp` | `HLR-053` | `vFlashDone_flushes_buffer_via_nvm_write_flash_and_replies_ok`, `vFlashDone_with_no_active_transaction_replies_ok_noop`, `m_packet_mid_vflash_transaction_aborts_and_returns_E22` |
+| `LLR-RSP-34` | `rsp` | `HLR-053` | `vFlashDone_flushes_buffer_via_nvm_write_flash_and_replies_ok`, `vFlashDone_with_no_active_transaction_replies_ok_noop`, `m_packet_mid_vflash_transaction_aborts_and_returns_E22`, `D9_rsp_vFlashErase_vFlashDone_smoke` |
 | `LLR-RSP-35` | `rsp` | `HLR-053` | `qSupported_advertises_vFlash_packets` |
-| `LLR-RSP-36` | `rsp` | `HLR-054` | `Z0_in_sw_mode_patches_BREAK_opcode_via_flash_patch`, `Z0_in_sw_mode_refuses_data_space_address_with_E22`, `Z0_in_hw_only_mode_falls_back_to_HW_BP_path`, `Z0_in_sw_mode_idempotent_on_same_address` |
-| `LLR-RSP-37` | `rsp` | `HLR-054` | `Z0_in_sw_mode_records_original_opcode_from_flash`, `Z0_in_sw_mode_snapshots_and_restores_cpu_state` |
-| `LLR-RSP-38` | `rsp` | `HLR-054` | `z0_in_sw_mode_restores_original_opcode` |
+| `LLR-RSP-36` | `rsp` | `HLR-054` | `Z0_in_sw_mode_patches_BREAK_opcode_via_flash_patch`, `Z0_in_sw_mode_refuses_data_space_address_with_E22`, `Z0_in_hw_only_mode_falls_back_to_HW_BP_path`, `Z0_in_sw_mode_idempotent_on_same_address`, `D10_rsp_Z0_z0_sw_bp_flash_break_round_trip` |
+| `LLR-RSP-37` | `rsp` | `HLR-054` | `Z0_in_sw_mode_records_original_opcode_from_flash`, `Z0_in_sw_mode_snapshots_and_restores_cpu_state`, `D10_rsp_Z0_z0_sw_bp_flash_break_round_trip` |
+| `LLR-RSP-38` | `rsp` | `HLR-054` | `z0_in_sw_mode_restores_original_opcode`, `D10_rsp_Z0_z0_sw_bp_flash_break_round_trip` |
 | `LLR-RSP-39` | `rsp` | `HLR-054` | `vFlashDone_also_clears_sw_bp_shadow` |
 | `LLR-ELF-01` | `elf` | `HLR-021` | `elf_open_accepts_valid_avr_elf32_binary`, `elf_open_returns_minus1_on_invalid_elf_magic`, `elf_open_returns_minus1_on_wrong_machine_type` |
 | `LLR-ELF-02` | `elf` | `HLR-021`, `HLR-040` | `elf_open_loads_symtab_and_strtab_into_heap_buffers`, `elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure` |
@@ -433,7 +440,7 @@ verified by code review — see
 | `LLR-FSM-04` | `fsm` | `HLR-026` | `fsm_get_registers_places_state_fn_as_pc_at_hex_positions_70_77`, `fsm_get_registers_non_active_r0_r31_sreg_spl_sph_all_zero`, `fsm_get_registers_active_thread_reads_live_sreg_spl_sph` |
 | `LLR-FSM-05` | `fsm` | `HLR-027` | `fsm_build_thread_list_caps_at_32_entries_and_logs_warning` |
 | `LLR-FSM-06` | `fsm` | `HLR-028` | `fsm_get_registers_non_active_no_updi_read_of_stack` |
-| `LLR-MON-01` | `monitor` | `HLR-029` | `monitor_dispatch_hex_decodes_cmd_before_prefix_matching`, `monitor_dispatch_treats_invalid_hex_sequence_as_unrecognised` |
+| `LLR-MON-01` | `monitor` | `HLR-029` | `monitor_dispatch_hex_decodes_cmd_before_prefix_matching`, `monitor_dispatch_treats_invalid_hex_sequence_as_unrecognised`, `D6_rsp_monitor_info_verb` |
 | `LLR-MON-02` | `monitor` | `HLR-029`, `HLR-030` | `monitor_dispatch_rejects_cmd_without_avros_space_prefix`, `monitor_dispatch_sends_usage_hint_o_packet_on_bad_prefix` |
 | `LLR-MON-03` | `monitor` | `HLR-029` | `cmd_events_reads_event_count_descriptors_from_evnt_table`, `cmd_events_reports_name_and_status_value_per_descriptor` |
 | `LLR-MON-04` | `monitor` | `HLR-030` | `cmd_queues_reads_queue_count_descriptors_from_que_table`, `cmd_queues_formats_capacity_and_sizeofelement_for_each_entry` |
@@ -462,3 +469,4 @@ verified by code review — see
 | `LLR-HWTEST-05` | `hwtest` | `HLR-045`, `HLR-014` | `D1_rsp_server_accepts_tcp_connection`, `D2_rsp_qsupported_round_trip`, `D3_rsp_ctrl_c_interrupt_returns_T02` |
 | `LLR-HWTEST-06` | `hwtest` | `HLR-045` | `B0_sram_single_byte_round_trip` |
 | `LLR-HWTEST-07` | `hwtest` | `HLR-045`, `HLR-049`, `HLR-050`, `HLR-051`, `HLR-052` | `F1_autobaud_picks_reliable_rung`, `F2_fuse_pretty_print_round_trip`, `F3_prog_mode_end_to_end_with_verify` |
+| `LLR-HWTEST-08` | `hwtest` | `HLR-053`, `HLR-054`, `HLR-055`, `HLR-056`, `HLR-058`, `HLR-059` | `D4_rsp_qC_current_thread`, `D5_rsp_qOffsets_section_bases`, `D6_rsp_monitor_info_verb`, `D7_rsp_Z2_z2_sram_watchpoint_round_trip`, `D8_rsp_vRun_reload_returns_Tstop`, `D9_rsp_vFlashErase_vFlashDone_smoke`, `D10_rsp_Z0_z0_sw_bp_flash_break_round_trip` |

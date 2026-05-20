@@ -2670,6 +2670,18 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="HLR" ref="HLR-052" name="Auto-Baud Link-Quality Probe in Device Mode"/>
         </traces>
       </llr>
+
+      <llr id="LLR-HWTEST-08">
+        <text><![CDATA[Group D's RSP-server smoke checks shall, after the existing D1–D3 (TCP accept, qSupported, Ctrl-C interrupt) pass, additionally exercise the Phase-10 RSP surface against the same spawned `build/avrOSdb` child over the same TCP socket: **D4** issue a framed `qC` packet and PASS if the reply payload begins with `QC` followed by a thread id; **D5** issue `qOffsets` and PASS if the reply payload begins with `Text=`; **D6** issue `qRcmd,696e666f` (the hex-encoded `monitor info` verb) and PASS if the reply payload is non-empty and does not begin with `E` (an error code); **D7** issue `Z2,<sram_addr|0x800000>,1` then `z2,<sram_addr|0x800000>,1` and PASS if both replies are `OK`; **D8** issue `vRun;` and PASS if the reply payload begins with `T` (any stop signal); **D9** (destructive, opt-in via `--with-nvm`) issue `vFlashErase:<flash_page>,200` followed by `vFlashDone` and PASS if both replies are `OK`; **D10** (destructive, opt-in via `--with-nvm`, must be ordered after D9 so the page baseline is 0xFF) issue `Z0,<flash_page>,2`, then read back with `m<flash_page>,2` expecting the 4-character hex literal `9895` (AVR `BREAK` opcode little-endian), then issue `z0,<flash_page>,2`, and PASS only when all three exchanges produce the expected replies. When `--with-rsp` is not set, D4–D10 shall be skipped together with D1–D3; when `--with-nvm` is not set, only D9–D10 shall be reported as SKIP. A short helper `send_rsp(fd, payload)` shall compute the modulo-256 RSP checksum and ship `+$<payload>#XX`; a companion `rsp_payload(buf, n, &p, &len)` shall locate the `$…#` payload in a raw reply buffer.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-053" name="Flash Programming via GDB load"/>
+          <trace target="HLR" ref="HLR-054" name="True Software Breakpoints via Flash BREAK Opcode"/>
+          <trace target="HLR" ref="HLR-055" name="avarice Monitor Verb Parity"/>
+          <trace target="HLR" ref="HLR-056" name="Data Access Watchpoints"/>
+          <trace target="HLR" ref="HLR-058" name="vRun / vAttach / vKill"/>
+          <trace target="HLR" ref="HLR-059" name="qC / qOffsets / T / R Replies"/>
+        </traces>
+      </llr>
     </function>
   </llrs>
 
@@ -3826,7 +3838,7 @@ Errors are propagated upward through the module stack without retrying:
     <!-- ============================================================ -->
     <!-- On-target hardware integration tests (manual; not in CI)     -->
     <!-- ============================================================ -->
-    <file path="tests/hw/hw_test.c" role="hardware" count="22">
+    <file path="tests/hw/hw_test.c" role="hardware" count="29">
       <header><![CDATA[On-target hardware integration test harness for the AVR-Dx UPDI driver, device-info report, SRAM/FLASH memory access, and the GDB RSP server. Manual-only: never invoked by `make test`. Driven by the Makefile targets `hw-test`, `hw-test-nvm`, `hw-test-rsp`, and `hw-test-all`. Configurable via `HW_PORT`, `HW_DEVICE_ID`, `HW_SRAM_ADDR`, `HW_FLASH_PAGE_ADDR`, `HW_RSP_PORT`, `HW_TEST_ELF`, `HW_ADDR_24BIT`, `HW_VERBOSE` (env or CLI). Destructive groups gated by `HW_TEST_NVM_CONFIRM=YES` (FLASH) and `HW_TEST_RSP=YES` (RSP).]]></header>
 
       <test name="A1_port_open_and_cold_start_handshake">
@@ -3922,6 +3934,41 @@ Errors are propagated upward through the module stack without retrying:
       <test name="D3_rsp_ctrl_c_interrupt_returns_T02">
         <purpose><![CDATA[With the spawned server running and a connected TCP client, dispatch a `c` (continue) RSP packet, wait long enough for the loop to enter its poll/select state, then send a single `0x03` byte (GDB Ctrl-C async-interrupt) on the same TCP connection. Assert that the server replies with a stop-reason packet whose signal field is `T02` (SIGINT) and that the live target is observably halted afterwards (via a subsequent `g` packet succeeding). Skipped unless `HW_TEST_RSP=YES`. Exercises the production async-interrupt path end-to-end through real silicon, validating both LLR-RSP-11 (Ctrl-C path) and LLR-UPDI-08 (`updi_halt()`).]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-11"/><trace target="LLR" ref="LLR-UPDI-08"/><trace target="LLR" ref="LLR-HWTEST-05"/></traces>
+      </test>
+
+      <test name="D4_rsp_qC_current_thread">
+        <purpose><![CDATA[Send a framed `qC` packet over the same TCP socket used by D1–D3 and assert the reply payload begins with the two-character prefix `QC` followed by a thread id. Validates HLR-059's qC handler against live silicon.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-08"/><trace target="LLR" ref="LLR-RSP-21"/></traces>
+      </test>
+
+      <test name="D5_rsp_qOffsets_section_bases">
+        <purpose><![CDATA[Send `qOffsets` and assert the reply payload begins with the literal `Text=` (the avrOSdb stub always reports `Text=0;Data=0;Bss=0` because the firmware image is linked at fixed addresses). Validates HLR-059's qOffsets handler against live silicon.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-08"/><trace target="LLR" ref="LLR-RSP-22"/></traces>
+      </test>
+
+      <test name="D6_rsp_monitor_info_verb">
+        <purpose><![CDATA[Send `qRcmd,696e666f` (the hex-encoded ASCII string `info`) and assert the reply payload is non-empty and does not begin with `E` (i.e. is not an `Exx` error code). Validates HLR-055's `monitor info` verb wiring against live silicon.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-08"/><trace target="LLR" ref="LLR-MON-01"/></traces>
+      </test>
+
+      <test name="D7_rsp_Z2_z2_sram_watchpoint_round_trip">
+        <purpose><![CDATA[Send `Z2,<sram_addr|0x800000>,1` (set 1-byte data-access watchpoint on the configured SRAM scratch address) followed by `z2,<sram_addr|0x800000>,1`. Assert both replies are `OK`. Validates HLR-056's DABP set+clear path end-to-end against live silicon.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-08"/><trace target="LLR" ref="LLR-RSP-26"/></traces>
+      </test>
+
+      <test name="D8_rsp_vRun_reload_returns_Tstop">
+        <purpose><![CDATA[Send `vRun;` and assert the reply payload begins with `T` (any stop signal — typically `T05` SIGTRAP after run-to-main). Validates HLR-058's vRun handler — full reload + reset + halt-at-entry — against live silicon.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-08"/><trace target="LLR" ref="LLR-RSP-18"/></traces>
+      </test>
+
+      <test name="D9_rsp_vFlashErase_vFlashDone_smoke">
+        <purpose><![CDATA[Destructive — opt-in via `--with-nvm`. Send `vFlashErase:<flash_page>,200` and assert reply is `OK`; then send `vFlashDone` and assert reply is `OK`. Erases one 512-byte FLASH page on live silicon; the subsequent vFlashDone flushes an all-0xFF buffer (the cleared state) which is a valid no-op. Validates HLR-053's vFlash* state machine end-to-end.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-08"/><trace target="LLR" ref="LLR-RSP-32"/><trace target="LLR" ref="LLR-RSP-34"/></traces>
+      </test>
+
+      <test name="D10_rsp_Z0_z0_sw_bp_flash_break_round_trip">
+        <purpose><![CDATA[Destructive — opt-in via `--with-nvm` AND must run after D9 so the FLASH page baseline is 0xFF. Send `Z0,<flash_page>,2` and assert reply is `OK`; then `m<flash_page>,2` and assert the 4-character hex payload equals `9895` (AVR `BREAK` opcode `0x9598` little-endian); then `z0,<flash_page>,2` and assert reply is `OK`. Validates HLR-054's full SW-BP install/restore loop — FLASH patch with BREAK, read-back, and restore of original opcode — against live silicon.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-08"/><trace target="LLR" ref="LLR-RSP-36"/><trace target="LLR" ref="LLR-RSP-37"/><trace target="LLR" ref="LLR-RSP-38"/></traces>
       </test>
 
       <test name="F1_autobaud_picks_reliable_rung">

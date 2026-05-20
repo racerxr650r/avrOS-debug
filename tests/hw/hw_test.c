@@ -1044,6 +1044,33 @@ static void drain_socket(int fd)
     }
 }
 
+/* Compute the GDB RSP modulo-256 checksum and ship `+$<payload>#XX` to the
+ * server. Used by the Phase-10 D4..D10 acceptance smoke tests. Returns 0 on
+ * success or -1 on a short write. */
+static int send_rsp(int fd, const char *payload)
+{
+    uint8_t cs = 0;
+    for (const char *p = payload; *p; ++p) cs = (uint8_t)(cs + (uint8_t)*p);
+    char frame[512];
+    int  n = snprintf(frame, sizeof frame, "+$%s#%02x", payload, cs);
+    if (n < 0 || (size_t)n >= sizeof frame) return -1;
+    return write(fd, frame, (size_t)n) == n ? 0 : -1;
+}
+
+/* Extract the `$...#` payload from a raw server reply buffer. Returns the
+ * payload length in *out_len or -1 if no complete packet was framed. */
+static int rsp_payload(const char *buf, ssize_t n, const char **out_p,
+                       size_t *out_len)
+{
+    const char *dollar = memchr(buf, '$', (size_t)n);
+    if (!dollar) return -1;
+    const char *hash = memchr(dollar, '#', (size_t)n - (size_t)(dollar - buf));
+    if (!hash) return -1;
+    *out_p   = dollar + 1;
+    *out_len = (size_t)(hash - dollar - 1);
+    return 0;
+}
+
 static void run_groupD(const HwCfg *cfg)
 {
     char why[160];
@@ -1160,6 +1187,158 @@ static void run_groupD(const HwCfg *cfg)
                 }
             }
         }
+    }
+
+    /* ── Phase-10 RSP surface acceptance (HLR-053..-056, -058, -059) ── */
+    char buf[1024];
+    ssize_t n;
+    const char *pay; size_t paylen;
+
+    /* D4: qC reports a current-thread id (HLR-059). */
+    drain_socket(sock);
+    t0 = now_ms();
+    if (send_rsp(sock, "qC") != 0) {
+        report_fail("D4", "qC current thread", "send failed");
+    } else {
+        n = read_rsp_packet(sock, buf, sizeof buf, 1500);
+        if (n > 0 && rsp_payload(buf, n, &pay, &paylen) == 0 &&
+            paylen >= 3 && memcmp(pay, "QC", 2) == 0) {
+            report_pass("D4", "qC current thread", now_ms() - t0);
+        } else {
+            report_fail("D4", "qC current thread", "no QC<tid> reply");
+        }
+    }
+
+    /* D5: qOffsets returns Text=0;Data=0;Bss=0 (HLR-059). */
+    drain_socket(sock);
+    t0 = now_ms();
+    if (send_rsp(sock, "qOffsets") != 0) {
+        report_fail("D5", "qOffsets section bases", "send failed");
+    } else {
+        n = read_rsp_packet(sock, buf, sizeof buf, 1500);
+        if (n > 0 && rsp_payload(buf, n, &pay, &paylen) == 0 &&
+            paylen >= 5 && memcmp(pay, "Text=", 5) == 0) {
+            report_pass("D5", "qOffsets section bases", now_ms() - t0);
+        } else {
+            report_fail("D5", "qOffsets section bases", "no Text= in reply");
+        }
+    }
+
+    /* D6: monitor info verb via qRcmd (HLR-055). 'info' = 696e666f. */
+    drain_socket(sock);
+    t0 = now_ms();
+    if (send_rsp(sock, "qRcmd,696e666f") != 0) {
+        report_fail("D6", "monitor info verb", "send failed");
+    } else {
+        n = read_rsp_packet(sock, buf, sizeof buf, 1500);
+        if (n > 0 && rsp_payload(buf, n, &pay, &paylen) == 0 && paylen > 0 &&
+            memcmp(pay, "E", 1) != 0) {
+            report_pass("D6", "monitor info verb", now_ms() - t0);
+        } else {
+            report_fail("D6", "monitor info verb", "empty/error reply");
+        }
+    }
+
+    /* D7: Z2/z2 SRAM data-access watchpoint set+clear (HLR-056). */
+    drain_socket(sock);
+    t0 = now_ms();
+    {
+        char z2pkt[64], zz2pkt[64];
+        snprintf(z2pkt,  sizeof z2pkt,  "Z2,%X,1", (unsigned)(cfg->sram_addr |
+                                                              0x800000u));
+        snprintf(zz2pkt, sizeof zz2pkt, "z2,%X,1", (unsigned)(cfg->sram_addr |
+                                                              0x800000u));
+        int ok = 0;
+        if (send_rsp(sock, z2pkt) == 0) {
+            n = read_rsp_packet(sock, buf, sizeof buf, 1500);
+            if (n > 0 && rsp_payload(buf, n, &pay, &paylen) == 0 &&
+                paylen == 2 && memcmp(pay, "OK", 2) == 0) ok = 1;
+        }
+        drain_socket(sock);
+        if (ok && send_rsp(sock, zz2pkt) == 0) {
+            n = read_rsp_packet(sock, buf, sizeof buf, 1500);
+            if (!(n > 0 && rsp_payload(buf, n, &pay, &paylen) == 0 &&
+                  paylen == 2 && memcmp(pay, "OK", 2) == 0)) ok = 0;
+        }
+        if (ok) report_pass("D7", "Z2/z2 SRAM watchpoint", now_ms() - t0);
+        else    report_fail("D7", "Z2/z2 SRAM watchpoint", "non-OK reply");
+    }
+
+    /* D8: vRun reload returns a T-stop packet (HLR-058). */
+    drain_socket(sock);
+    t0 = now_ms();
+    if (send_rsp(sock, "vRun;") != 0) {
+        report_fail("D8", "vRun reload + T-stop", "send failed");
+    } else {
+        n = read_rsp_packet(sock, buf, sizeof buf, 3000);
+        if (n > 0 && rsp_payload(buf, n, &pay, &paylen) == 0 &&
+            paylen >= 3 && pay[0] == 'T') {
+            report_pass("D8", "vRun reload + T-stop", now_ms() - t0);
+        } else {
+            report_fail("D8", "vRun reload + T-stop", "no T-reply");
+        }
+    }
+
+    /* D9: vFlashErase + vFlashDone smoke (HLR-053). DESTRUCTIVE — gated by
+     * --with-nvm because it erases one FLASH page. */
+    if (!cfg->with_nvm) {
+        report_skip("D9", "vFlashErase+vFlashDone smoke",
+                    "opt-in via --with-nvm (DESTRUCTIVE)");
+        report_skip("D10", "Z0/z0 SW BP via FLASH BREAK",
+                    "opt-in via --with-nvm (DESTRUCTIVE)");
+    } else {
+        drain_socket(sock);
+        t0 = now_ms();
+        char vfe[64];
+        snprintf(vfe, sizeof vfe, "vFlashErase:%X,200",
+                 (unsigned)cfg->flash_page);
+        int ok = 0;
+        if (send_rsp(sock, vfe) == 0) {
+            n = read_rsp_packet(sock, buf, sizeof buf, 5000);
+            if (n > 0 && rsp_payload(buf, n, &pay, &paylen) == 0 &&
+                paylen == 2 && memcmp(pay, "OK", 2) == 0) ok = 1;
+        }
+        drain_socket(sock);
+        if (ok && send_rsp(sock, "vFlashDone") == 0) {
+            n = read_rsp_packet(sock, buf, sizeof buf, 10000);
+            if (!(n > 0 && rsp_payload(buf, n, &pay, &paylen) == 0 &&
+                  paylen == 2 && memcmp(pay, "OK", 2) == 0)) ok = 0;
+        }
+        if (ok) report_pass("D9", "vFlashErase+vFlashDone smoke",
+                            now_ms() - t0);
+        else    report_fail("D9", "vFlashErase+vFlashDone smoke",
+                            "non-OK reply");
+
+        /* D10: Z0 patches FLASH with BREAK opcode; z0 restores (HLR-054).
+         * After the D9 erase, the page reads 0xFF — perfect baseline. */
+        drain_socket(sock);
+        t0 = now_ms();
+        char z0pkt[64], zz0pkt[64], mread[64];
+        snprintf(z0pkt,  sizeof z0pkt,  "Z0,%X,2", (unsigned)cfg->flash_page);
+        snprintf(zz0pkt, sizeof zz0pkt, "z0,%X,2", (unsigned)cfg->flash_page);
+        snprintf(mread,  sizeof mread,  "m%X,2",   (unsigned)cfg->flash_page);
+        int ok2 = 0;
+        if (send_rsp(sock, z0pkt) == 0) {
+            n = read_rsp_packet(sock, buf, sizeof buf, 5000);
+            if (n > 0 && rsp_payload(buf, n, &pay, &paylen) == 0 &&
+                paylen == 2 && memcmp(pay, "OK", 2) == 0) ok2 = 1;
+        }
+        drain_socket(sock);
+        if (ok2 && send_rsp(sock, mread) == 0) {
+            n = read_rsp_packet(sock, buf, sizeof buf, 2000);
+            if (!(n > 0 && rsp_payload(buf, n, &pay, &paylen) == 0 &&
+                  paylen == 4 && memcmp(pay, "9895", 4) == 0)) ok2 = 0;
+        }
+        drain_socket(sock);
+        if (ok2 && send_rsp(sock, zz0pkt) == 0) {
+            n = read_rsp_packet(sock, buf, sizeof buf, 5000);
+            if (!(n > 0 && rsp_payload(buf, n, &pay, &paylen) == 0 &&
+                  paylen == 2 && memcmp(pay, "OK", 2) == 0)) ok2 = 0;
+        }
+        if (ok2) report_pass("D10", "Z0/z0 SW BP via FLASH BREAK",
+                             now_ms() - t0);
+        else     report_fail("D10", "Z0/z0 SW BP via FLASH BREAK",
+                             "BREAK opcode not observed");
     }
 
     close(sock);
