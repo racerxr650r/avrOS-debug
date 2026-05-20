@@ -203,7 +203,8 @@ TEST_WRAP_test_monitor  := updi_mem_read rsp_send_packet \
                             updi_enter_debug updi_halt updi_run \
                             updi_chip_erase \
                             fsm_invalidate fsm_get_active_thread \
-                            rsp_hw_bp_clear_all rsp_hw_wp_clear_all
+                            rsp_hw_bp_clear_all rsp_hw_wp_clear_all \
+                            rsp_sw_bp_clear_all
 TEST_EXTRA_LDFLAGS_test_monitor :=
 
 # test_rsp
@@ -212,7 +213,8 @@ TEST_SRCS_test_rsp := $(TESTDIR)/test_rsp.c \
                        $(SRCDIR)/fsm_mapper.c \
                        $(SRCDIR)/monitor.c
 TEST_WRAP_test_rsp  := updi_mem_read updi_mem_write updi_halt updi_run updi_step \
-                       updi_nvm_write_flash updi_console_poll \
+                       updi_nvm_write_flash updi_nvm_flash_patch \
+                       updi_console_poll \
                        updi_enter_debug updi_chip_erase \
                        updi_ocd_poll_halted updi_ocd_read_halt_status \
                        updi_ocd_read_gpr updi_ocd_write_gpr \

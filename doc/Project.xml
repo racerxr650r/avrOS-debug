@@ -2299,6 +2299,34 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="HLR" ref="HLR-053" name="Flash Programming via GDB load"/>
         </traces>
       </llr>
+
+      <llr id="LLR-RSP-36">
+        <text><![CDATA[The `dh_insert_bp()` default handler shall route `Z0,<addr>[,<kind>]` to a software-breakpoint installer when `ctx->bp_mode == RSP_BP_MODE_SW` (the default) and to the legacy hardware-comparator path when `ctx->bp_mode == RSP_BP_MODE_HW_ONLY` (per HLR-055 `monitor bp-mode hw-only`). Addresses with the `GDB_AVR_DATA_FLAG` (0x800000) bit set — EEPROM, USERROW, FUSES, LOCK, SIGROW — shall be refused with `E22` because the AVR `BREAK` opcode is only meaningful when fetched from FLASH. A duplicate `Z0` on an address already shadowed shall reply `OK` without re-patching. When all `RSP_MAX_SW_BREAKPOINTS` (64) shadow slots are occupied the handler shall reply `E08`. Z1 packets continue to alias to the two OCD HW comparators regardless of `bp_mode` (HLR-016).]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-054" name="True Software Breakpoints via Flash BREAK Opcode"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-37">
+        <text><![CDATA[The SW-BP install path shall, for each `Z0` accepted in `RSP_BP_MODE_SW`, (1) snapshot R0–R31 via `updi_ocd_read_gpr()`, SREG via `updi_ocd_read_sreg()`, SP via `updi_ocd_read_sp()`, and PC via `updi_ocd_read_pc()`; (2) read the 2-byte original opcode at `UPDI_FLASH_BASE + (addr & GDB_AVR_ADDR_MASK)` via `updi_mem_read()`; (3) write `{0x98, 0x95}` (`BREAK` opcode, little-endian) to the same FLASH word via `updi_nvm_flash_patch()`; (4) call `updi_enter_debug()` to leave NVMPROG and re-enter OCD; (5) restore R0–R31, SREG, SP, and PC via the matching `updi_ocd_write_*()` primitives; and (6) record `(addr, orig[0], orig[1], in_use=true)` in the first free `RspContext.sw_bp[]` slot. Any UPDI link error during the sequence shall cause the handler to reply `E01` without partially populating the shadow slot.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-054" name="True Software Breakpoints via Flash BREAK Opcode"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-38">
+        <text><![CDATA[The `dh_remove_bp()` default handler, on `z0,<addr>` in `RSP_BP_MODE_SW`, shall scan `ctx->sw_bp[]` for a slot whose `addr` matches and, when found, repeat the snapshot/patch/restore sequence of LLR-RSP-37 — writing the saved `orig[0..1]` bytes back to FLASH at `UPDI_FLASH_BASE + (addr & GDB_AVR_ADDR_MASK)` — then mark the slot `in_use=false` and reply `OK`. When no SW shadow slot matches, the handler shall fall through to the HW-comparator removal path so a `z0` after a `monitor bp-mode` toggle still drains both shadow tables. A UPDI link error during the FLASH patch shall reply `E01`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-054" name="True Software Breakpoints via Flash BREAK Opcode"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-39">
+        <text><![CDATA[The helper `rsp_sw_bp_clear_all(RspContext *ctx)` shall clear every entry in `ctx->sw_bp[]` (`in_use=false`, `addr=0`, `orig[0]=orig[1]=0`) without issuing any UPDI I/O. It shall be invoked by `dh_vflash_done()` (HLR-053) on successful flush, and by the `monitor reset` / `monitor erase` / `monitor chip-erase` verbs (HLR-055) immediately after their UPDI side-effect, because the underlying FLASH instruction (and therefore the `BREAK` opcode that would otherwise persist) is no longer present.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-054" name="True Software Breakpoints via Flash BREAK Opcode"/>
+        </traces>
+      </llr>
     </function>
 
     <function number="5" title="src/elf_parser.c — ELF Binary Parser" name="elf" source="src/elf_parser.c">
@@ -3075,7 +3103,7 @@ Errors are propagated upward through the module stack without retrying:
     <!-- ============================================================ -->
     <!-- src/gdb_rsp.c unit tests                                     -->
     <!-- ============================================================ -->
-    <file path="tests/test_rsp.c" role="unit" count="60">
+    <file path="tests/test_rsp.c" role="unit" count="68">
       <header><![CDATA[Unit tests for `src/gdb_rsp.c`: socket configuration, RSP packet framing, register and memory handlers, hardware-breakpoint comparator management, OCD-based execution control, async Ctrl-C interrupt, detach cleanup, session lifecycle packets, and monitor relay. Uses a `socketpair()` as a drop-in socket substitute and replaces every `updi_*`, `fsm_*`, and `monitor_dispatch` call site with `ld --wrap` mocks so all tests run without real silicon.]]></header>
 
       <test name="rsp_listen_sets_so_reuseaddr_before_bind">
@@ -3382,6 +3410,46 @@ Errors are propagated upward through the module stack without retrying:
       <test name="qSupported_advertises_vFlash_packets">
         <purpose><![CDATA[Dispatch `qSupported:multiprocess+` and verify the reply payload contains the substrings `vFlashErase+`, `vFlashWrite+`, and `vFlashDone+`.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-35"/></traces>
+      </test>
+
+      <test name="Z0_in_sw_mode_patches_BREAK_opcode_via_flash_patch">
+        <purpose><![CDATA[With default `bp_mode == RSP_BP_MODE_SW`, dispatch `Z0,400,2` and verify the reply is `OK`, `updi_nvm_flash_patch()` was invoked exactly once with `addr == UPDI_FLASH_BASE + 0x400`, `len == 2`, and payload `{0x98, 0x95}` (the AVR `BREAK` opcode little-endian), while no HW comparator was touched.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-36"/></traces>
+      </test>
+
+      <test name="Z0_in_sw_mode_records_original_opcode_from_flash">
+        <purpose><![CDATA[Pre-load the `__wrap_updi_mem_read()` canned buffer with `{0xCD, 0xAB}`, dispatch `Z0,500,2`, and verify `ctx.sw_bp[0]` is `{addr=0x500, orig={0xCD, 0xAB}, in_use=true}`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-37"/></traces>
+      </test>
+
+      <test name="z0_in_sw_mode_restores_original_opcode">
+        <purpose><![CDATA[Pre-load the canned read buffer with `{0x42, 0xC9}`, dispatch `Z0,600,2` followed by `z0,600,2`, and verify two `updi_nvm_flash_patch()` calls were made — the second writing `{0x42, 0xC9}` back to `UPDI_FLASH_BASE + 0x600` — and that `ctx.sw_bp[0].in_use == false` afterward.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-38"/></traces>
+      </test>
+
+      <test name="Z0_in_sw_mode_refuses_data_space_address_with_E22">
+        <purpose><![CDATA[Dispatch `Z0,810000,2` (data-space address with `GDB_AVR_DATA_FLAG` set, EEPROM window) and verify the reply is `E22`, `updi_nvm_flash_patch()` was not called, and `ctx.sw_bp[0].in_use == false`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-36"/></traces>
+      </test>
+
+      <test name="Z0_in_sw_mode_snapshots_and_restores_cpu_state">
+        <purpose><![CDATA[Pre-load `mock_ocd_gpr[i] = 0x10 + i`, `mock_ocd_sreg = 0xAA`, `mock_ocd_sp = 0xBEEF`, `mock_ocd_pc = 0xCAFE`, dispatch `Z0,700,2`, and verify ≥32 GPR writes, ≥1 SREG write, ≥1 SP write, and ≥1 PC write were observed, and that the shadow mock state still matches the pre-load values after the round-trip.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-37"/></traces>
+      </test>
+
+      <test name="Z0_in_hw_only_mode_falls_back_to_HW_BP_path">
+        <purpose><![CDATA[Set `ctx.bp_mode = RSP_BP_MODE_HW_ONLY`, dispatch `Z0,800,2`, and verify `mock_hw_bp_set_calls == 1`, `mock_flash_patch_count == 0`, and `ctx.sw_bp[0].in_use == false` — preserving the Phase 1–8 legacy semantics.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-36"/></traces>
+      </test>
+
+      <test name="Z0_in_sw_mode_idempotent_on_same_address">
+        <purpose><![CDATA[Dispatch `Z0,900,2` twice and verify `mock_flash_patch_count == 1` — the second install on a shadowed address shall reply `OK` without re-patching FLASH.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-36"/></traces>
+      </test>
+
+      <test name="vFlashDone_also_clears_sw_bp_shadow">
+        <purpose><![CDATA[Install a SW breakpoint via `Z0,A00,2`, run a `vFlashErase:0,200` / `vFlashDone` cycle, and verify `ctx.sw_bp[0].in_use == false` afterward — the BREAK opcode is no longer in FLASH so the shadow must be dropped.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-39"/></traces>
       </test>
     </file>
 

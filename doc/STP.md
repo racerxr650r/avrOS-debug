@@ -111,7 +111,7 @@ Role: **unit**. **47 test(s).**
 
 ### 3.3. [tests/test_rsp.c](../tests/test_rsp.c)
 
-Role: **unit**. **60 test(s).**
+Role: **unit**. **68 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -175,6 +175,14 @@ Role: **unit**. **60 test(s).**
 | 58 | <a id="vFlashDone_with_no_active_transaction_replies_ok_noop"></a>`vFlashDone_with_no_active_transaction_replies_ok_noop` | `LLR-RSP-34` | Dispatch `vFlashDone` with no preceding `vFlashErase` and verify reply is `OK` and `mock_flash_write_count==0` (no FLASH writes attempted). |
 | 59 | <a id="m_packet_mid_vflash_transaction_aborts_and_returns_E22"></a>`m_packet_mid_vflash_transaction_aborts_and_returns_E22` | `LLR-RSP-34` | After `vFlashErase:0,200`, dispatch `m800100,4` and verify reply is `E22` and `ctx.flash_xact_buf` is NULL (the abort path freed the in-progress buffer). |
 | 60 | <a id="qSupported_advertises_vFlash_packets"></a>`qSupported_advertises_vFlash_packets` | `LLR-RSP-35` | Dispatch `qSupported:multiprocess+` and verify the reply payload contains the substrings `vFlashErase+`, `vFlashWrite+`, and `vFlashDone+`. |
+| 61 | <a id="Z0_in_sw_mode_patches_BREAK_opcode_via_flash_patch"></a>`Z0_in_sw_mode_patches_BREAK_opcode_via_flash_patch` | `LLR-RSP-36` | With default `bp_mode == RSP_BP_MODE_SW`, dispatch `Z0,400,2` and verify the reply is `OK`, `updi_nvm_flash_patch()` was invoked exactly once with `addr == UPDI_FLASH_BASE + 0x400`, `len == 2`, and payload `{0x98, 0x95}` (the AVR `BREAK` opcode little-endian), while no HW comparator was touched. |
+| 62 | <a id="Z0_in_sw_mode_records_original_opcode_from_flash"></a>`Z0_in_sw_mode_records_original_opcode_from_flash` | `LLR-RSP-37` | Pre-load the `__wrap_updi_mem_read()` canned buffer with `{0xCD, 0xAB}`, dispatch `Z0,500,2`, and verify `ctx.sw_bp[0]` is `{addr=0x500, orig={0xCD, 0xAB}, in_use=true}`. |
+| 63 | <a id="z0_in_sw_mode_restores_original_opcode"></a>`z0_in_sw_mode_restores_original_opcode` | `LLR-RSP-38` | Pre-load the canned read buffer with `{0x42, 0xC9}`, dispatch `Z0,600,2` followed by `z0,600,2`, and verify two `updi_nvm_flash_patch()` calls were made — the second writing `{0x42, 0xC9}` back to `UPDI_FLASH_BASE + 0x600` — and that `ctx.sw_bp[0].in_use == false` afterward. |
+| 64 | <a id="Z0_in_sw_mode_refuses_data_space_address_with_E22"></a>`Z0_in_sw_mode_refuses_data_space_address_with_E22` | `LLR-RSP-36` | Dispatch `Z0,810000,2` (data-space address with `GDB_AVR_DATA_FLAG` set, EEPROM window) and verify the reply is `E22`, `updi_nvm_flash_patch()` was not called, and `ctx.sw_bp[0].in_use == false`. |
+| 65 | <a id="Z0_in_sw_mode_snapshots_and_restores_cpu_state"></a>`Z0_in_sw_mode_snapshots_and_restores_cpu_state` | `LLR-RSP-37` | Pre-load `mock_ocd_gpr[i] = 0x10 + i`, `mock_ocd_sreg = 0xAA`, `mock_ocd_sp = 0xBEEF`, `mock_ocd_pc = 0xCAFE`, dispatch `Z0,700,2`, and verify ≥32 GPR writes, ≥1 SREG write, ≥1 SP write, and ≥1 PC write were observed, and that the shadow mock state still matches the pre-load values after the round-trip. |
+| 66 | <a id="Z0_in_hw_only_mode_falls_back_to_HW_BP_path"></a>`Z0_in_hw_only_mode_falls_back_to_HW_BP_path` | `LLR-RSP-36` | Set `ctx.bp_mode = RSP_BP_MODE_HW_ONLY`, dispatch `Z0,800,2`, and verify `mock_hw_bp_set_calls == 1`, `mock_flash_patch_count == 0`, and `ctx.sw_bp[0].in_use == false` — preserving the Phase 1–8 legacy semantics. |
+| 67 | <a id="Z0_in_sw_mode_idempotent_on_same_address"></a>`Z0_in_sw_mode_idempotent_on_same_address` | `LLR-RSP-36` | Dispatch `Z0,900,2` twice and verify `mock_flash_patch_count == 1` — the second install on a shadowed address shall reply `OK` without re-patching FLASH. |
+| 68 | <a id="vFlashDone_also_clears_sw_bp_shadow"></a>`vFlashDone_also_clears_sw_bp_shadow` | `LLR-RSP-39` | Install a SW breakpoint via `Z0,A00,2`, run a `vFlashErase:0,200` / `vFlashDone` cycle, and verify `ctx.sw_bp[0].in_use == false` afterward — the BREAK opcode is no longer in FLASH so the shadow must be dropped. |
 
 ### 3.4. [tests/test_elf.c](../tests/test_elf.c)
 
@@ -406,6 +414,10 @@ verified by code review — see
 | `LLR-RSP-33` | `rsp` | `HLR-053` | `vFlashWrite_copies_payload_into_buffer_at_offset`, `vFlashWrite_decodes_0x7D_xor_0x20_binary_escape` |
 | `LLR-RSP-34` | `rsp` | `HLR-053` | `vFlashDone_flushes_buffer_via_nvm_write_flash_and_replies_ok`, `vFlashDone_with_no_active_transaction_replies_ok_noop`, `m_packet_mid_vflash_transaction_aborts_and_returns_E22` |
 | `LLR-RSP-35` | `rsp` | `HLR-053` | `qSupported_advertises_vFlash_packets` |
+| `LLR-RSP-36` | `rsp` | `HLR-054` | `Z0_in_sw_mode_patches_BREAK_opcode_via_flash_patch`, `Z0_in_sw_mode_refuses_data_space_address_with_E22`, `Z0_in_hw_only_mode_falls_back_to_HW_BP_path`, `Z0_in_sw_mode_idempotent_on_same_address` |
+| `LLR-RSP-37` | `rsp` | `HLR-054` | `Z0_in_sw_mode_records_original_opcode_from_flash`, `Z0_in_sw_mode_snapshots_and_restores_cpu_state` |
+| `LLR-RSP-38` | `rsp` | `HLR-054` | `z0_in_sw_mode_restores_original_opcode` |
+| `LLR-RSP-39` | `rsp` | `HLR-054` | `vFlashDone_also_clears_sw_bp_shadow` |
 | `LLR-ELF-01` | `elf` | `HLR-021` | `elf_open_accepts_valid_avr_elf32_binary`, `elf_open_returns_minus1_on_invalid_elf_magic`, `elf_open_returns_minus1_on_wrong_machine_type` |
 | `LLR-ELF-02` | `elf` | `HLR-021`, `HLR-040` | `elf_open_loads_symtab_and_strtab_into_heap_buffers`, `elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure` |
 | `LLR-ELF-03` | `elf` | `HLR-021` | `elf_find_avros_tables_performs_single_linear_scan`, `elf_find_avros_tables_populates_all_7_avros_sentinel_fields` |

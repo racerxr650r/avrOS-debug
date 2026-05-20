@@ -274,6 +274,7 @@ static int verb_reset(int rsp_fd, RspContext *ctx)
     if (updi_enter_debug(ctx->updi_fd) < 0) return -1;
     rsp_hw_bp_clear_all(ctx);
     rsp_hw_wp_clear_all(ctx);
+    rsp_sw_bp_clear_all(ctx);   /* HLR-054 */
     if (ctx->fsm != NULL) fsm_invalidate(ctx->fsm);
     (void)o_line(rsp_fd, "target reset, halted at reset vector\n");
     return 0;
@@ -311,6 +312,7 @@ static int verb_erase(int rsp_fd, RspContext *ctx)
     if (updi_enter_debug(ctx->updi_fd) < 0) return -1;
     rsp_hw_bp_clear_all(ctx);
     rsp_hw_wp_clear_all(ctx);
+    rsp_sw_bp_clear_all(ctx);   /* HLR-054 */
     if (ctx->fsm != NULL) fsm_invalidate(ctx->fsm);
     (void)o_line(rsp_fd, "chip-erase complete; target halted\n");
     return 0;

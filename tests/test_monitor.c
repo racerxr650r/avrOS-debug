@@ -86,6 +86,7 @@ static int g_chip_erase_rc;
 static int g_fsm_invalidate_calls;
 static int g_hw_bp_clear_calls;
 static int g_hw_wp_clear_calls;
+static int g_sw_bp_clear_calls;
 
 int __wrap_updi_enter_debug(int fd)
 {
@@ -112,6 +113,10 @@ void __wrap_rsp_hw_wp_clear_all(struct RspContext *c)
 {
     (void)c; g_hw_wp_clear_calls++;
 }
+void __wrap_rsp_sw_bp_clear_all(struct RspContext *c)
+{
+    (void)c; g_sw_bp_clear_calls++;
+}
 
 /* Override __wrap_updi_halt above's RC: we keep the counter but allow
  * tests to inject a non-zero return.  Redefine via a thin shim: */
@@ -122,6 +127,7 @@ static void hlr055_mock_reset(void)
     g_chip_erase_calls = 0;  g_chip_erase_rc = 0;
     g_fsm_invalidate_calls = 0;
     g_hw_bp_clear_calls = 0; g_hw_wp_clear_calls = 0;
+    g_sw_bp_clear_calls = 0;
     g_halt_rc = 0;
 }
 

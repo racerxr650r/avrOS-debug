@@ -48,6 +48,9 @@ static MockMemOp mock_writes[MAX_MOCK_CALLS];
 static int       mock_write_count;
 static MockMemOp mock_flash_writes[MAX_MOCK_CALLS];
 static int       mock_flash_write_count;
+/* HLR-054: updi_nvm_flash_patch records (used by SW BP install/remove). */
+static MockMemOp mock_flash_patches[MAX_MOCK_CALLS];
+static int       mock_flash_patch_count;
 static MockMemOp mock_reads[MAX_MOCK_CALLS];
 static int       mock_read_count;
 static uint8_t   mock_read_canned[64];
@@ -163,6 +166,23 @@ int __wrap_updi_nvm_write_flash(int fd, uint32_t addr, const uint8_t *buf, size_
         size_t n = len < sizeof mock_flash_writes[0].data ? len : sizeof mock_flash_writes[0].data;
         memcpy(mock_flash_writes[mock_flash_write_count].data, buf, n);
         ++mock_flash_write_count;
+    }
+    return 0;
+}
+
+/* HLR-054: software-breakpoint FLASH RMW.  Captures the call args so
+ * SW BP install/remove tests can verify BREAK / original opcodes.    */
+int __wrap_updi_nvm_flash_patch(int fd, uint32_t addr,
+                                const uint8_t *buf, size_t len)
+{
+    (void)fd;
+    if (mock_flash_patch_count < MAX_MOCK_CALLS) {
+        mock_flash_patches[mock_flash_patch_count].addr = addr;
+        mock_flash_patches[mock_flash_patch_count].len  = len;
+        size_t n = len < sizeof mock_flash_patches[0].data ? len
+                                                           : sizeof mock_flash_patches[0].data;
+        memcpy(mock_flash_patches[mock_flash_patch_count].data, buf, n);
+        ++mock_flash_patch_count;
     }
     return 0;
 }
@@ -393,8 +413,10 @@ static void reset_mocks(void)
     mock_run_calls = mock_step_calls = mock_invalidate_calls = 0;
     mock_halt_calls = mock_build_calls = 0;
     mock_write_count = mock_flash_write_count = mock_read_count = 0;
+    mock_flash_patch_count = 0;
     memset(mock_writes, 0, sizeof mock_writes);
     memset(mock_flash_writes, 0, sizeof mock_flash_writes);
+    memset(mock_flash_patches, 0, sizeof mock_flash_patches);
     memset(mock_reads, 0, sizeof mock_reads);
     memset(mock_read_canned, 0, sizeof mock_read_canned);
     mock_read_canned_len = 0;
@@ -654,6 +676,7 @@ static void on_write_mem_X_calls_nvm_write_flash_for_flash_address(void)
 static void on_insert_bp_calls_updi_ocd_set_hw_bp_with_byte_addr(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    ctx.bp_mode = RSP_BP_MODE_HW_ONLY;   /* legacy Z0→HW path */
     rsp_dispatch(sock_pair[1], "Z0,200,2", &h);
     char stream[64]; drain(sock_pair[0], stream, sizeof stream);
     char payload[64];
@@ -668,6 +691,7 @@ static void on_insert_bp_calls_updi_ocd_set_hw_bp_with_byte_addr(void)
 static void on_insert_bp_second_slot_succeeds(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    ctx.bp_mode = RSP_BP_MODE_HW_ONLY;
     rsp_dispatch(sock_pair[1], "Z0,200,2", &h);
     rsp_dispatch(sock_pair[1], "Z0,400,2", &h);
     TEST_ASSERT_EQUAL(2, mock_hw_bp_set_calls);
@@ -678,6 +702,7 @@ static void on_insert_bp_second_slot_succeeds(void)
 static void on_insert_bp_duplicate_returns_ok_without_reprogramming(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    ctx.bp_mode = RSP_BP_MODE_HW_ONLY;
     rsp_dispatch(sock_pair[1], "Z0,201,2", &h);
     rsp_dispatch(sock_pair[1], "Z0,201,2", &h);
     TEST_ASSERT_EQUAL(1, mock_hw_bp_set_calls);
@@ -688,6 +713,7 @@ static void on_insert_bp_duplicate_returns_ok_without_reprogramming(void)
 static void on_remove_bp_calls_updi_ocd_clear_hw_bp(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    ctx.bp_mode = RSP_BP_MODE_HW_ONLY;
     rsp_dispatch(sock_pair[1], "Z0,300,2", &h);
     rsp_dispatch(sock_pair[1], "z0,300,2", &h);
     TEST_ASSERT_EQUAL(1, mock_hw_bp_clear_calls);
@@ -710,6 +736,7 @@ static void on_remove_bp_unknown_address_returns_ok_for_resync(void)
 static void on_insert_bp_returns_E08_when_both_slots_occupied(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    ctx.bp_mode = RSP_BP_MODE_HW_ONLY;
     rsp_dispatch(sock_pair[1], "Z0,200,2", &h);
     rsp_dispatch(sock_pair[1], "Z0,400,2", &h);
     char drain_buf[256]; drain(sock_pair[0], drain_buf, sizeof drain_buf);
@@ -854,6 +881,7 @@ static void on_detach_D_resumes_target_closes_socket_resets_gdb_fd(void)
 static void on_detach_clears_hw_bps_before_run(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    ctx.bp_mode = RSP_BP_MODE_HW_ONLY;
     rsp_dispatch(sock_pair[1], "Z0,200,2", &h);
     rsp_dispatch(sock_pair[1], "Z0,400,2", &h);
     char drain_buf[256]; drain(sock_pair[0], drain_buf, sizeof drain_buf);
@@ -1335,6 +1363,124 @@ static void qSupported_advertises_vFlash_packets(void)
     TEST_ASSERT_NOT_NULL(strstr(payload, "vFlashDone+"));
 }
 
+/* ── HLR-054: true SW breakpoints via FLASH BREAK opcode ────────────── */
+
+static void Z0_in_sw_mode_patches_BREAK_opcode_via_flash_patch(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    /* default bp_mode == RSP_BP_MODE_SW */
+    rsp_dispatch(sock_pair[1], "Z0,400,2", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("OK", payload);
+    TEST_ASSERT_EQUAL(1, mock_flash_patch_count);
+    TEST_ASSERT_EQUAL(UPDI_FLASH_BASE + 0x400u, mock_flash_patches[0].addr);
+    TEST_ASSERT_EQUAL(2u, mock_flash_patches[0].len);
+    TEST_ASSERT_EQUAL_HEX8(0x98u, mock_flash_patches[0].data[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x95u, mock_flash_patches[0].data[1]);
+    /* No HW comparator should have been touched. */
+    TEST_ASSERT_EQUAL(0, mock_hw_bp_set_calls);
+}
+
+static void Z0_in_sw_mode_records_original_opcode_from_flash(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    mock_read_canned[0] = 0xCDu;
+    mock_read_canned[1] = 0xABu;
+    mock_read_canned_len = 2;
+    rsp_dispatch(sock_pair[1], "Z0,500,2", &h);
+    TEST_ASSERT_TRUE(ctx.sw_bp[0].in_use);
+    TEST_ASSERT_EQUAL(0x500u, ctx.sw_bp[0].addr);
+    TEST_ASSERT_EQUAL_HEX8(0xCDu, ctx.sw_bp[0].orig[0]);
+    TEST_ASSERT_EQUAL_HEX8(0xABu, ctx.sw_bp[0].orig[1]);
+}
+
+static void z0_in_sw_mode_restores_original_opcode(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    mock_read_canned[0] = 0x42u;
+    mock_read_canned[1] = 0xC9u;
+    mock_read_canned_len = 2;
+    rsp_dispatch(sock_pair[1], "Z0,600,2", &h);
+    char drain_buf[256]; drain(sock_pair[0], drain_buf, sizeof drain_buf);
+    rsp_dispatch(sock_pair[1], "z0,600,2", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("OK", payload);
+    TEST_ASSERT_EQUAL(2, mock_flash_patch_count);
+    /* Second patch must rewrite the saved original opcode. */
+    TEST_ASSERT_EQUAL(UPDI_FLASH_BASE + 0x600u, mock_flash_patches[1].addr);
+    TEST_ASSERT_EQUAL_HEX8(0x42u, mock_flash_patches[1].data[0]);
+    TEST_ASSERT_EQUAL_HEX8(0xC9u, mock_flash_patches[1].data[1]);
+    TEST_ASSERT_FALSE(ctx.sw_bp[0].in_use);
+}
+
+static void Z0_in_sw_mode_refuses_data_space_address_with_E22(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    rsp_dispatch(sock_pair[1], "Z0,810000,2", &h);   /* EEPROM window */
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("E22", payload);
+    TEST_ASSERT_EQUAL(0, mock_flash_patch_count);
+    TEST_ASSERT_FALSE(ctx.sw_bp[0].in_use);
+}
+
+static void Z0_in_sw_mode_snapshots_and_restores_cpu_state(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    for (int i = 0; i < 32; i++) mock_ocd_gpr[i] = (uint8_t)(0x10u + i);
+    mock_ocd_sreg = 0xAAu;
+    mock_ocd_sp   = 0xBEEFu;
+    mock_ocd_pc   = 0xCAFEu;
+    rsp_dispatch(sock_pair[1], "Z0,700,2", &h);
+    TEST_ASSERT_GREATER_OR_EQUAL(32, mock_ocd_gpr_writes);
+    TEST_ASSERT_GREATER_OR_EQUAL(1,  mock_ocd_sreg_writes);
+    TEST_ASSERT_GREATER_OR_EQUAL(1,  mock_ocd_sp_writes);
+    TEST_ASSERT_GREATER_OR_EQUAL(1,  mock_ocd_pc_writes);
+    /* The mock writes update the same shadow the reads consume, so
+     * the round-trip leaves the state intact. */
+    for (int i = 0; i < 32; i++) {
+        TEST_ASSERT_EQUAL_HEX8((uint8_t)(0x10u + i), mock_ocd_gpr[i]);
+    }
+    TEST_ASSERT_EQUAL_HEX8(0xAAu, mock_ocd_sreg);
+    TEST_ASSERT_EQUAL(0xBEEFu, mock_ocd_sp);
+    TEST_ASSERT_EQUAL(0xCAFEu, mock_ocd_pc);
+}
+
+static void Z0_in_hw_only_mode_falls_back_to_HW_BP_path(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    ctx.bp_mode = RSP_BP_MODE_HW_ONLY;
+    rsp_dispatch(sock_pair[1], "Z0,800,2", &h);
+    TEST_ASSERT_EQUAL(1, mock_hw_bp_set_calls);
+    TEST_ASSERT_EQUAL(0, mock_flash_patch_count);
+    TEST_ASSERT_FALSE(ctx.sw_bp[0].in_use);
+}
+
+static void Z0_in_sw_mode_idempotent_on_same_address(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    rsp_dispatch(sock_pair[1], "Z0,900,2", &h);
+    rsp_dispatch(sock_pair[1], "Z0,900,2", &h);
+    TEST_ASSERT_EQUAL(1, mock_flash_patch_count);
+}
+
+static void vFlashDone_also_clears_sw_bp_shadow(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    rsp_dispatch(sock_pair[1], "Z0,A00,2", &h);
+    TEST_ASSERT_TRUE(ctx.sw_bp[0].in_use);
+    char drain_buf[256]; drain(sock_pair[0], drain_buf, sizeof drain_buf);
+    rsp_dispatch(sock_pair[1], "vFlashErase:0,200", &h);
+    drain(sock_pair[0], drain_buf, sizeof drain_buf);
+    rsp_dispatch(sock_pair[1], "vFlashDone", &h);
+    TEST_ASSERT_FALSE(ctx.sw_bp[0].in_use);
+}
+
 /* ── Runner ─────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -1401,5 +1547,13 @@ int main(void)
     RUN_TEST(vFlashDone_with_no_active_transaction_replies_ok_noop);
     RUN_TEST(m_packet_mid_vflash_transaction_aborts_and_returns_E22);
     RUN_TEST(qSupported_advertises_vFlash_packets);
+    RUN_TEST(Z0_in_sw_mode_patches_BREAK_opcode_via_flash_patch);
+    RUN_TEST(Z0_in_sw_mode_records_original_opcode_from_flash);
+    RUN_TEST(z0_in_sw_mode_restores_original_opcode);
+    RUN_TEST(Z0_in_sw_mode_refuses_data_space_address_with_E22);
+    RUN_TEST(Z0_in_sw_mode_snapshots_and_restores_cpu_state);
+    RUN_TEST(Z0_in_hw_only_mode_falls_back_to_HW_BP_path);
+    RUN_TEST(Z0_in_sw_mode_idempotent_on_same_address);
+    RUN_TEST(vFlashDone_also_clears_sw_bp_shadow);
     return UNITY_END();
 }

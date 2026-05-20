@@ -283,6 +283,84 @@ void rsp_hw_wp_clear_all(RspContext *ctx)
 #define hw_bp_clear_all rsp_hw_bp_clear_all
 #define hw_wp_clear_all rsp_hw_wp_clear_all
 
+/* HLR-054: drop every SW-BP shadow entry.  Callers (vFlashDone,
+ * monitor reset, monitor chip-erase) have already destroyed the
+ * underlying FLASH instruction, so no silicon I/O is needed.        */
+void rsp_sw_bp_clear_all(RspContext *ctx)
+{
+    for (int i = 0; i < RSP_MAX_SW_BREAKPOINTS; i++) {
+        ctx->sw_bp[i].in_use = false;
+        ctx->sw_bp[i].addr   = 0;
+        ctx->sw_bp[i].orig[0] = 0;
+        ctx->sw_bp[i].orig[1] = 0;
+    }
+}
+
+/* HLR-054: AVR BREAK instruction (little-endian in FLASH).  Decoded
+ * by the AVR core as an OCD-trapping breakpoint regardless of the
+ * current debug-enable state — exactly the semantic GDB needs for a
+ * software breakpoint.                                              */
+static const uint8_t SW_BP_BREAK_BYTES[2] = { 0x98u, 0x95u };
+
+/* Snapshot R0–R31, SREG, SP, and PC via the OCD register file.
+ * Returns -1 on any UPDI link failure.                              */
+static int sw_bp_snapshot_cpu(int updi_fd, uint8_t gpr[32],
+                              uint8_t *sreg, uint16_t *sp, uint32_t *pc)
+{
+    for (int i = 0; i < 32; i++) {
+        if (updi_ocd_read_gpr(updi_fd, (uint8_t)i, &gpr[i]) < 0) return -1;
+    }
+    if (updi_ocd_read_sreg(updi_fd, sreg) < 0) return -1;
+    if (updi_ocd_read_sp  (updi_fd, sp)   < 0) return -1;
+    if (updi_ocd_read_pc  (updi_fd, pc)   < 0) return -1;
+    return 0;
+}
+
+/* Restore the register file after the NVMPROG → OCD round-trip.    */
+static int sw_bp_restore_cpu(int updi_fd, const uint8_t gpr[32],
+                             uint8_t sreg, uint16_t sp, uint32_t pc)
+{
+    for (int i = 0; i < 32; i++) {
+        if (updi_ocd_write_gpr(updi_fd, (uint8_t)i, gpr[i]) < 0) return -1;
+    }
+    if (updi_ocd_write_sreg(updi_fd, sreg) < 0) return -1;
+    if (updi_ocd_write_sp  (updi_fd, sp)   < 0) return -1;
+    if (updi_ocd_write_pc  (updi_fd, pc)   < 0) return -1;
+    return 0;
+}
+
+/* HLR-054: install or remove a software breakpoint by patching the
+ * 2-byte FLASH word at `byte_addr` (UPDI-side address, no FLASH_BASE
+ * offset).  When `orig_out` is non-NULL the current FLASH word is
+ * read out first (used during Z0 install to capture the opcode that
+ * z0 will later restore).  CPU state is snapshotted before the
+ * NVMPROG entry that `updi_nvm_flash_patch()` performs internally
+ * and restored after `updi_enter_debug()` brings the chip back into
+ * OCD.  Returns 0 on success, -1 on any UPDI failure.               */
+static int sw_bp_patch_flash(int updi_fd, uint32_t byte_addr,
+                             const uint8_t bytes[2], uint8_t orig_out[2])
+{
+    uint8_t  gpr[32], sreg;
+    uint16_t sp;
+    uint32_t pc;
+
+    if (sw_bp_snapshot_cpu(updi_fd, gpr, &sreg, &sp, &pc) < 0) return -1;
+
+    if (orig_out != NULL) {
+        if (updi_mem_read(updi_fd, UPDI_FLASH_BASE + byte_addr,
+                          orig_out, 2) < 0)
+            return -1;
+    }
+
+    if (updi_nvm_flash_patch(updi_fd, UPDI_FLASH_BASE + byte_addr,
+                             bytes, 2) < 0)
+        return -1;
+
+    if (updi_enter_debug(updi_fd) < 0) return -1;
+
+    return sw_bp_restore_cpu(updi_fd, gpr, sreg, sp, pc);
+}
+
 /* HLR-056: scan halt-status for a data-watchpoint trigger and, if
  * found, append the GDB stop-key (`watch:`, `rwatch:`, or `awatch:`)
  * followed by the GDB-side address.  Idempotent — writes nothing
@@ -705,6 +783,37 @@ static int dh_insert_bp(int fd, const char *pkt, void *vctx)
     uint32_t addr;
     if (parse_hex_u32(&p, &addr) < 0) return reply_err(fd, "E01");
 
+    /* HLR-054: Z0 with bp_mode==SW patches the BREAK opcode into FLASH
+     * for an unbounded number of simultaneous SW breakpoints.  Z1, or
+     * Z0 in `hw-only` mode (HLR-055), still aliases to the two OCD HW
+     * comparators preserved from the Phase 1–8 baseline (HLR-016).    */
+    if (kind == '0' && ctx->bp_mode == RSP_BP_MODE_SW) {
+        /* Reject addresses in the data-space windows (SIGROW, FUSES,
+         * USERROW, EEPROM, LOCK) — `BREAK` is only meaningful when
+         * fetched from FLASH as an instruction.                       */
+        if (addr & GDB_AVR_DATA_FLAG) return reply_err(fd, "E22");
+        /* Idempotent re-insert on the same address. */
+        for (int i = 0; i < RSP_MAX_SW_BREAKPOINTS; i++) {
+            if (ctx->sw_bp[i].in_use && ctx->sw_bp[i].addr == addr)
+                return reply_ok(fd);
+        }
+        int slot_i = -1;
+        for (int i = 0; i < RSP_MAX_SW_BREAKPOINTS; i++) {
+            if (!ctx->sw_bp[i].in_use) { slot_i = i; break; }
+        }
+        if (slot_i < 0) return reply_err(fd, "E08");
+        uint32_t byte_addr = addr & GDB_AVR_ADDR_MASK;
+        uint8_t  orig[2];
+        if (sw_bp_patch_flash(ctx->updi_fd, byte_addr,
+                              SW_BP_BREAK_BYTES, orig) < 0)
+            return reply_err(fd, "E01");
+        ctx->sw_bp[slot_i].in_use  = true;
+        ctx->sw_bp[slot_i].addr    = addr;
+        ctx->sw_bp[slot_i].orig[0] = orig[0];
+        ctx->sw_bp[slot_i].orig[1] = orig[1];
+        return reply_ok(fd);
+    }
+
     /* Already set?  Idempotent OK. */
     for (int i = 0; i < 2; i++) {
         if (ctx->hw_bp_addr[i] == addr) return reply_ok(fd);
@@ -751,6 +860,27 @@ static int dh_remove_bp(int fd, const char *pkt, void *vctx)
     ++p;
     uint32_t addr;
     if (parse_hex_u32(&p, &addr) < 0) return reply_err(fd, "E01");
+
+    /* HLR-054: matching z0 in SW mode restores the captured original
+     * opcode and frees the shadow slot.  If no shadow matches we fall
+     * through to the HW-comparator path so a server that toggled
+     * bp_mode mid-session still drains both shadow tables.            */
+    if (kind == '0' && ctx->bp_mode == RSP_BP_MODE_SW) {
+        for (int i = 0; i < RSP_MAX_SW_BREAKPOINTS; i++) {
+            if (ctx->sw_bp[i].in_use && ctx->sw_bp[i].addr == addr) {
+                uint32_t byte_addr = addr & GDB_AVR_ADDR_MASK;
+                if (sw_bp_patch_flash(ctx->updi_fd, byte_addr,
+                                      ctx->sw_bp[i].orig, NULL) < 0)
+                    return reply_err(fd, "E01");
+                ctx->sw_bp[i].in_use  = false;
+                ctx->sw_bp[i].addr    = 0;
+                ctx->sw_bp[i].orig[0] = 0;
+                ctx->sw_bp[i].orig[1] = 0;
+                return reply_ok(fd);
+            }
+        }
+        /* Not in SW shadow — fall through to HW shadow scan below.   */
+    }
 
     for (int i = 0; i < 2; i++) {
         if (ctx->hw_bp_addr[i] == addr) {
@@ -1089,6 +1219,7 @@ static int dh_vflash_done(int fd, const char *pkt, void *vctx)
     flash_xact_abort(ctx);
     if (rc < 0) return reply_err(fd, "E22");
     rsp_hw_bp_clear_all(ctx);
+    rsp_sw_bp_clear_all(ctx);
     (void)updi_enter_debug(ctx->updi_fd);
     return reply_ok(fd);
 }
@@ -1145,6 +1276,8 @@ void rsp_default_handlers(RspHandlers *h, RspContext *ctx)
     /* HLR-056: mark both DABP watchpoint comparators empty (kind='\0'). */
     ctx->hw_wp[0].kind = '\0';
     ctx->hw_wp[1].kind = '\0';
+    /* HLR-054: drop any SW-BP shadow that survived memset(). */
+    rsp_sw_bp_clear_all(ctx);
 
     h->on_halt_reason  = dh_halt_reason;
     h->on_read_regs    = dh_read_regs;

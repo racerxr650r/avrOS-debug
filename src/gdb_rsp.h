@@ -20,6 +20,21 @@
 #define RSP_BP_MODE_SW       0
 #define RSP_BP_MODE_HW_ONLY  1
 
+/* HLR-054: maximum number of simultaneous software breakpoints.  The
+ * AVR architecture imposes no inherent limit (every two-byte FLASH
+ * word can be patched independently) but the shadow table is a
+ * fixed-size array to keep the RspContext POD-like and avoid heap
+ * allocations on the fast path.  64 simultaneous SW BPs is well
+ * beyond typical GDB use.                                            */
+#define RSP_MAX_SW_BREAKPOINTS 64
+
+/* HLR-054: per-session shadow entry for one software breakpoint. */
+typedef struct {
+    uint32_t addr;          /* GDB-side byte address (FLASH window)   */
+    uint8_t  orig[2];       /* original 2-byte opcode, little-endian  */
+    bool     in_use;
+} RspSwBp;
+
 struct RspHandlers;
 
 /* Shared session state passed to every default handler as ctx. */
@@ -63,6 +78,12 @@ typedef struct {
     uint8_t                  *flash_xact_buf;
     uint32_t                  flash_xact_base;   /* UPDI byte-addr      */
     size_t                    flash_xact_len;    /* bytes in buf        */
+    /* HLR-054: per-session shadow of installed software breakpoints.
+     * Empty slots have `in_use == false`.  Populated on Z0 (when the
+     * server is in `bp_mode == RSP_BP_MODE_SW`, the default) and
+     * drained on z0.  Cleared wholesale on `vFlashDone`,
+     * `monitor reset`, and `monitor chip-erase`.                      */
+    RspSwBp                   sw_bp[RSP_MAX_SW_BREAKPOINTS];
 } RspContext;
 
 /* Each handler returns 0 on success or -1 on error. The handler is
@@ -124,5 +145,8 @@ void rsp_default_handlers(RspHandlers *h, RspContext *ctx);
 /* ── Helpers exposed for HLR-055 monitor verbs ───────────────────────── */
 void rsp_hw_bp_clear_all(RspContext *ctx);
 void rsp_hw_wp_clear_all(RspContext *ctx);
+/* HLR-054: drop every SW-BP shadow entry (no silicon I/O — used by
+ * the callers that have already destroyed the underlying FLASH).      */
+void rsp_sw_bp_clear_all(RspContext *ctx);
 
 #endif /* AOD_GDB_RSP_H */
