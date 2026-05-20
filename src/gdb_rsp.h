@@ -55,6 +55,14 @@ typedef struct {
      * lifetime of the server process.                                */
     int                       allow_erase;
     int                       bp_mode;
+    /* HLR-053: in-progress vFlash* transaction state.  `flash_xact_buf`
+     * is malloc()'d on the first `vFlashErase` of a load sequence (or
+     * extended by subsequent erases of contiguous ranges) and freed on
+     * `vFlashDone` (success) or on any g/G/m/M/c/s packet that arrives
+     * mid-transaction (abort).  NULL ⇔ no transaction in progress.    */
+    uint8_t                  *flash_xact_buf;
+    uint32_t                  flash_xact_base;   /* UPDI byte-addr      */
+    size_t                    flash_xact_len;    /* bytes in buf        */
 } RspContext;
 
 /* Each handler returns 0 on success or -1 on error. The handler is
@@ -84,6 +92,9 @@ typedef struct RspHandlers {
     RspHandlerFn on_vrun;           /* vRun;<args>                    */
     RspHandlerFn on_vattach;        /* vAttach;<pid>                  */
     RspHandlerFn on_vkill;          /* vKill;<pid>                    */
+    RspHandlerFn on_vflash_erase;   /* vFlashErase:addr,length        */
+    RspHandlerFn on_vflash_write;   /* vFlashWrite:addr:<binary>      */
+    RspHandlerFn on_vflash_done;    /* vFlashDone                     */
     void        *ctx;
 } RspHandlers;
 
@@ -102,6 +113,10 @@ bool rsp_get_noack(void);
 
 /* ── Dispatch ────────────────────────────────────────────────────────── */
 int  rsp_dispatch(int fd, const char *packet, RspHandlers *h);
+/* Length-carrying variant.  Required for binary packets (vFlashWrite)
+ * whose payload may contain embedded NUL bytes; the caller passes the
+ * exact byte count returned by rsp_recv_packet().                      */
+int  rsp_dispatch_n(int fd, const char *packet, size_t plen, RspHandlers *h);
 
 /* ── Default handlers (used by main; tests may override individually) ── */
 void rsp_default_handlers(RspHandlers *h, RspContext *ctx);

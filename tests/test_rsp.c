@@ -1190,6 +1190,151 @@ static void detach_clears_data_watchpoints_in_silicon(void)
     TEST_ASSERT_EQUAL('\0', mock_data_bp_silicon[0].kind);
 }
 
+/* ── HLR-053: vFlashErase / vFlashWrite / vFlashDone — (gdb) load ─── */
+
+static void vFlashErase_allocates_buffer_and_replies_ok_for_flash_range(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    rsp_dispatch(sock_pair[1], "vFlashErase:100,200", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[32];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("OK", payload);
+    TEST_ASSERT_NOT_NULL(ctx.flash_xact_buf);
+    TEST_ASSERT_EQUAL(0u, ctx.flash_xact_base);           /* page-floor(0x100) = 0 */
+    /* Range [0x100..0x300) straddles two 512-byte pages → 1024 bytes. */
+    TEST_ASSERT_EQUAL(2u * UPDI_FLASH_PAGE_SIZE, ctx.flash_xact_len);
+    /* Buffer pre-filled with 0xFF. */
+    TEST_ASSERT_EQUAL_HEX8(0xFFu, ctx.flash_xact_buf[0]);
+    TEST_ASSERT_EQUAL_HEX8(0xFFu, ctx.flash_xact_buf[ctx.flash_xact_len - 1u]);
+    free(ctx.flash_xact_buf);
+}
+
+static void vFlashErase_E22_for_data_space_address(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    /* 0x810000 is EEPROM on the GDB side (bit-23 data-flag set). */
+    rsp_dispatch(sock_pair[1], "vFlashErase:810000,10", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[32];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("E22", payload);
+    TEST_ASSERT_NULL(ctx.flash_xact_buf);
+}
+
+static void vFlashWrite_copies_payload_into_buffer_at_offset(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    rsp_dispatch(sock_pair[1], "vFlashErase:0,200", &h);
+    char stream0[64]; drain(sock_pair[0], stream0, sizeof stream0);
+    /* Plain 4-byte payload at offset 0x10, no escapes. */
+    rsp_dispatch(sock_pair[1], "vFlashWrite:10:\x11\x22\x33\x44", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[32];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("OK", payload);
+    TEST_ASSERT_EQUAL_HEX8(0x11u, ctx.flash_xact_buf[0x10]);
+    TEST_ASSERT_EQUAL_HEX8(0x22u, ctx.flash_xact_buf[0x11]);
+    TEST_ASSERT_EQUAL_HEX8(0x33u, ctx.flash_xact_buf[0x12]);
+    TEST_ASSERT_EQUAL_HEX8(0x44u, ctx.flash_xact_buf[0x13]);
+    /* Surrounding bytes still erased. */
+    TEST_ASSERT_EQUAL_HEX8(0xFFu, ctx.flash_xact_buf[0x0F]);
+    TEST_ASSERT_EQUAL_HEX8(0xFFu, ctx.flash_xact_buf[0x14]);
+    free(ctx.flash_xact_buf);
+}
+
+static void vFlashWrite_decodes_0x7D_xor_0x20_binary_escape(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    rsp_dispatch(sock_pair[1], "vFlashErase:0,200", &h);
+    char stream0[64]; drain(sock_pair[0], stream0, sizeof stream0);
+    /* 0x7D 0x03 → 0x23 ('#'); 0x7D 0x0A → 0x2A ('*'). */
+    static const char pkt[] = {
+        'v','F','l','a','s','h','W','r','i','t','e',':','0',':',
+        0x7D, 0x03, 0x7D, 0x0A, 0x00
+    };
+    /* Pass the length explicitly via rsp_dispatch_n so the embedded
+     * sequence isn't truncated by strlen.                            */
+    rsp_dispatch_n(sock_pair[1], pkt, sizeof pkt - 1, &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[32];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("OK", payload);
+    TEST_ASSERT_EQUAL_HEX8(0x23u, ctx.flash_xact_buf[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x2Au, ctx.flash_xact_buf[1]);
+    free(ctx.flash_xact_buf);
+}
+
+static void vFlashDone_flushes_buffer_via_nvm_write_flash_and_replies_ok(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    rsp_dispatch(sock_pair[1], "vFlashErase:0,200", &h);
+    char s0[64]; drain(sock_pair[0], s0, sizeof s0);
+    rsp_dispatch(sock_pair[1], "vFlashWrite:0:\x98\x95", &h);
+    char s1[64]; drain(sock_pair[0], s1, sizeof s1);
+
+    /* Pre-install an HW BP shadow entry so we can prove vFlashDone
+     * clears it (HLR-053 spec).                                      */
+    ctx.hw_bp_addr[0] = 0x42u;
+
+    rsp_dispatch(sock_pair[1], "vFlashDone", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[32];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("OK", payload);
+
+    TEST_ASSERT_EQUAL(1, mock_flash_write_count);
+    TEST_ASSERT_EQUAL(UPDI_FLASH_BASE + 0u, mock_flash_writes[0].addr);
+    TEST_ASSERT_EQUAL(UPDI_FLASH_PAGE_SIZE, mock_flash_writes[0].len);
+    TEST_ASSERT_EQUAL_HEX8(0x98u, mock_flash_writes[0].data[0]);
+    TEST_ASSERT_EQUAL_HEX8(0x95u, mock_flash_writes[0].data[1]);
+
+    /* Buffer freed and xact cleared. */
+    TEST_ASSERT_NULL(ctx.flash_xact_buf);
+    TEST_ASSERT_EQUAL(0u, ctx.flash_xact_len);
+    /* HW BP shadow cleared. */
+    TEST_ASSERT_EQUAL_HEX32(0xFFFFFFFFu, ctx.hw_bp_addr[0]);
+}
+
+static void vFlashDone_with_no_active_transaction_replies_ok_noop(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    rsp_dispatch(sock_pair[1], "vFlashDone", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[32];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("OK", payload);
+    TEST_ASSERT_EQUAL(0, mock_flash_write_count);
+}
+
+static void m_packet_mid_vflash_transaction_aborts_and_returns_E22(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    rsp_dispatch(sock_pair[1], "vFlashErase:0,200", &h);
+    char s0[64]; drain(sock_pair[0], s0, sizeof s0);
+    TEST_ASSERT_NOT_NULL(ctx.flash_xact_buf);
+
+    rsp_dispatch(sock_pair[1], "m800100,4", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[32];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("E22", payload);
+    /* Buffer freed by the abort path. */
+    TEST_ASSERT_NULL(ctx.flash_xact_buf);
+}
+
+static void qSupported_advertises_vFlash_packets(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    rsp_dispatch(sock_pair[1], "qSupported:multiprocess+", &h);
+    char stream[256]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[256];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_NOT_NULL(strstr(payload, "vFlashErase+"));
+    TEST_ASSERT_NOT_NULL(strstr(payload, "vFlashWrite+"));
+    TEST_ASSERT_NOT_NULL(strstr(payload, "vFlashDone+"));
+}
+
 /* ── Runner ─────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -1247,5 +1392,14 @@ int main(void)
     RUN_TEST(z2_remove_calls_clear_and_clears_shadow);
     RUN_TEST(halt_with_DABP0_bit_appends_watch_suffix);
     RUN_TEST(detach_clears_data_watchpoints_in_silicon);
+    /* HLR-053: vFlashErase / vFlashWrite / vFlashDone (`gdb load`). */
+    RUN_TEST(vFlashErase_allocates_buffer_and_replies_ok_for_flash_range);
+    RUN_TEST(vFlashErase_E22_for_data_space_address);
+    RUN_TEST(vFlashWrite_copies_payload_into_buffer_at_offset);
+    RUN_TEST(vFlashWrite_decodes_0x7D_xor_0x20_binary_escape);
+    RUN_TEST(vFlashDone_flushes_buffer_via_nvm_write_flash_and_replies_ok);
+    RUN_TEST(vFlashDone_with_no_active_transaction_replies_ok_noop);
+    RUN_TEST(m_packet_mid_vflash_transaction_aborts_and_returns_E22);
+    RUN_TEST(qSupported_advertises_vFlash_packets);
     return UNITY_END();
 }

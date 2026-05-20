@@ -44,6 +44,27 @@ bool rsp_get_noack(void)   { return g_noack; }
 /* Sentinel: no breakpoint installed in this HW comparator slot. */
 #define HW_BP_SLOT_EMPTY    0xFFFFFFFFu
 
+/* HLR-053: byte length of the most recently received packet.  Set by
+ * rsp_dispatch_n(); read by binary handlers (vFlashWrite) that need the
+ * true length because the payload may contain embedded NUL bytes that
+ * would truncate strlen().  Defaults to 0 so handlers invoked by tests
+ * via rsp_dispatch() compute their own length from strlen().          */
+static size_t g_dispatch_packet_len = 0;
+
+/* HLR-053: abort any in-progress vFlash* transaction.  Called by the
+ * core target-access handlers (m/M/c/s/g/G) when GDB violates the
+ * "no other packets between vFlashErase and vFlashDone" rule.         */
+static void flash_xact_abort(RspContext *ctx)
+{
+    if (ctx == NULL) return;
+    if (ctx->flash_xact_buf != NULL) {
+        free(ctx->flash_xact_buf);
+        ctx->flash_xact_buf = NULL;
+    }
+    ctx->flash_xact_base = 0;
+    ctx->flash_xact_len  = 0;
+}
+
 /* ── small helpers ───────────────────────────────────────────────────── */
 
 static int hex_nibble(char c)
@@ -939,6 +960,139 @@ static int dh_restart(int fd, const char *pkt, void *vctx)
     return dh_continue(fd, "c", vctx);
 }
 
+/* Round v down to the nearest multiple of UPDI_FLASH_PAGE_SIZE. */
+static uint32_t flash_page_floor(uint32_t v)
+{
+    return v - (v % UPDI_FLASH_PAGE_SIZE);
+}
+
+/* Round v up to the nearest multiple of UPDI_FLASH_PAGE_SIZE. */
+static uint32_t flash_page_ceil(uint32_t v)
+{
+    uint32_t r = v % UPDI_FLASH_PAGE_SIZE;
+    return (r == 0u) ? v : (v + UPDI_FLASH_PAGE_SIZE - r);
+}
+
+/* HLR-053 (LLR-RSP-26): vFlashErase:addr,length.  Validate that the
+ * range falls entirely within the FLASH window (no data-space flag).
+ * Allocate (or extend) a page-aligned 0xFF-filled buffer covering the
+ * erased range and reply OK.  Erase-on-silicon is deferred to
+ * updi_nvm_write_flash() in dh_vflash_done(), which page-erases each
+ * page before programming.                                            */
+static int dh_vflash_erase(int fd, const char *pkt, void *vctx)
+{
+    RspContext *ctx = (RspContext *)vctx;
+    const char *p = pkt + strlen("vFlashErase:");
+    uint32_t addr = 0, len = 0;
+    if (parse_hex_u32(&p, &addr) < 0) return reply_err(fd, "E22");
+    if (*p != ',')                    return reply_err(fd, "E22");
+    ++p;
+    if (parse_hex_u32(&p, &len) < 0)  return reply_err(fd, "E22");
+    if (len == 0u)                    return reply_err(fd, "E22");
+
+    /* Reject any range that strays into data space (EEPROM, USERROW,
+     * FUSES, LOCK, SIGROW all have bit 23 set on the GDB side).       */
+    if ((addr | (addr + len - 1u)) & GDB_AVR_DATA_FLAG) {
+        return reply_err(fd, "E22");
+    }
+    /* Defensive upper bound — refuse > 1 MB to avoid runaway alloc.   */
+    if (len > 0x100000u) return reply_err(fd, "E22");
+
+    uint32_t pg_lo = flash_page_floor(addr);
+    uint32_t pg_hi = flash_page_ceil(addr + len);
+    size_t   need  = (size_t)(pg_hi - pg_lo);
+
+    if (ctx->flash_xact_buf == NULL) {
+        ctx->flash_xact_buf  = (uint8_t *)malloc(need);
+        if (ctx->flash_xact_buf == NULL) return reply_err(fd, "E22");
+        memset(ctx->flash_xact_buf, 0xFF, need);
+        ctx->flash_xact_base = pg_lo;
+        ctx->flash_xact_len  = need;
+    } else {
+        /* Extend the existing buffer to span the union of the old and
+         * new ranges; newly-added pages are pre-filled with 0xFF.     */
+        uint32_t old_lo  = ctx->flash_xact_base;
+        uint32_t old_hi  = ctx->flash_xact_base +
+                           (uint32_t)ctx->flash_xact_len;
+        uint32_t new_lo  = (pg_lo < old_lo) ? pg_lo : old_lo;
+        uint32_t new_hi  = (pg_hi > old_hi) ? pg_hi : old_hi;
+        size_t   new_len = (size_t)(new_hi - new_lo);
+        if (new_lo != old_lo || new_hi != old_hi) {
+            uint8_t *nb = (uint8_t *)malloc(new_len);
+            if (nb == NULL) return reply_err(fd, "E22");
+            memset(nb, 0xFF, new_len);
+            memcpy(nb + (old_lo - new_lo),
+                   ctx->flash_xact_buf, ctx->flash_xact_len);
+            free(ctx->flash_xact_buf);
+            ctx->flash_xact_buf  = nb;
+            ctx->flash_xact_base = new_lo;
+            ctx->flash_xact_len  = new_len;
+        }
+    }
+    return reply_ok(fd);
+}
+
+/* HLR-053 (LLR-RSP-27): vFlashWrite:addr:<binary>.  Decode RSP binary
+ * escapes (0x7D XOR 0x20) and copy the payload into the page buffer
+ * at the right offset.  Refuses if no transaction is active, the
+ * address is outside the erased range, or the payload overflows it.  */
+static int dh_vflash_write(int fd, const char *pkt, void *vctx)
+{
+    RspContext *ctx = (RspContext *)vctx;
+    if (ctx->flash_xact_buf == NULL) return reply_err(fd, "E22");
+
+    const char *prefix = "vFlashWrite:";
+    size_t plen = g_dispatch_packet_len;
+    if (plen == 0u) plen = strlen(pkt);
+    size_t pref_len = strlen(prefix);
+    if (plen <= pref_len) { flash_xact_abort(ctx); return reply_err(fd, "E22"); }
+
+    const char *p = pkt + pref_len;
+    uint32_t addr = 0;
+    if (parse_hex_u32(&p, &addr) < 0) { flash_xact_abort(ctx); return reply_err(fd, "E22"); }
+    if (*p != ':')                    { flash_xact_abort(ctx); return reply_err(fd, "E22"); }
+    ++p;
+
+    if (addr & GDB_AVR_DATA_FLAG)        { flash_xact_abort(ctx); return reply_err(fd, "E22"); }
+    if (addr < ctx->flash_xact_base)     { flash_xact_abort(ctx); return reply_err(fd, "E22"); }
+
+    size_t off    = (size_t)(addr - ctx->flash_xact_base);
+    size_t remain = plen - (size_t)(p - pkt);
+    size_t out    = off;
+    for (size_t i = 0; i < remain; ++i) {
+        uint8_t b = (uint8_t)p[i];
+        if (b == 0x7Du) {
+            if (i + 1u >= remain)         { flash_xact_abort(ctx); return reply_err(fd, "E22"); }
+            b = (uint8_t)(p[++i] ^ 0x20);
+        }
+        if (out >= ctx->flash_xact_len)   { flash_xact_abort(ctx); return reply_err(fd, "E22"); }
+        ctx->flash_xact_buf[out++] = b;
+    }
+    return reply_ok(fd);
+}
+
+/* HLR-053 (LLR-RSP-28): vFlashDone.  Flush the accumulated page buffer
+ * to FLASH via updi_nvm_write_flash() (which page-erases before each
+ * write), call updi_enter_debug() to leave the CPU halted at reset,
+ * clear the HW-breakpoint shadow because the underlying instructions
+ * may have changed, and reply OK.                                     */
+static int dh_vflash_done(int fd, const char *pkt, void *vctx)
+{
+    (void)pkt;
+    RspContext *ctx = (RspContext *)vctx;
+    if (ctx->flash_xact_buf == NULL) return reply_ok(fd);
+
+    uint32_t updi_addr = UPDI_FLASH_BASE + ctx->flash_xact_base;
+    int rc = updi_nvm_write_flash(ctx->updi_fd, updi_addr,
+                                  ctx->flash_xact_buf,
+                                  ctx->flash_xact_len);
+    flash_xact_abort(ctx);
+    if (rc < 0) return reply_err(fd, "E22");
+    rsp_hw_bp_clear_all(ctx);
+    (void)updi_enter_debug(ctx->updi_fd);
+    return reply_ok(fd);
+}
+
 /* HLR-058 (LLR-RSP-23): vRun;[<filename>][;<arg>...] — extended-remote
  * start-new-program.  avr-updi-gdb has no filesystem on the target and
  * the program is already in FLASH, so all arguments are ignored.  The
@@ -1014,6 +1168,9 @@ void rsp_default_handlers(RspHandlers *h, RspContext *ctx)
     h->on_vrun         = dh_vrun;
     h->on_vattach      = dh_vattach;
     h->on_vkill        = dh_vkill;
+    h->on_vflash_erase = dh_vflash_erase;
+    h->on_vflash_write = dh_vflash_write;
+    h->on_vflash_done  = dh_vflash_done;
     h->ctx             = ctx;
 }
 
@@ -1027,13 +1184,19 @@ static int call_handler(RspHandlerFn fn, int fd, const char *pkt, void *ctx)
 
 int rsp_dispatch(int fd, const char *packet, RspHandlers *h)
 {
-    if (packet == NULL || packet[0] == '\0') return reply_empty(fd);
+    return rsp_dispatch_n(fd, packet, (packet == NULL) ? 0u : strlen(packet), h);
+}
+
+int rsp_dispatch_n(int fd, const char *packet, size_t plen, RspHandlers *h)
+{
+    if (packet == NULL || plen == 0u || packet[0] == '\0') return reply_empty(fd);
+    g_dispatch_packet_len = plen;
 
     /* ── Inline-handled (no target access) ─────────────────────────── */
     if (strncmp(packet, "qSupported", 10) == 0) {
         return rsp_send_packet(fd,
             "PacketSize=800;QStartNoAckMode+;multiprocess+;vContSupported+"
-            ";vRun+;vAttach+;vKill+");
+            ";vRun+;vAttach+;vKill+;vFlashErase+;vFlashWrite+;vFlashDone+");
     }
     if (strncmp(packet, "qAttached", 9) == 0) {
         return rsp_send_packet(fd, "1");
@@ -1044,6 +1207,16 @@ int rsp_dispatch(int fd, const char *packet, RspHandlers *h)
     }
     if (strncmp(packet, "vCont?", 6) == 0) {
         return rsp_send_packet(fd, "vCont;c;s");
+    }
+    /* HLR-053: vFlash* — route before vCont/vRun checks. */
+    if (strncmp(packet, "vFlashErase:", 12) == 0) {
+        return call_handler(h->on_vflash_erase, fd, packet, h->ctx);
+    }
+    if (strncmp(packet, "vFlashWrite:", 12) == 0) {
+        return call_handler(h->on_vflash_write, fd, packet, h->ctx);
+    }
+    if (strncmp(packet, "vFlashDone", 10) == 0) {
+        return call_handler(h->on_vflash_done, fd, packet, h->ctx);
     }
     if (strncmp(packet, "vCont;c", 7) == 0) {
         return call_handler(h->on_continue, fd, packet, h->ctx);
@@ -1063,6 +1236,20 @@ int rsp_dispatch(int fd, const char *packet, RspHandlers *h)
     if (strncmp(packet, "vKill", 5) == 0 &&
         (packet[5] == '\0' || packet[5] == ';')) {
         return call_handler(h->on_vkill, fd, packet, h->ctx);
+    }
+
+    /* HLR-053: any g/G/m/M/X/c/s that arrives mid-vFlash-transaction
+     * is a protocol error; reject with E22 and discard the buffer.    */
+    {
+        RspContext *xctx = (RspContext *)h->ctx;
+        char c0 = packet[0];
+        bool target_access = (c0 == 'g' || c0 == 'G' || c0 == 'P' ||
+                              c0 == 'm' || c0 == 'M' || c0 == 'X' ||
+                              c0 == 'c' || c0 == 's');
+        if (target_access && xctx != NULL && xctx->flash_xact_buf != NULL) {
+            flash_xact_abort(xctx);
+            return reply_err(fd, "E22");
+        }
     }
 
     /* ── Dispatch by leading character ────────────────────────────── */

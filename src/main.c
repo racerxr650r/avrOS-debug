@@ -333,7 +333,7 @@ MAYBE_STATIC void event_loop(AppConfig *cfg, RspHandlers *h)
                 rsp_close(cfg->gdb_fd);
                 cfg->gdb_fd = -1;
             } else {
-                (void)rsp_dispatch(cfg->gdb_fd, pkt, h);
+                (void)rsp_dispatch_n(cfg->gdb_fd, pkt, (size_t)rc, h);
             }
         }
     }

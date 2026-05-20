@@ -2271,6 +2271,34 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="HLR" ref="HLR-056" name="GDB watchpoints (Z2/Z3/Z4)"/>
         </traces>
       </llr>
+
+      <llr id="LLR-RSP-32">
+        <text><![CDATA[The `dh_vflash_erase()` default handler (`vFlashErase:<addr>,<length>`) shall parse the two hex fields and refuse with `E22` if either is malformed, `length` is zero, or any address in the range `[addr, addr+length)` has the data-space flag set (i.e. `(addr | (addr+length-1)) & GDB_AVR_DATA_FLAG`) — this rejects EEPROM, USERROW, FUSES, LOCK, and SIGROW windows since `gdb load` provides no per-window verb. Lengths larger than 1 MB shall also be refused with `E22` as a runaway-allocation guard. On success the handler shall (re-)allocate `RspContext.flash_xact_buf` to span the page-aligned union of any prior erased range and `[floor_page(addr), ceil_page(addr+length))`, pre-filling new pages with `0xFF`, and reply `OK`. Erase-on-silicon is deferred until `dh_vflash_done()` because `updi_nvm_write_flash()` performs an FLPER per page before each FLWR.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-053" name="Flash Programming via GDB load"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-33">
+        <text><![CDATA[The `dh_vflash_write()` default handler (`vFlashWrite:<addr>:<binary>`) shall refuse with `E22` (and discard any in-progress page buffer) if no `vFlashErase` is active, the address is malformed, the address has the data-space flag set, or the address is below `RspContext.flash_xact_base`. Otherwise it shall decode RSP binary-protocol escapes (`0x7D <b>` → `b XOR 0x20`) in the payload and copy the resulting bytes into `flash_xact_buf` at offset `addr - flash_xact_base`, replying `E22` on buffer overflow and `OK` on success. The payload byte count is derived from the `plen` argument threaded through `rsp_dispatch_n()` so embedded NUL bytes do not truncate the copy.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-053" name="Flash Programming via GDB load"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-34">
+        <text><![CDATA[The `dh_vflash_done()` default handler (`vFlashDone`) shall (a) if no transaction is active, reply `OK` immediately (treating the packet as a no-op); (b) otherwise call `updi_nvm_write_flash(updi_fd, UPDI_FLASH_BASE + flash_xact_base, flash_xact_buf, flash_xact_len)`, freeing the buffer and clearing `flash_xact_base/len` regardless of outcome, then reply `E22` on UPDI failure or — on success — call `rsp_hw_bp_clear_all()` (because the FLASH word at each shadowed HW-BP address may have been overwritten by the load), call `updi_enter_debug()` to leave the CPU halted at reset, and reply `OK`. Any `g`/`G`/`P`/`m`/`M`/`X`/`c`/`s` packet that arrives between `vFlashErase` and `vFlashDone` shall be rejected with `E22` by `rsp_dispatch_n()` and the in-progress page buffer shall be discarded.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-053" name="Flash Programming via GDB load"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-35">
+        <text><![CDATA[The `qSupported` inline reply shall additionally advertise `vFlashErase+;vFlashWrite+;vFlashDone+` so GDB enables the `vFlash*` flow for the `load` command. The length-carrying `rsp_dispatch_n(fd, packet, plen, handlers)` entry point shall be the public dispatch API used by the main event loop; the legacy `rsp_dispatch()` shall remain as a thin wrapper that derives `plen` from `strlen(packet)`, for tests and any caller that knows the packet is ASCII-only.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-053" name="Flash Programming via GDB load"/>
+        </traces>
+      </llr>
     </function>
 
     <function number="5" title="src/elf_parser.c — ELF Binary Parser" name="elf" source="src/elf_parser.c">
@@ -3047,7 +3075,7 @@ Errors are propagated upward through the module stack without retrying:
     <!-- ============================================================ -->
     <!-- src/gdb_rsp.c unit tests                                     -->
     <!-- ============================================================ -->
-    <file path="tests/test_rsp.c" role="unit" count="52">
+    <file path="tests/test_rsp.c" role="unit" count="60">
       <header><![CDATA[Unit tests for `src/gdb_rsp.c`: socket configuration, RSP packet framing, register and memory handlers, hardware-breakpoint comparator management, OCD-based execution control, async Ctrl-C interrupt, detach cleanup, session lifecycle packets, and monitor relay. Uses a `socketpair()` as a drop-in socket substitute and replaces every `updi_*`, `fsm_*`, and `monitor_dispatch` call site with `ld --wrap` mocks so all tests run without real silicon.]]></header>
 
       <test name="rsp_listen_sets_so_reuseaddr_before_bind">
@@ -3314,6 +3342,46 @@ Errors are propagated upward through the module stack without retrying:
       <test name="detach_clears_data_watchpoints_in_silicon">
         <purpose><![CDATA[Install a Z3 watchpoint, dispatch `D`, and verify `updi_ocd_clear_data_bp` was invoked at least once and the silicon-side mock for slot 0 has `kind='\0'`.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-30"/></traces>
+      </test>
+
+      <test name="vFlashErase_allocates_buffer_and_replies_ok_for_flash_range">
+        <purpose><![CDATA[Dispatch `vFlashErase:100,200`, verify reply is `OK`, `ctx.flash_xact_buf` is non-NULL, `ctx.flash_xact_base==0`, `ctx.flash_xact_len==2*UPDI_FLASH_PAGE_SIZE` (the range straddles two 512-byte pages), and the buffer is pre-filled with `0xFF`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-32"/></traces>
+      </test>
+
+      <test name="vFlashErase_E22_for_data_space_address">
+        <purpose><![CDATA[Dispatch `vFlashErase:810000,10` (EEPROM window on the GDB side) and verify reply is `E22` and `ctx.flash_xact_buf` remains NULL.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-32"/></traces>
+      </test>
+
+      <test name="vFlashWrite_copies_payload_into_buffer_at_offset">
+        <purpose><![CDATA[After a `vFlashErase:0,200`, dispatch `vFlashWrite:10:\x11\x22\x33\x44`, verify reply is `OK`, the four bytes appear in `ctx.flash_xact_buf` at offsets 0x10..0x13, and the surrounding bytes remain `0xFF`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-33"/></traces>
+      </test>
+
+      <test name="vFlashWrite_decodes_0x7D_xor_0x20_binary_escape">
+        <purpose><![CDATA[Construct a packet `vFlashWrite:0:` followed by `0x7D 0x03 0x7D 0x0A` and dispatch via `rsp_dispatch_n()` with the explicit byte length, verify reply is `OK`, and the buffer contains `0x23` (`'#'`) at offset 0 and `0x2A` (`'*'`) at offset 1.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-33"/></traces>
+      </test>
+
+      <test name="vFlashDone_flushes_buffer_via_nvm_write_flash_and_replies_ok">
+        <purpose><![CDATA[After `vFlashErase:0,200` + `vFlashWrite:0:\x98\x95` and pre-loading `ctx.hw_bp_addr[0]=0x42`, dispatch `vFlashDone`. Verify reply is `OK`; `mock_flash_write_count==1`; `mock_flash_writes[0].addr==UPDI_FLASH_BASE`; the first two bytes of the captured page buffer are `0x98 0x95`; `ctx.flash_xact_buf==NULL`; `ctx.flash_xact_len==0`; and `ctx.hw_bp_addr[0]==0xFFFFFFFF` (HW-BP shadow cleared per the HLR-053 spec).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-34"/></traces>
+      </test>
+
+      <test name="vFlashDone_with_no_active_transaction_replies_ok_noop">
+        <purpose><![CDATA[Dispatch `vFlashDone` with no preceding `vFlashErase` and verify reply is `OK` and `mock_flash_write_count==0` (no FLASH writes attempted).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-34"/></traces>
+      </test>
+
+      <test name="m_packet_mid_vflash_transaction_aborts_and_returns_E22">
+        <purpose><![CDATA[After `vFlashErase:0,200`, dispatch `m800100,4` and verify reply is `E22` and `ctx.flash_xact_buf` is NULL (the abort path freed the in-progress buffer).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-34"/></traces>
+      </test>
+
+      <test name="qSupported_advertises_vFlash_packets">
+        <purpose><![CDATA[Dispatch `qSupported:multiprocess+` and verify the reply payload contains the substrings `vFlashErase+`, `vFlashWrite+`, and `vFlashDone+`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-35"/></traces>
       </test>
     </file>
 

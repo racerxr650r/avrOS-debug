@@ -111,7 +111,7 @@ Role: **unit**. **47 test(s).**
 
 ### 3.3. [tests/test_rsp.c](../tests/test_rsp.c)
 
-Role: **unit**. **52 test(s).**
+Role: **unit**. **60 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -167,6 +167,14 @@ Role: **unit**. **52 test(s).**
 | 50 | <a id="z2_remove_calls_clear_and_clears_shadow"></a>`z2_remove_calls_clear_and_clears_shadow` | `LLR-RSP-30`, `LLR-RSP-28` | Install a Z2 then dispatch its `z2,...` peer and verify the reply is `OK`, `updi_ocd_clear_data_bp` was invoked once, and both the silicon-side mock and the `RspContext.hw_wp[0].kind` shadow are cleared to `'\0'`. |
 | 51 | <a id="halt_with_DABP0_bit_appends_watch_suffix"></a>`halt_with_DABP0_bit_appends_watch_suffix` | `LLR-RSP-31` | Pre-load `ctx.hw_wp[0]` as if a Z2 had been installed at GDB-side address `0x800100`, raise the mock `OCD_STATUS1_DABP0` bit, dispatch `?`, and verify the stop-reply payload contains the substring `watch:800100;`. |
 | 52 | <a id="detach_clears_data_watchpoints_in_silicon"></a>`detach_clears_data_watchpoints_in_silicon` | `LLR-RSP-30` | Install a Z3 watchpoint, dispatch `D`, and verify `updi_ocd_clear_data_bp` was invoked at least once and the silicon-side mock for slot 0 has `kind='\0'`. |
+| 53 | <a id="vFlashErase_allocates_buffer_and_replies_ok_for_flash_range"></a>`vFlashErase_allocates_buffer_and_replies_ok_for_flash_range` | `LLR-RSP-32` | Dispatch `vFlashErase:100,200`, verify reply is `OK`, `ctx.flash_xact_buf` is non-NULL, `ctx.flash_xact_base==0`, `ctx.flash_xact_len==2*UPDI_FLASH_PAGE_SIZE` (the range straddles two 512-byte pages), and the buffer is pre-filled with `0xFF`. |
+| 54 | <a id="vFlashErase_E22_for_data_space_address"></a>`vFlashErase_E22_for_data_space_address` | `LLR-RSP-32` | Dispatch `vFlashErase:810000,10` (EEPROM window on the GDB side) and verify reply is `E22` and `ctx.flash_xact_buf` remains NULL. |
+| 55 | <a id="vFlashWrite_copies_payload_into_buffer_at_offset"></a>`vFlashWrite_copies_payload_into_buffer_at_offset` | `LLR-RSP-33` | After a `vFlashErase:0,200`, dispatch `vFlashWrite:10:\x11\x22\x33\x44`, verify reply is `OK`, the four bytes appear in `ctx.flash_xact_buf` at offsets 0x10..0x13, and the surrounding bytes remain `0xFF`. |
+| 56 | <a id="vFlashWrite_decodes_0x7D_xor_0x20_binary_escape"></a>`vFlashWrite_decodes_0x7D_xor_0x20_binary_escape` | `LLR-RSP-33` | Construct a packet `vFlashWrite:0:` followed by `0x7D 0x03 0x7D 0x0A` and dispatch via `rsp_dispatch_n()` with the explicit byte length, verify reply is `OK`, and the buffer contains `0x23` (`'#'`) at offset 0 and `0x2A` (`'*'`) at offset 1. |
+| 57 | <a id="vFlashDone_flushes_buffer_via_nvm_write_flash_and_replies_ok"></a>`vFlashDone_flushes_buffer_via_nvm_write_flash_and_replies_ok` | `LLR-RSP-34` | After `vFlashErase:0,200` + `vFlashWrite:0:\x98\x95` and pre-loading `ctx.hw_bp_addr[0]=0x42`, dispatch `vFlashDone`. Verify reply is `OK`; `mock_flash_write_count==1`; `mock_flash_writes[0].addr==UPDI_FLASH_BASE`; the first two bytes of the captured page buffer are `0x98 0x95`; `ctx.flash_xact_buf==NULL`; `ctx.flash_xact_len==0`; and `ctx.hw_bp_addr[0]==0xFFFFFFFF` (HW-BP shadow cleared per the HLR-053 spec). |
+| 58 | <a id="vFlashDone_with_no_active_transaction_replies_ok_noop"></a>`vFlashDone_with_no_active_transaction_replies_ok_noop` | `LLR-RSP-34` | Dispatch `vFlashDone` with no preceding `vFlashErase` and verify reply is `OK` and `mock_flash_write_count==0` (no FLASH writes attempted). |
+| 59 | <a id="m_packet_mid_vflash_transaction_aborts_and_returns_E22"></a>`m_packet_mid_vflash_transaction_aborts_and_returns_E22` | `LLR-RSP-34` | After `vFlashErase:0,200`, dispatch `m800100,4` and verify reply is `E22` and `ctx.flash_xact_buf` is NULL (the abort path freed the in-progress buffer). |
+| 60 | <a id="qSupported_advertises_vFlash_packets"></a>`qSupported_advertises_vFlash_packets` | `LLR-RSP-35` | Dispatch `qSupported:multiprocess+` and verify the reply payload contains the substrings `vFlashErase+`, `vFlashWrite+`, and `vFlashDone+`. |
 
 ### 3.4. [tests/test_elf.c](../tests/test_elf.c)
 
@@ -394,6 +402,10 @@ verified by code review — see
 | `LLR-RSP-29` | `rsp` | `HLR-056` | `Z2_write_watchpoint_calls_updi_ocd_set_data_bp_with_kind_w`, `Z3_read_watchpoint_uses_kind_r`, `Z4_access_watchpoint_uses_kind_a`, `Z2_returns_E08_when_both_wp_slots_full` |
 | `LLR-RSP-30` | `rsp` | `HLR-056` | `z2_remove_calls_clear_and_clears_shadow`, `detach_clears_data_watchpoints_in_silicon` |
 | `LLR-RSP-31` | `rsp` | `HLR-056` | `halt_with_DABP0_bit_appends_watch_suffix` |
+| `LLR-RSP-32` | `rsp` | `HLR-053` | `vFlashErase_allocates_buffer_and_replies_ok_for_flash_range`, `vFlashErase_E22_for_data_space_address` |
+| `LLR-RSP-33` | `rsp` | `HLR-053` | `vFlashWrite_copies_payload_into_buffer_at_offset`, `vFlashWrite_decodes_0x7D_xor_0x20_binary_escape` |
+| `LLR-RSP-34` | `rsp` | `HLR-053` | `vFlashDone_flushes_buffer_via_nvm_write_flash_and_replies_ok`, `vFlashDone_with_no_active_transaction_replies_ok_noop`, `m_packet_mid_vflash_transaction_aborts_and_returns_E22` |
+| `LLR-RSP-35` | `rsp` | `HLR-053` | `qSupported_advertises_vFlash_packets` |
 | `LLR-ELF-01` | `elf` | `HLR-021` | `elf_open_accepts_valid_avr_elf32_binary`, `elf_open_returns_minus1_on_invalid_elf_magic`, `elf_open_returns_minus1_on_wrong_machine_type` |
 | `LLR-ELF-02` | `elf` | `HLR-021`, `HLR-040` | `elf_open_loads_symtab_and_strtab_into_heap_buffers`, `elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure` |
 | `LLR-ELF-03` | `elf` | `HLR-021` | `elf_find_avros_tables_performs_single_linear_scan`, `elf_find_avros_tables_populates_all_7_avros_sentinel_fields` |
