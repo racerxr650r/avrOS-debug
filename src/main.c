@@ -292,11 +292,19 @@ MAYBE_STATIC void event_loop(AppConfig *cfg, RspHandlers *h)
             break;
         }
 
-        /* (1) accept new GDB client when none is connected */
+        /* (1) accept new GDB client when none is connected.
+         * Halt the CPU on attach so the very first `?` / `g` reflects
+         * a coherent stopped state.  After a prior session's detach
+         * (which calls updi_run) the target is free-running, and the
+         * subsequent vCont;c would fail because the OCD module sees
+         * the RUN bit being set on an already-running CPU.            */
         if (cfg->listen_fd >= 0 && FD_ISSET(cfg->listen_fd, &rfds) &&
             cfg->gdb_fd < 0) {
             int fd = rsp_accept(cfg->listen_fd);
-            if (fd >= 0) cfg->gdb_fd = fd;
+            if (fd >= 0) {
+                cfg->gdb_fd = fd;
+                if (cfg->updi_fd >= 0) (void)updi_halt(cfg->updi_fd);
+            }
         }
 
         /* (2) forward UPDI console traffic to stdout */

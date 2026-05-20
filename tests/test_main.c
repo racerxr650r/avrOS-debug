@@ -186,6 +186,15 @@ int __wrap_updi_chip_erase(int fd)
     return mk_updi_chip_erase_ret;
 }
 
+/* updi_halt is wrapped so the event loop's halt-on-attach call is a
+ * harmless no-op in unit tests (no live UPDI link in CI).            */
+int __wrap_updi_halt(int fd);
+int __wrap_updi_halt(int fd)
+{
+    (void)fd;
+    return 0;
+}
+
 /* Phase 9 wraps (LLR-MAIN-14, LLR-MAIN-15, LLR-MAIN-16, LLR-UPDI-30..32) */
 static int      mk_updi_nvm_read_calls;
 static int      mk_updi_nvm_read_ret    = 0;

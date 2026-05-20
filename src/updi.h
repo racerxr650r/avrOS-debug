@@ -149,6 +149,11 @@ int  updi_enter_debug(int fd);
 int  updi_halt(int fd);
 int  updi_run(int fd);
 int  updi_step(int fd);
+/* Poll the OCD STOPPED status for up to `timeout_ms` (1 ms ticks).
+ * Returns:
+ *   0  = CPU is halted now
+ *   1  = link OK, CPU still running within the budget
+ *   -1 = UPDI I/O error                                            */
 int  updi_ocd_poll_halted(int fd, int timeout_ms);
 int  updi_ocd_read_halt_status(int fd, uint8_t *st0, uint8_t *st1);
 
