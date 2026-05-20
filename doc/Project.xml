@@ -2210,7 +2210,7 @@ Errors are propagated upward through the module stack without retrying:
       </llr>
 
       <llr id="LLR-RSP-23">
-        <text><![CDATA[The `dh_vrun()` default handler (`vRun;[<filename>][;<arg>...]`) shall implement extended-remote start-new-program by ignoring the filename and argument list (the target program is already in FLASH and there is no host-side filesystem), then performing the same three-step sequence as `dh_restart()`: `updi_enter_debug()` (reply `E01` on failure), `fsm_invalidate()`, and delegate to `dh_continue()` with `c`. The resulting stop-reply packet is emitted to GDB on the next halt.]]></text>
+        <text><![CDATA[The `dh_vrun()` default handler (`vRun;[<filename>][;<arg>...]`) shall implement extended-remote start-new-program by ignoring the filename and argument list (the target program is already in FLASH and there is no host-side filesystem), then performing a reset-and-halt-at-entry sequence: call `updi_enter_debug()` (reply `E01` on failure) to halt the CPU at the reset vector, call `fsm_invalidate()`, call `fsm_build_thread_list()` to rebuild the per-FSM thread cache, and delegate to `dh_halt_reason()` (`?`) to emit a `T05` stop reply. Per the GDB Remote Serial Protocol, `vRun` must return a stop reply immediately — the client decides when to start execution via its own `c` / `s` packets; the handler must NOT call `updi_run()` or otherwise resume the CPU.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-058" name="Extended-remote — multiprocess+, vRun, vAttach, vKill"/>
         </traces>
@@ -3324,7 +3324,7 @@ Errors are propagated upward through the module stack without retrying:
       </test>
 
       <test name="vRun_invalidates_fsm_runs_and_emits_stop">
-        <purpose><![CDATA[Dispatch `vRun;;arg1` (empty filename, ignored arg) and verify the same side-effects as `R00`: `fsm_invalidate()` called, `updi_run()` called once, thread list rebuilt, and a `T05` stop reply emitted.]]></purpose>
+        <purpose><![CDATA[Dispatch `vRun;;arg1` (empty filename, ignored arg) and verify the GDB-protocol-compliant halt-at-entry behaviour: `fsm_invalidate()` called, thread list rebuilt via `fsm_build_thread_list()`, a `T05` stop reply emitted, and `updi_run()` NOT called (the client decides when to resume execution).]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-23"/></traces>
       </test>
 

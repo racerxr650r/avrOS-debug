@@ -1064,8 +1064,12 @@ static void vRun_invalidates_fsm_runs_and_emits_stop(void)
     /* vRun with empty filename and one arg, both ignored. */
     rsp_dispatch(sock_pair[1], "vRun;;arg1", &h);
 
+    /* Per GDB protocol, vRun must reset the program and respond with a
+     * stop reply describing the halt-at-entry state.  No CPU "run" is
+     * issued — the client decides when to start execution via its own
+     * `c` / `s`. */
     TEST_ASSERT_GREATER_THAN(0, mock_invalidate_calls);
-    TEST_ASSERT_EQUAL(1, mock_run_calls);
+    TEST_ASSERT_EQUAL(0, mock_run_calls);
     TEST_ASSERT_GREATER_THAN(0, mock_build_calls);
     char stream[128]; drain(sock_pair[0], stream, sizeof stream);
     char payload[128];

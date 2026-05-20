@@ -174,10 +174,11 @@ static bool parse_id3(const char *s, uint8_t out[3])
  *  Group A — link & identity (non-destructive)                         *
  * ──────────────────────────────────────────────────────────────────── */
 
-static int run_groupA(const HwCfg *cfg, int fd, UpdiDeviceInfo *info)
+static int run_groupA(const HwCfg *cfg, int *pfd, UpdiDeviceInfo *info)
 {
     char why[128];
     double t0;
+    int    fd = *pfd;
 
     /* A1: port openable + cold-start handshake completed (open already done). */
     if (fd < 0) {
@@ -248,12 +249,47 @@ static int run_groupA(const HwCfg *cfg, int fd, UpdiDeviceInfo *info)
     else
         report_fail("A6", "sernum non-zero (16 bytes)", "all 16 bytes 0x00");
 
-    /* A7: ASI_SYS_STATUS: NVMPROG bit (b3) should be clear in normal state.  */
-    if ((info->asi_sys_status & 0x08u) == 0)
-        report_pass("A7", "asi_sys_status: NVMPROG clear", 0.0);
-    else
-        report_fail("A7", "asi_sys_status: NVMPROG clear",
-                    "target stuck in NVMPROG");
+    /* A7: ASI_SYS_STATUS sanity check. Bit map (AVR-Dx datasheet §35.5.10):
+     *   bit 0  LOCKSTATUS — chip is LOCK'd (only chip-erase can unlock)
+     *   bit 1  UROWPROG   — USERROW programming mode active
+     *   bit 2  NVMPROG    — NVM programming mode active (expected: 1 after
+     *                      updi_open(), which deliberately enters it to
+     *                      halt the CPU)
+     *   bit 3  INSLEEP    — MCU is/was in a sleep mode (informational —
+     *                      benign on its own; target firmware that sleeps
+     *                      in idle will set this even when the CPU is
+     *                      currently halted via NVMPROG, since the bit
+     *                      tracks MCU-mode state independently of the
+     *                      UPDI halt override)
+     *   bit 4  RSTSYS     — system held in reset
+     *   bits 5-7  reserved
+     *
+     * Invariant: LOCKSTATUS=0 (else NVM is inaccessible) and RSTSYS=0
+     * (else the CPU cannot run). INSLEEP alone is reported but does not
+     * fail — see analysis above.
+     */
+    {
+        uint8_t s = info->asi_sys_status;
+        if (s & 0x01u) {
+            snprintf(why, sizeof why,
+                     "LOCKSTATUS set (SYS_STATUS=0x%02X); chip-erase required",
+                     s);
+            report_fail("A7", "asi_sys_status sanity", why);
+        } else if (s & 0x10u) {
+            snprintf(why, sizeof why,
+                     "RSTSYS set (SYS_STATUS=0x%02X); target held in reset",
+                     s);
+            report_fail("A7", "asi_sys_status sanity", why);
+        } else if (s & 0x08u) {
+            char note[64];
+            snprintf(note, sizeof note,
+                     "asi_sys_status sanity (INSLEEP=1, 0x%02X)", s);
+            report_pass("A7", note, 0.0);
+        } else {
+            report_pass("A7", "asi_sys_status sanity", 0.0);
+        }
+    }
+    (void)pfd;
     return 0;
 }
 
@@ -1318,27 +1354,52 @@ static void run_groupD(const HwCfg *cfg)
         snprintf(zz0pkt, sizeof zz0pkt, "z0,%X,2", (unsigned)cfg->flash_page);
         snprintf(mread,  sizeof mread,  "m%X,2",   (unsigned)cfg->flash_page);
         int ok2 = 0;
+        const char *fail_reason = "BREAK opcode not observed";
+        char fail_detail[96]; fail_detail[0] = '\0';
         if (send_rsp(sock, z0pkt) == 0) {
             n = read_rsp_packet(sock, buf, sizeof buf, 5000);
             if (n > 0 && rsp_payload(buf, n, &pay, &paylen) == 0 &&
                 paylen == 2 && memcmp(pay, "OK", 2) == 0) ok2 = 1;
+            else {
+                /* Hex-dump first 24 bytes of the raw reply so we can
+                 * see exactly what the server sent. */
+                char hex[80]; size_t hp = 0;
+                int show = (n > 0) ? (n < 24 ? n : 24) : 0;
+                for (int i = 0; i < show && hp + 3 < sizeof hex; i++)
+                    hp += (size_t)snprintf(hex + hp, sizeof hex - hp,
+                                           "%02x ", (unsigned char)buf[i]);
+                snprintf(fail_detail, sizeof fail_detail,
+                         "Z0 reply not OK (n=%d, raw=%s)", n, hex);
+                fail_reason = fail_detail;
+            }
         }
         drain_socket(sock);
         if (ok2 && send_rsp(sock, mread) == 0) {
             n = read_rsp_packet(sock, buf, sizeof buf, 2000);
             if (!(n > 0 && rsp_payload(buf, n, &pay, &paylen) == 0 &&
-                  paylen == 4 && memcmp(pay, "9895", 4) == 0)) ok2 = 0;
+                  paylen == 4 && memcmp(pay, "9895", 4) == 0)) {
+                ok2 = 0;
+                int pl = (n > 0 && rsp_payload(buf, n, &pay, &paylen) == 0)
+                         ? (int)paylen : 0;
+                snprintf(fail_detail, sizeof fail_detail,
+                         "m readback != 9895 (n=%d, paylen=%d, pay=%.*s)",
+                         n, pl, pl > 16 ? 16 : pl, pl > 0 ? pay : "");
+                fail_reason = fail_detail;
+            }
         }
         drain_socket(sock);
         if (ok2 && send_rsp(sock, zz0pkt) == 0) {
             n = read_rsp_packet(sock, buf, sizeof buf, 5000);
             if (!(n > 0 && rsp_payload(buf, n, &pay, &paylen) == 0 &&
-                  paylen == 2 && memcmp(pay, "OK", 2) == 0)) ok2 = 0;
+                  paylen == 2 && memcmp(pay, "OK", 2) == 0)) {
+                ok2 = 0;
+                fail_reason = "z0 reply not OK";
+            }
         }
         if (ok2) report_pass("D10", "Z0/z0 SW BP via FLASH BREAK",
                              now_ms() - t0);
         else     report_fail("D10", "Z0/z0 SW BP via FLASH BREAK",
-                             "BREAK opcode not observed");
+                             fail_reason);
     }
 
     close(sock);
@@ -1459,7 +1520,7 @@ int main(int argc, char *argv[])
     UpdiDeviceInfo info;
     memset(&info, 0, sizeof info);
 
-    (void)run_groupA(&cfg, fd, &info);
+    (void)run_groupA(&cfg, &fd, &info);
     if (fd >= 0) run_groupB(&cfg, fd);
     if (fd >= 0) run_groupC(&cfg, fd);
     if (fd >= 0) run_groupE(&cfg, fd);

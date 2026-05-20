@@ -1226,9 +1226,13 @@ static int dh_vflash_done(int fd, const char *pkt, void *vctx)
 
 /* HLR-058 (LLR-RSP-23): vRun;[<filename>][;<arg>...] — extended-remote
  * start-new-program.  avr-updi-gdb has no filesystem on the target and
- * the program is already in FLASH, so all arguments are ignored.  The
- * behaviour is identical to R<XX>: reset the AVR, invalidate the FSM
- * cache, then continue and emit a stop reply when the target halts.    */
+ * the program is already in FLASH, so all arguments are ignored.  Per
+ * the GDB protocol, vRun must immediately return a stop reply (the
+ * client interprets it as "program loaded, halted at entry").  We
+ * reset the AVR via updi_enter_debug() (halts at the reset vector),
+ * invalidate and rebuild the FSM thread cache, and emit a T05 halt
+ * reason.  The client is then free to issue its own `c` / `s` to
+ * begin execution.                                                    */
 static int dh_vrun(int fd, const char *pkt, void *vctx)
 {
     (void)pkt;
@@ -1236,7 +1240,8 @@ static int dh_vrun(int fd, const char *pkt, void *vctx)
 
     if (updi_enter_debug(ctx->updi_fd) < 0) return reply_err(fd, "E01");
     fsm_invalidate(ctx->fsm);
-    return dh_continue(fd, "c", vctx);
+    (void)fsm_build_thread_list(ctx->fsm, ctx->idx, ctx->updi_fd);
+    return dh_halt_reason(fd, "?", vctx);
 }
 
 /* HLR-058 (LLR-RSP-24): vAttach;<pid> — extended-remote attach.  The
