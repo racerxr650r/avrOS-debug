@@ -531,7 +531,7 @@ hw-test-rsp: $(HW_TEST_BIN) all
 	$(Q)$(HW_ENV) $(HW_TEST_BIN) --with-rsp
 
 # Run Groups A + B + C + D in one go. NVM still requires explicit confirm.
-hw-test-all: $(HW_TEST_BIN) all
+hw-test-all: $(HW_TEST_BIN) $(FIXBINDIR)/all_nvm.elf all
 	@if [ "$(HW_TEST_NVM_CONFIRM)" != "YES" ]; then \
 	    echo "hw-test-all: refused — set HW_TEST_NVM_CONFIRM=YES to include NVM"; \
 	    exit 1; \
@@ -540,7 +540,8 @@ hw-test-all: $(HW_TEST_BIN) all
 	    echo "hw-test-all: refused — HW_TEST_ELF=path/to/fw.elf is required"; \
 	    exit 1; \
 	fi
-	$(Q)$(HW_ENV) $(HW_TEST_BIN) --with-nvm --with-rsp
+	$(Q)$(HW_ENV) HW_TEST_NVM_ELF='$(if $(HW_TEST_NVM_ELF),$(HW_TEST_NVM_ELF),$(FIXBINDIR)/all_nvm.elf)' \
+	    $(HW_TEST_BIN) --with-nvm --with-rsp
 
 # ── check-tools target ────────────────────────────────────────────────────────
 # LLR-INST-01: verify every required host tool is on PATH.
