@@ -88,7 +88,18 @@ Phase 10 work shall continue to honour the layered architecture (§2.1) and the 
     </references>
 
     <architecture>
-      <intro><![CDATA[`avrOSdb` is a single-process C99 application. Responsibilities are divided into six source modules arranged in protocol layers: an entry-point and event-loop layer, a hardware layer (UPDI), a network layer (GDB RSP), and three application-layer modules (ELF parser, FSM mapper, monitor handler).
+      <intro><![CDATA[`avrOSdb` is a single-process C99 application. Responsibilities are divided into six source modules arranged in four protocol layers; each layer depends only on the layers below it, and no upward calls are permitted. This layering is a hard design rule — see §2.2 "Layered Architecture" — and is enforced by review and by the `.h` dependency graph (the lower layers' headers must not `#include` any header from a higher layer).
+
+**Layer stack (top to bottom):**
+
+| # | Layer | Source modules | Owns | May call |
+| - | ----- | -------------- | ---- | -------- |
+| 4 | **Application** | `src/elf_parser.c`, `src/fsm_mapper.c`, `src/monitor.c` | ELF parsing, FSM-to-thread mapping, monitor verb dispatch | Layers 1–3 |
+| 3 | **Protocol** | `src/gdb_rsp.c` | GDB RSP codec, packet dispatch table, GDB TCP socket lifecycle | Layers 1–2 (and Layer 4 callbacks via `RspHandlers`) |
+| 2 | **Transport / Hardware** | `src/updi.c` | UART fd, UPDI framing, NVM programming, OCD register access, execution-control primitives | Layer 1 (libc / POSIX) |
+| 1 | **Entry / Event Loop** | `src/main.c` | `AppConfig`, argv parsing, `select()` loop, signal handlers, resource teardown | All layers (top-of-stack orchestrator) |
+
+Layer 1 (`src/main.c`) is the orchestrator and is permitted to reach into any module to wire fds and contexts; it sits notionally above the stack rather than inside it. Within layers 2–4, calls are strictly downward: Layer 4 may call Layer 2 for memory/OCD primitives, Layer 3 may call Layer 4 for FSM/monitor work via the `RspHandlers` callback table, but Layer 2 never calls Layers 3 or 4 and Layer 3 never calls Layer 1.
 
 **Concurrency model:** The application is entirely single-threaded. All I/O multiplexing is performed by a single `select()` call inside `event_loop()`. No POSIX threads (`pthreads`) are used at any point. All module entry points are called synchronously and must return before the next I/O event can be processed. Long-blocking operations (e.g., NVM flash write, UPDI link initialisation) are therefore only permitted at startup or in response to explicit GDB commands, never in the event-loop hot path.
 
@@ -131,6 +142,7 @@ Phase 10 work shall continue to honour the layered architecture (§2.1) and the 
     </architecture>
 
     <design_goals>
+      <goal name="Layered Architecture"><![CDATA[The source tree is organised into four protocol layers with strictly downward call direction (entry/event-loop → protocol → transport/hardware, with the application layer sitting above the protocol layer; see §2.1). A header in a lower layer shall not `#include` a header from a higher layer, and a lower-layer function shall not call a higher-layer function. The single permitted upward path is dependency-inversion via the `RspHandlers` callback table in `src/gdb_rsp.h`, which lets the protocol layer (Layer 3) invoke application-layer (Layer 4) code without taking a compile-time dependency on it. This rule is checked at review time: every new module shall declare its layer in this SDD, and every new `#include` shall be either same-layer or lower-layer.]]></goal>
       <goal name="FSM-First Visualization"><![CDATA[Virtual threads map 1-to-1 to avrOS FSM table entries. The server never attempts to unwind dormant stack frames; execution context is defined solely by the FSM's current state function pointer.]]></goal>
       <goal name="Lean Host Architecture"><![CDATA[The server is a single C99 process. Runtime dependencies are limited to libc and the POSIX serial and socket APIs. No Java, Python virtualization, or Electron runtime is required on the host.]]></goal>
       <goal name="Editor-Agnostic Core"><![CDATA[The server exposes only standard GDB RSP. IDE-specific integration (Cortex-Debug, Zed DAP adapter) is handled entirely by the GDB client; the server does not implement any IDE extension protocol.]]></goal>
