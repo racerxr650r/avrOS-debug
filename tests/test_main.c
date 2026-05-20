@@ -416,6 +416,17 @@ int __wrap_rsp_dispatch(int fd, const char *packet, RspHandlers *h)
     return 0;
 }
 
+int __wrap_rsp_dispatch_n(int fd, const char *packet, size_t plen,
+                          RspHandlers *h);
+int __wrap_rsp_dispatch_n(int fd, const char *packet, size_t plen,
+                          RspHandlers *h)
+{
+    (void)fd; (void)packet; (void)plen; (void)h;
+    mk_rsp_dispatch_calls++;
+    LOG(CALL_RSP_DISPATCH);
+    return 0;
+}
+
 void __wrap_rsp_default_handlers(RspHandlers *h, RspContext *ctx);
 void __wrap_rsp_default_handlers(RspHandlers *h, RspContext *ctx)
 {
@@ -888,6 +899,25 @@ static void test_parse_args_no_autobaud_sets_flag(void)
     TEST_ASSERT_TRUE(cfg.no_autobaud);
 }
 
+/* HLR-055 / LLR-MAIN-21: parse_args() recognises --allow-erase. */
+static void test_parse_args_allow_erase_sets_flag(void)
+{
+    char *argv[] = { (char*)"prog", (char*)"--allow-erase", (char*)"/dev/x",
+                     (char*)"a.elf" };
+    AppConfig cfg;
+    parse_args(4, argv, &cfg);
+    TEST_ASSERT_TRUE(cfg.allow_erase);
+}
+
+/* HLR-055 / LLR-MAIN-21: --allow-erase defaults to false when absent. */
+static void test_parse_args_allow_erase_defaults_false(void)
+{
+    char *argv[] = { (char*)"prog", (char*)"/dev/x", (char*)"a.elf" };
+    AppConfig cfg;
+    parse_args(3, argv, &cfg);
+    TEST_ASSERT_FALSE(cfg.allow_erase);
+}
+
 /* Shared driver: build an ELF with one PT_LOAD at `vma` of size `sz`,
  * run app_main with --load (+ optional extra argv tokens), return rc. */
 static int run_load_with_one_segment(uint32_t vma, uint32_t sz,
@@ -1089,6 +1119,8 @@ int main(void)
     RUN_TEST(test_parse_args_prog_mode_sets_flag);
     RUN_TEST(test_parse_args_no_verify_sets_flag);
     RUN_TEST(test_parse_args_no_autobaud_sets_flag);
+    RUN_TEST(test_parse_args_allow_erase_sets_flag);
+    RUN_TEST(test_parse_args_allow_erase_defaults_false);
     RUN_TEST(test_load_segments_dispatches_eeprom_segment_to_eeprom_writer);
     RUN_TEST(test_load_segments_dispatches_fuses_segment_to_fuses_writer);
     RUN_TEST(test_load_segments_dispatches_userrow_segment_to_userrow_writer);

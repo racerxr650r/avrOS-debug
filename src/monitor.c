@@ -10,6 +10,7 @@
 #include "monitor.h"
 #include "gdb_rsp.h"
 #include "updi.h"
+#include "fsm_mapper.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -233,5 +234,174 @@ int monitor_dispatch(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx,
     }
 
     send_usage_hint(rsp_fd);
+    return -2;
+}
+
+/* ──────────────────────────────────────────────────────────────────────
+ * HLR-055: avarice-compatible top-level monitor verbs.
+ * Implemented here so the dispatcher is one consistent module.  These
+ * verbs take an RspContext to reach the FSM cache, BP shadow, and the
+ * `--allow-erase` gate.
+ * ──────────────────────────────────────────────────────────────────── */
+
+#ifndef AVROSDB_VERSION
+#define AVROSDB_VERSION "unknown"
+#endif
+
+/* Emit a single hex-encoded O-packet line.  Returns 0/-1. */
+static int o_line(int rsp_fd, const char *line)
+{
+    return send_text_as_o_packet(rsp_fd, line, strlen(line));
+}
+
+static int verb_reset(int rsp_fd, RspContext *ctx)
+{
+    /* updi_enter_debug() applies an ASI_RESET pulse and re-enters OCD
+     * so the CPU lands halted at the reset vector — exactly the
+     * semantic mandated by HLR-055.                                  */
+    if (updi_enter_debug(ctx->updi_fd) < 0) return -1;
+    rsp_hw_bp_clear_all(ctx);
+    rsp_sw_bp_clear_all(ctx);   /* HLR-054 */
+    if (ctx->fsm != NULL) fsm_invalidate(ctx->fsm);
+    (void)o_line(rsp_fd, "target reset, halted at reset vector\n");
+    return 0;
+}
+
+static int verb_halt(int rsp_fd, RspContext *ctx)
+{
+    if (updi_halt(ctx->updi_fd) < 0) return -1;
+    /* Stay within qRcmd protocol: emit a human-readable O-packet line
+     * and let dh_monitor send the default `OK`. GDB will re-fetch
+     * registers on the next `info`/`print` command via $g, so PC will
+     * reflect the post-halt state. (T05 is *not* a valid reply to
+     * qRcmd — sending it here triggers "Invalid hex digit" parse
+     * errors in the gdb client.) */
+    (void)o_line(rsp_fd, "target halted\n");
+    return 0;
+}
+
+static int verb_go(int rsp_fd, RspContext *ctx)
+{
+    if (updi_run(ctx->updi_fd) < 0) return -1;
+    (void)o_line(rsp_fd, "target running\n");
+    return 0;
+}
+
+static int verb_erase(int rsp_fd, RspContext *ctx)
+{
+    if (!ctx->allow_erase) {
+        (void)o_line(rsp_fd,
+            "monitor erase: refused — launch the server with "
+            "--allow-erase to enable.\n");
+        return -1;
+    }
+    if (updi_chip_erase(ctx->updi_fd) < 0) return -1;
+    /* The chip is now blank and in NVMPROG-exit state.  Re-enter OCD
+     * so subsequent register/PC reads succeed, and drop all BP shadow
+     * entries because FLASH no longer holds any patched instructions. */
+    if (updi_enter_debug(ctx->updi_fd) < 0) return -1;
+    rsp_hw_bp_clear_all(ctx);
+    rsp_sw_bp_clear_all(ctx);   /* HLR-054 */
+    if (ctx->fsm != NULL) fsm_invalidate(ctx->fsm);
+    (void)o_line(rsp_fd, "chip-erase complete; target halted\n");
+    return 0;
+}
+
+static int verb_version(int rsp_fd)
+{
+    char line[128];
+    snprintf(line, sizeof line,
+             "avrOSdb %s (built " __DATE__ ")\n", AVROSDB_VERSION);
+    (void)o_line(rsp_fd, line);
+    return 0;
+}
+
+static int verb_bp_mode(int rsp_fd, RspContext *ctx, const char *arg)
+{
+    if (arg == NULL || arg[0] == '\0') {
+        char line[64];
+        snprintf(line, sizeof line, "bp-mode: %s\n",
+                 ctx->bp_mode == RSP_BP_MODE_HW_ONLY ? "hw-only" : "sw");
+        (void)o_line(rsp_fd, line);
+        return 0;
+    }
+    if (strcmp(arg, "sw") == 0) {
+        ctx->bp_mode = RSP_BP_MODE_SW;
+        (void)o_line(rsp_fd, "bp-mode: sw\n");
+        return 0;
+    }
+    if (strcmp(arg, "hw-only") == 0) {
+        ctx->bp_mode = RSP_BP_MODE_HW_ONLY;
+        (void)o_line(rsp_fd, "bp-mode: hw-only\n");
+        return 0;
+    }
+    (void)o_line(rsp_fd, "bp-mode: argument must be 'sw' or 'hw-only'\n");
+    return -2;
+}
+
+static int verb_help(int rsp_fd)
+{
+    static const char *const lines[] = {
+        "monitor reset            — reset target, halt at reset vector\n",
+        "monitor halt             — halt target now (emits T05 stop-reply)\n",
+        "monitor go               — resume target (OK; stop-reply on next halt)\n",
+        "monitor erase            — chip-erase (requires --allow-erase)\n",
+        "monitor chip-erase       — alias of `monitor erase`\n",
+        "monitor version          — print server version + build date\n",
+        "monitor bp-mode <sw|hw-only> — select breakpoint installation policy\n",
+        "monitor help             — this help text\n",
+        "monitor avros events     — list avrOS event descriptors\n",
+        "monitor avros queues     — list avrOS queue descriptors\n",
+    };
+    for (size_t i = 0; i < sizeof lines / sizeof lines[0]; ++i) {
+        if (o_line(rsp_fd, lines[i]) < 0) return -1;
+    }
+    return 0;
+}
+
+/* Trim leading whitespace from `s`. */
+static const char *skip_ws(const char *s)
+{
+    while (*s == ' ' || *s == '\t') ++s;
+    return s;
+}
+
+int monitor_dispatch_ex(int rsp_fd, RspContext *ctx, const char *cmd)
+{
+    if (ctx == NULL || cmd == NULL) return -2;
+
+    /* Decode the hex blob into the same buffer monitor_dispatch uses
+     * so the avros sub-dispatch keeps working.  We need a writable
+     * decoded copy because we tokenise it for top-level verbs.       */
+    char decoded[256];
+    int dlen = hex_decode(cmd, decoded, sizeof decoded);
+    if (dlen < 0) return -2;
+
+    const char *p = skip_ws(decoded);
+
+    /* `avros ...` delegates to the legacy dispatcher (which itself
+     * re-decodes — accept that small cost rather than refactoring).  */
+    static const char avros[] = "avros ";
+    if (strncmp(p, avros, sizeof avros - 1u) == 0) {
+        return monitor_dispatch(rsp_fd, ctx->updi_fd, ctx->idx, cmd);
+    }
+
+    if (strcmp(p, "reset") == 0)       return verb_reset(rsp_fd, ctx);
+    if (strcmp(p, "halt")  == 0)       return verb_halt(rsp_fd, ctx);
+    if (strcmp(p, "go")    == 0)       return verb_go(rsp_fd, ctx);
+    if (strcmp(p, "erase") == 0 ||
+        strcmp(p, "chip-erase") == 0)  return verb_erase(rsp_fd, ctx);
+    if (strcmp(p, "version") == 0)     return verb_version(rsp_fd);
+    if (strcmp(p, "help")    == 0)     return verb_help(rsp_fd);
+
+    static const char bpm[] = "bp-mode";
+    if (strncmp(p, bpm, sizeof bpm - 1u) == 0) {
+        const char *arg = skip_ws(p + sizeof bpm - 1u);
+        return verb_bp_mode(rsp_fd, ctx, arg);
+    }
+
+    (void)o_line(rsp_fd,
+        "usage: monitor <reset|halt|go|erase|chip-erase|version|"
+        "bp-mode|help|avros …>\n");
     return -2;
 }

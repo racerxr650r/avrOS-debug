@@ -154,6 +154,15 @@ int __wrap_rsp_dispatch(int fd, const char *packet, RspHandlers *h)
     return 0;
 }
 
+int __wrap_rsp_dispatch_n(int fd, const char *packet, size_t plen,
+                          RspHandlers *h);
+int __wrap_rsp_dispatch_n(int fd, const char *packet, size_t plen,
+                          RspHandlers *h)
+{
+    (void)fd; (void)packet; (void)plen; (void)h;
+    return 0;
+}
+
 void __wrap_rsp_default_handlers(RspHandlers *h, RspContext *ctx);
 void __wrap_rsp_default_handlers(RspHandlers *h, RspContext *ctx)
 {

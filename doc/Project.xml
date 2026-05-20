@@ -56,15 +56,14 @@
 * **Auto-baud / link-quality probe (`--device` mode).** Replace the hard-coded 115200 baud with a probe that walks a candidate ladder (`230400, 200000, 150000, 115200, 57600, 38400, 19200`), at each step opening the link, issuing a small fixed UPDI transaction sequence (LDCS, NVMCTRL STATUS read × N), and recording the byte error / retry rate. The highest rate with zero retries over the sample window becomes the reported negotiated baud. Result is printed as `baud=<N> errors=<K>/<total>` per candidate and the chosen rate is highlighted. Probe is read-only; no NVM, fuses, or system-reset paths are touched.
 
 Phase 9 work shall reuse the existing layered architecture (§2.1): the NVM read primitives live in `src/updi.c`, the verify and progress-bar wiring lives in `src/main.c`, and the fuse-decode tables live alongside the per-family `g_device_table[]` in `src/updi.c` so they are selected by the same `updi_select_device()` path. No new top-level module is introduced.]]></para>
-      <para><![CDATA[**Planned — Phase 10 — GDB Protocol Completion / avarice Drop-In Parity (not yet implemented).** The Phase 1–8 RSP server implements the minimum subset of the GDB Remote Serial Protocol needed to attach, read state, single-step, set up to two hardware breakpoints, continue, interrupt, and detach. Phase 10 closes the remaining gap between `avrOSdb` and the legacy `avarice` JTAG/dW stub so that any tool, script, IDE configuration, or `.gdbinit` written against `avarice` works unchanged against `avrOSdb` over UPDI. Tracked in GitHub issue #31; bound to HLRs in §12 below.
+      <para><![CDATA[**Planned — Phase 10 — GDB Protocol Completion (avarice Feature Parity) (not yet implemented).** The Phase 1–8 RSP server implements the minimum subset of the GDB Remote Serial Protocol needed to attach, read state, single-step, set up to two hardware breakpoints, continue, interrupt, and detach. Phase 10 brings the protocol surface up to functional parity with the legacy `avarice` JTAG/dW stub for the AVR-Dx UPDI use case: equivalent `monitor` verbs, equivalent `(gdb) load` behaviour, equivalent watchpoint and software-breakpoint experience, and equivalent extended-remote lifecycle. Wire-level drop-in compatibility with `avarice`-specific scripts is an explicit non-goal — individual `.gdbinit` files, IDE launch configurations, and CI invocations may need targeted edits to reach the same outcome. Tracked in GitHub issue #31; bound to HLRs in §12 below.
 
 The following protocol features and monitor commands are in scope; each is justified by an `avarice` capability that today forces the operator either to drop out of the GDB session or to bridge through a second tool (avrdude, pymcuprog, raw scripts).
 
 * **Flash programming from the GDB session (`vFlashErase`, `vFlashWrite`, `vFlashDone`).** Implements `(gdb) load` so a developer can rebuild and reflash without exiting `avr-gdb`. The handlers shall reuse the existing `updi_nvm_*` page primitives in `src/updi.c`; on `vFlashDone` the application shall re-enter OCD via `updi_enter_debug()` and present the post-load CPU as halted at reset for the next `c`/`s`. `vFlashErase` requests outside the on-target FLASH window (i.e. into EEPROM/USERROW/FUSES) shall be rejected with `E22` rather than silently corrupting non-FLASH NVM, because `gdb load` has no per-section verb to disambiguate.
 * **Software breakpoints via flash `BREAK` opcode (`Z0`/`z0` true SW BP).** Phase 1–8 aliases `Z0` to the two OCD hardware comparators (HLR-016), capping the user at two simultaneous breakpoints. Phase 10 adds a true software-breakpoint path that patches the AVR `BREAK` opcode (`0x9598`) into the affected FLASH page, with a per-session shadow map of `(address, original 2-byte opcode)` so `z0` restores the original instruction on remove. The save/patch/restore sequence shall preserve live register, SREG, and SP state across the unavoidable NVMPROG enter/exit (which issues a CPU reset). Implementation shall reuse the page-aligned read-modify-write helper from `src/updi.c`. When the operator opts out via `monitor avros bp-mode hw-only`, `Z0` continues to alias to the HW comparators (the Phase 1–8 behaviour).
-* **Hardware data watchpoints (`Z2`/`Z3`/`Z4`, `z2`/`z3`/`z4`).** Exposes the AVR-Dx OCD data-address comparators (`DABP0`, `DABP1`) as GDB write (`Z2`), read (`Z3`), and access (`Z4`) watchpoints. Implementation lives in `src/updi.c` (new `updi_ocd_set_data_bp()` / `_clear_data_bp()` primitives) and `src/gdb_rsp.c` (new `on_insert_wp`/`on_remove_wp` handler slots). Watchpoint hits shall be reported in the stop-reply packet with the standard `T05watch:<addr>;` / `rwatch` / `awatch` keys so the IDE displays the offending address.
+* **Hardware data watchpoints (`Z2`/`Z3`/`Z4`, `z2`/`z3`/`z4`).** Originally scoped to expose on-silicon data-address comparators, but the FF-bomb experiment in `doc/reference/guesswork.md` and cross-checks against Bloom, `feline-felicity/avr-absurd`, and Microchip's own `pyavrdebug` (CMSIS-DAP stack) all confirm the AVR-Dx UPDI OCD exposes no data-watchpoint hardware. The server therefore replies the empty RSP packet (`$#00`) to Z2/Z3/Z4 — the documented "unsupported" signal — and GDB falls back transparently to software watchpoints (single-step + memory poll). The user-visible `watch <expr>` command continues to work; no `qSupported` capability is advertised.
 * **Standard GDB monitor commands.** The `monitor avros` namespace is kept (and remains the home for FSM-specific introspection); Phase 10 adds an `avarice`-compatible top-level set of monitor verbs: `monitor reset` (issue `updi_reset()` and halt), `monitor halt` (call `updi_halt()`), `monitor go` (call `updi_run()`), `monitor erase` / `monitor chip-erase` (CHIPERASE via `updi_chip_erase()`, refused unless the session was opened with `--allow-erase`), `monitor version` (print server version, git hash, and target family), and `monitor help` (list every known verb). Implementation lives in `src/monitor.c`; the dispatcher shall continue to route the `avros` prefix to the existing avrOS-specific handlers, falling through to the new generic handlers for any other verb.
-* **Memory-map and target-description XML (`qXfer:memory-map:read`, `qXfer:features:read`).** Phase 1–8 returns the empty packet for both, forcing GDB to fall back to its built-in `avr` defaults. Phase 10 ships a runtime-generated XML map that reflects the selected device family (HLR-048): FLASH base / size, SRAM base / size, EEPROM, USERROW, FUSES, LOCK, SIGROW windows. This enables `gdb load` to pick the right NVM controller automatically and lets the IDE colour memory views by region. Implementation reuses `g_device_table[]`.
 * **Extended-remote lifecycle and protocol cleanup.** Implements `vRun`/`vAttach`/`vKill` so an IDE can launch and relaunch the debug target from one persistent GDB session (`target extended-remote` semantics), and fills in the small standard packets that `avarice` answers but Phase 1–8 leaves as empty replies: `qC` (current thread), `qOffsets` (returns zeros for our position-independent reset vector), `T<tid>` (is-thread-alive), and `R` (RCmd restart, equivalent to `monitor reset` + `c`). These are individually trivial but cumulatively eliminate the "selected thread is gone" and "unsupported feature" spurious warnings that some IDE configurations promote to errors.
 
 Phase 10 work shall continue to honour the layered architecture (§2.1) and the FSM-first principles (`doc/PVD.md §6.1`): no SW-breakpoint or watchpoint installation may unwind or rewrite FSM virtual-thread state, and `monitor reset` / `monitor chip-erase` shall always invalidate the FSM context before silicon side-effects so the next register/memory query sees a coherent thread list. The single-threaded `select()` event loop and `updi_*` primitive APIs are unchanged.]]></para>
@@ -89,7 +88,18 @@ Phase 10 work shall continue to honour the layered architecture (§2.1) and the 
     </references>
 
     <architecture>
-      <intro><![CDATA[`avrOSdb` is a single-process C99 application. Responsibilities are divided into six source modules arranged in protocol layers: an entry-point and event-loop layer, a hardware layer (UPDI), a network layer (GDB RSP), and three application-layer modules (ELF parser, FSM mapper, monitor handler).
+      <intro><![CDATA[`avrOSdb` is a single-process C99 application. Responsibilities are divided into six source modules arranged in four protocol layers; each layer depends only on the layers below it, and no upward calls are permitted. This layering is a hard design rule — see §2.2 "Layered Architecture" — and is enforced by review and by the `.h` dependency graph (the lower layers' headers must not `#include` any header from a higher layer).
+
+**Layer stack (top to bottom):**
+
+| # | Layer | Source modules | Owns | May call |
+| - | ----- | -------------- | ---- | -------- |
+| 4 | **Application** | `src/elf_parser.c`, `src/fsm_mapper.c`, `src/monitor.c` | ELF parsing, FSM-to-thread mapping, monitor verb dispatch | Layers 1–3 |
+| 3 | **Protocol** | `src/gdb_rsp.c` | GDB RSP codec, packet dispatch table, GDB TCP socket lifecycle | Layers 1–2 (and Layer 4 callbacks via `RspHandlers`) |
+| 2 | **Transport / Hardware** | `src/updi.c` | UART fd, UPDI framing, NVM programming, OCD register access, execution-control primitives | Layer 1 (libc / POSIX) |
+| 1 | **Entry / Event Loop** | `src/main.c` | `AppConfig`, argv parsing, `select()` loop, signal handlers, resource teardown | All layers (top-of-stack orchestrator) |
+
+Layer 1 (`src/main.c`) is the orchestrator and is permitted to reach into any module to wire fds and contexts; it sits notionally above the stack rather than inside it. Within layers 2–4, calls are strictly downward: Layer 4 may call Layer 2 for memory/OCD primitives, Layer 3 may call Layer 4 for FSM/monitor work via the `RspHandlers` callback table, but Layer 2 never calls Layers 3 or 4 and Layer 3 never calls Layer 1.
 
 **Concurrency model:** The application is entirely single-threaded. All I/O multiplexing is performed by a single `select()` call inside `event_loop()`. No POSIX threads (`pthreads`) are used at any point. All module entry points are called synchronously and must return before the next I/O event can be processed. Long-blocking operations (e.g., NVM flash write, UPDI link initialisation) are therefore only permitted at startup or in response to explicit GDB commands, never in the event-loop hot path.
 
@@ -132,6 +142,7 @@ Phase 10 work shall continue to honour the layered architecture (§2.1) and the 
     </architecture>
 
     <design_goals>
+      <goal name="Layered Architecture"><![CDATA[The source tree is organised into four protocol layers with strictly downward call direction (entry/event-loop → protocol → transport/hardware, with the application layer sitting above the protocol layer; see §2.1). A header in a lower layer shall not `#include` a header from a higher layer, and a lower-layer function shall not call a higher-layer function. The single permitted upward path is dependency-inversion via the `RspHandlers` callback table in `src/gdb_rsp.h`, which lets the protocol layer (Layer 3) invoke application-layer (Layer 4) code without taking a compile-time dependency on it. This rule is checked at review time: every new module shall declare its layer in this SDD, and every new `#include` shall be either same-layer or lower-layer.]]></goal>
       <goal name="FSM-First Visualization"><![CDATA[Virtual threads map 1-to-1 to avrOS FSM table entries. The server never attempts to unwind dormant stack frames; execution context is defined solely by the FSM's current state function pointer.]]></goal>
       <goal name="Lean Host Architecture"><![CDATA[The server is a single C99 process. Runtime dependencies are limited to libc and the POSIX serial and socket APIs. No Java, Python virtualization, or Electron runtime is required on the host.]]></goal>
       <goal name="Editor-Agnostic Core"><![CDATA[The server exposes only standard GDB RSP. IDE-specific integration (Cortex-Debug, Zed DAP adapter) is handled entirely by the GDB client; the server does not implement any IDE extension protocol.]]></goal>
@@ -1594,8 +1605,8 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
     </section>
 
-    <section number="12" title="GDB Protocol Completion (avarice Drop-In Parity)">
-      <intro><![CDATA[Requirements in this section govern the Phase 10 features that bring `avrOSdb`'s GDB Remote Serial Protocol surface up to functional parity with the legacy `avarice` JTAG/dW stub, so that any GDB script, IDE configuration, or `.gdbinit` written for `avarice` works unchanged against `avrOSdb` over UPDI. Tracked as GitHub issue #31; implements the design narrative from the Phase 10 overview paragraph in the SDD.]]></intro>
+    <section number="12" title="GDB Protocol Completion (avarice Feature Parity)">
+      <intro><![CDATA[Requirements in this section govern the Phase 10 features that bring `avrOSdb`'s GDB Remote Serial Protocol surface up to functional parity with the legacy `avarice` JTAG/dW stub: equivalent monitor verbs, equivalent `(gdb) load`, equivalent watchpoint and software-breakpoint experience, and equivalent extended-remote lifecycle. Wire-level drop-in compatibility with `avarice`-specific scripts is an explicit non-goal. Tracked as GitHub issue #31; implements the design narrative from the Phase 10 overview paragraph in the SDD.]]></intro>
 
       <hlr id="HLR-053" name="Flash Programming via GDB load">
         <text><![CDATA[The application shall implement the GDB `vFlashErase:addr,length`, `vFlashWrite:addr:XX...`, and `vFlashDone` packets so that the standard `(gdb) load` command programs the AVR FLASH directly from the running GDB session without exiting to an external programmer. On `vFlashErase` the server shall reject any address range that falls outside the FLASH window of the runtime-selected device (HLR-048) with reply `E22`; ranges that fall in EEPROM, USERROW, FUSES, LOCK, or SIGROW shall be refused for the same reason because `gdb load` carries no per-window verb to disambiguate. Erase shall be performed page-aligned via `updi_nvm_erase_flash_page()`; `vFlashWrite` shall accumulate the binary payload into the corresponding page buffer and program it with `updi_nvm_write_flash()`; `vFlashDone` shall flush any pending page, call `updi_enter_debug()` to leave the CPU halted at reset, and reply `OK`. The session's hardware-breakpoint shadow (`RspContext.hw_bp_addr[]`) and SW-breakpoint shadow (HLR-054) shall be cleared on `vFlashDone` because their underlying instructions may have been overwritten by the load. While a `vFlash*` transaction is in progress the server shall not service `g`/`G`/`m`/`M`/`c`/`s` packets; if such a packet arrives between `vFlashErase` and `vFlashDone` the server shall reply `E22` and discard the in-progress page buffers.]]></text>
@@ -1622,18 +1633,9 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-056" name="Hardware Data Watchpoints">
-        <text><![CDATA[The application shall implement GDB watchpoint packets `Z2`/`z2` (write), `Z3`/`z3` (read), and `Z4`/`z4` (access) by programming the AVR-Dx OCD data-address comparator pair `DABP0`/`DABP1`. Up to two simultaneous watchpoints shall be supported, mirroring the two-comparator hardware limit; a third unique-address insert shall reply `E08`. A per-session shadow array `RspContext.hw_wp[]` shall record `(addr, length, kind)` for each programmed comparator so `z*` is exact and detach restores silicon to the unarmed state. The new UPDI primitives `updi_ocd_set_data_bp(slot, addr, length, kind)` and `updi_ocd_clear_data_bp(slot)` shall live alongside the existing `updi_ocd_set_hw_bp()` / `_clear_hw_bp()` so the OCD register accesses are kept in one module. On a watchpoint trigger the stop-reply packet shall carry the standard GDB stop-key `watch:<addr>;` (write), `rwatch:<addr>;` (read), or `awatch:<addr>;` (access) appended to the `T05thread:<id>;` payload so the IDE highlights the responsible address; the address shall be the GDB-side data-space address (UPDI byte address ORed with `0x800000`).]]></text>
+        <text><![CDATA[The application shall reply with the empty RSP packet (`$#00`) to the GDB watchpoint requests `Z2`/`z2` (write), `Z3`/`z3` (read), and `Z4`/`z4` (access). The empty reply is the documented RSP signal for "feature unsupported" and causes GDB to fall back transparently to software watchpoints (single-step + memory poll), so the user-visible `watch <expr>` command continues to work. The empty-packet behaviour reflects a silicon constraint: the AVR-Dx OCD exposed over UPDI provides only the program-counter breakpoint comparators (`OCD_BP0A` / `OCD_BP1A`) and does NOT expose any data-address comparator hardware. The conclusion is confirmed by four independent sources: (1) the FF-bomb experiment in `doc/reference/guesswork.md`, which finds writable bits only at `BP0A`, `BP1A`, `CTRL0`, `CTRL1`, `STATUS0/1`, `INSN0/1`, `PC`, `SP`, `SREG`, and the register file; (2) the canonical open-source AVR debugger Bloom, whose UPDI driver declares `hardwareBreakpoints=1` and exposes no `setDataWatchpoint` method; (3) the sibling SerialUPDI debugger `feline-felicity/avr-absurd`, whose feature list documents "Two hardware breakpoints" and no watchpoints; and (4) Microchip's own `mraardvark/pyavrdebug` (CMSIS-DAP / Atmel-ICE stack), whose Z-packet handler explicitly replies the empty packet for Z2/Z3/Z4 — i.e. even the proprietary EDBG protocol over a debugger pod does not expose data watchpoints. The server shall not advertise any watchpoint-related capability in its `qSupported` reply.]]></text>
         <traces>
           <trace target="SDD" ref="5.3.1"/>
-          <trace target="SDD" ref="4.3.1"/>
-        </traces>
-      </hlr>
-
-      <hlr id="HLR-057" name="Memory-Map and Target Description XML">
-        <text><![CDATA[The application shall implement the `qXfer:memory-map:read` and `qXfer:features:read:target.xml` annexed transfer packets so that GDB ceases to fall back to its built-in `avr` defaults and instead receives a runtime-generated description tailored to the device selected by HLR-048. The advertised feature string returned from `qSupported` shall be extended with `qXfer:memory-map:read+;qXfer:features:read+`. The memory map shall list FLASH (`type="flash" blocksize=<page_size>`), SRAM (`type="ram"`), EEPROM, USERROW, FUSES, LOCK, and SIGROW (`type="rom"`) regions using the addresses already published in `g_device_table[]`, expressed in the GDB unified address space (bit 23 set for data-space windows). The target description shall declare a single `<feature name="org.gnu.gdb.avr.cpu">` group enumerating R0–R31, SREG, SP, and PC with their canonical sizes and types, matching what `avr-gdb` synthesises today but explicit so the server is correct against non-AVR-aware GDB builds. Both transfer payloads shall be generated lazily on first request and cached for the lifetime of the session.]]></text>
-        <traces>
-          <trace target="SDD" ref="5.3.1"/>
-          <trace target="SDD" ref="5.1"/>
         </traces>
       </hlr>
 
@@ -1793,6 +1795,13 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="HLR" ref="HLR-050" name="Program-and-Exit Mode"/>
           <trace target="HLR" ref="HLR-051" name="Fuses Pretty-Printer in Device Mode"/>
           <trace target="HLR" ref="HLR-052" name="Auto-Baud Link-Quality Probe in Device Mode"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MAIN-21">
+        <text><![CDATA[`parse_args()` shall recognise `--allow-erase` as a boolean flag (no argument) and set `cfg->allow_erase = true` when present. The default initialiser shall set the flag to `false`. The `usage()` help text shall include a one-paragraph description naming the verbs it unlocks (`monitor erase`, `monitor chip-erase`) so operators see the gating relationship without consulting the man page. The flag value shall be propagated to the constructed `RspContext` at server start by assigning `ctx.allow_erase = cfg->allow_erase ? 1 : 0;`, and the default breakpoint mode shall be set to `RSP_BP_MODE_SW` in the same initialiser block.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-055" name="avarice-Compatible Monitor Commands"/>
         </traces>
       </llr>
     </function>
@@ -2170,6 +2179,125 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="HLR" ref="HLR-019" name="RSP Capability Negotiation and Lifecycle"/>
         </traces>
       </llr>
+
+      <llr id="LLR-RSP-19">
+        <text><![CDATA[The `dh_query_c()` default handler (`qC`) shall reply with `QC<hex>` where `<hex>` is the lowercase-hexadecimal GDB thread id currently selected for `c`/`s` operations (the most recent `Hc<tid>` value, stored at `*ctx->c_thread_p`). If no `c`-thread has been selected, or the selected value is zero or negative, the reply shall be the literal `QC0`. The handler shall not touch the UPDI link, the FSM context, or any OCD register.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-059" name="Protocol Cleanup — qC, qOffsets, T, R"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-20">
+        <text><![CDATA[The `dh_query_offsets()` default handler (`qOffsets`) shall reply with the fixed literal string `Text=0;Data=0;Bss=0`. The AVR reset vector is anchored at FLASH address zero and avrOS performs no position-independent loading, so all three section offsets are reported as zero unconditionally. The handler shall not touch the UPDI link, the FSM context, or any OCD register.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-059" name="Protocol Cleanup — qC, qOffsets, T, R"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-21">
+        <text><![CDATA[The `dh_thread_alive()` default handler (`T<tid>`) shall parse `<tid>` as a hexadecimal GDB thread id and reply `OK` when the id is present in `ctx->fsm->threads[].gdb_id` (with `ctx->fsm->valid == true`), `E01` otherwise. When the FSM context is unset or invalid the handler shall accept thread id `1` only (the default active thread on a freshly-attached session) and reject all others with `E01`. The handler shall not touch the UPDI link or any OCD register.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-059" name="Protocol Cleanup — qC, qOffsets, T, R"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-22">
+        <text><![CDATA[The `dh_restart()` default handler (`R<XX>`) shall implement the extended-remote restart semantics by: (1) calling `updi_enter_debug()` to pulse `ASI_RESET_REQ` and re-enter OCD halted at the reset vector, replying `E01` and returning if the UPDI primitive fails; (2) calling `fsm_invalidate()` to drop the stale virtual-thread cache; and (3) delegating to `dh_continue()` with a synthetic `c` packet so the target resumes, the thread list is rebuilt on the next halt, and the resulting stop-reply packet is emitted to GDB. The `<XX>` byte of the inbound packet shall be ignored per the GDB protocol.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-059" name="Protocol Cleanup — qC, qOffsets, T, R"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-23">
+        <text><![CDATA[The `dh_vrun()` default handler (`vRun;[<filename>][;<arg>...]`) shall implement extended-remote start-new-program by ignoring the filename and argument list (the target program is already in FLASH and there is no host-side filesystem), then performing a reset-and-halt-at-entry sequence: call `updi_enter_debug()` (reply `E01` on failure) to halt the CPU at the reset vector, call `fsm_invalidate()`, call `fsm_build_thread_list()` to rebuild the per-FSM thread cache, and delegate to `dh_halt_reason()` (`?`) to emit a `T05` stop reply. Per the GDB Remote Serial Protocol, `vRun` must return a stop reply immediately — the client decides when to start execution via its own `c` / `s` packets; the handler must NOT call `updi_run()` or otherwise resume the CPU.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-058" name="Extended-remote — multiprocess+, vRun, vAttach, vKill"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-24">
+        <text><![CDATA[The `dh_vattach()` default handler (`vAttach;<pid>`) shall implement extended-remote attach by ignoring `<pid>` (the AVR target has no process namespace), then: (1) calling `updi_enter_debug()` to halt the running target and re-enter OCD, replying `E01` on UPDI failure; (2) calling `fsm_invalidate()` and `fsm_build_thread_list()` so virtual-thread state is fresh; and (3) delegating to `dh_halt_reason()` to emit a SIGTRAP stop reply containing the active `thread:<hex>;` so GDB knows the target is halted and ready for register and memory queries.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-058" name="Extended-remote — multiprocess+, vRun, vAttach, vKill"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-25">
+        <text><![CDATA[The `dh_vkill()` default handler (`vKill[;<pid>]`) shall implement extended-remote kill by ignoring `<pid>`, setting `*ctx->quit_p = 1` so the main loop terminates after the current packet, and replying `OK`. This mirrors the behaviour of the legacy `k` packet path so a GDB session that uses either form releases the debugger identically.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-058" name="Extended-remote — multiprocess+, vRun, vAttach, vKill"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-26">
+        <text><![CDATA[The inline `qSupported` reply shall be the literal string `PacketSize=800;QStartNoAckMode+;multiprocess+;vContSupported+;vRun+;vAttach+;vKill+`. The `multiprocess+` feature is advertised even though the AVR target supports only a single process — it informs GDB that the server understands `<pid>.<tid>` thread-id syntax and accepts the extended-remote `v*` packets. `vRun+`, `vAttach+`, and `vKill+` advertise the corresponding handlers added by HLR-058. The inbound `vAttach?` capability probe shall be answered with `OK`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-058" name="Extended-remote — multiprocess+, vRun, vAttach, vKill"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-27">
+        <text><![CDATA[The `dh_insert_bp()` handler shall recognise the GDB watchpoint request prefixes `Z2`, `Z3`, and `Z4` and reply with the empty RSP packet (payload of length zero, on-the-wire `$#00`). The `dh_remove_bp()` handler shall do the same for `z2`, `z3`, and `z4`. The empty reply is the documented RSP signal for "feature unsupported" and causes GDB to silently fall back to software watchpoints. No call into the UPDI layer is made; no shadow state is consulted or updated; and no `qSupported` capability advertises watchpoints.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-056" name="GDB watchpoints (Z2/Z3/Z4)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-32">
+        <text><![CDATA[The `dh_vflash_erase()` default handler (`vFlashErase:<addr>,<length>`) shall parse the two hex fields and refuse with `E22` if either is malformed, `length` is zero, or any address in the range `[addr, addr+length)` has the data-space flag set (i.e. `(addr | (addr+length-1)) & GDB_AVR_DATA_FLAG`) — this rejects EEPROM, USERROW, FUSES, LOCK, and SIGROW windows since `gdb load` provides no per-window verb. Lengths larger than 1 MB shall also be refused with `E22` as a runaway-allocation guard. On success the handler shall (re-)allocate `RspContext.flash_xact_buf` to span the page-aligned union of any prior erased range and `[floor_page(addr), ceil_page(addr+length))`, pre-filling new pages with `0xFF`, and reply `OK`. Erase-on-silicon is deferred until `dh_vflash_done()` because `updi_nvm_write_flash()` performs an FLPER per page before each FLWR.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-053" name="Flash Programming via GDB load"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-33">
+        <text><![CDATA[The `dh_vflash_write()` default handler (`vFlashWrite:<addr>:<binary>`) shall refuse with `E22` (and discard any in-progress page buffer) if no `vFlashErase` is active, the address is malformed, the address has the data-space flag set, or the address is below `RspContext.flash_xact_base`. Otherwise it shall decode RSP binary-protocol escapes (`0x7D <b>` → `b XOR 0x20`) in the payload and copy the resulting bytes into `flash_xact_buf` at offset `addr - flash_xact_base`, replying `E22` on buffer overflow and `OK` on success. The payload byte count is derived from the `plen` argument threaded through `rsp_dispatch_n()` so embedded NUL bytes do not truncate the copy.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-053" name="Flash Programming via GDB load"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-34">
+        <text><![CDATA[The `dh_vflash_done()` default handler (`vFlashDone`) shall (a) if no transaction is active, reply `OK` immediately (treating the packet as a no-op); (b) otherwise call `updi_nvm_write_flash(updi_fd, UPDI_FLASH_BASE + flash_xact_base, flash_xact_buf, flash_xact_len)`, freeing the buffer and clearing `flash_xact_base/len` regardless of outcome, then reply `E22` on UPDI failure or — on success — call `rsp_hw_bp_clear_all()` (because the FLASH word at each shadowed HW-BP address may have been overwritten by the load), call `updi_enter_debug()` to leave the CPU halted at reset, and reply `OK`. Any `g`/`G`/`P`/`m`/`M`/`X`/`c`/`s` packet that arrives between `vFlashErase` and `vFlashDone` shall be rejected with `E22` by `rsp_dispatch_n()` and the in-progress page buffer shall be discarded.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-053" name="Flash Programming via GDB load"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-35">
+        <text><![CDATA[The `qSupported` inline reply shall additionally advertise `vFlashErase+;vFlashWrite+;vFlashDone+` so GDB enables the `vFlash*` flow for the `load` command. The length-carrying `rsp_dispatch_n(fd, packet, plen, handlers)` entry point shall be the public dispatch API used by the main event loop; the legacy `rsp_dispatch()` shall remain as a thin wrapper that derives `plen` from `strlen(packet)`, for tests and any caller that knows the packet is ASCII-only.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-053" name="Flash Programming via GDB load"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-36">
+        <text><![CDATA[The `dh_insert_bp()` default handler shall route `Z0,<addr>[,<kind>]` to a software-breakpoint installer when `ctx->bp_mode == RSP_BP_MODE_SW` (the default) and to the legacy hardware-comparator path when `ctx->bp_mode == RSP_BP_MODE_HW_ONLY` (per HLR-055 `monitor bp-mode hw-only`). Addresses with the `GDB_AVR_DATA_FLAG` (0x800000) bit set — EEPROM, USERROW, FUSES, LOCK, SIGROW — shall be refused with `E22` because the AVR `BREAK` opcode is only meaningful when fetched from FLASH. A duplicate `Z0` on an address already shadowed shall reply `OK` without re-patching. When all `RSP_MAX_SW_BREAKPOINTS` (64) shadow slots are occupied the handler shall reply `E08`. Z1 packets continue to alias to the two OCD HW comparators regardless of `bp_mode` (HLR-016).]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-054" name="True Software Breakpoints via Flash BREAK Opcode"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-37">
+        <text><![CDATA[The SW-BP install path shall, for each `Z0` accepted in `RSP_BP_MODE_SW`, (1) snapshot R0–R31 via `updi_ocd_read_gpr()`, SREG via `updi_ocd_read_sreg()`, SP via `updi_ocd_read_sp()`, and PC via `updi_ocd_read_pc()`; (2) read the 2-byte original opcode at `UPDI_FLASH_BASE + (addr & GDB_AVR_ADDR_MASK)` via `updi_mem_read()`; (3) write `{0x98, 0x95}` (`BREAK` opcode, little-endian) to the same FLASH word via `updi_nvm_flash_patch()`; (4) call `updi_enter_debug()` to leave NVMPROG and re-enter OCD; (5) restore R0–R31, SREG, SP, and PC via the matching `updi_ocd_write_*()` primitives; and (6) record `(addr, orig[0], orig[1], in_use=true)` in the first free `RspContext.sw_bp[]` slot. Any UPDI link error during the sequence shall cause the handler to reply `E01` without partially populating the shadow slot.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-054" name="True Software Breakpoints via Flash BREAK Opcode"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-38">
+        <text><![CDATA[The `dh_remove_bp()` default handler, on `z0,<addr>` in `RSP_BP_MODE_SW`, shall scan `ctx->sw_bp[]` for a slot whose `addr` matches and, when found, repeat the snapshot/patch/restore sequence of LLR-RSP-37 — writing the saved `orig[0..1]` bytes back to FLASH at `UPDI_FLASH_BASE + (addr & GDB_AVR_ADDR_MASK)` — then mark the slot `in_use=false` and reply `OK`. When no SW shadow slot matches, the handler shall fall through to the HW-comparator removal path so a `z0` after a `monitor bp-mode` toggle still drains both shadow tables. A UPDI link error during the FLASH patch shall reply `E01`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-054" name="True Software Breakpoints via Flash BREAK Opcode"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-39">
+        <text><![CDATA[The helper `rsp_sw_bp_clear_all(RspContext *ctx)` shall clear every entry in `ctx->sw_bp[]` (`in_use=false`, `addr=0`, `orig[0]=orig[1]=0`) without issuing any UPDI I/O. It shall be invoked by `dh_vflash_done()` (HLR-053) on successful flush, and by the `monitor reset` / `monitor erase` / `monitor chip-erase` verbs (HLR-055) immediately after their UPDI side-effect, because the underlying FLASH instruction (and therefore the `BREAK` opcode that would otherwise persist) is no longer present.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-054" name="True Software Breakpoints via Flash BREAK Opcode"/>
+        </traces>
+      </llr>
     </function>
 
     <function number="5" title="src/elf_parser.c — ELF Binary Parser" name="elf" source="src/elf_parser.c">
@@ -2335,6 +2463,63 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="HLR" ref="HLR-032" name="Introspection Reliability"/>
         </traces>
       </llr>
+
+      <llr id="LLR-MON-08">
+        <text><![CDATA[`monitor_dispatch_ex(int rsp_fd, RspContext *ctx, const char *cmd)` shall be the top-level entry for `qRcmd` packets and shall hex-decode `cmd` into a writable buffer of at least 256 bytes, then dispatch on the first whitespace-stripped token. If the token is `avros` followed by a space the call shall be forwarded verbatim to the legacy `monitor_dispatch()` so all pre-existing `monitor avros …` sub-commands keep working unchanged. Recognised top-level verbs are `reset`, `halt`, `go`, `erase`, `chip-erase`, `version`, `bp-mode`, and `help`. Any other first token shall emit an O-packet `"usage: monitor <reset|halt|go|erase|chip-erase|version|bp-mode|help|avros …>\n"` and return -2.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-055" name="avarice-Compatible Monitor Commands"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MON-09">
+        <text><![CDATA[The `monitor reset` verb shall call `updi_enter_debug(ctx->updi_fd)` (issuing the OCD KEY + ASI_RESET_REQ pulse and waiting for the STOPPED bit so the CPU is halted at the reset vector), discard all hardware-breakpoint shadow entries via `rsp_hw_bp_clear_all(ctx)`, invalidate the FSM thread cache via `fsm_invalidate(ctx->fsm)` when `ctx->fsm` is non-NULL, emit one diagnostic O-packet line `"target reset, halted at reset vector\n"`, and return 0 so `dh_monitor` appends the trailing `OK`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-055" name="avarice-Compatible Monitor Commands"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MON-10">
+        <text><![CDATA[The `monitor halt` verb shall call `updi_halt(ctx->updi_fd)` and then emit the same stop-reply packet shape used by the step/continue paths — `T05thread:<id>;` where `<id>` is `fsm_get_active_thread(ctx->fsm)` (or 1 when no FSM mapping is available) — via `rsp_send_packet()`. The verb shall return -3 so `dh_monitor` suppresses the trailing `OK` and the GDB client sees exactly one packet per halt.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-055" name="avarice-Compatible Monitor Commands"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MON-11">
+        <text><![CDATA[The `monitor go` verb shall call `updi_run(ctx->updi_fd)`, emit a diagnostic O-packet `"target running\n"`, and return 0. The subsequent stop-reply is emitted by the existing poll loop when the CPU next halts; the verb itself does not synthesise one.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-055" name="avarice-Compatible Monitor Commands"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MON-12">
+        <text><![CDATA[The `monitor erase` verb (alias `monitor chip-erase`) shall consult `ctx->allow_erase` before issuing any UPDI traffic. When the flag is zero, the verb shall emit one diagnostic O-packet `"monitor erase: refused — launch the server with --allow-erase to enable.\n"` and return -1 so `dh_monitor` sends an `E22` error packet. When the flag is set the verb shall call `updi_chip_erase(ctx->updi_fd)`, then re-enter OCD via `updi_enter_debug()`, discard all BP/WP shadow entries, invalidate the FSM thread cache, emit a confirmation O-packet, and return 0.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-055" name="avarice-Compatible Monitor Commands"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MON-13">
+        <text><![CDATA[The `monitor version` verb shall emit one O-packet of the form `"avrOSdb <version> (built <date>)\n"` where `<version>` is the compile-time string `AVROSDB_VERSION` (supplied by the Makefile via `-DAVROSDB_VERSION='"$(VERSION)"'`) and `<date>` is the standard `__DATE__` macro. It shall return 0.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-055" name="avarice-Compatible Monitor Commands"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MON-14">
+        <text><![CDATA[The `monitor bp-mode <arg>` verb shall accept exactly two argument tokens: `sw` (sets `ctx->bp_mode = RSP_BP_MODE_SW`, the default) and `hw-only` (sets `ctx->bp_mode = RSP_BP_MODE_HW_ONLY`). With no argument it shall report the current setting. Any other argument shall emit an error O-packet and return -2. The mode persists for the lifetime of the server process and influences how `Z0` packets are routed (HLR-054).]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-054" name="True Software Breakpoints via FLASH BREAK Opcode"/>
+          <trace target="HLR" ref="HLR-055" name="avarice-Compatible Monitor Commands"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MON-15">
+        <text><![CDATA[The `monitor help` verb shall emit one O-packet per recognised verb, each line briefly summarising the verb's syntax and side-effects, in the order: `reset`, `halt`, `go`, `erase`, `chip-erase`, `version`, `bp-mode`, `help`, `avros events`, `avros queues`. After the last line it shall return 0 so `dh_monitor` terminates the output with `OK`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-055" name="avarice-Compatible Monitor Commands"/>
+        </traces>
+      </llr>
     </function>
 
     <function number="8" title="Makefile and Documentation" name="inst">
@@ -2456,6 +2641,18 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="HLR" ref="HLR-052" name="Auto-Baud Link-Quality Probe in Device Mode"/>
         </traces>
       </llr>
+
+      <llr id="LLR-HWTEST-08">
+        <text><![CDATA[Group D's RSP-server smoke checks shall, after the existing D1–D3 (TCP accept, qSupported, Ctrl-C interrupt) pass, additionally exercise the Phase-10 RSP surface against the same spawned `build/avrOSdb` child over the same TCP socket: **D4** issue a framed `qC` packet and PASS if the reply payload begins with `QC` followed by a thread id; **D5** issue `qOffsets` and PASS if the reply payload begins with `Text=`; **D6** issue `qRcmd,696e666f` (the hex-encoded `monitor info` verb) and PASS if the reply payload is non-empty and does not begin with `E` (an error code); **D7** issue `Z2,<sram_addr|0x800000>,1` then `z2,<sram_addr|0x800000>,1` and PASS only if both replies are the empty packet (`$#00`, payload length zero) — the silicon has no data-watchpoint hardware (HLR-056); **D8** issue `vRun;` and PASS if the reply payload begins with `T` (any stop signal); **D9** (destructive, opt-in via `--with-nvm`) issue `vFlashErase:<flash_page>,200` followed by `vFlashDone` and PASS if both replies are `OK`; **D10** (destructive, opt-in via `--with-nvm`, must be ordered after D9 so the page baseline is 0xFF) issue `Z0,<flash_page>,2`, then read back with `m<flash_page>,2` expecting the 4-character hex literal `9895` (AVR `BREAK` opcode little-endian), then issue `z0,<flash_page>,2`, and PASS only when all three exchanges produce the expected replies. When `--with-rsp` is not set, D4–D10 shall be skipped together with D1–D3; when `--with-nvm` is not set, only D9–D10 shall be reported as SKIP. A short helper `send_rsp(fd, payload)` shall compute the modulo-256 RSP checksum and ship `+$<payload>#XX`; a companion `rsp_payload(buf, n, &p, &len)` shall locate the `$…#` payload in a raw reply buffer.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-053" name="Flash Programming via GDB load"/>
+          <trace target="HLR" ref="HLR-054" name="True Software Breakpoints via Flash BREAK Opcode"/>
+          <trace target="HLR" ref="HLR-055" name="avarice Monitor Verb Parity"/>
+          <trace target="HLR" ref="HLR-056" name="Data Access Watchpoints"/>
+          <trace target="HLR" ref="HLR-058" name="vRun / vAttach / vKill"/>
+          <trace target="HLR" ref="HLR-059" name="qC / qOffsets / T / R Replies"/>
+        </traces>
+      </llr>
     </function>
   </llrs>
 
@@ -2465,7 +2662,7 @@ Errors are propagated upward through the module stack without retrying:
     <!-- ============================================================ -->
     <!-- src/main.c unit tests                                        -->
     <!-- ============================================================ -->
-    <file path="tests/test_main.c" role="unit" count="32">
+    <file path="tests/test_main.c" role="unit" count="34">
       <header><![CDATA[Unit tests for `src/main.c`: argument parsing, event loop, signal handling, and resource teardown. Uses `fork()`/`waitpid()` to test `exit()` paths and a mock UPDI/RSP layer to exercise the event loop without real hardware.]]></header>
 
       <test name="parse_args_valid_positional_args_populate_config">
@@ -2626,6 +2823,16 @@ Errors are propagated upward through the module stack without retrying:
       <test name="parse_args_no_autobaud_sets_flag">
         <purpose><![CDATA[Call `parse_args()` with argv `{ "prog", "--device", "--no-autobaud", "/dev/x" }` and assert `cfg.no_autobaud == true` — confirming the autobaud-suppression flag is recognised and stored on `AppConfig` so `run_device_mode()` can gate its probe call accordingly.]]></purpose>
         <traces><trace target="LLR" ref="LLR-MAIN-17"/></traces>
+      </test>
+
+      <test name="parse_args_allow_erase_sets_flag">
+        <purpose><![CDATA[Call `parse_args()` with argv `{ "prog", "--allow-erase", "/dev/x", "a.elf" }` and assert `cfg.allow_erase == true` — confirming the destructive-erase gate is recognised by the option parser.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-21"/></traces>
+      </test>
+
+      <test name="parse_args_allow_erase_defaults_false">
+        <purpose><![CDATA[Call `parse_args()` with argv that omits `--allow-erase` and assert `cfg.allow_erase == false` — confirming the safety default refuses destructive erase verbs unless the operator explicitly opts in.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-21"/></traces>
       </test>
     </file>
 
@@ -2879,7 +3086,7 @@ Errors are propagated upward through the module stack without retrying:
     <!-- ============================================================ -->
     <!-- src/gdb_rsp.c unit tests                                     -->
     <!-- ============================================================ -->
-    <file path="tests/test_rsp.c" role="unit" count="33">
+    <file path="tests/test_rsp.c" role="unit" count="63">
       <header><![CDATA[Unit tests for `src/gdb_rsp.c`: socket configuration, RSP packet framing, register and memory handlers, hardware-breakpoint comparator management, OCD-based execution control, async Ctrl-C interrupt, detach cleanup, session lifecycle packets, and monitor relay. Uses a `socketpair()` as a drop-in socket substitute and replaces every `updi_*`, `fsm_*`, and `monitor_dispatch` call site with `ld --wrap` mocks so all tests run without real silicon.]]></header>
 
       <test name="rsp_listen_sets_so_reuseaddr_before_bind">
@@ -3056,6 +3263,146 @@ Errors are propagated upward through the module stack without retrying:
         <purpose><![CDATA[Dispatch `Hg-1` and `Hg0` in turn, each followed by a `g` packet, and verify that both select the active FSM thread's register frame.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-16"/></traces>
       </test>
+
+      <test name="qC_returns_QC0_when_no_c_thread_selected">
+        <purpose><![CDATA[Dispatch `qC` with no prior `Hc` and verify the reply is the literal `QC0` and that the handler issues no UPDI memory reads, OCD register reads, or `fsm_*` calls.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-19"/></traces>
+      </test>
+
+      <test name="qC_returns_selected_c_thread_in_hex">
+        <purpose><![CDATA[Pre-set `*ctx->c_thread_p` to 0x2a, dispatch `qC`, and verify the reply is `QC2a` (lowercase hex, no padding).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-19"/></traces>
+      </test>
+
+      <test name="qOffsets_returns_text_data_bss_all_zero">
+        <purpose><![CDATA[Dispatch `qOffsets` and verify the reply is the literal `Text=0;Data=0;Bss=0` with no UPDI memory access.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-20"/></traces>
+      </test>
+
+      <test name="T_packet_returns_OK_for_live_thread">
+        <purpose><![CDATA[Populate `ctx->fsm->threads[]` with GDB ids 1 and 3, dispatch `T3`, and verify the reply is `OK`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-21"/></traces>
+      </test>
+
+      <test name="T_packet_returns_E01_for_unknown_thread">
+        <purpose><![CDATA[Populate `ctx->fsm->threads[]` with only GDB id 1, dispatch `T2a` (tid 42), and verify the reply is `E01`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-21"/></traces>
+      </test>
+
+      <test name="R_packet_invalidates_fsm_runs_and_emits_stop">
+        <purpose><![CDATA[Dispatch `R00` and verify that `fsm_invalidate()` is called, `updi_run()` is called exactly once (via the delegated `c`), the thread list is rebuilt on halt, and a `T05` stop packet is emitted on the wire.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-22"/></traces>
+      </test>
+
+      <test name="vRun_invalidates_fsm_runs_and_emits_stop">
+        <purpose><![CDATA[Dispatch `vRun;;arg1` (empty filename, ignored arg) and verify the GDB-protocol-compliant halt-at-entry behaviour: `fsm_invalidate()` called, thread list rebuilt via `fsm_build_thread_list()`, a `T05` stop reply emitted, and `updi_run()` NOT called (the client decides when to resume execution).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-23"/></traces>
+      </test>
+
+      <test name="vAttach_halts_target_and_emits_stop_reply">
+        <purpose><![CDATA[Dispatch `vAttach;1` and verify that `updi_run()` and `updi_step()` are NOT called, that `fsm_invalidate()` and `fsm_build_thread_list()` are called, and that the reply is a `T05` stop packet containing a `thread:<hex>;` suffix.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-24"/></traces>
+      </test>
+
+      <test name="vKill_sets_quit_and_replies_ok">
+        <purpose><![CDATA[Dispatch `vKill;1` and verify that the context's `*quit_p` flag is raised and the reply is the literal `OK`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-25"/></traces>
+      </test>
+
+      <test name="qSupported_advertises_multiprocess_vRun_vAttach_vKill">
+        <purpose><![CDATA[Dispatch `qSupported:multiprocess+` and verify the reply contains the substrings `multiprocess+`, `vRun+`, `vAttach+`, and `vKill+`, and does NOT contain `multiprocess-`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-26"/></traces>
+      </test>
+
+      <test name="Z2_replies_empty_packet_so_gdb_falls_back_to_sw_watch">
+        <purpose><![CDATA[Dispatch `Z2,800100,1` and verify the reply is the empty RSP packet (payload length zero), proving the server signals \"unsupported\" so GDB transparently falls back to software watchpoints. No call into the UPDI layer is made.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-27"/></traces>
+      </test>
+
+      <test name="z3_remove_also_replies_empty_packet">
+        <purpose><![CDATA[Dispatch `z3,800200,1` and verify the reply is the empty RSP packet (payload length zero); the `z` form must behave identically to the `Z` form for the unsupported Z2/Z3/Z4 family.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-27"/></traces>
+      </test>
+
+      <test name="vFlashErase_allocates_buffer_and_replies_ok_for_flash_range">
+        <purpose><![CDATA[Dispatch `vFlashErase:100,200`, verify reply is `OK`, `ctx.flash_xact_buf` is non-NULL, `ctx.flash_xact_base==0`, `ctx.flash_xact_len==2*UPDI_FLASH_PAGE_SIZE` (the range straddles two 512-byte pages), and the buffer is pre-filled with `0xFF`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-32"/></traces>
+      </test>
+
+      <test name="vFlashErase_E22_for_data_space_address">
+        <purpose><![CDATA[Dispatch `vFlashErase:810000,10` (EEPROM window on the GDB side) and verify reply is `E22` and `ctx.flash_xact_buf` remains NULL.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-32"/></traces>
+      </test>
+
+      <test name="vFlashWrite_copies_payload_into_buffer_at_offset">
+        <purpose><![CDATA[After a `vFlashErase:0,200`, dispatch `vFlashWrite:10:\x11\x22\x33\x44`, verify reply is `OK`, the four bytes appear in `ctx.flash_xact_buf` at offsets 0x10..0x13, and the surrounding bytes remain `0xFF`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-33"/></traces>
+      </test>
+
+      <test name="vFlashWrite_decodes_0x7D_xor_0x20_binary_escape">
+        <purpose><![CDATA[Construct a packet `vFlashWrite:0:` followed by `0x7D 0x03 0x7D 0x0A` and dispatch via `rsp_dispatch_n()` with the explicit byte length, verify reply is `OK`, and the buffer contains `0x23` (`'#'`) at offset 0 and `0x2A` (`'*'`) at offset 1.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-33"/></traces>
+      </test>
+
+      <test name="vFlashDone_flushes_buffer_via_nvm_write_flash_and_replies_ok">
+        <purpose><![CDATA[After `vFlashErase:0,200` + `vFlashWrite:0:\x98\x95` and pre-loading `ctx.hw_bp_addr[0]=0x42`, dispatch `vFlashDone`. Verify reply is `OK`; `mock_flash_write_count==1`; `mock_flash_writes[0].addr==UPDI_FLASH_BASE`; the first two bytes of the captured page buffer are `0x98 0x95`; `ctx.flash_xact_buf==NULL`; `ctx.flash_xact_len==0`; and `ctx.hw_bp_addr[0]==0xFFFFFFFF` (HW-BP shadow cleared per the HLR-053 spec).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-34"/></traces>
+      </test>
+
+      <test name="vFlashDone_with_no_active_transaction_replies_ok_noop">
+        <purpose><![CDATA[Dispatch `vFlashDone` with no preceding `vFlashErase` and verify reply is `OK` and `mock_flash_write_count==0` (no FLASH writes attempted).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-34"/></traces>
+      </test>
+
+      <test name="m_packet_mid_vflash_transaction_aborts_and_returns_E22">
+        <purpose><![CDATA[After `vFlashErase:0,200`, dispatch `m800100,4` and verify reply is `E22` and `ctx.flash_xact_buf` is NULL (the abort path freed the in-progress buffer).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-34"/></traces>
+      </test>
+
+      <test name="qSupported_advertises_vFlash_packets">
+        <purpose><![CDATA[Dispatch `qSupported:multiprocess+` and verify the reply payload contains the substrings `vFlashErase+`, `vFlashWrite+`, and `vFlashDone+`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-35"/></traces>
+      </test>
+
+      <test name="Z0_in_sw_mode_patches_BREAK_opcode_via_flash_patch">
+        <purpose><![CDATA[With default `bp_mode == RSP_BP_MODE_SW`, dispatch `Z0,400,2` and verify the reply is `OK`, `updi_nvm_flash_patch()` was invoked exactly once with `addr == UPDI_FLASH_BASE + 0x400`, `len == 2`, and payload `{0x98, 0x95}` (the AVR `BREAK` opcode little-endian), while no HW comparator was touched.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-36"/></traces>
+      </test>
+
+      <test name="Z0_in_sw_mode_records_original_opcode_from_flash">
+        <purpose><![CDATA[Pre-load the `__wrap_updi_mem_read()` canned buffer with `{0xCD, 0xAB}`, dispatch `Z0,500,2`, and verify `ctx.sw_bp[0]` is `{addr=0x500, orig={0xCD, 0xAB}, in_use=true}`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-37"/></traces>
+      </test>
+
+      <test name="z0_in_sw_mode_restores_original_opcode">
+        <purpose><![CDATA[Pre-load the canned read buffer with `{0x42, 0xC9}`, dispatch `Z0,600,2` followed by `z0,600,2`, and verify two `updi_nvm_flash_patch()` calls were made — the second writing `{0x42, 0xC9}` back to `UPDI_FLASH_BASE + 0x600` — and that `ctx.sw_bp[0].in_use == false` afterward.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-38"/></traces>
+      </test>
+
+      <test name="Z0_in_sw_mode_refuses_data_space_address_with_E22">
+        <purpose><![CDATA[Dispatch `Z0,810000,2` (data-space address with `GDB_AVR_DATA_FLAG` set, EEPROM window) and verify the reply is `E22`, `updi_nvm_flash_patch()` was not called, and `ctx.sw_bp[0].in_use == false`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-36"/></traces>
+      </test>
+
+      <test name="Z0_in_sw_mode_snapshots_and_restores_cpu_state">
+        <purpose><![CDATA[Pre-load `mock_ocd_gpr[i] = 0x10 + i`, `mock_ocd_sreg = 0xAA`, `mock_ocd_sp = 0xBEEF`, `mock_ocd_pc = 0xCAFE`, dispatch `Z0,700,2`, and verify ≥32 GPR writes, ≥1 SREG write, ≥1 SP write, and ≥1 PC write were observed, and that the shadow mock state still matches the pre-load values after the round-trip.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-37"/></traces>
+      </test>
+
+      <test name="Z0_in_hw_only_mode_falls_back_to_HW_BP_path">
+        <purpose><![CDATA[Set `ctx.bp_mode = RSP_BP_MODE_HW_ONLY`, dispatch `Z0,800,2`, and verify `mock_hw_bp_set_calls == 1`, `mock_flash_patch_count == 0`, and `ctx.sw_bp[0].in_use == false` — preserving the Phase 1–8 legacy semantics.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-36"/></traces>
+      </test>
+
+      <test name="Z0_in_sw_mode_idempotent_on_same_address">
+        <purpose><![CDATA[Dispatch `Z0,900,2` twice and verify `mock_flash_patch_count == 1` — the second install on a shadowed address shall reply `OK` without re-patching FLASH.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-36"/></traces>
+      </test>
+
+      <test name="vFlashDone_also_clears_sw_bp_shadow">
+        <purpose><![CDATA[Install a SW breakpoint via `Z0,A00,2`, run a `vFlashErase:0,200` / `vFlashDone` cycle, and verify `ctx.sw_bp[0].in_use == false` afterward — the BREAK opcode is no longer in FLASH so the shadow must be dropped.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-39"/></traces>
+      </test>
     </file>
 
     <!-- ============================================================ -->
@@ -3210,7 +3557,7 @@ Errors are propagated upward through the module stack without retrying:
     <!-- ============================================================ -->
     <!-- src/monitor.c unit tests                                     -->
     <!-- ============================================================ -->
-    <file path="tests/test_monitor.c" role="unit" count="10">
+    <file path="tests/test_monitor.c" role="unit" count="20">
       <header><![CDATA[Unit tests for `src/monitor.c`: hex command decoding, prefix matching, per-sub-command UPDI reads, O-packet output formatting, 512-byte buffer constraint, and the no-halt guarantee. All UPDI calls are intercepted by a mock layer that records calls and returns injected data.]]></header>
 
       <test name="monitor_dispatch_hex_decodes_cmd_before_prefix_matching">
@@ -3261,6 +3608,56 @@ Errors are propagated upward through the module stack without retrying:
       <test name="monitor_dispatch_and_helpers_never_call_updi_halt">
         <purpose><![CDATA[Execute both sub-commands (`events`, `queues`) through `monitor_dispatch()` and verify that `updi_halt()` is never called by inspecting the mock call log.]]></purpose>
         <traces><trace target="LLR" ref="LLR-MON-07"/></traces>
+      </test>
+
+      <test name="verb_reset_pulses_updi_and_clears_shadows">
+        <purpose><![CDATA[Hex-encode `"reset"` through `monitor_dispatch_ex()` with a stub `RspContext` and verify that `updi_enter_debug()` and `rsp_hw_bp_clear_all()` are each called exactly once and that `updi_halt()` is not called.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-09"/></traces>
+      </test>
+
+      <test name="verb_halt_emits_T05_stop_reply_and_suppresses_OK">
+        <purpose><![CDATA[Hex-encode `"halt"` through `monitor_dispatch_ex()` and verify the captured `rsp_send_packet()` payload starts with the literal three characters `T05`, and that the dispatcher returns -3 so the caller suppresses the trailing `OK`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-10"/></traces>
+      </test>
+
+      <test name="verb_go_calls_updi_run_and_returns_OK">
+        <purpose><![CDATA[Hex-encode `"go"` through `monitor_dispatch_ex()` and verify `updi_run()` is invoked exactly once and the dispatcher returns 0 so the caller emits `OK`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-11"/></traces>
+      </test>
+
+      <test name="verb_erase_refused_without_allow_erase_flag">
+        <purpose><![CDATA[Dispatch `"erase"` with `ctx.allow_erase = 0` and verify `updi_chip_erase()` is NOT called, the captured O-packet text mentions `--allow-erase`, and the dispatcher returns -1 so the caller emits `E22`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-12"/></traces>
+      </test>
+
+      <test name="verb_erase_allowed_when_flag_set_clears_shadows">
+        <purpose><![CDATA[Dispatch `"chip-erase"` with `ctx.allow_erase = 1` and verify `updi_chip_erase()`, `updi_enter_debug()`, and `rsp_hw_bp_clear_all()` are each called exactly once.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-12"/></traces>
+      </test>
+
+      <test name="verb_version_emits_o_packet_with_version_and_date">
+        <purpose><![CDATA[Dispatch `"version"` and verify the captured O-packet decodes to a string containing both `"avrOSdb"` and `"built"`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-13"/></traces>
+      </test>
+
+      <test name="verb_bp_mode_sw_and_hw_only_mutate_ctx">
+        <purpose><![CDATA[Dispatch `"bp-mode hw-only"` then `"bp-mode sw"` on the same `RspContext` and verify `ctx.bp_mode` cycles through `RSP_BP_MODE_HW_ONLY` and back to `RSP_BP_MODE_SW`; an invalid argument returns -2.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-14"/></traces>
+      </test>
+
+      <test name="verb_help_emits_one_line_per_recognised_verb">
+        <purpose><![CDATA[Dispatch `"help"` and verify that at least 8 O-packets are sent (one per documented top-level verb) before the dispatcher returns 0.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-15"/></traces>
+      </test>
+
+      <test name="unknown_top_level_verb_emits_usage_hint">
+        <purpose><![CDATA[Dispatch a token that is neither a known verb nor `avros …` and verify the captured O-packet text contains `"usage:"` and the dispatcher returns -2.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-08"/></traces>
+      </test>
+
+      <test name="avros_prefix_still_routed_to_legacy_dispatch">
+        <purpose><![CDATA[Dispatch `"avros events"` through `monitor_dispatch_ex()` and verify the call is forwarded to `monitor_dispatch()` (none of the top-level verb side-effects fire: `updi_enter_debug`, `updi_chip_erase`, and `updi_halt` all remain at zero invocations).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-08"/></traces>
       </test>
     </file>
 
@@ -3381,7 +3778,7 @@ Errors are propagated upward through the module stack without retrying:
     <!-- ============================================================ -->
     <!-- On-target hardware integration tests (manual; not in CI)     -->
     <!-- ============================================================ -->
-    <file path="tests/hw/hw_test.c" role="hardware" count="22">
+    <file path="tests/hw/hw_test.c" role="hardware" count="29">
       <header><![CDATA[On-target hardware integration test harness for the AVR-Dx UPDI driver, device-info report, SRAM/FLASH memory access, and the GDB RSP server. Manual-only: never invoked by `make test`. Driven by the Makefile targets `hw-test`, `hw-test-nvm`, `hw-test-rsp`, and `hw-test-all`. Configurable via `HW_PORT`, `HW_DEVICE_ID`, `HW_SRAM_ADDR`, `HW_FLASH_PAGE_ADDR`, `HW_RSP_PORT`, `HW_TEST_ELF`, `HW_ADDR_24BIT`, `HW_VERBOSE` (env or CLI). Destructive groups gated by `HW_TEST_NVM_CONFIRM=YES` (FLASH) and `HW_TEST_RSP=YES` (RSP).]]></header>
 
       <test name="A1_port_open_and_cold_start_handshake">
@@ -3477,6 +3874,41 @@ Errors are propagated upward through the module stack without retrying:
       <test name="D3_rsp_ctrl_c_interrupt_returns_T02">
         <purpose><![CDATA[With the spawned server running and a connected TCP client, dispatch a `c` (continue) RSP packet, wait long enough for the loop to enter its poll/select state, then send a single `0x03` byte (GDB Ctrl-C async-interrupt) on the same TCP connection. Assert that the server replies with a stop-reason packet whose signal field is `T02` (SIGINT) and that the live target is observably halted afterwards (via a subsequent `g` packet succeeding). Skipped unless `HW_TEST_RSP=YES`. Exercises the production async-interrupt path end-to-end through real silicon, validating both LLR-RSP-11 (Ctrl-C path) and LLR-UPDI-08 (`updi_halt()`).]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-11"/><trace target="LLR" ref="LLR-UPDI-08"/><trace target="LLR" ref="LLR-HWTEST-05"/></traces>
+      </test>
+
+      <test name="D4_rsp_qC_current_thread">
+        <purpose><![CDATA[Send a framed `qC` packet over the same TCP socket used by D1–D3 and assert the reply payload begins with the two-character prefix `QC` followed by a thread id. Validates HLR-059's qC handler against live silicon.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-08"/><trace target="LLR" ref="LLR-RSP-21"/></traces>
+      </test>
+
+      <test name="D5_rsp_qOffsets_section_bases">
+        <purpose><![CDATA[Send `qOffsets` and assert the reply payload begins with the literal `Text=` (the avrOSdb stub always reports `Text=0;Data=0;Bss=0` because the firmware image is linked at fixed addresses). Validates HLR-059's qOffsets handler against live silicon.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-08"/><trace target="LLR" ref="LLR-RSP-22"/></traces>
+      </test>
+
+      <test name="D6_rsp_monitor_info_verb">
+        <purpose><![CDATA[Send `qRcmd,696e666f` (the hex-encoded ASCII string `info`) and assert the reply payload is non-empty and does not begin with `E` (i.e. is not an `Exx` error code). Validates HLR-055's `monitor info` verb wiring against live silicon.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-08"/><trace target="LLR" ref="LLR-MON-01"/></traces>
+      </test>
+
+      <test name="D7_rsp_Z2_z2_replies_empty_packet_unsupported">
+        <purpose><![CDATA[Send `Z2,<sram_addr|0x800000>,1` (request a 1-byte write watchpoint on the configured SRAM scratch address) followed by `z2,<sram_addr|0x800000>,1`. Assert both replies are the empty RSP packet (`$#00`, payload length zero), proving the server signals "unsupported" so GDB falls back to software watchpoints. Validates HLR-056 against live silicon — AVR-Dx UPDI exposes no data-watchpoint hardware.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-08"/><trace target="LLR" ref="LLR-RSP-27"/></traces>
+      </test>
+
+      <test name="D8_rsp_vRun_reload_returns_Tstop">
+        <purpose><![CDATA[Send `vRun;` and assert the reply payload begins with `T` (any stop signal — typically `T05` SIGTRAP after run-to-main). Validates HLR-058's vRun handler — full reload + reset + halt-at-entry — against live silicon.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-08"/><trace target="LLR" ref="LLR-RSP-18"/></traces>
+      </test>
+
+      <test name="D9_rsp_vFlashErase_vFlashDone_smoke">
+        <purpose><![CDATA[Destructive — opt-in via `--with-nvm`. Send `vFlashErase:<flash_page>,200` and assert reply is `OK`; then send `vFlashDone` and assert reply is `OK`. Erases one 512-byte FLASH page on live silicon; the subsequent vFlashDone flushes an all-0xFF buffer (the cleared state) which is a valid no-op. Validates HLR-053's vFlash* state machine end-to-end.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-08"/><trace target="LLR" ref="LLR-RSP-32"/><trace target="LLR" ref="LLR-RSP-34"/></traces>
+      </test>
+
+      <test name="D10_rsp_Z0_z0_sw_bp_flash_break_round_trip">
+        <purpose><![CDATA[Destructive — opt-in via `--with-nvm` AND must run after D9 so the FLASH page baseline is 0xFF. Send `Z0,<flash_page>,2` and assert reply is `OK`; then `m<flash_page>,2` and assert the 4-character hex payload equals `9895` (AVR `BREAK` opcode `0x9598` little-endian); then `z0,<flash_page>,2` and assert reply is `OK`. Validates HLR-054's full SW-BP install/restore loop — FLASH patch with BREAK, read-back, and restore of original opcode — against live silicon.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-08"/><trace target="LLR" ref="LLR-RSP-36"/><trace target="LLR" ref="LLR-RSP-37"/><trace target="LLR" ref="LLR-RSP-38"/></traces>
       </test>
 
       <test name="F1_autobaud_picks_reliable_rung">

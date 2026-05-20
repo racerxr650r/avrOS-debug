@@ -16,6 +16,25 @@
  * routed to the same two slots — see src/gdb_rsp.c dh_insert_bp.    */
 #define RSP_MAX_BREAKPOINTS 2
 
+/* HLR-055: monitor bp-mode values. */
+#define RSP_BP_MODE_SW       0
+#define RSP_BP_MODE_HW_ONLY  1
+
+/* HLR-054: maximum number of simultaneous software breakpoints.  The
+ * AVR architecture imposes no inherent limit (every two-byte FLASH
+ * word can be patched independently) but the shadow table is a
+ * fixed-size array to keep the RspContext POD-like and avoid heap
+ * allocations on the fast path.  64 simultaneous SW BPs is well
+ * beyond typical GDB use.                                            */
+#define RSP_MAX_SW_BREAKPOINTS 64
+
+/* HLR-054: per-session shadow entry for one software breakpoint. */
+typedef struct {
+    uint32_t addr;          /* GDB-side byte address (FLASH window)   */
+    uint8_t  orig[2];       /* original 2-byte opcode, little-endian  */
+    bool     in_use;
+} RspSwBp;
+
 struct RspHandlers;
 
 /* Shared session state passed to every default handler as ctx. */
@@ -33,6 +52,28 @@ typedef struct {
      * it (designated initialiser leaves both = 0, then handler init
      * marks them empty on first use).                                */
     uint32_t                  hw_bp_addr[2];
+    /* HLR-055: monitor verbs.  `allow_erase` mirrors the --allow-erase
+     * CLI flag and gates `monitor erase` / `monitor chip-erase`.
+     * `bp_mode` is 0 = "sw" (true SW BPs via FLASH BREAK, HLR-054) or
+     * 1 = "hw-only" (legacy: Z0 aliases to HW comparators).  Mode is
+     * mutated by `monitor bp-mode <sw|hw-only>` and persists for the
+     * lifetime of the server process.                                */
+    int                       allow_erase;
+    int                       bp_mode;
+    /* HLR-053: in-progress vFlash* transaction state.  `flash_xact_buf`
+     * is malloc()'d on the first `vFlashErase` of a load sequence (or
+     * extended by subsequent erases of contiguous ranges) and freed on
+     * `vFlashDone` (success) or on any g/G/m/M/c/s packet that arrives
+     * mid-transaction (abort).  NULL ⇔ no transaction in progress.    */
+    uint8_t                  *flash_xact_buf;
+    uint32_t                  flash_xact_base;   /* UPDI byte-addr      */
+    size_t                    flash_xact_len;    /* bytes in buf        */
+    /* HLR-054: per-session shadow of installed software breakpoints.
+     * Empty slots have `in_use == false`.  Populated on Z0 (when the
+     * server is in `bp_mode == RSP_BP_MODE_SW`, the default) and
+     * drained on z0.  Cleared wholesale on `vFlashDone`,
+     * `monitor reset`, and `monitor chip-erase`.                      */
+    RspSwBp                   sw_bp[RSP_MAX_SW_BREAKPOINTS];
 } RspContext;
 
 /* Each handler returns 0 on success or -1 on error. The handler is
@@ -55,6 +96,16 @@ typedef struct RspHandlers {
     RspHandlerFn on_set_thread_c;   /* Hc<tid>                        */
     RspHandlerFn on_monitor;        /* qRcmd,<hex>                    */
     RspHandlerFn on_detach;         /* D , k                          */
+    RspHandlerFn on_query_c;        /* qC                             */
+    RspHandlerFn on_query_offsets;  /* qOffsets                       */
+    RspHandlerFn on_thread_alive;   /* T<tid>                         */
+    RspHandlerFn on_restart;        /* R<XX>                          */
+    RspHandlerFn on_vrun;           /* vRun;<args>                    */
+    RspHandlerFn on_vattach;        /* vAttach;<pid>                  */
+    RspHandlerFn on_vkill;          /* vKill;<pid>                    */
+    RspHandlerFn on_vflash_erase;   /* vFlashErase:addr,length        */
+    RspHandlerFn on_vflash_write;   /* vFlashWrite:addr:<binary>      */
+    RspHandlerFn on_vflash_done;    /* vFlashDone                     */
     void        *ctx;
 } RspHandlers;
 
@@ -73,8 +124,19 @@ bool rsp_get_noack(void);
 
 /* ── Dispatch ────────────────────────────────────────────────────────── */
 int  rsp_dispatch(int fd, const char *packet, RspHandlers *h);
+/* Length-carrying variant.  Required for binary packets (vFlashWrite)
+ * whose payload may contain embedded NUL bytes; the caller passes the
+ * exact byte count returned by rsp_recv_packet().                      */
+int  rsp_dispatch_n(int fd, const char *packet, size_t plen, RspHandlers *h);
 
 /* ── Default handlers (used by main; tests may override individually) ── */
 void rsp_default_handlers(RspHandlers *h, RspContext *ctx);
+
+/* ── Helpers exposed for HLR-055 monitor verbs ───────────────────────── */
+void rsp_hw_bp_clear_all(RspContext *ctx);
+
+/* HLR-054: drop every SW-BP shadow entry (no silicon I/O — used by
+ * the callers that have already destroyed the underlying FLASH).      */
+void rsp_sw_bp_clear_all(RspContext *ctx);
 
 #endif /* AOD_GDB_RSP_H */

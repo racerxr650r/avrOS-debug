@@ -1121,6 +1121,13 @@ int updi_ocd_clear_hw_bp(int fd, int idx)
     return 0;
 }
 
+/* NOTE: AVR-Dx OCD over UPDI does not expose data-address watchpoint
+ * hardware.  The previous updi_ocd_{set,clear}_data_bp() entry points
+ * wrote to fabricated registers (OCD+0x07/0x0A/0x0E) that the
+ * exhaustive FF-bomb in doc/reference/guesswork.md proved are not
+ * backed by silicon.  GDB Z2/Z3/Z4 packets now reply with the empty
+ * packet and avr-gdb transparently uses software watchpoints.       */
+
 /* Forward decl: defined later in this file, used by updi_nvm_write_flash. */
 static int nvm_erase_page(int fd, uint32_t page_addr);
 

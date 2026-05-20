@@ -58,7 +58,8 @@ These principles are the tie-breakers when requirements conflict.
 3.  **Editor-Agnostic Core.** The server communicates exclusively via standard GDB remote serial protocol (RSP). We never implement IDE-specific plugins directly inside the server; all VS Code and Zed support is handled via their respective standard adapters (e.g., Cortex-Debug, DAP).
 4.  **Non-Intrusive Polling.** System introspection (queues, events) prioritizes UPDI asynchronous memory reads. We never arbitrarily halt the CPU core to evaluate a system state unless explicitly requested by a user breakpoint.
 5.  **Fail-Safe Address Resolution.** If the server cannot dynamically locate the avrOS system tables in the ELF/FLASH, it gracefully degrades to a standard bare-metal GDB server rather than crashing.
-6.  **Verifiable.** Every behaviour worth describing is captured as an HLR/LLR with at least one bound test. The Traceability Matrix (e.g., via TraceR workflows) is the contract.
+6.  **Layered Architecture.** Source modules are organised into four layers — entry/event-loop, transport/hardware (UPDI), protocol (GDB RSP), and application (ELF/FSM/monitor) — with strictly downward call direction. New features land in the layer that owns the corresponding concern; we never reach across layers or invert dependencies, and lower-layer headers never include higher-layer headers. The single permitted upward path is the `RspHandlers` callback table that lets the protocol layer invoke application-layer code without depending on it at compile time.
+7.  **Verifiable.** Every behaviour worth describing is captured as an HLR/LLR with at least one bound test. The Traceability Matrix (e.g., via TraceR workflows) is the contract.
 
 ## 7. Scope
 
@@ -104,6 +105,7 @@ These principles are the tie-breakers when requirements conflict.
 
 These are *themes* — not committed features — that frame future investment. Specific work items live in HLRs/LLRs as they are adopted.
 
+* **avarice Feature Parity.** Bringing the GDB Remote Serial Protocol surface up to functional parity with the legacy `avarice` JTAG/dW stub for the AVR-Dx UPDI use case: `(gdb) load` over `vFlash*`, true software breakpoints, hardware data watchpoints, an expanded `monitor` verb set, and extended-remote lifecycle (`vRun`/`vAttach`/`vKill`). Wire-level drop-in compatibility with `avarice`-specific scripts is an explicit non-goal — individual `.gdbinit` files, IDE launch configurations, and CI invocations may need targeted edits to reach the same outcome.
 * **Native DAP Translation.** Developing a direct Debug Adapter Protocol (DAP) interface to bypass `avr-gdb` entirely, optimizing integration for ultra-fast editors like Zed.
 * **Live Profiling.** Utilizing non-intrusive UPDI reads to sample FSM execution times and queue depths over time, outputting a data stream suitable for visual performance profiling. 
 

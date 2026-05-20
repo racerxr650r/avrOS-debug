@@ -15,7 +15,7 @@ Snapshot: **115 test(s)** across
 
 ### 3.1. [tests/test_main.c](../tests/test_main.c)
 
-Role: **unit**. **32 test(s).**
+Role: **unit**. **34 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -51,6 +51,8 @@ Role: **unit**. **32 test(s).**
 | 30 | <a id="parse_args_prog_mode_sets_flag"></a>`parse_args_prog_mode_sets_flag` | `LLR-MAIN-14` | Call `parse_args()` with argv `{ "prog", "--prog", "/dev/x", "a.elf" }` and assert `cfg.prog_mode == true`, `cfg.device_info == false`, and `cfg.load_flash == false` — confirming `--prog` is recognised, sets only `prog_mode`, and does not implicitly set the other operating-mode flags. |
 | 31 | <a id="parse_args_no_verify_sets_flag"></a>`parse_args_no_verify_sets_flag` | `LLR-MAIN-14` | Call `parse_args()` with argv `{ "prog", "--load", "--no-verify", "/dev/x", "a.elf" }` and assert `cfg.no_verify == true` — confirming the verify-suppression flag is recognised and stored on `AppConfig`. |
 | 32 | <a id="parse_args_no_autobaud_sets_flag"></a>`parse_args_no_autobaud_sets_flag` | `LLR-MAIN-17` | Call `parse_args()` with argv `{ "prog", "--device", "--no-autobaud", "/dev/x" }` and assert `cfg.no_autobaud == true` — confirming the autobaud-suppression flag is recognised and stored on `AppConfig` so `run_device_mode()` can gate its probe call accordingly. |
+| 33 | <a id="parse_args_allow_erase_sets_flag"></a>`parse_args_allow_erase_sets_flag` | `LLR-MAIN-21` | Call `parse_args()` with argv `{ "prog", "--allow-erase", "/dev/x", "a.elf" }` and assert `cfg.allow_erase == true` — confirming the destructive-erase gate is recognised by the option parser. |
+| 34 | <a id="parse_args_allow_erase_defaults_false"></a>`parse_args_allow_erase_defaults_false` | `LLR-MAIN-21` | Call `parse_args()` with argv that omits `--allow-erase` and assert `cfg.allow_erase == false` — confirming the safety default refuses destructive erase verbs unless the operator explicitly opts in. |
 
 ### 3.2. [tests/test_updi.c](../tests/test_updi.c)
 
@@ -109,7 +111,7 @@ Role: **unit**. **47 test(s).**
 
 ### 3.3. [tests/test_rsp.c](../tests/test_rsp.c)
 
-Role: **unit**. **33 test(s).**
+Role: **unit**. **63 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -148,6 +150,34 @@ Role: **unit**. **33 test(s).**
 | 33 | <a id="on_monitor_sends_o_packet_error_on_updi_failure"></a>`on_monitor_sends_o_packet_error_on_updi_failure` | `LLR-RSP-15` | Inject a mock `monitor_dispatch()` that returns -1 and verify that the `qRcmd` handler sends an O-packet error message to the GDB console. |
 | 34 | <a id="H_packet_stores_thread_id_for_register_operations"></a>`H_packet_stores_thread_id_for_register_operations` | `LLR-RSP-16` | Dispatch `Hg3` (set thread 3 for register operations) and then a `g` packet, and verify that `fsm_get_registers()` is called with the thread entry for GDB thread ID 3. |
 | 35 | <a id="H_packet_minus1_and_0_both_map_to_active_fsm_thread"></a>`H_packet_minus1_and_0_both_map_to_active_fsm_thread` | `LLR-RSP-16` | Dispatch `Hg-1` and `Hg0` in turn, each followed by a `g` packet, and verify that both select the active FSM thread's register frame. |
+| 36 | <a id="qC_returns_QC0_when_no_c_thread_selected"></a>`qC_returns_QC0_when_no_c_thread_selected` | `LLR-RSP-19` | Dispatch `qC` with no prior `Hc` and verify the reply is the literal `QC0` and that the handler issues no UPDI memory reads, OCD register reads, or `fsm_*` calls. |
+| 37 | <a id="qC_returns_selected_c_thread_in_hex"></a>`qC_returns_selected_c_thread_in_hex` | `LLR-RSP-19` | Pre-set `*ctx->c_thread_p` to 0x2a, dispatch `qC`, and verify the reply is `QC2a` (lowercase hex, no padding). |
+| 38 | <a id="qOffsets_returns_text_data_bss_all_zero"></a>`qOffsets_returns_text_data_bss_all_zero` | `LLR-RSP-20` | Dispatch `qOffsets` and verify the reply is the literal `Text=0;Data=0;Bss=0` with no UPDI memory access. |
+| 39 | <a id="T_packet_returns_OK_for_live_thread"></a>`T_packet_returns_OK_for_live_thread` | `LLR-RSP-21` | Populate `ctx->fsm->threads[]` with GDB ids 1 and 3, dispatch `T3`, and verify the reply is `OK`. |
+| 40 | <a id="T_packet_returns_E01_for_unknown_thread"></a>`T_packet_returns_E01_for_unknown_thread` | `LLR-RSP-21` | Populate `ctx->fsm->threads[]` with only GDB id 1, dispatch `T2a` (tid 42), and verify the reply is `E01`. |
+| 41 | <a id="R_packet_invalidates_fsm_runs_and_emits_stop"></a>`R_packet_invalidates_fsm_runs_and_emits_stop` | `LLR-RSP-22` | Dispatch `R00` and verify that `fsm_invalidate()` is called, `updi_run()` is called exactly once (via the delegated `c`), the thread list is rebuilt on halt, and a `T05` stop packet is emitted on the wire. |
+| 42 | <a id="vRun_invalidates_fsm_runs_and_emits_stop"></a>`vRun_invalidates_fsm_runs_and_emits_stop` | `LLR-RSP-23` | Dispatch `vRun;;arg1` (empty filename, ignored arg) and verify the GDB-protocol-compliant halt-at-entry behaviour: `fsm_invalidate()` called, thread list rebuilt via `fsm_build_thread_list()`, a `T05` stop reply emitted, and `updi_run()` NOT called (the client decides when to resume execution). |
+| 43 | <a id="vAttach_halts_target_and_emits_stop_reply"></a>`vAttach_halts_target_and_emits_stop_reply` | `LLR-RSP-24` | Dispatch `vAttach;1` and verify that `updi_run()` and `updi_step()` are NOT called, that `fsm_invalidate()` and `fsm_build_thread_list()` are called, and that the reply is a `T05` stop packet containing a `thread:<hex>;` suffix. |
+| 44 | <a id="vKill_sets_quit_and_replies_ok"></a>`vKill_sets_quit_and_replies_ok` | `LLR-RSP-25` | Dispatch `vKill;1` and verify that the context's `*quit_p` flag is raised and the reply is the literal `OK`. |
+| 45 | <a id="qSupported_advertises_multiprocess_vRun_vAttach_vKill"></a>`qSupported_advertises_multiprocess_vRun_vAttach_vKill` | `LLR-RSP-26` | Dispatch `qSupported:multiprocess+` and verify the reply contains the substrings `multiprocess+`, `vRun+`, `vAttach+`, and `vKill+`, and does NOT contain `multiprocess-`. |
+| 46 | <a id="Z2_replies_empty_packet_so_gdb_falls_back_to_sw_watch"></a>`Z2_replies_empty_packet_so_gdb_falls_back_to_sw_watch` | `LLR-RSP-27` | Dispatch `Z2,800100,1` and verify the reply is the empty RSP packet (payload length zero), proving the server signals \"unsupported\" so GDB transparently falls back to software watchpoints. No call into the UPDI layer is made. |
+| 47 | <a id="z3_remove_also_replies_empty_packet"></a>`z3_remove_also_replies_empty_packet` | `LLR-RSP-27` | Dispatch `z3,800200,1` and verify the reply is the empty RSP packet (payload length zero); the `z` form must behave identically to the `Z` form for the unsupported Z2/Z3/Z4 family. |
+| 48 | <a id="vFlashErase_allocates_buffer_and_replies_ok_for_flash_range"></a>`vFlashErase_allocates_buffer_and_replies_ok_for_flash_range` | `LLR-RSP-32` | Dispatch `vFlashErase:100,200`, verify reply is `OK`, `ctx.flash_xact_buf` is non-NULL, `ctx.flash_xact_base==0`, `ctx.flash_xact_len==2*UPDI_FLASH_PAGE_SIZE` (the range straddles two 512-byte pages), and the buffer is pre-filled with `0xFF`. |
+| 49 | <a id="vFlashErase_E22_for_data_space_address"></a>`vFlashErase_E22_for_data_space_address` | `LLR-RSP-32` | Dispatch `vFlashErase:810000,10` (EEPROM window on the GDB side) and verify reply is `E22` and `ctx.flash_xact_buf` remains NULL. |
+| 50 | <a id="vFlashWrite_copies_payload_into_buffer_at_offset"></a>`vFlashWrite_copies_payload_into_buffer_at_offset` | `LLR-RSP-33` | After a `vFlashErase:0,200`, dispatch `vFlashWrite:10:\x11\x22\x33\x44`, verify reply is `OK`, the four bytes appear in `ctx.flash_xact_buf` at offsets 0x10..0x13, and the surrounding bytes remain `0xFF`. |
+| 51 | <a id="vFlashWrite_decodes_0x7D_xor_0x20_binary_escape"></a>`vFlashWrite_decodes_0x7D_xor_0x20_binary_escape` | `LLR-RSP-33` | Construct a packet `vFlashWrite:0:` followed by `0x7D 0x03 0x7D 0x0A` and dispatch via `rsp_dispatch_n()` with the explicit byte length, verify reply is `OK`, and the buffer contains `0x23` (`'#'`) at offset 0 and `0x2A` (`'*'`) at offset 1. |
+| 52 | <a id="vFlashDone_flushes_buffer_via_nvm_write_flash_and_replies_ok"></a>`vFlashDone_flushes_buffer_via_nvm_write_flash_and_replies_ok` | `LLR-RSP-34` | After `vFlashErase:0,200` + `vFlashWrite:0:\x98\x95` and pre-loading `ctx.hw_bp_addr[0]=0x42`, dispatch `vFlashDone`. Verify reply is `OK`; `mock_flash_write_count==1`; `mock_flash_writes[0].addr==UPDI_FLASH_BASE`; the first two bytes of the captured page buffer are `0x98 0x95`; `ctx.flash_xact_buf==NULL`; `ctx.flash_xact_len==0`; and `ctx.hw_bp_addr[0]==0xFFFFFFFF` (HW-BP shadow cleared per the HLR-053 spec). |
+| 53 | <a id="vFlashDone_with_no_active_transaction_replies_ok_noop"></a>`vFlashDone_with_no_active_transaction_replies_ok_noop` | `LLR-RSP-34` | Dispatch `vFlashDone` with no preceding `vFlashErase` and verify reply is `OK` and `mock_flash_write_count==0` (no FLASH writes attempted). |
+| 54 | <a id="m_packet_mid_vflash_transaction_aborts_and_returns_E22"></a>`m_packet_mid_vflash_transaction_aborts_and_returns_E22` | `LLR-RSP-34` | After `vFlashErase:0,200`, dispatch `m800100,4` and verify reply is `E22` and `ctx.flash_xact_buf` is NULL (the abort path freed the in-progress buffer). |
+| 55 | <a id="qSupported_advertises_vFlash_packets"></a>`qSupported_advertises_vFlash_packets` | `LLR-RSP-35` | Dispatch `qSupported:multiprocess+` and verify the reply payload contains the substrings `vFlashErase+`, `vFlashWrite+`, and `vFlashDone+`. |
+| 56 | <a id="Z0_in_sw_mode_patches_BREAK_opcode_via_flash_patch"></a>`Z0_in_sw_mode_patches_BREAK_opcode_via_flash_patch` | `LLR-RSP-36` | With default `bp_mode == RSP_BP_MODE_SW`, dispatch `Z0,400,2` and verify the reply is `OK`, `updi_nvm_flash_patch()` was invoked exactly once with `addr == UPDI_FLASH_BASE + 0x400`, `len == 2`, and payload `{0x98, 0x95}` (the AVR `BREAK` opcode little-endian), while no HW comparator was touched. |
+| 57 | <a id="Z0_in_sw_mode_records_original_opcode_from_flash"></a>`Z0_in_sw_mode_records_original_opcode_from_flash` | `LLR-RSP-37` | Pre-load the `__wrap_updi_mem_read()` canned buffer with `{0xCD, 0xAB}`, dispatch `Z0,500,2`, and verify `ctx.sw_bp[0]` is `{addr=0x500, orig={0xCD, 0xAB}, in_use=true}`. |
+| 58 | <a id="z0_in_sw_mode_restores_original_opcode"></a>`z0_in_sw_mode_restores_original_opcode` | `LLR-RSP-38` | Pre-load the canned read buffer with `{0x42, 0xC9}`, dispatch `Z0,600,2` followed by `z0,600,2`, and verify two `updi_nvm_flash_patch()` calls were made — the second writing `{0x42, 0xC9}` back to `UPDI_FLASH_BASE + 0x600` — and that `ctx.sw_bp[0].in_use == false` afterward. |
+| 59 | <a id="Z0_in_sw_mode_refuses_data_space_address_with_E22"></a>`Z0_in_sw_mode_refuses_data_space_address_with_E22` | `LLR-RSP-36` | Dispatch `Z0,810000,2` (data-space address with `GDB_AVR_DATA_FLAG` set, EEPROM window) and verify the reply is `E22`, `updi_nvm_flash_patch()` was not called, and `ctx.sw_bp[0].in_use == false`. |
+| 60 | <a id="Z0_in_sw_mode_snapshots_and_restores_cpu_state"></a>`Z0_in_sw_mode_snapshots_and_restores_cpu_state` | `LLR-RSP-37` | Pre-load `mock_ocd_gpr[i] = 0x10 + i`, `mock_ocd_sreg = 0xAA`, `mock_ocd_sp = 0xBEEF`, `mock_ocd_pc = 0xCAFE`, dispatch `Z0,700,2`, and verify ≥32 GPR writes, ≥1 SREG write, ≥1 SP write, and ≥1 PC write were observed, and that the shadow mock state still matches the pre-load values after the round-trip. |
+| 61 | <a id="Z0_in_hw_only_mode_falls_back_to_HW_BP_path"></a>`Z0_in_hw_only_mode_falls_back_to_HW_BP_path` | `LLR-RSP-36` | Set `ctx.bp_mode = RSP_BP_MODE_HW_ONLY`, dispatch `Z0,800,2`, and verify `mock_hw_bp_set_calls == 1`, `mock_flash_patch_count == 0`, and `ctx.sw_bp[0].in_use == false` — preserving the Phase 1–8 legacy semantics. |
+| 62 | <a id="Z0_in_sw_mode_idempotent_on_same_address"></a>`Z0_in_sw_mode_idempotent_on_same_address` | `LLR-RSP-36` | Dispatch `Z0,900,2` twice and verify `mock_flash_patch_count == 1` — the second install on a shadowed address shall reply `OK` without re-patching FLASH. |
+| 63 | <a id="vFlashDone_also_clears_sw_bp_shadow"></a>`vFlashDone_also_clears_sw_bp_shadow` | `LLR-RSP-39` | Install a SW breakpoint via `Z0,A00,2`, run a `vFlashErase:0,200` / `vFlashDone` cycle, and verify `ctx.sw_bp[0].in_use == false` afterward — the BREAK opcode is no longer in FLASH so the shadow must be dropped. |
 
 ### 3.4. [tests/test_elf.c](../tests/test_elf.c)
 
@@ -192,7 +222,7 @@ Role: **unit**. **11 test(s).**
 
 ### 3.6. [tests/test_monitor.c](../tests/test_monitor.c)
 
-Role: **unit**. **10 test(s).**
+Role: **unit**. **20 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -206,6 +236,16 @@ Role: **unit**. **10 test(s).**
 | 8 | <a id="cmd_queues_reads_queue_count_descriptors_from_que_table"></a>`cmd_queues_reads_queue_count_descriptors_from_que_table` | `LLR-MON-04` | Dispatch `"avros queues"` and verify that `updi_mem_read()` is called with `idx->queue_table_addr` and a length equal to `idx->queue_count` × 10 bytes (`queDescriptor_t` size). |
 | 9 | <a id="cmd_queues_formats_capacity_and_sizeofelement_for_each_entry"></a>`cmd_queues_formats_capacity_and_sizeofelement_for_each_entry` | `LLR-MON-04` | Inject two `queDescriptor_t` records with `(capacity, sizeOfElement)` of `(8, 1)` and `(16, 4)` respectively and verify the decoded O-packet text contains `"capacity=8 sizeOfElement=1"` and `"capacity=16 sizeOfElement=4"`. |
 | 10 | <a id="monitor_dispatch_and_helpers_never_call_updi_halt"></a>`monitor_dispatch_and_helpers_never_call_updi_halt` | `LLR-MON-07` | Execute both sub-commands (`events`, `queues`) through `monitor_dispatch()` and verify that `updi_halt()` is never called by inspecting the mock call log. |
+| 11 | <a id="verb_reset_pulses_updi_and_clears_shadows"></a>`verb_reset_pulses_updi_and_clears_shadows` | `LLR-MON-09` | Hex-encode `"reset"` through `monitor_dispatch_ex()` with a stub `RspContext` and verify that `updi_enter_debug()` and `rsp_hw_bp_clear_all()` are each called exactly once and that `updi_halt()` is not called. |
+| 12 | <a id="verb_halt_emits_T05_stop_reply_and_suppresses_OK"></a>`verb_halt_emits_T05_stop_reply_and_suppresses_OK` | `LLR-MON-10` | Hex-encode `"halt"` through `monitor_dispatch_ex()` and verify the captured `rsp_send_packet()` payload starts with the literal three characters `T05`, and that the dispatcher returns -3 so the caller suppresses the trailing `OK`. |
+| 13 | <a id="verb_go_calls_updi_run_and_returns_OK"></a>`verb_go_calls_updi_run_and_returns_OK` | `LLR-MON-11` | Hex-encode `"go"` through `monitor_dispatch_ex()` and verify `updi_run()` is invoked exactly once and the dispatcher returns 0 so the caller emits `OK`. |
+| 14 | <a id="verb_erase_refused_without_allow_erase_flag"></a>`verb_erase_refused_without_allow_erase_flag` | `LLR-MON-12` | Dispatch `"erase"` with `ctx.allow_erase = 0` and verify `updi_chip_erase()` is NOT called, the captured O-packet text mentions `--allow-erase`, and the dispatcher returns -1 so the caller emits `E22`. |
+| 15 | <a id="verb_erase_allowed_when_flag_set_clears_shadows"></a>`verb_erase_allowed_when_flag_set_clears_shadows` | `LLR-MON-12` | Dispatch `"chip-erase"` with `ctx.allow_erase = 1` and verify `updi_chip_erase()`, `updi_enter_debug()`, and `rsp_hw_bp_clear_all()` are each called exactly once. |
+| 16 | <a id="verb_version_emits_o_packet_with_version_and_date"></a>`verb_version_emits_o_packet_with_version_and_date` | `LLR-MON-13` | Dispatch `"version"` and verify the captured O-packet decodes to a string containing both `"avrOSdb"` and `"built"`. |
+| 17 | <a id="verb_bp_mode_sw_and_hw_only_mutate_ctx"></a>`verb_bp_mode_sw_and_hw_only_mutate_ctx` | `LLR-MON-14` | Dispatch `"bp-mode hw-only"` then `"bp-mode sw"` on the same `RspContext` and verify `ctx.bp_mode` cycles through `RSP_BP_MODE_HW_ONLY` and back to `RSP_BP_MODE_SW`; an invalid argument returns -2. |
+| 18 | <a id="verb_help_emits_one_line_per_recognised_verb"></a>`verb_help_emits_one_line_per_recognised_verb` | `LLR-MON-15` | Dispatch `"help"` and verify that at least 8 O-packets are sent (one per documented top-level verb) before the dispatcher returns 0. |
+| 19 | <a id="unknown_top_level_verb_emits_usage_hint"></a>`unknown_top_level_verb_emits_usage_hint` | `LLR-MON-08` | Dispatch a token that is neither a known verb nor `avros …` and verify the captured O-packet text contains `"usage:"` and the dispatcher returns -2. |
+| 20 | <a id="avros_prefix_still_routed_to_legacy_dispatch"></a>`avros_prefix_still_routed_to_legacy_dispatch` | `LLR-MON-08` | Dispatch `"avros events"` through `monitor_dispatch_ex()` and verify the call is forwarded to `monitor_dispatch()` (none of the top-level verb side-effects fire: `updi_enter_debug`, `updi_chip_erase`, and `updi_halt` all remain at zero invocations). |
 
 ### 3.7. [tests/test_integration.c](../tests/test_integration.c)
 
@@ -248,7 +288,7 @@ Role: **unit**. **6 test(s).**
 
 ### 3.10. [tests/hw/hw_test.c](../tests/hw/hw_test.c)
 
-Role: **hardware**. **22 test(s).**
+Role: **hardware**. **29 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -271,9 +311,16 @@ Role: **hardware**. **22 test(s).**
 | 17 | <a id="D1_rsp_server_accepts_tcp_connection"></a>`D1_rsp_server_accepts_tcp_connection` | `LLR-HWTEST-05` | When `HW_TEST_RSP=YES`, `fork`+`execl` the production `build/avrOSdb` against the configured serial port; open a TCP client to `127.0.0.1:HW_RSP_PORT` and assert the connect succeeds within a bounded timeout. Skipped otherwise. |
 | 18 | <a id="D2_rsp_qsupported_round_trip"></a>`D2_rsp_qsupported_round_trip` | `LLR-HWTEST-05` | Send an RSP `$qSupported#37` packet to the spawned server and assert a non-empty, properly-framed RSP reply is received. Skipped unless `HW_TEST_RSP=YES`. On completion the harness shall terminate the spawned server cleanly via SIGTERM + `waitpid`. |
 | 19 | <a id="D3_rsp_ctrl_c_interrupt_returns_T02"></a>`D3_rsp_ctrl_c_interrupt_returns_T02` | `LLR-RSP-11`, `LLR-UPDI-08`, `LLR-HWTEST-05` | With the spawned server running and a connected TCP client, dispatch a `c` (continue) RSP packet, wait long enough for the loop to enter its poll/select state, then send a single `0x03` byte (GDB Ctrl-C async-interrupt) on the same TCP connection. Assert that the server replies with a stop-reason packet whose signal field is `T02` (SIGINT) and that the live target is observably halted afterwards (via a subsequent `g` packet succeeding). Skipped unless `HW_TEST_RSP=YES`. Exercises the production async-interrupt path end-to-end through real silicon, validating both LLR-RSP-11 (Ctrl-C path) and LLR-UPDI-08 (`updi_halt()`). |
-| 20 | <a id="F1_autobaud_picks_reliable_rung"></a>`F1_autobaud_picks_reliable_rung` | `LLR-HWTEST-07`, `LLR-UPDI-31` | Close the harness UPDI fd, then call `updi_probe_baud(cfg->port, 8, visitor, NULL)`. The visitor records each rung's `{baud, errors, samples}` triple for the log. PASS if the returned baud is ≥ 19200 (the slowest rung in the ladder) — proving the probe walked the ladder, observed at least one zero-error rung on live silicon, and returned the highest-rate working candidate. Exercises the full read-only probe path end-to-end. |
-| 21 | <a id="F2_fuse_pretty_print_round_trip"></a>`F2_fuse_pretty_print_round_trip` | `LLR-HWTEST-07`, `LLR-UPDI-29`, `LLR-UPDI-32` | With the harness UPDI fd re-opened at `cfg->baud`, read the FUSES window and the 4-byte LOCK window via `updi_nvm_read()`, then call `updi_format_fuses()` into a 2 KiB stack buffer. PASS if the formatted output contains the literal substrings `WDTCFG`, `OSCCFG`, `SYSCFG0`, and `Lock:` — confirming the per-family fuse decode table fired and the lock-byte trailer was emitted. |
-| 22 | <a id="F3_prog_mode_end_to_end_with_verify"></a>`F3_prog_mode_end_to_end_with_verify` | `LLR-HWTEST-07`, `LLR-MAIN-15`, `LLR-MAIN-16` | Destructive — gated by `HW_TEST_NVM_CONFIRM=YES`. With the harness UPDI fd closed, `fork` and `execl` the production `build/avrOSdb --prog --erase --baud <N> <port> <elf>` against the bench ELF (`build/fixtures/all_nvm.elf` by default, which intentionally avoids FUSES/LOCK windows so the bench stays in a known state). Capture the child's stdout+stderr through an 8 KiB buffer. PASS if `WEXITSTATUS == 0` AND the captured output contains the literal `verify: OK`. Validates `--prog` end-to-end including chip-erase, FLASH/EEPROM/USERROW programming, and read-back verify against live silicon. |
+| 20 | <a id="D4_rsp_qC_current_thread"></a>`D4_rsp_qC_current_thread` | `LLR-HWTEST-08`, `LLR-RSP-21` | Send a framed `qC` packet over the same TCP socket used by D1–D3 and assert the reply payload begins with the two-character prefix `QC` followed by a thread id. Validates HLR-059's qC handler against live silicon. |
+| 21 | <a id="D5_rsp_qOffsets_section_bases"></a>`D5_rsp_qOffsets_section_bases` | `LLR-HWTEST-08`, `LLR-RSP-22` | Send `qOffsets` and assert the reply payload begins with the literal `Text=` (the avrOSdb stub always reports `Text=0;Data=0;Bss=0` because the firmware image is linked at fixed addresses). Validates HLR-059's qOffsets handler against live silicon. |
+| 22 | <a id="D6_rsp_monitor_info_verb"></a>`D6_rsp_monitor_info_verb` | `LLR-HWTEST-08`, `LLR-MON-01` | Send `qRcmd,696e666f` (the hex-encoded ASCII string `info`) and assert the reply payload is non-empty and does not begin with `E` (i.e. is not an `Exx` error code). Validates HLR-055's `monitor info` verb wiring against live silicon. |
+| 23 | <a id="D7_rsp_Z2_z2_replies_empty_packet_unsupported"></a>`D7_rsp_Z2_z2_replies_empty_packet_unsupported` | `LLR-HWTEST-08`, `LLR-RSP-27` | Send `Z2,<sram_addr|0x800000>,1` (request a 1-byte write watchpoint on the configured SRAM scratch address) followed by `z2,<sram_addr|0x800000>,1`. Assert both replies are the empty RSP packet (`$#00`, payload length zero), proving the server signals "unsupported" so GDB falls back to software watchpoints. Validates HLR-056 against live silicon — AVR-Dx UPDI exposes no data-watchpoint hardware. |
+| 24 | <a id="D8_rsp_vRun_reload_returns_Tstop"></a>`D8_rsp_vRun_reload_returns_Tstop` | `LLR-HWTEST-08`, `LLR-RSP-18` | Send `vRun;` and assert the reply payload begins with `T` (any stop signal — typically `T05` SIGTRAP after run-to-main). Validates HLR-058's vRun handler — full reload + reset + halt-at-entry — against live silicon. |
+| 25 | <a id="D9_rsp_vFlashErase_vFlashDone_smoke"></a>`D9_rsp_vFlashErase_vFlashDone_smoke` | `LLR-HWTEST-08`, `LLR-RSP-32`, `LLR-RSP-34` | Destructive — opt-in via `--with-nvm`. Send `vFlashErase:<flash_page>,200` and assert reply is `OK`; then send `vFlashDone` and assert reply is `OK`. Erases one 512-byte FLASH page on live silicon; the subsequent vFlashDone flushes an all-0xFF buffer (the cleared state) which is a valid no-op. Validates HLR-053's vFlash* state machine end-to-end. |
+| 26 | <a id="D10_rsp_Z0_z0_sw_bp_flash_break_round_trip"></a>`D10_rsp_Z0_z0_sw_bp_flash_break_round_trip` | `LLR-HWTEST-08`, `LLR-RSP-36`, `LLR-RSP-37`, `LLR-RSP-38` | Destructive — opt-in via `--with-nvm` AND must run after D9 so the FLASH page baseline is 0xFF. Send `Z0,<flash_page>,2` and assert reply is `OK`; then `m<flash_page>,2` and assert the 4-character hex payload equals `9895` (AVR `BREAK` opcode `0x9598` little-endian); then `z0,<flash_page>,2` and assert reply is `OK`. Validates HLR-054's full SW-BP install/restore loop — FLASH patch with BREAK, read-back, and restore of original opcode — against live silicon. |
+| 27 | <a id="F1_autobaud_picks_reliable_rung"></a>`F1_autobaud_picks_reliable_rung` | `LLR-HWTEST-07`, `LLR-UPDI-31` | Close the harness UPDI fd, then call `updi_probe_baud(cfg->port, 8, visitor, NULL)`. The visitor records each rung's `{baud, errors, samples}` triple for the log. PASS if the returned baud is ≥ 19200 (the slowest rung in the ladder) — proving the probe walked the ladder, observed at least one zero-error rung on live silicon, and returned the highest-rate working candidate. Exercises the full read-only probe path end-to-end. |
+| 28 | <a id="F2_fuse_pretty_print_round_trip"></a>`F2_fuse_pretty_print_round_trip` | `LLR-HWTEST-07`, `LLR-UPDI-29`, `LLR-UPDI-32` | With the harness UPDI fd re-opened at `cfg->baud`, read the FUSES window and the 4-byte LOCK window via `updi_nvm_read()`, then call `updi_format_fuses()` into a 2 KiB stack buffer. PASS if the formatted output contains the literal substrings `WDTCFG`, `OSCCFG`, `SYSCFG0`, and `Lock:` — confirming the per-family fuse decode table fired and the lock-byte trailer was emitted. |
+| 29 | <a id="F3_prog_mode_end_to_end_with_verify"></a>`F3_prog_mode_end_to_end_with_verify` | `LLR-HWTEST-07`, `LLR-MAIN-15`, `LLR-MAIN-16` | Destructive — gated by `HW_TEST_NVM_CONFIRM=YES`. With the harness UPDI fd closed, `fork` and `execl` the production `build/avrOSdb --prog --erase --baud <N> <port> <elf>` against the bench ELF (`build/fixtures/all_nvm.elf` by default, which intentionally avoids FUSES/LOCK windows so the bench stays in a known state). Capture the child's stdout+stderr through an 8 KiB buffer. PASS if `WEXITSTATUS == 0` AND the captured output contains the literal `verify: OK`. Validates `--prog` end-to-end including chip-erase, FLASH/EEPROM/USERROW programming, and read-back verify against live silicon. |
 
 ## 4. LLR Coverage Matrix
 
@@ -301,6 +348,7 @@ verified by code review — see
 | `LLR-MAIN-15` | `main` | `HLR-049`, `HLR-050` | `F3_prog_mode_end_to_end_with_verify` |
 | `LLR-MAIN-16` | `main` | `HLR-050`, `HLR-049` | `F3_prog_mode_end_to_end_with_verify` |
 | `LLR-MAIN-17` | `main` | `HLR-050`, `HLR-051`, `HLR-052` | `parse_args_no_autobaud_sets_flag` |
+| `LLR-MAIN-21` | `main` | `HLR-055` | `parse_args_allow_erase_sets_flag`, `parse_args_allow_erase_defaults_false` |
 | `LLR-UPDI-01` | `updi` | `HLR-006` | `updi_open_sets_8e2_raw_half_duplex_via_termios`, `updi_open_returns_minus1_on_device_open_failure` |
 | `LLR-UPDI-02` | `updi` | `HLR-006`, `HLR-036` | `updi_open_asserts_wake_byte_then_stcs_ctrlb`, `updi_open_restores_session_baud_after_break` |
 | `LLR-UPDI-03` | `updi` | `HLR-036` | `updi_open_issues_stcs_ctrla_and_ldcs_statusa`, `updi_open_retries_cold_start_3_times_on_no_ack`, `updi_open_returns_minus1_after_3_consecutive_link_failures` |
@@ -350,7 +398,24 @@ verified by code review — see
 | `LLR-RSP-15` | `rsp` | `HLR-029`, `HLR-030` | `on_monitor_qRcmd_passes_hex_body_to_monitor_dispatch`, `on_monitor_returns_ok_when_monitor_dispatch_succeeds`, `on_monitor_sends_o_packet_error_on_updi_failure` |
 | `LLR-RSP-16` | `rsp` | `HLR-025` | `H_packet_stores_thread_id_for_register_operations`, `H_packet_minus1_and_0_both_map_to_active_fsm_thread` |
 | `LLR-RSP-17` | `rsp` | `HLR-017`, `HLR-018` | `on_halt_reason_returns_T02_when_extbrk_set` |
-| `LLR-RSP-18` | `rsp` | `HLR-016`, `HLR-019` | `on_detach_clears_hw_bps_before_run` |
+| `LLR-RSP-18` | `rsp` | `HLR-016`, `HLR-019` | `on_detach_clears_hw_bps_before_run`, `D8_rsp_vRun_reload_returns_Tstop` |
+| `LLR-RSP-19` | `rsp` | `HLR-059` | `qC_returns_QC0_when_no_c_thread_selected`, `qC_returns_selected_c_thread_in_hex` |
+| `LLR-RSP-20` | `rsp` | `HLR-059` | `qOffsets_returns_text_data_bss_all_zero` |
+| `LLR-RSP-21` | `rsp` | `HLR-059` | `T_packet_returns_OK_for_live_thread`, `T_packet_returns_E01_for_unknown_thread`, `D4_rsp_qC_current_thread` |
+| `LLR-RSP-22` | `rsp` | `HLR-059` | `R_packet_invalidates_fsm_runs_and_emits_stop`, `D5_rsp_qOffsets_section_bases` |
+| `LLR-RSP-23` | `rsp` | `HLR-058` | `vRun_invalidates_fsm_runs_and_emits_stop` |
+| `LLR-RSP-24` | `rsp` | `HLR-058` | `vAttach_halts_target_and_emits_stop_reply` |
+| `LLR-RSP-25` | `rsp` | `HLR-058` | `vKill_sets_quit_and_replies_ok` |
+| `LLR-RSP-26` | `rsp` | `HLR-058` | `qSupported_advertises_multiprocess_vRun_vAttach_vKill` |
+| `LLR-RSP-27` | `rsp` | `HLR-056` | `Z2_replies_empty_packet_so_gdb_falls_back_to_sw_watch`, `z3_remove_also_replies_empty_packet`, `D7_rsp_Z2_z2_replies_empty_packet_unsupported` |
+| `LLR-RSP-32` | `rsp` | `HLR-053` | `vFlashErase_allocates_buffer_and_replies_ok_for_flash_range`, `vFlashErase_E22_for_data_space_address`, `D9_rsp_vFlashErase_vFlashDone_smoke` |
+| `LLR-RSP-33` | `rsp` | `HLR-053` | `vFlashWrite_copies_payload_into_buffer_at_offset`, `vFlashWrite_decodes_0x7D_xor_0x20_binary_escape` |
+| `LLR-RSP-34` | `rsp` | `HLR-053` | `vFlashDone_flushes_buffer_via_nvm_write_flash_and_replies_ok`, `vFlashDone_with_no_active_transaction_replies_ok_noop`, `m_packet_mid_vflash_transaction_aborts_and_returns_E22`, `D9_rsp_vFlashErase_vFlashDone_smoke` |
+| `LLR-RSP-35` | `rsp` | `HLR-053` | `qSupported_advertises_vFlash_packets` |
+| `LLR-RSP-36` | `rsp` | `HLR-054` | `Z0_in_sw_mode_patches_BREAK_opcode_via_flash_patch`, `Z0_in_sw_mode_refuses_data_space_address_with_E22`, `Z0_in_hw_only_mode_falls_back_to_HW_BP_path`, `Z0_in_sw_mode_idempotent_on_same_address`, `D10_rsp_Z0_z0_sw_bp_flash_break_round_trip` |
+| `LLR-RSP-37` | `rsp` | `HLR-054` | `Z0_in_sw_mode_records_original_opcode_from_flash`, `Z0_in_sw_mode_snapshots_and_restores_cpu_state`, `D10_rsp_Z0_z0_sw_bp_flash_break_round_trip` |
+| `LLR-RSP-38` | `rsp` | `HLR-054` | `z0_in_sw_mode_restores_original_opcode`, `D10_rsp_Z0_z0_sw_bp_flash_break_round_trip` |
+| `LLR-RSP-39` | `rsp` | `HLR-054` | `vFlashDone_also_clears_sw_bp_shadow` |
 | `LLR-ELF-01` | `elf` | `HLR-021` | `elf_open_accepts_valid_avr_elf32_binary`, `elf_open_returns_minus1_on_invalid_elf_magic`, `elf_open_returns_minus1_on_wrong_machine_type` |
 | `LLR-ELF-02` | `elf` | `HLR-021`, `HLR-040` | `elf_open_loads_symtab_and_strtab_into_heap_buffers`, `elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure` |
 | `LLR-ELF-03` | `elf` | `HLR-021` | `elf_find_avros_tables_performs_single_linear_scan`, `elf_find_avros_tables_populates_all_7_avros_sentinel_fields` |
@@ -366,12 +431,20 @@ verified by code review — see
 | `LLR-FSM-04` | `fsm` | `HLR-026` | `fsm_get_registers_places_state_fn_as_pc_at_hex_positions_70_77`, `fsm_get_registers_non_active_r0_r31_sreg_spl_sph_all_zero`, `fsm_get_registers_active_thread_reads_live_sreg_spl_sph` |
 | `LLR-FSM-05` | `fsm` | `HLR-027` | `fsm_build_thread_list_caps_at_32_entries_and_logs_warning` |
 | `LLR-FSM-06` | `fsm` | `HLR-028` | `fsm_get_registers_non_active_no_updi_read_of_stack` |
-| `LLR-MON-01` | `monitor` | `HLR-029` | `monitor_dispatch_hex_decodes_cmd_before_prefix_matching`, `monitor_dispatch_treats_invalid_hex_sequence_as_unrecognised` |
+| `LLR-MON-01` | `monitor` | `HLR-029` | `monitor_dispatch_hex_decodes_cmd_before_prefix_matching`, `monitor_dispatch_treats_invalid_hex_sequence_as_unrecognised`, `D6_rsp_monitor_info_verb` |
 | `LLR-MON-02` | `monitor` | `HLR-029`, `HLR-030` | `monitor_dispatch_rejects_cmd_without_avros_space_prefix`, `monitor_dispatch_sends_usage_hint_o_packet_on_bad_prefix` |
 | `LLR-MON-03` | `monitor` | `HLR-029` | `cmd_events_reads_event_count_descriptors_from_evnt_table`, `cmd_events_reports_name_and_status_value_per_descriptor` |
 | `LLR-MON-04` | `monitor` | `HLR-030` | `cmd_queues_reads_queue_count_descriptors_from_que_table`, `cmd_queues_formats_capacity_and_sizeofelement_for_each_entry` |
 | `LLR-MON-06` | `monitor` | `HLR-029`, `HLR-030` | `cmd_events_output_is_hex_encoded_o_packet` |
 | `LLR-MON-07` | `monitor` | `HLR-011`, `HLR-032` | `monitor_dispatch_and_helpers_never_call_updi_halt` |
+| `LLR-MON-08` | `monitor` | `HLR-055` | `unknown_top_level_verb_emits_usage_hint`, `avros_prefix_still_routed_to_legacy_dispatch` |
+| `LLR-MON-09` | `monitor` | `HLR-055` | `verb_reset_pulses_updi_and_clears_shadows` |
+| `LLR-MON-10` | `monitor` | `HLR-055` | `verb_halt_emits_T05_stop_reply_and_suppresses_OK` |
+| `LLR-MON-11` | `monitor` | `HLR-055` | `verb_go_calls_updi_run_and_returns_OK` |
+| `LLR-MON-12` | `monitor` | `HLR-055` | `verb_erase_refused_without_allow_erase_flag`, `verb_erase_allowed_when_flag_set_clears_shadows` |
+| `LLR-MON-13` | `monitor` | `HLR-055` | `verb_version_emits_o_packet_with_version_and_date` |
+| `LLR-MON-14` | `monitor` | `HLR-054`, `HLR-055` | `verb_bp_mode_sw_and_hw_only_mutate_ctx` |
+| `LLR-MON-15` | `monitor` | `HLR-055` | `verb_help_emits_one_line_per_recognised_verb` |
 | `LLR-INST-01` | `inst` | `HLR-041` | `check_tools_exits_nonzero_when_required_tool_is_absent` |
 | `LLR-INST-02` | `inst` | `HLR-041` | `make_install_places_binary_at_prefix_bin`, `make_install_places_man_page_at_prefix_man1` |
 | `LLR-INST-03` | `inst` | `HLR-041` | `make_uninstall_removes_all_installed_files` |
@@ -387,3 +460,4 @@ verified by code review — see
 | `LLR-HWTEST-05` | `hwtest` | `HLR-045`, `HLR-014` | `D1_rsp_server_accepts_tcp_connection`, `D2_rsp_qsupported_round_trip`, `D3_rsp_ctrl_c_interrupt_returns_T02` |
 | `LLR-HWTEST-06` | `hwtest` | `HLR-045` | `B0_sram_single_byte_round_trip` |
 | `LLR-HWTEST-07` | `hwtest` | `HLR-045`, `HLR-049`, `HLR-050`, `HLR-051`, `HLR-052` | `F1_autobaud_picks_reliable_rung`, `F2_fuse_pretty_print_round_trip`, `F3_prog_mode_end_to_end_with_verify` |
+| `LLR-HWTEST-08` | `hwtest` | `HLR-053`, `HLR-054`, `HLR-055`, `HLR-056`, `HLR-058`, `HLR-059` | `D4_rsp_qC_current_thread`, `D5_rsp_qOffsets_section_bases`, `D6_rsp_monitor_info_verb`, `D7_rsp_Z2_z2_replies_empty_packet_unsupported`, `D8_rsp_vRun_reload_returns_Tstop`, `D9_rsp_vFlashErase_vFlashDone_smoke`, `D10_rsp_Z0_z0_sw_bp_flash_break_round_trip` |

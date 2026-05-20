@@ -103,6 +103,14 @@
 #define OCD_BASE        0x0F80u
 #define OCD_BP0A        (OCD_BASE + 0x00u)  /* 3 bytes: BP0 byte address    */
 #define OCD_BP1A        (OCD_BASE + 0x04u)  /* 3 bytes: BP1 byte address    */
+/* NOTE: AVR-Dx OCD over UPDI does NOT expose data-address watchpoint
+ * hardware.  The exhaustive FF-bomb in doc/reference/guesswork.md
+ * found no writable bits anywhere in the OCD window except those
+ * documented below.  Bloom (the canonical open-source AVR debugger)
+ * advertises hardwareBreakpoints=1 and zero data watchpoints for the
+ * UPDI physical interface for the same reason.  GDB's Z2/Z3/Z4
+ * packets are answered with the empty reply ("unsupported"), which
+ * causes GDB to transparently fall back to software watchpoints.   */
 #define OCD_CTRL0       (OCD_BASE + 0x08u)  /* PCHOLD/HWBP/STEP             */
 #define OCD_CTRL1       (OCD_BASE + 0x09u)  /* BP0/BP1/EXTBRK/SWBP/JMP/INT  */
 #define OCD_STATUS0     (OCD_BASE + 0x0Cu)  /* STOPPED/EXT/RESET            */
