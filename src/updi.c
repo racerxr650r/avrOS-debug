@@ -1003,11 +1003,11 @@ int updi_ocd_poll_halted(int fd, int timeout_ms)
     int budget = (timeout_ms <= 0) ? 1 : timeout_ms;
     for (int i = 0; i < budget; i++) {
         int s = updi_ldcs(fd, ASI_OCD_STATUS);
-        if (s < 0) return -1;
-        if (s & ASI_OCD_STATUS_STOPPED) return 0;
+        if (s < 0) return -1;                       /* UPDI I/O error */
+        if (s & ASI_OCD_STATUS_STOPPED) return 0;   /* halted */
         nanosleep(&ts, NULL);
     }
-    return -1;   /* not halted within budget */
+    return 1;   /* link OK, target still running within budget */
 }
 
 int updi_ocd_read_halt_status(int fd, uint8_t *st0, uint8_t *st1)

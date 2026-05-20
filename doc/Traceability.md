@@ -45,18 +45,18 @@ Each row maps an SDD section to the HLRs that cite it in their
 | [Section 4.1](SDD.md#41-purpose-and-responsibilities-srcupdic) | Purpose and Responsibilities (src/updi.c) | [`HLR-002`](HLRs.md#HLR-002), [`HLR-011`](HLRs.md#HLR-011), [`HLR-012`](HLRs.md#HLR-012), [`HLR-044`](HLRs.md#HLR-044), [`HLR-045`](HLRs.md#HLR-045) |
 | [Section 4.2.1](SDD.md#421-public-c-api-srcupdih) | Public C API (src/updi.h) | [`HLR-045`](HLRs.md#HLR-045) |
 | [Section 4.2.2](SDD.md#422-hardware-connection) | Hardware Connection | [`HLR-006`](HLRs.md#HLR-006) |
-| [Section 4.3.1](SDD.md#431-key-data-structures) | Key Data Structures | [`HLR-004`](HLRs.md#HLR-004), [`HLR-007`](HLRs.md#HLR-007), [`HLR-008`](HLRs.md#HLR-008), [`HLR-009`](HLRs.md#HLR-009), [`HLR-010`](HLRs.md#HLR-010), [`HLR-011`](HLRs.md#HLR-011), [`HLR-012`](HLRs.md#HLR-012), [`HLR-016`](HLRs.md#HLR-016), [`HLR-017`](HLRs.md#HLR-017), [`HLR-018`](HLRs.md#HLR-018), [`HLR-032`](HLRs.md#HLR-032), [`HLR-046`](HLRs.md#HLR-046), [`HLR-047`](HLRs.md#HLR-047), [`HLR-048`](HLRs.md#HLR-048), [`HLR-049`](HLRs.md#HLR-049), [`HLR-050`](HLRs.md#HLR-050) |
+| [Section 4.3.1](SDD.md#431-key-data-structures) | Key Data Structures | [`HLR-004`](HLRs.md#HLR-004), [`HLR-007`](HLRs.md#HLR-007), [`HLR-008`](HLRs.md#HLR-008), [`HLR-009`](HLRs.md#HLR-009), [`HLR-010`](HLRs.md#HLR-010), [`HLR-011`](HLRs.md#HLR-011), [`HLR-012`](HLRs.md#HLR-012), [`HLR-016`](HLRs.md#HLR-016), [`HLR-017`](HLRs.md#HLR-017), [`HLR-018`](HLRs.md#HLR-018), [`HLR-032`](HLRs.md#HLR-032), [`HLR-046`](HLRs.md#HLR-046), [`HLR-047`](HLRs.md#HLR-047), [`HLR-048`](HLRs.md#HLR-048), [`HLR-049`](HLRs.md#HLR-049), [`HLR-050`](HLRs.md#HLR-050), [`HLR-053`](HLRs.md#HLR-053), [`HLR-054`](HLRs.md#HLR-054), [`HLR-056`](HLRs.md#HLR-056) |
 | [Section 4.3.3](SDD.md#433-parsing-strategy-algorithm) | Parsing Strategy / Algorithm | [`HLR-036`](HLRs.md#HLR-036), [`HLR-037`](HLRs.md#HLR-037) |
-| [Section 5.1](SDD.md#51-purpose-and-responsibilities-srcgdb_rspc) | Purpose and Responsibilities (src/gdb_rsp.c) | [`HLR-003`](HLRs.md#HLR-003), [`HLR-019`](HLRs.md#HLR-019), [`HLR-020`](HLRs.md#HLR-020) |
+| [Section 5.1](SDD.md#51-purpose-and-responsibilities-srcgdb_rspc) | Purpose and Responsibilities (src/gdb_rsp.c) | [`HLR-003`](HLRs.md#HLR-003), [`HLR-019`](HLRs.md#HLR-019), [`HLR-020`](HLRs.md#HLR-020), [`HLR-057`](HLRs.md#HLR-057), [`HLR-058`](HLRs.md#HLR-058) |
 | [Section 5.2.2](SDD.md#522-gdb-network-interface) | GDB Network Interface | [`HLR-013`](HLRs.md#HLR-013) |
-| [Section 5.3.1](SDD.md#531-key-data-structures) | Key Data Structures | [`HLR-014`](HLRs.md#HLR-014), [`HLR-015`](HLRs.md#HLR-015), [`HLR-016`](HLRs.md#HLR-016), [`HLR-017`](HLRs.md#HLR-017), [`HLR-018`](HLRs.md#HLR-018), [`HLR-019`](HLRs.md#HLR-019) |
+| [Section 5.3.1](SDD.md#531-key-data-structures) | Key Data Structures | [`HLR-014`](HLRs.md#HLR-014), [`HLR-015`](HLRs.md#HLR-015), [`HLR-016`](HLRs.md#HLR-016), [`HLR-017`](HLRs.md#HLR-017), [`HLR-018`](HLRs.md#HLR-018), [`HLR-019`](HLRs.md#HLR-019), [`HLR-053`](HLRs.md#HLR-053), [`HLR-054`](HLRs.md#HLR-054), [`HLR-055`](HLRs.md#HLR-055), [`HLR-056`](HLRs.md#HLR-056), [`HLR-057`](HLRs.md#HLR-057), [`HLR-058`](HLRs.md#HLR-058), [`HLR-059`](HLRs.md#HLR-059) |
 | [Section 5.3.3](SDD.md#533-parsing-strategy-algorithm) | Parsing Strategy / Algorithm | [`HLR-038`](HLRs.md#HLR-038) |
 | [Section 6.1](SDD.md#61-purpose-and-responsibilities-srcelf_parserc) | Purpose and Responsibilities (src/elf_parser.c) | [`HLR-021`](HLRs.md#HLR-021) |
 | [Section 6.3.1](SDD.md#631-key-data-structures) | Key Data Structures | [`HLR-021`](HLRs.md#HLR-021), [`HLR-022`](HLRs.md#HLR-022) |
 | [Section 6.5](SDD.md#65-error-handling-and-logging-srcelf_parserc) | Error Handling and Logging (src/elf_parser.c) | [`HLR-023`](HLRs.md#HLR-023) |
 | [Section 7.1](SDD.md#71-purpose-and-responsibilities-srcfsm_mapperc) | Purpose and Responsibilities (src/fsm_mapper.c) | [`HLR-024`](HLRs.md#HLR-024), [`HLR-026`](HLRs.md#HLR-026), [`HLR-027`](HLRs.md#HLR-027), [`HLR-028`](HLRs.md#HLR-028) |
 | [Section 7.3.1](SDD.md#731-key-data-structures) | Key Data Structures | [`HLR-024`](HLRs.md#HLR-024), [`HLR-025`](HLRs.md#HLR-025), [`HLR-026`](HLRs.md#HLR-026), [`HLR-027`](HLRs.md#HLR-027) |
-| [Section 8.1](SDD.md#81-purpose-and-responsibilities-srcmonitorc) | Purpose and Responsibilities (src/monitor.c) | [`HLR-032`](HLRs.md#HLR-032) |
+| [Section 8.1](SDD.md#81-purpose-and-responsibilities-srcmonitorc) | Purpose and Responsibilities (src/monitor.c) | [`HLR-032`](HLRs.md#HLR-032), [`HLR-055`](HLRs.md#HLR-055) |
 | [Section 8.2.2](SDD.md#822-gdb-monitor-sub-commands) | GDB Monitor Sub-commands | [`HLR-029`](HLRs.md#HLR-029), [`HLR-030`](HLRs.md#HLR-030) |
 | [Section 8.3.1](SDD.md#831-key-functions-srcmonitorc) | Key Functions (src/monitor.c) | [`HLR-029`](HLRs.md#HLR-029), [`HLR-030`](HLRs.md#HLR-030) |
 | [Section 9](SDD.md#9-data-dictionary) | Data Dictionary | [`HLR-040`](HLRs.md#HLR-040) |
@@ -121,6 +121,13 @@ catalogue is in [STP.md §3](STP.md#3-test-catalogue).
 | [`HLR-050`](HLRs.md#HLR-050) | Program-and-Exit Mode | [`LLR-HWTEST-07`](LLRs.md#LLR-HWTEST-07), [`LLR-MAIN-14`](LLRs.md#LLR-MAIN-14), [`LLR-MAIN-15`](LLRs.md#LLR-MAIN-15), [`LLR-MAIN-16`](LLRs.md#LLR-MAIN-16), [`LLR-MAIN-17`](LLRs.md#LLR-MAIN-17) | [`F1_autobaud_picks_reliable_rung`](STP.md#F1_autobaud_picks_reliable_rung), [`F2_fuse_pretty_print_round_trip`](STP.md#F2_fuse_pretty_print_round_trip), [`F3_prog_mode_end_to_end_with_verify`](STP.md#F3_prog_mode_end_to_end_with_verify), [`parse_args_no_autobaud_sets_flag`](STP.md#parse_args_no_autobaud_sets_flag), [`parse_args_no_verify_sets_flag`](STP.md#parse_args_no_verify_sets_flag), [`parse_args_prog_mode_sets_flag`](STP.md#parse_args_prog_mode_sets_flag) |
 | [`HLR-051`](HLRs.md#HLR-051) | Fuses Pretty-Printer in Device Mode | [`LLR-HWTEST-07`](LLRs.md#LLR-HWTEST-07), [`LLR-MAIN-17`](LLRs.md#LLR-MAIN-17), [`LLR-UPDI-29`](LLRs.md#LLR-UPDI-29), [`LLR-UPDI-32`](LLRs.md#LLR-UPDI-32) | [`F1_autobaud_picks_reliable_rung`](STP.md#F1_autobaud_picks_reliable_rung), [`F2_fuse_pretty_print_round_trip`](STP.md#F2_fuse_pretty_print_round_trip), [`F3_prog_mode_end_to_end_with_verify`](STP.md#F3_prog_mode_end_to_end_with_verify), [`parse_args_no_autobaud_sets_flag`](STP.md#parse_args_no_autobaud_sets_flag) |
 | [`HLR-052`](HLRs.md#HLR-052) | Auto-Baud Link-Quality Probe in Device Mode | [`LLR-HWTEST-07`](LLRs.md#LLR-HWTEST-07), [`LLR-MAIN-14`](LLRs.md#LLR-MAIN-14), [`LLR-MAIN-17`](LLRs.md#LLR-MAIN-17), [`LLR-UPDI-31`](LLRs.md#LLR-UPDI-31) | [`F1_autobaud_picks_reliable_rung`](STP.md#F1_autobaud_picks_reliable_rung), [`F2_fuse_pretty_print_round_trip`](STP.md#F2_fuse_pretty_print_round_trip), [`F3_prog_mode_end_to_end_with_verify`](STP.md#F3_prog_mode_end_to_end_with_verify), [`parse_args_no_autobaud_sets_flag`](STP.md#parse_args_no_autobaud_sets_flag), [`parse_args_no_verify_sets_flag`](STP.md#parse_args_no_verify_sets_flag), [`parse_args_prog_mode_sets_flag`](STP.md#parse_args_prog_mode_sets_flag) |
+| [`HLR-053`](HLRs.md#HLR-053) | Flash Programming via GDB load | — | **(no test)** |
+| [`HLR-054`](HLRs.md#HLR-054) | True Software Breakpoints via Flash BREAK Opcode | — | **(no test)** |
+| [`HLR-055`](HLRs.md#HLR-055) | avarice-Compatible Monitor Commands | — | **(no test)** |
+| [`HLR-056`](HLRs.md#HLR-056) | Hardware Data Watchpoints | — | **(no test)** |
+| [`HLR-057`](HLRs.md#HLR-057) | Memory-Map and Target Description XML | — | **(no test)** |
+| [`HLR-058`](HLRs.md#HLR-058) | Extended-Remote Lifecycle Packets | — | **(no test)** |
+| [`HLR-059`](HLRs.md#HLR-059) | Protocol Cleanup — qC, qOffsets, T, R | — | **(no test)** |
 
 ## 3. HLR Section Coverage Summary
 
@@ -140,6 +147,7 @@ locating areas of the spec that may need additional tests.
 | §9 Diagnostics and Bring-up | 1 | 4 | 13 | — |
 | §10 Hardware Integration Testing | 4 | 17 | 49 | — |
 | §11 CI-Grade Loader and Link Diagnostics | 4 | 9 | 9 | — |
+| §12 GDB Protocol Completion (avarice Drop-In Parity) | 7 | 0 | 0 | [`HLR-053`](HLRs.md#HLR-053), [`HLR-054`](HLRs.md#HLR-054), [`HLR-055`](HLRs.md#HLR-055), [`HLR-056`](HLRs.md#HLR-056), [`HLR-057`](HLRs.md#HLR-057), [`HLR-058`](HLRs.md#HLR-058), [`HLR-059`](HLRs.md#HLR-059) |
 
 ## 4. LLR Coverage
 
@@ -477,6 +485,13 @@ LLR-bound test in their implementation chain.
 
 | HLR | Name |
 | --- | ---- |
+| [`HLR-053`](HLRs.md#HLR-053) | Flash Programming via GDB load |
+| [`HLR-054`](HLRs.md#HLR-054) | True Software Breakpoints via Flash BREAK Opcode |
+| [`HLR-055`](HLRs.md#HLR-055) | avarice-Compatible Monitor Commands |
+| [`HLR-056`](HLRs.md#HLR-056) | Hardware Data Watchpoints |
+| [`HLR-057`](HLRs.md#HLR-057) | Memory-Map and Target Description XML |
+| [`HLR-058`](HLRs.md#HLR-058) | Extended-Remote Lifecycle Packets |
+| [`HLR-059`](HLRs.md#HLR-059) | Protocol Cleanup — qC, qOffsets, T, R |
 
 ---
 

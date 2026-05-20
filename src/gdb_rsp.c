@@ -136,6 +136,13 @@ int rsp_accept(int listen_fd)
 
     int one = 1;
     (void)setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+
+    /* Each new GDB session starts in ack mode and must explicitly
+     * negotiate QStartNoAckMode again.  Without this reset, a second
+     * client inherits the previous session's no-ack state, causing
+     * gdb to retry qSupported (no '+' arrives) and eventually parse
+     * its own internal "timeout" token as a feature item.            */
+    g_noack = false;
     return cfd;
 }
 
@@ -530,16 +537,17 @@ static int dh_continue(int fd, const char *pkt, void *vctx)
             /* Liberal: discard any other stray bytes mid-run. */
             continue;
         }
-        /* select() timed out — probe OCD STATUS for spontaneous halt. */
+        /* select() timed out — probe OCD STATUS for spontaneous halt.
+         *   updi_ocd_poll_halted() returns:
+         *     0  = CPU halted (we're done)
+         *     1  = link OK, still running (keep polling)
+         *    -1  = UPDI I/O error (count toward UPDI_FAIL_MAX)        */
         int s = updi_ocd_poll_halted(ctx->updi_fd, 1);
         if (s == 0) { updi_fails = 0; break; }       /* halted */
-        if (s < 0) {
-            if (++updi_fails >= UPDI_FAIL_MAX) {
-                (void)updi_halt(ctx->updi_fd);
-                return reply_err(fd, "E01");
-            }
-        } else {
-            updi_fails = 0;
+        if (s > 0)  { updi_fails = 0; continue; }    /* still running */
+        if (++updi_fails >= UPDI_FAIL_MAX) {
+            (void)updi_halt(ctx->updi_fd);
+            return reply_err(fd, "E01");
         }
     }
 
