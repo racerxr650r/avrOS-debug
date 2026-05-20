@@ -892,6 +892,93 @@ static void H_packet_minus1_and_0_both_map_to_active_fsm_thread(void)
     TEST_ASSERT_EQUAL(7, g_tid_var);
 }
 
+/* ── LLR-RSP-19: qC ─────────────────────────────────────────────────── */
+
+static void qC_returns_QC0_when_no_c_thread_selected(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    rsp_dispatch(sock_pair[1], "qC", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("QC0", payload);
+    /* No target access. */
+    TEST_ASSERT_EQUAL(0, mock_read_count);
+    TEST_ASSERT_EQUAL(0, mock_ocd_gpr_reads_active);
+}
+
+static void qC_returns_selected_c_thread_in_hex(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    c_tid_var = 0x2a;   /* 42 → "QC2a" */
+    rsp_dispatch(sock_pair[1], "qC", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("QC2a", payload);
+}
+
+/* ── LLR-RSP-20: qOffsets ──────────────────────────────────────────── */
+
+static void qOffsets_returns_text_data_bss_all_zero(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    rsp_dispatch(sock_pair[1], "qOffsets", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("Text=0;Data=0;Bss=0", payload);
+    TEST_ASSERT_EQUAL(0, mock_read_count);
+}
+
+/* ── LLR-RSP-21: T<tid> is-thread-alive ────────────────────────────── */
+
+static void T_packet_returns_OK_for_live_thread(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    fake_fsm.thread_count = 2;
+    fake_fsm.threads[0].gdb_id = 1;
+    fake_fsm.threads[1].gdb_id = 3;
+    rsp_dispatch(sock_pair[1], "T3", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("OK", payload);
+}
+
+static void T_packet_returns_E01_for_unknown_thread(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    fake_fsm.thread_count = 1;
+    fake_fsm.threads[0].gdb_id = 1;
+    rsp_dispatch(sock_pair[1], "T2a", &h);   /* tid 42 */
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("E01", payload);
+}
+
+/* ── LLR-RSP-22: R<XX> restart ─────────────────────────────────────── */
+
+static void R_packet_invalidates_fsm_runs_and_emits_stop(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    mock_ocd_poll_default = 0;   /* halt on first poll */
+
+    rsp_dispatch(sock_pair[1], "R00", &h);
+
+    /* Reset path (enter_debug) → fsm_invalidate → continue. */
+    TEST_ASSERT_GREATER_THAN(0, mock_invalidate_calls);
+    TEST_ASSERT_EQUAL(1, mock_run_calls);
+    /* dh_continue rebuilds the thread list after the halt and emits a
+     * T05 stop packet so GDB resumes interactive control. */
+    TEST_ASSERT_GREATER_THAN(0, mock_build_calls);
+    char stream[128]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[128];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL(0, strncmp(payload, "T05", 3));
+}
+
 /* ── Runner ─────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -932,5 +1019,11 @@ int main(void)
     RUN_TEST(on_monitor_sends_o_packet_error_on_updi_failure);
     RUN_TEST(H_packet_stores_thread_id_for_register_operations);
     RUN_TEST(H_packet_minus1_and_0_both_map_to_active_fsm_thread);
+    RUN_TEST(qC_returns_QC0_when_no_c_thread_selected);
+    RUN_TEST(qC_returns_selected_c_thread_in_hex);
+    RUN_TEST(qOffsets_returns_text_data_bss_all_zero);
+    RUN_TEST(T_packet_returns_OK_for_live_thread);
+    RUN_TEST(T_packet_returns_E01_for_unknown_thread);
+    RUN_TEST(R_packet_invalidates_fsm_runs_and_emits_stop);
     return UNITY_END();
 }

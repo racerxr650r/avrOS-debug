@@ -221,6 +221,18 @@ Requirements for RSP packet framing, dispatch, GDB packet handlers, session life
 *   <a id="LLR-RSP-18"></a>**LLR-RSP-18** — The `hw_bp_clear_all(ctx)` helper shall iterate `ctx->hw_bp_addr[0..1]` and, for every slot not equal to the empty sentinel (`0xFFFFFFFF`), call `updi_ocd_clear_hw_bp()` and reset the slot. It shall be called by `on_detach` for the `D` packet to guarantee the silicon comparators are released before the target is resumed.
     *Trace:* HLR-016 (Breakpoints), HLR-019 (RSP Capability Negotiation and Lifecycle).
 
+*   <a id="LLR-RSP-19"></a>**LLR-RSP-19** — The `dh_query_c()` default handler (`qC`) shall reply with `QC<hex>` where `<hex>` is the lowercase-hexadecimal GDB thread id currently selected for `c`/`s` operations (the most recent `Hc<tid>` value, stored at `*ctx->c_thread_p`). If no `c`-thread has been selected, or the selected value is zero or negative, the reply shall be the literal `QC0`. The handler shall not touch the UPDI link, the FSM context, or any OCD register.
+    *Trace:* HLR-059 (Protocol Cleanup — qC, qOffsets, T, R).
+
+*   <a id="LLR-RSP-20"></a>**LLR-RSP-20** — The `dh_query_offsets()` default handler (`qOffsets`) shall reply with the fixed literal string `Text=0;Data=0;Bss=0`. The AVR reset vector is anchored at FLASH address zero and avrOS performs no position-independent loading, so all three section offsets are reported as zero unconditionally. The handler shall not touch the UPDI link, the FSM context, or any OCD register.
+    *Trace:* HLR-059 (Protocol Cleanup — qC, qOffsets, T, R).
+
+*   <a id="LLR-RSP-21"></a>**LLR-RSP-21** — The `dh_thread_alive()` default handler (`T<tid>`) shall parse `<tid>` as a hexadecimal GDB thread id and reply `OK` when the id is present in `ctx->fsm->threads[].gdb_id` (with `ctx->fsm->valid == true`), `E01` otherwise. When the FSM context is unset or invalid the handler shall accept thread id `1` only (the default active thread on a freshly-attached session) and reject all others with `E01`. The handler shall not touch the UPDI link or any OCD register.
+    *Trace:* HLR-059 (Protocol Cleanup — qC, qOffsets, T, R).
+
+*   <a id="LLR-RSP-22"></a>**LLR-RSP-22** — The `dh_restart()` default handler (`R<XX>`) shall implement the extended-remote restart semantics by: (1) calling `updi_enter_debug()` to pulse `ASI_RESET_REQ` and re-enter OCD halted at the reset vector, replying `E01` and returning if the UPDI primitive fails; (2) calling `fsm_invalidate()` to drop the stale virtual-thread cache; and (3) delegating to `dh_continue()` with a synthetic `c` packet so the target resumes, the thread list is rebuilt on the next halt, and the resulting stop-reply packet is emitted to GDB. The `<XX>` byte of the inbound packet shall be ignored per the GDB protocol.
+    *Trace:* HLR-059 (Protocol Cleanup — qC, qOffsets, T, R).
+
 ## 5. src/elf_parser.c — ELF Binary Parser
 
 Requirements for `elf_open()`, `elf_close()`, `elf_find_avros_tables()`, and `elf_flash_addr()`.

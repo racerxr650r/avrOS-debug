@@ -109,7 +109,7 @@ Role: **unit**. **47 test(s).**
 
 ### 3.3. [tests/test_rsp.c](../tests/test_rsp.c)
 
-Role: **unit**. **33 test(s).**
+Role: **unit**. **39 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -148,6 +148,12 @@ Role: **unit**. **33 test(s).**
 | 33 | <a id="on_monitor_sends_o_packet_error_on_updi_failure"></a>`on_monitor_sends_o_packet_error_on_updi_failure` | `LLR-RSP-15` | Inject a mock `monitor_dispatch()` that returns -1 and verify that the `qRcmd` handler sends an O-packet error message to the GDB console. |
 | 34 | <a id="H_packet_stores_thread_id_for_register_operations"></a>`H_packet_stores_thread_id_for_register_operations` | `LLR-RSP-16` | Dispatch `Hg3` (set thread 3 for register operations) and then a `g` packet, and verify that `fsm_get_registers()` is called with the thread entry for GDB thread ID 3. |
 | 35 | <a id="H_packet_minus1_and_0_both_map_to_active_fsm_thread"></a>`H_packet_minus1_and_0_both_map_to_active_fsm_thread` | `LLR-RSP-16` | Dispatch `Hg-1` and `Hg0` in turn, each followed by a `g` packet, and verify that both select the active FSM thread's register frame. |
+| 36 | <a id="qC_returns_QC0_when_no_c_thread_selected"></a>`qC_returns_QC0_when_no_c_thread_selected` | `LLR-RSP-19` | Dispatch `qC` with no prior `Hc` and verify the reply is the literal `QC0` and that the handler issues no UPDI memory reads, OCD register reads, or `fsm_*` calls. |
+| 37 | <a id="qC_returns_selected_c_thread_in_hex"></a>`qC_returns_selected_c_thread_in_hex` | `LLR-RSP-19` | Pre-set `*ctx->c_thread_p` to 0x2a, dispatch `qC`, and verify the reply is `QC2a` (lowercase hex, no padding). |
+| 38 | <a id="qOffsets_returns_text_data_bss_all_zero"></a>`qOffsets_returns_text_data_bss_all_zero` | `LLR-RSP-20` | Dispatch `qOffsets` and verify the reply is the literal `Text=0;Data=0;Bss=0` with no UPDI memory access. |
+| 39 | <a id="T_packet_returns_OK_for_live_thread"></a>`T_packet_returns_OK_for_live_thread` | `LLR-RSP-21` | Populate `ctx->fsm->threads[]` with GDB ids 1 and 3, dispatch `T3`, and verify the reply is `OK`. |
+| 40 | <a id="T_packet_returns_E01_for_unknown_thread"></a>`T_packet_returns_E01_for_unknown_thread` | `LLR-RSP-21` | Populate `ctx->fsm->threads[]` with only GDB id 1, dispatch `T2a` (tid 42), and verify the reply is `E01`. |
+| 41 | <a id="R_packet_invalidates_fsm_runs_and_emits_stop"></a>`R_packet_invalidates_fsm_runs_and_emits_stop` | `LLR-RSP-22` | Dispatch `R00` and verify that `fsm_invalidate()` is called, `updi_run()` is called exactly once (via the delegated `c`), the thread list is rebuilt on halt, and a `T05` stop packet is emitted on the wire. |
 
 ### 3.4. [tests/test_elf.c](../tests/test_elf.c)
 
@@ -351,6 +357,10 @@ verified by code review — see
 | `LLR-RSP-16` | `rsp` | `HLR-025` | `H_packet_stores_thread_id_for_register_operations`, `H_packet_minus1_and_0_both_map_to_active_fsm_thread` |
 | `LLR-RSP-17` | `rsp` | `HLR-017`, `HLR-018` | `on_halt_reason_returns_T02_when_extbrk_set` |
 | `LLR-RSP-18` | `rsp` | `HLR-016`, `HLR-019` | `on_detach_clears_hw_bps_before_run` |
+| `LLR-RSP-19` | `rsp` | `HLR-059` | `qC_returns_QC0_when_no_c_thread_selected`, `qC_returns_selected_c_thread_in_hex` |
+| `LLR-RSP-20` | `rsp` | `HLR-059` | `qOffsets_returns_text_data_bss_all_zero` |
+| `LLR-RSP-21` | `rsp` | `HLR-059` | `T_packet_returns_OK_for_live_thread`, `T_packet_returns_E01_for_unknown_thread` |
+| `LLR-RSP-22` | `rsp` | `HLR-059` | `R_packet_invalidates_fsm_runs_and_emits_stop` |
 | `LLR-ELF-01` | `elf` | `HLR-021` | `elf_open_accepts_valid_avr_elf32_binary`, `elf_open_returns_minus1_on_invalid_elf_magic`, `elf_open_returns_minus1_on_wrong_machine_type` |
 | `LLR-ELF-02` | `elf` | `HLR-021`, `HLR-040` | `elf_open_loads_symtab_and_strtab_into_heap_buffers`, `elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure` |
 | `LLR-ELF-03` | `elf` | `HLR-021` | `elf_find_avros_tables_performs_single_linear_scan`, `elf_find_avros_tables_populates_all_7_avros_sentinel_fields` |

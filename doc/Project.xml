@@ -2173,6 +2173,34 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="HLR" ref="HLR-019" name="RSP Capability Negotiation and Lifecycle"/>
         </traces>
       </llr>
+
+      <llr id="LLR-RSP-19">
+        <text><![CDATA[The `dh_query_c()` default handler (`qC`) shall reply with `QC<hex>` where `<hex>` is the lowercase-hexadecimal GDB thread id currently selected for `c`/`s` operations (the most recent `Hc<tid>` value, stored at `*ctx->c_thread_p`). If no `c`-thread has been selected, or the selected value is zero or negative, the reply shall be the literal `QC0`. The handler shall not touch the UPDI link, the FSM context, or any OCD register.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-059" name="Protocol Cleanup — qC, qOffsets, T, R"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-20">
+        <text><![CDATA[The `dh_query_offsets()` default handler (`qOffsets`) shall reply with the fixed literal string `Text=0;Data=0;Bss=0`. The AVR reset vector is anchored at FLASH address zero and avrOS performs no position-independent loading, so all three section offsets are reported as zero unconditionally. The handler shall not touch the UPDI link, the FSM context, or any OCD register.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-059" name="Protocol Cleanup — qC, qOffsets, T, R"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-21">
+        <text><![CDATA[The `dh_thread_alive()` default handler (`T<tid>`) shall parse `<tid>` as a hexadecimal GDB thread id and reply `OK` when the id is present in `ctx->fsm->threads[].gdb_id` (with `ctx->fsm->valid == true`), `E01` otherwise. When the FSM context is unset or invalid the handler shall accept thread id `1` only (the default active thread on a freshly-attached session) and reject all others with `E01`. The handler shall not touch the UPDI link or any OCD register.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-059" name="Protocol Cleanup — qC, qOffsets, T, R"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-22">
+        <text><![CDATA[The `dh_restart()` default handler (`R<XX>`) shall implement the extended-remote restart semantics by: (1) calling `updi_enter_debug()` to pulse `ASI_RESET_REQ` and re-enter OCD halted at the reset vector, replying `E01` and returning if the UPDI primitive fails; (2) calling `fsm_invalidate()` to drop the stale virtual-thread cache; and (3) delegating to `dh_continue()` with a synthetic `c` packet so the target resumes, the thread list is rebuilt on the next halt, and the resulting stop-reply packet is emitted to GDB. The `<XX>` byte of the inbound packet shall be ignored per the GDB protocol.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-059" name="Protocol Cleanup — qC, qOffsets, T, R"/>
+        </traces>
+      </llr>
     </function>
 
     <function number="5" title="src/elf_parser.c — ELF Binary Parser" name="elf" source="src/elf_parser.c">
@@ -2882,7 +2910,7 @@ Errors are propagated upward through the module stack without retrying:
     <!-- ============================================================ -->
     <!-- src/gdb_rsp.c unit tests                                     -->
     <!-- ============================================================ -->
-    <file path="tests/test_rsp.c" role="unit" count="33">
+    <file path="tests/test_rsp.c" role="unit" count="39">
       <header><![CDATA[Unit tests for `src/gdb_rsp.c`: socket configuration, RSP packet framing, register and memory handlers, hardware-breakpoint comparator management, OCD-based execution control, async Ctrl-C interrupt, detach cleanup, session lifecycle packets, and monitor relay. Uses a `socketpair()` as a drop-in socket substitute and replaces every `updi_*`, `fsm_*`, and `monitor_dispatch` call site with `ld --wrap` mocks so all tests run without real silicon.]]></header>
 
       <test name="rsp_listen_sets_so_reuseaddr_before_bind">
@@ -3058,6 +3086,36 @@ Errors are propagated upward through the module stack without retrying:
       <test name="H_packet_minus1_and_0_both_map_to_active_fsm_thread">
         <purpose><![CDATA[Dispatch `Hg-1` and `Hg0` in turn, each followed by a `g` packet, and verify that both select the active FSM thread's register frame.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-16"/></traces>
+      </test>
+
+      <test name="qC_returns_QC0_when_no_c_thread_selected">
+        <purpose><![CDATA[Dispatch `qC` with no prior `Hc` and verify the reply is the literal `QC0` and that the handler issues no UPDI memory reads, OCD register reads, or `fsm_*` calls.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-19"/></traces>
+      </test>
+
+      <test name="qC_returns_selected_c_thread_in_hex">
+        <purpose><![CDATA[Pre-set `*ctx->c_thread_p` to 0x2a, dispatch `qC`, and verify the reply is `QC2a` (lowercase hex, no padding).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-19"/></traces>
+      </test>
+
+      <test name="qOffsets_returns_text_data_bss_all_zero">
+        <purpose><![CDATA[Dispatch `qOffsets` and verify the reply is the literal `Text=0;Data=0;Bss=0` with no UPDI memory access.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-20"/></traces>
+      </test>
+
+      <test name="T_packet_returns_OK_for_live_thread">
+        <purpose><![CDATA[Populate `ctx->fsm->threads[]` with GDB ids 1 and 3, dispatch `T3`, and verify the reply is `OK`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-21"/></traces>
+      </test>
+
+      <test name="T_packet_returns_E01_for_unknown_thread">
+        <purpose><![CDATA[Populate `ctx->fsm->threads[]` with only GDB id 1, dispatch `T2a` (tid 42), and verify the reply is `E01`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-21"/></traces>
+      </test>
+
+      <test name="R_packet_invalidates_fsm_runs_and_emits_stop">
+        <purpose><![CDATA[Dispatch `R00` and verify that `fsm_invalidate()` is called, `updi_run()` is called exactly once (via the delegated `c`), the thread list is rebuilt on halt, and a `T05` stop packet is emitted on the wire.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-22"/></traces>
       </test>
     </file>
 

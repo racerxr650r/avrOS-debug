@@ -771,6 +771,72 @@ static int dh_detach(int fd, const char *pkt, void *vctx)
     return 0;
 }
 
+/* HLR-059 (LLR-RSP-19): qC — report the currently selected c-thread.
+ * Reply "QC<hex tid>" using the c-thread selected by the most recent
+ * Hc packet, falling back to "QC0" when no thread is selected.  No
+ * target access.                                                       */
+static int dh_query_c(int fd, const char *pkt, void *vctx)
+{
+    (void)pkt;
+    RspContext *ctx = (RspContext *)vctx;
+    int tid = (ctx->c_thread_p != NULL) ? *ctx->c_thread_p : 0;
+    if (tid <= 0) return rsp_send_packet(fd, "QC0");
+    char reply[16];
+    (void)snprintf(reply, sizeof reply, "QC%x", (unsigned)tid);
+    return rsp_send_packet(fd, reply);
+}
+
+/* HLR-059 (LLR-RSP-20): qOffsets — the AVR reset vector is fixed at
+ * address zero and avrOS performs no position-independent loading, so
+ * all three section offsets are reported as zero unconditionally. No
+ * target access.                                                       */
+static int dh_query_offsets(int fd, const char *pkt, void *vctx)
+{
+    (void)pkt; (void)vctx;
+    return rsp_send_packet(fd, "Text=0;Data=0;Bss=0");
+}
+
+/* HLR-059 (LLR-RSP-21): T<tid> — is-thread-alive.  Reply OK when the
+ * decoded thread id is present in FsmContext.threads[], else E01. When
+ * the FSM context has not yet been built the active thread id (1) is
+ * the only live tid; this mirrors the default empty thread list. */
+static int dh_thread_alive(int fd, const char *pkt, void *vctx)
+{
+    RspContext *ctx = (RspContext *)vctx;
+    const char *p = pkt + 1;            /* skip 'T' */
+    uint32_t tid = 0;
+    if (parse_hex_u32(&p, &tid) < 0) return reply_err(fd, "E01");
+    if (ctx->fsm != NULL && ctx->fsm->valid) {
+        for (int i = 0; i < ctx->fsm->thread_count; ++i) {
+            if ((uint32_t)ctx->fsm->threads[i].gdb_id == tid) {
+                return reply_ok(fd);
+            }
+        }
+        return reply_err(fd, "E01");
+    }
+    /* No valid FSM context — accept the default thread id 1. */
+    return (tid == 1u) ? reply_ok(fd) : reply_err(fd, "E01");
+}
+
+/* HLR-059 (LLR-RSP-22): R<XX> — extended-remote restart.  Behaves as
+ * "monitor reset" (CPU reset, leave halted in OCD) followed by a "c"
+ * (run, poll for halt, emit a stop packet).  The <XX> byte is ignored
+ * per the GDB protocol — it is present only to keep the packet length
+ * predictable.                                                         */
+static int dh_restart(int fd, const char *pkt, void *vctx)
+{
+    (void)pkt;
+    RspContext *ctx = (RspContext *)vctx;
+
+    /* Reset the target and re-enter OCD halted at the reset vector.   */
+    if (updi_enter_debug(ctx->updi_fd) < 0) return reply_err(fd, "E01");
+    /* Invalidate FSM cache — post-reset state must be re-read.         */
+    fsm_invalidate(ctx->fsm);
+    /* Continue execution; dh_continue() will rebuild the thread list
+     * after the next halt and emit the stop reply.                     */
+    return dh_continue(fd, "c", vctx);
+}
+
 void rsp_default_handlers(RspHandlers *h, RspContext *ctx)
 {
     /* Mark both HW BP comparators empty.  Caller may have memset()
@@ -793,6 +859,10 @@ void rsp_default_handlers(RspHandlers *h, RspContext *ctx)
     h->on_set_thread_c = dh_set_thread_c;
     h->on_monitor      = dh_monitor;
     h->on_detach       = dh_detach;
+    h->on_query_c      = dh_query_c;
+    h->on_query_offsets= dh_query_offsets;
+    h->on_thread_alive = dh_thread_alive;
+    h->on_restart      = dh_restart;
     h->ctx             = ctx;
 }
 
@@ -845,6 +915,8 @@ int rsp_dispatch(int fd, const char *packet, RspHandlers *h)
         case 'z':  return call_handler(h->on_remove_bp,    fd, packet, h->ctx);
         case 'D':  return call_handler(h->on_detach,       fd, packet, h->ctx);
         case 'k':  return call_handler(h->on_detach,       fd, packet, h->ctx);
+        case 'T':  return call_handler(h->on_thread_alive, fd, packet, h->ctx);
+        case 'R':  return call_handler(h->on_restart,      fd, packet, h->ctx);
         case 'H':
             if (packet[1] == 'g') return call_handler(h->on_set_thread_g, fd, packet, h->ctx);
             if (packet[1] == 'c') return call_handler(h->on_set_thread_c, fd, packet, h->ctx);
@@ -859,6 +931,15 @@ int rsp_dispatch(int fd, const char *packet, RspHandlers *h)
             }
             if (strncmp(packet, "qRcmd,", 6) == 0) {
                 return call_handler(h->on_monitor, fd, packet, h->ctx);
+            }
+            if (strncmp(packet, "qOffsets", 8) == 0) {
+                return call_handler(h->on_query_offsets, fd, packet, h->ctx);
+            }
+            /* qC must be matched after the longer qC* probes above
+             * (none today; safe).  Match only "qC" exactly so we don't
+             * shadow a future "qCRC" or similar.                       */
+            if (packet[1] == 'C' && (packet[2] == '\0' || packet[2] == ';')) {
+                return call_handler(h->on_query_c, fd, packet, h->ctx);
             }
             return reply_empty(fd);
         default:

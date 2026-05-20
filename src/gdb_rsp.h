@@ -55,6 +55,10 @@ typedef struct RspHandlers {
     RspHandlerFn on_set_thread_c;   /* Hc<tid>                        */
     RspHandlerFn on_monitor;        /* qRcmd,<hex>                    */
     RspHandlerFn on_detach;         /* D , k                          */
+    RspHandlerFn on_query_c;        /* qC                             */
+    RspHandlerFn on_query_offsets;  /* qOffsets                       */
+    RspHandlerFn on_thread_alive;   /* T<tid>                         */
+    RspHandlerFn on_restart;        /* R<XX>                          */
     void        *ctx;
 } RspHandlers;
 
