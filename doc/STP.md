@@ -15,7 +15,7 @@ Snapshot: **115 test(s)** across
 
 ### 3.1. [tests/test_main.c](../tests/test_main.c)
 
-Role: **unit**. **32 test(s).**
+Role: **unit**. **34 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -51,6 +51,8 @@ Role: **unit**. **32 test(s).**
 | 30 | <a id="parse_args_prog_mode_sets_flag"></a>`parse_args_prog_mode_sets_flag` | `LLR-MAIN-14` | Call `parse_args()` with argv `{ "prog", "--prog", "/dev/x", "a.elf" }` and assert `cfg.prog_mode == true`, `cfg.device_info == false`, and `cfg.load_flash == false` — confirming `--prog` is recognised, sets only `prog_mode`, and does not implicitly set the other operating-mode flags. |
 | 31 | <a id="parse_args_no_verify_sets_flag"></a>`parse_args_no_verify_sets_flag` | `LLR-MAIN-14` | Call `parse_args()` with argv `{ "prog", "--load", "--no-verify", "/dev/x", "a.elf" }` and assert `cfg.no_verify == true` — confirming the verify-suppression flag is recognised and stored on `AppConfig`. |
 | 32 | <a id="parse_args_no_autobaud_sets_flag"></a>`parse_args_no_autobaud_sets_flag` | `LLR-MAIN-17` | Call `parse_args()` with argv `{ "prog", "--device", "--no-autobaud", "/dev/x" }` and assert `cfg.no_autobaud == true` — confirming the autobaud-suppression flag is recognised and stored on `AppConfig` so `run_device_mode()` can gate its probe call accordingly. |
+| 33 | <a id="parse_args_allow_erase_sets_flag"></a>`parse_args_allow_erase_sets_flag` | `LLR-MAIN-21` | Call `parse_args()` with argv `{ "prog", "--allow-erase", "/dev/x", "a.elf" }` and assert `cfg.allow_erase == true` — confirming the destructive-erase gate is recognised by the option parser. |
+| 34 | <a id="parse_args_allow_erase_defaults_false"></a>`parse_args_allow_erase_defaults_false` | `LLR-MAIN-21` | Call `parse_args()` with argv that omits `--allow-erase` and assert `cfg.allow_erase == false` — confirming the safety default refuses destructive erase verbs unless the operator explicitly opts in. |
 
 ### 3.2. [tests/test_updi.c](../tests/test_updi.c)
 
@@ -209,7 +211,7 @@ Role: **unit**. **11 test(s).**
 
 ### 3.6. [tests/test_monitor.c](../tests/test_monitor.c)
 
-Role: **unit**. **10 test(s).**
+Role: **unit**. **20 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -223,6 +225,16 @@ Role: **unit**. **10 test(s).**
 | 8 | <a id="cmd_queues_reads_queue_count_descriptors_from_que_table"></a>`cmd_queues_reads_queue_count_descriptors_from_que_table` | `LLR-MON-04` | Dispatch `"avros queues"` and verify that `updi_mem_read()` is called with `idx->queue_table_addr` and a length equal to `idx->queue_count` × 10 bytes (`queDescriptor_t` size). |
 | 9 | <a id="cmd_queues_formats_capacity_and_sizeofelement_for_each_entry"></a>`cmd_queues_formats_capacity_and_sizeofelement_for_each_entry` | `LLR-MON-04` | Inject two `queDescriptor_t` records with `(capacity, sizeOfElement)` of `(8, 1)` and `(16, 4)` respectively and verify the decoded O-packet text contains `"capacity=8 sizeOfElement=1"` and `"capacity=16 sizeOfElement=4"`. |
 | 10 | <a id="monitor_dispatch_and_helpers_never_call_updi_halt"></a>`monitor_dispatch_and_helpers_never_call_updi_halt` | `LLR-MON-07` | Execute both sub-commands (`events`, `queues`) through `monitor_dispatch()` and verify that `updi_halt()` is never called by inspecting the mock call log. |
+| 11 | <a id="verb_reset_pulses_updi_and_clears_shadows"></a>`verb_reset_pulses_updi_and_clears_shadows` | `LLR-MON-09` | Hex-encode `"reset"` through `monitor_dispatch_ex()` with a stub `RspContext` and verify that `updi_enter_debug()`, `rsp_hw_bp_clear_all()`, and `rsp_hw_wp_clear_all()` are each called exactly once and that `updi_halt()` is not called. |
+| 12 | <a id="verb_halt_emits_T05_stop_reply_and_suppresses_OK"></a>`verb_halt_emits_T05_stop_reply_and_suppresses_OK` | `LLR-MON-10` | Hex-encode `"halt"` through `monitor_dispatch_ex()` and verify the captured `rsp_send_packet()` payload starts with the literal three characters `T05`, and that the dispatcher returns -3 so the caller suppresses the trailing `OK`. |
+| 13 | <a id="verb_go_calls_updi_run_and_returns_OK"></a>`verb_go_calls_updi_run_and_returns_OK` | `LLR-MON-11` | Hex-encode `"go"` through `monitor_dispatch_ex()` and verify `updi_run()` is invoked exactly once and the dispatcher returns 0 so the caller emits `OK`. |
+| 14 | <a id="verb_erase_refused_without_allow_erase_flag"></a>`verb_erase_refused_without_allow_erase_flag` | `LLR-MON-12` | Dispatch `"erase"` with `ctx.allow_erase = 0` and verify `updi_chip_erase()` is NOT called, the captured O-packet text mentions `--allow-erase`, and the dispatcher returns -1 so the caller emits `E22`. |
+| 15 | <a id="verb_erase_allowed_when_flag_set_clears_shadows"></a>`verb_erase_allowed_when_flag_set_clears_shadows` | `LLR-MON-12` | Dispatch `"chip-erase"` with `ctx.allow_erase = 1` and verify `updi_chip_erase()`, `updi_enter_debug()`, `rsp_hw_bp_clear_all()`, and `rsp_hw_wp_clear_all()` are each called exactly once. |
+| 16 | <a id="verb_version_emits_o_packet_with_version_and_date"></a>`verb_version_emits_o_packet_with_version_and_date` | `LLR-MON-13` | Dispatch `"version"` and verify the captured O-packet decodes to a string containing both `"avrOSdb"` and `"built"`. |
+| 17 | <a id="verb_bp_mode_sw_and_hw_only_mutate_ctx"></a>`verb_bp_mode_sw_and_hw_only_mutate_ctx` | `LLR-MON-14` | Dispatch `"bp-mode hw-only"` then `"bp-mode sw"` on the same `RspContext` and verify `ctx.bp_mode` cycles through `RSP_BP_MODE_HW_ONLY` and back to `RSP_BP_MODE_SW`; an invalid argument returns -2. |
+| 18 | <a id="verb_help_emits_one_line_per_recognised_verb"></a>`verb_help_emits_one_line_per_recognised_verb` | `LLR-MON-15` | Dispatch `"help"` and verify that at least 8 O-packets are sent (one per documented top-level verb) before the dispatcher returns 0. |
+| 19 | <a id="unknown_top_level_verb_emits_usage_hint"></a>`unknown_top_level_verb_emits_usage_hint` | `LLR-MON-08` | Dispatch a token that is neither a known verb nor `avros …` and verify the captured O-packet text contains `"usage:"` and the dispatcher returns -2. |
+| 20 | <a id="avros_prefix_still_routed_to_legacy_dispatch"></a>`avros_prefix_still_routed_to_legacy_dispatch` | `LLR-MON-08` | Dispatch `"avros events"` through `monitor_dispatch_ex()` and verify the call is forwarded to `monitor_dispatch()` (none of the top-level verb side-effects fire: `updi_enter_debug`, `updi_chip_erase`, and `updi_halt` all remain at zero invocations). |
 
 ### 3.7. [tests/test_integration.c](../tests/test_integration.c)
 
@@ -318,6 +330,7 @@ verified by code review — see
 | `LLR-MAIN-15` | `main` | `HLR-049`, `HLR-050` | `F3_prog_mode_end_to_end_with_verify` |
 | `LLR-MAIN-16` | `main` | `HLR-050`, `HLR-049` | `F3_prog_mode_end_to_end_with_verify` |
 | `LLR-MAIN-17` | `main` | `HLR-050`, `HLR-051`, `HLR-052` | `parse_args_no_autobaud_sets_flag` |
+| `LLR-MAIN-21` | `main` | `HLR-055` | `parse_args_allow_erase_sets_flag`, `parse_args_allow_erase_defaults_false` |
 | `LLR-UPDI-01` | `updi` | `HLR-006` | `updi_open_sets_8e2_raw_half_duplex_via_termios`, `updi_open_returns_minus1_on_device_open_failure` |
 | `LLR-UPDI-02` | `updi` | `HLR-006`, `HLR-036` | `updi_open_asserts_wake_byte_then_stcs_ctrlb`, `updi_open_restores_session_baud_after_break` |
 | `LLR-UPDI-03` | `updi` | `HLR-036` | `updi_open_issues_stcs_ctrla_and_ldcs_statusa`, `updi_open_retries_cold_start_3_times_on_no_ack`, `updi_open_returns_minus1_after_3_consecutive_link_failures` |
@@ -402,6 +415,14 @@ verified by code review — see
 | `LLR-MON-04` | `monitor` | `HLR-030` | `cmd_queues_reads_queue_count_descriptors_from_que_table`, `cmd_queues_formats_capacity_and_sizeofelement_for_each_entry` |
 | `LLR-MON-06` | `monitor` | `HLR-029`, `HLR-030` | `cmd_events_output_is_hex_encoded_o_packet` |
 | `LLR-MON-07` | `monitor` | `HLR-011`, `HLR-032` | `monitor_dispatch_and_helpers_never_call_updi_halt` |
+| `LLR-MON-08` | `monitor` | `HLR-055` | `unknown_top_level_verb_emits_usage_hint`, `avros_prefix_still_routed_to_legacy_dispatch` |
+| `LLR-MON-09` | `monitor` | `HLR-055` | `verb_reset_pulses_updi_and_clears_shadows` |
+| `LLR-MON-10` | `monitor` | `HLR-055` | `verb_halt_emits_T05_stop_reply_and_suppresses_OK` |
+| `LLR-MON-11` | `monitor` | `HLR-055` | `verb_go_calls_updi_run_and_returns_OK` |
+| `LLR-MON-12` | `monitor` | `HLR-055` | `verb_erase_refused_without_allow_erase_flag`, `verb_erase_allowed_when_flag_set_clears_shadows` |
+| `LLR-MON-13` | `monitor` | `HLR-055` | `verb_version_emits_o_packet_with_version_and_date` |
+| `LLR-MON-14` | `monitor` | `HLR-054`, `HLR-055` | `verb_bp_mode_sw_and_hw_only_mutate_ctx` |
+| `LLR-MON-15` | `monitor` | `HLR-055` | `verb_help_emits_one_line_per_recognised_verb` |
 | `LLR-INST-01` | `inst` | `HLR-041` | `check_tools_exits_nonzero_when_required_tool_is_absent` |
 | `LLR-INST-02` | `inst` | `HLR-041` | `make_install_places_binary_at_prefix_bin`, `make_install_places_man_page_at_prefix_man1` |
 | `LLR-INST-03` | `inst` | `HLR-041` | `make_uninstall_removes_all_installed_files` |

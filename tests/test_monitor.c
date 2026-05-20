@@ -36,6 +36,7 @@ static char  *g_packets[MAX_PACKETS];
 static size_t g_packet_count;
 
 static int    g_halt_calls;
+static int    g_halt_rc;
 static int    g_read_calls;
 static size_t g_read_total_bytes;
 
@@ -73,7 +74,56 @@ int __wrap_updi_mem_read(int fd, uint32_t addr, uint8_t *buf, size_t len)
     return -1;
 }
 
-int __wrap_updi_halt(int fd) { (void)fd; g_halt_calls++; return 0; }
+int __wrap_updi_halt(int fd) { (void)fd; g_halt_calls++; return g_halt_rc; }
+
+/* HLR-055 mocks: counters + injectable return codes for verb tests. */
+static int g_enter_debug_calls;
+static int g_enter_debug_rc;
+static int g_run_calls;
+static int g_run_rc;
+static int g_chip_erase_calls;
+static int g_chip_erase_rc;
+static int g_fsm_invalidate_calls;
+static int g_hw_bp_clear_calls;
+static int g_hw_wp_clear_calls;
+
+int __wrap_updi_enter_debug(int fd)
+{
+    (void)fd; g_enter_debug_calls++; return g_enter_debug_rc;
+}
+int __wrap_updi_run(int fd) { (void)fd; g_run_calls++; return g_run_rc; }
+int __wrap_updi_chip_erase(int fd)
+{
+    (void)fd; g_chip_erase_calls++; return g_chip_erase_rc;
+}
+struct FsmContext;
+void __wrap_fsm_invalidate(struct FsmContext *c)
+{
+    (void)c; g_fsm_invalidate_calls++;
+}
+int __wrap_fsm_get_active_thread(struct FsmContext *c) { (void)c; return 1; }
+
+struct RspContext;
+void __wrap_rsp_hw_bp_clear_all(struct RspContext *c)
+{
+    (void)c; g_hw_bp_clear_calls++;
+}
+void __wrap_rsp_hw_wp_clear_all(struct RspContext *c)
+{
+    (void)c; g_hw_wp_clear_calls++;
+}
+
+/* Override __wrap_updi_halt above's RC: we keep the counter but allow
+ * tests to inject a non-zero return.  Redefine via a thin shim: */
+static void hlr055_mock_reset(void)
+{
+    g_enter_debug_calls = 0; g_enter_debug_rc = 0;
+    g_run_calls = 0;         g_run_rc = 0;
+    g_chip_erase_calls = 0;  g_chip_erase_rc = 0;
+    g_fsm_invalidate_calls = 0;
+    g_hw_bp_clear_calls = 0; g_hw_wp_clear_calls = 0;
+    g_halt_rc = 0;
+}
 
 int __wrap_rsp_send_packet(int fd, const char *payload)
 {
@@ -375,6 +425,170 @@ void test_monitor_dispatch_and_helpers_never_call_updi_halt(void)
     TEST_ASSERT_EQUAL_INT(0, g_halt_calls);
 }
 
+/* ── HLR-055: top-level monitor verbs via monitor_dispatch_ex ─────── */
+
+static RspContext make_ctx(void)
+{
+    RspContext c;
+    memset(&c, 0, sizeof c);
+    c.updi_fd = 2;
+    c.fsm     = NULL;
+    c.idx     = NULL;
+    c.bp_mode = RSP_BP_MODE_SW;
+    return c;
+}
+
+void test_verb_reset_pulses_updi_and_clears_shadows(void)
+{
+    mock_reset(); hlr055_mock_reset();
+    RspContext ctx = make_ctx();
+    char *hex = hexify("reset");
+    int rc = monitor_dispatch_ex(1, &ctx, hex);
+    TEST_ASSERT_EQUAL_INT(0, rc);
+    TEST_ASSERT_EQUAL_INT(1, g_enter_debug_calls);
+    TEST_ASSERT_EQUAL_INT(1, g_hw_bp_clear_calls);
+    TEST_ASSERT_EQUAL_INT(1, g_hw_wp_clear_calls);
+    TEST_ASSERT_EQUAL_INT(0, g_halt_calls);
+    free(hex);
+}
+
+void test_verb_halt_emits_T05_stop_reply_and_suppresses_OK(void)
+{
+    mock_reset(); hlr055_mock_reset();
+    RspContext ctx = make_ctx();
+    char *hex = hexify("halt");
+    int rc = monitor_dispatch_ex(1, &ctx, hex);
+    /* -3 tells the dh_monitor caller to NOT send a trailing OK. */
+    TEST_ASSERT_EQUAL_INT(-3, rc);
+    TEST_ASSERT_EQUAL_INT(1, g_halt_calls);
+    /* Last captured packet must be a T05 stop-reply, not an O-packet. */
+    TEST_ASSERT_GREATER_THAN(0, g_packet_count);
+    const char *last = g_packets[g_packet_count - 1];
+    TEST_ASSERT_EQUAL_CHAR('T', last[0]);
+    TEST_ASSERT_EQUAL_CHAR('0', last[1]);
+    TEST_ASSERT_EQUAL_CHAR('5', last[2]);
+    free(hex);
+}
+
+void test_verb_go_calls_updi_run_and_returns_OK(void)
+{
+    mock_reset(); hlr055_mock_reset();
+    RspContext ctx = make_ctx();
+    char *hex = hexify("go");
+    int rc = monitor_dispatch_ex(1, &ctx, hex);
+    TEST_ASSERT_EQUAL_INT(0, rc);
+    TEST_ASSERT_EQUAL_INT(1, g_run_calls);
+    free(hex);
+}
+
+void test_verb_erase_refused_without_allow_erase_flag(void)
+{
+    mock_reset(); hlr055_mock_reset();
+    RspContext ctx = make_ctx();
+    ctx.allow_erase = 0;
+    char *hex = hexify("erase");
+    int rc = monitor_dispatch_ex(1, &ctx, hex);
+    TEST_ASSERT_EQUAL_INT(-1, rc);
+    TEST_ASSERT_EQUAL_INT(0, g_chip_erase_calls);
+    /* Diagnostic O-packet must mention --allow-erase. */
+    char *txt = last_o_packet_text();
+    TEST_ASSERT_NOT_NULL(strstr(txt, "--allow-erase"));
+    free(txt);
+    free(hex);
+}
+
+void test_verb_erase_allowed_when_flag_set_clears_shadows(void)
+{
+    mock_reset(); hlr055_mock_reset();
+    RspContext ctx = make_ctx();
+    ctx.allow_erase = 1;
+    char *hex = hexify("chip-erase");
+    int rc = monitor_dispatch_ex(1, &ctx, hex);
+    TEST_ASSERT_EQUAL_INT(0, rc);
+    TEST_ASSERT_EQUAL_INT(1, g_chip_erase_calls);
+    TEST_ASSERT_EQUAL_INT(1, g_enter_debug_calls);
+    TEST_ASSERT_EQUAL_INT(1, g_hw_bp_clear_calls);
+    TEST_ASSERT_EQUAL_INT(1, g_hw_wp_clear_calls);
+    free(hex);
+}
+
+void test_verb_version_emits_o_packet_with_version_and_date(void)
+{
+    mock_reset(); hlr055_mock_reset();
+    RspContext ctx = make_ctx();
+    char *hex = hexify("version");
+    int rc = monitor_dispatch_ex(1, &ctx, hex);
+    TEST_ASSERT_EQUAL_INT(0, rc);
+    char *txt = last_o_packet_text();
+    TEST_ASSERT_NOT_NULL(strstr(txt, "avrOSdb"));
+    TEST_ASSERT_NOT_NULL(strstr(txt, "built"));
+    free(txt);
+    free(hex);
+}
+
+void test_verb_bp_mode_sw_and_hw_only_mutate_ctx(void)
+{
+    mock_reset(); hlr055_mock_reset();
+    RspContext ctx = make_ctx();
+
+    char *hex1 = hexify("bp-mode hw-only");
+    TEST_ASSERT_EQUAL_INT(0, monitor_dispatch_ex(1, &ctx, hex1));
+    TEST_ASSERT_EQUAL_INT(RSP_BP_MODE_HW_ONLY, ctx.bp_mode);
+    free(hex1);
+
+    char *hex2 = hexify("bp-mode sw");
+    TEST_ASSERT_EQUAL_INT(0, monitor_dispatch_ex(1, &ctx, hex2));
+    TEST_ASSERT_EQUAL_INT(RSP_BP_MODE_SW, ctx.bp_mode);
+    free(hex2);
+
+    /* Bad arg → -2 plus diagnostic. */
+    char *hex3 = hexify("bp-mode banana");
+    TEST_ASSERT_EQUAL_INT(-2, monitor_dispatch_ex(1, &ctx, hex3));
+    free(hex3);
+}
+
+void test_verb_help_emits_one_line_per_recognised_verb(void)
+{
+    mock_reset(); hlr055_mock_reset();
+    RspContext ctx = make_ctx();
+    char *hex = hexify("help");
+    int rc = monitor_dispatch_ex(1, &ctx, hex);
+    TEST_ASSERT_EQUAL_INT(0, rc);
+    /* Expect at least one packet per top-level verb (>= 8). */
+    TEST_ASSERT_GREATER_OR_EQUAL_INT(8, (int)g_packet_count);
+    free(hex);
+}
+
+void test_unknown_top_level_verb_emits_usage_hint(void)
+{
+    mock_reset(); hlr055_mock_reset();
+    RspContext ctx = make_ctx();
+    char *hex = hexify("teleport");
+    int rc = monitor_dispatch_ex(1, &ctx, hex);
+    TEST_ASSERT_EQUAL_INT(-2, rc);
+    char *txt = last_o_packet_text();
+    TEST_ASSERT_NOT_NULL(strstr(txt, "usage:"));
+    free(txt);
+    free(hex);
+}
+
+void test_avros_prefix_still_routed_to_legacy_dispatch(void)
+{
+    mock_reset(); hlr055_mock_reset();
+    /* No symbol index → legacy dispatch emits its own diagnostic but
+     * the return code must not be the unknown-verb -2.  We accept the
+     * legacy contract: -2 (idx==NULL path also returns -2, but the
+     * caller can tell the difference because no top-level verb name
+     * was tried).  Assert chip_erase / enter_debug NOT called.       */
+    RspContext ctx = make_ctx();
+    char *hex = hexify("avros events");
+    (void)monitor_dispatch_ex(1, &ctx, hex);
+    TEST_ASSERT_EQUAL_INT(0, g_enter_debug_calls);
+    TEST_ASSERT_EQUAL_INT(0, g_chip_erase_calls);
+    TEST_ASSERT_EQUAL_INT(0, g_halt_calls);
+    free(hex);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -388,5 +602,15 @@ int main(void)
     RUN_TEST(test_cmd_queues_reads_queue_count_descriptors_from_que_table);
     RUN_TEST(test_cmd_queues_formats_capacity_and_sizeofelement_for_each_entry);
     RUN_TEST(test_monitor_dispatch_and_helpers_never_call_updi_halt);
+    RUN_TEST(test_verb_reset_pulses_updi_and_clears_shadows);
+    RUN_TEST(test_verb_halt_emits_T05_stop_reply_and_suppresses_OK);
+    RUN_TEST(test_verb_go_calls_updi_run_and_returns_OK);
+    RUN_TEST(test_verb_erase_refused_without_allow_erase_flag);
+    RUN_TEST(test_verb_erase_allowed_when_flag_set_clears_shadows);
+    RUN_TEST(test_verb_version_emits_o_packet_with_version_and_date);
+    RUN_TEST(test_verb_bp_mode_sw_and_hw_only_mutate_ctx);
+    RUN_TEST(test_verb_help_emits_one_line_per_recognised_verb);
+    RUN_TEST(test_unknown_top_level_verb_emits_usage_hint);
+    RUN_TEST(test_avros_prefix_still_routed_to_legacy_dispatch);
     return UNITY_END();
 }

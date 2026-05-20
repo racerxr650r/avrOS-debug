@@ -63,6 +63,9 @@ Requirements for `main()`, `parse_args()`, and `event_loop()`. These functions o
 *   <a id="LLR-MAIN-17"></a>**LLR-MAIN-17** — The progress indicator shall be implemented by two static helpers `progress_render(phase, window, page, total_pages, percent)` and `progress_finish(void)`. When `isatty(STDOUT_FILENO)` is true `progress_render()` shall emit an in-place ANSI-friendly single-line bar of the form `[####....] PPP%% page N/M PHASE WINDOW` followed by carriage return (no newline) and `progress_finish()` shall emit a final newline to terminate the line. When `stdout` is not a TTY `progress_render()` shall emit one full newline-terminated line per call and `progress_finish()` shall be a no-op. Both helpers are called from `load_segments()`, `verify_segments()`, and `run_prog_mode()`. Additionally, `run_device_mode()` shall, after the existing SIGROW / REVID / ASI status print and unless `cfg->no_autobaud` is true, call `updi_probe_baud(cfg->serial_device, 8, autobaud_report_cb, NULL)` BEFORE opening the UPDI link and pass the selected rate to `updi_open()`; and shall, after the existing report, read the full FUSES window and the 4-byte LOCK window via `updi_nvm_read()` and emit the decode via `updi_format_fuses()` into a 2 KiB stack buffer.
     *Trace:* HLR-050 (Program-and-Exit Mode), HLR-051 (Fuses Pretty-Printer in Device Mode), HLR-052 (Auto-Baud Link-Quality Probe in Device Mode).
 
+*   <a id="LLR-MAIN-21"></a>**LLR-MAIN-21** — `parse_args()` shall recognise `--allow-erase` as a boolean flag (no argument) and set `cfg->allow_erase = true` when present. The default initialiser shall set the flag to `false`. The `usage()` help text shall include a one-paragraph description naming the verbs it unlocks (`monitor erase`, `monitor chip-erase`) so operators see the gating relationship without consulting the man page. The flag value shall be propagated to the constructed `RspContext` at server start by assigning `ctx.allow_erase = cfg->allow_erase ? 1 : 0;`, and the default breakpoint mode shall be set to `RSP_BP_MODE_SW` in the same initialiser block.
+    *Trace:* HLR-055 (avarice-Compatible Monitor Commands).
+
 ## 3. src/updi.c — UPDI Physical Layer
 
 Requirements for all public functions in `src/updi.c`: link initialisation, memory access, execution control, NVM programming, and console bridging.
@@ -334,6 +337,30 @@ Requirements for `monitor_dispatch()` and its static sub-command helpers `cmd_ev
 
 *   <a id="LLR-MON-07"></a>**LLR-MON-07** — `monitor_dispatch()` and all of its static helpers (`cmd_events()`, `cmd_queues()`) shall use `updi_mem_read()` exclusively for all target memory access. None of these functions shall call `updi_halt()`, ensuring that monitor commands never interrupt firmware execution.
     *Trace:* HLR-011 (Non-Intrusive Background Memory Read), HLR-032 (Introspection Reliability).
+
+*   <a id="LLR-MON-08"></a>**LLR-MON-08** — `monitor_dispatch_ex(int rsp_fd, RspContext *ctx, const char *cmd)` shall be the top-level entry for `qRcmd` packets and shall hex-decode `cmd` into a writable buffer of at least 256 bytes, then dispatch on the first whitespace-stripped token. If the token is `avros` followed by a space the call shall be forwarded verbatim to the legacy `monitor_dispatch()` so all pre-existing `monitor avros …` sub-commands keep working unchanged. Recognised top-level verbs are `reset`, `halt`, `go`, `erase`, `chip-erase`, `version`, `bp-mode`, and `help`. Any other first token shall emit an O-packet `"usage: monitor <reset|halt|go|erase|chip-erase|version|bp-mode|help|avros …>\n"` and return -2.
+    *Trace:* HLR-055 (avarice-Compatible Monitor Commands).
+
+*   <a id="LLR-MON-09"></a>**LLR-MON-09** — The `monitor reset` verb shall call `updi_enter_debug(ctx->updi_fd)` (issuing the OCD KEY + ASI_RESET_REQ pulse and waiting for the STOPPED bit so the CPU is halted at the reset vector), discard all hardware-breakpoint and data-breakpoint shadow entries via `rsp_hw_bp_clear_all(ctx)` and `rsp_hw_wp_clear_all(ctx)`, invalidate the FSM thread cache via `fsm_invalidate(ctx->fsm)` when `ctx->fsm` is non-NULL, emit one diagnostic O-packet line `"target reset, halted at reset vector\n"`, and return 0 so `dh_monitor` appends the trailing `OK`.
+    *Trace:* HLR-055 (avarice-Compatible Monitor Commands).
+
+*   <a id="LLR-MON-10"></a>**LLR-MON-10** — The `monitor halt` verb shall call `updi_halt(ctx->updi_fd)` and then emit the same stop-reply packet shape used by the step/continue paths — `T05thread:<id>;` where `<id>` is `fsm_get_active_thread(ctx->fsm)` (or 1 when no FSM mapping is available) — via `rsp_send_packet()`. The verb shall return -3 so `dh_monitor` suppresses the trailing `OK` and the GDB client sees exactly one packet per halt.
+    *Trace:* HLR-055 (avarice-Compatible Monitor Commands).
+
+*   <a id="LLR-MON-11"></a>**LLR-MON-11** — The `monitor go` verb shall call `updi_run(ctx->updi_fd)`, emit a diagnostic O-packet `"target running\n"`, and return 0. The subsequent stop-reply is emitted by the existing poll loop when the CPU next halts; the verb itself does not synthesise one.
+    *Trace:* HLR-055 (avarice-Compatible Monitor Commands).
+
+*   <a id="LLR-MON-12"></a>**LLR-MON-12** — The `monitor erase` verb (alias `monitor chip-erase`) shall consult `ctx->allow_erase` before issuing any UPDI traffic. When the flag is zero, the verb shall emit one diagnostic O-packet `"monitor erase: refused — launch the server with --allow-erase to enable.\n"` and return -1 so `dh_monitor` sends an `E22` error packet. When the flag is set the verb shall call `updi_chip_erase(ctx->updi_fd)`, then re-enter OCD via `updi_enter_debug()`, discard all BP/WP shadow entries, invalidate the FSM thread cache, emit a confirmation O-packet, and return 0.
+    *Trace:* HLR-055 (avarice-Compatible Monitor Commands).
+
+*   <a id="LLR-MON-13"></a>**LLR-MON-13** — The `monitor version` verb shall emit one O-packet of the form `"avrOSdb <version> (built <date>)\n"` where `<version>` is the compile-time string `AVROSDB_VERSION` (supplied by the Makefile via `-DAVROSDB_VERSION='"$(VERSION)"'`) and `<date>` is the standard `__DATE__` macro. It shall return 0.
+    *Trace:* HLR-055 (avarice-Compatible Monitor Commands).
+
+*   <a id="LLR-MON-14"></a>**LLR-MON-14** — The `monitor bp-mode <arg>` verb shall accept exactly two argument tokens: `sw` (sets `ctx->bp_mode = RSP_BP_MODE_SW`, the default) and `hw-only` (sets `ctx->bp_mode = RSP_BP_MODE_HW_ONLY`). With no argument it shall report the current setting. Any other argument shall emit an error O-packet and return -2. The mode persists for the lifetime of the server process and influences how `Z0` packets are routed (HLR-054).
+    *Trace:* HLR-054 (True Software Breakpoints via FLASH BREAK Opcode), HLR-055 (avarice-Compatible Monitor Commands).
+
+*   <a id="LLR-MON-15"></a>**LLR-MON-15** — The `monitor help` verb shall emit one O-packet per recognised verb, each line briefly summarising the verb's syntax and side-effects, in the order: `reset`, `halt`, `go`, `erase`, `chip-erase`, `version`, `bp-mode`, `help`, `avros events`, `avros queues`. After the last line it shall return 0 so `dh_monitor` terminates the output with `OK`.
+    *Trace:* HLR-055 (avarice-Compatible Monitor Commands).
 
 ## 8. Makefile and Documentation
 

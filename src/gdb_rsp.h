@@ -16,6 +16,10 @@
  * routed to the same two slots — see src/gdb_rsp.c dh_insert_bp.    */
 #define RSP_MAX_BREAKPOINTS 2
 
+/* HLR-055: monitor bp-mode values. */
+#define RSP_BP_MODE_SW       0
+#define RSP_BP_MODE_HW_ONLY  1
+
 struct RspHandlers;
 
 /* Shared session state passed to every default handler as ctx. */
@@ -43,6 +47,14 @@ typedef struct {
         uint8_t  length;
         char     kind;
     }                         hw_wp[2];
+    /* HLR-055: monitor verbs.  `allow_erase` mirrors the --allow-erase
+     * CLI flag and gates `monitor erase` / `monitor chip-erase`.
+     * `bp_mode` is 0 = "sw" (true SW BPs via FLASH BREAK, HLR-054) or
+     * 1 = "hw-only" (legacy: Z0 aliases to HW comparators).  Mode is
+     * mutated by `monitor bp-mode <sw|hw-only>` and persists for the
+     * lifetime of the server process.                                */
+    int                       allow_erase;
+    int                       bp_mode;
 } RspContext;
 
 /* Each handler returns 0 on success or -1 on error. The handler is
@@ -93,5 +105,9 @@ int  rsp_dispatch(int fd, const char *packet, RspHandlers *h);
 
 /* ── Default handlers (used by main; tests may override individually) ── */
 void rsp_default_handlers(RspHandlers *h, RspContext *ctx);
+
+/* ── Helpers exposed for HLR-055 monitor verbs ───────────────────────── */
+void rsp_hw_bp_clear_all(RspContext *ctx);
+void rsp_hw_wp_clear_all(RspContext *ctx);
 
 #endif /* AOD_GDB_RSP_H */

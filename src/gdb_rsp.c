@@ -235,7 +235,7 @@ static const char *signal_for_halt_status(int updi_fd)
 
 /* Clear all OCD HW breakpoints in silicon and reset the local shadow.
  * Idempotent and tolerant of UPDI errors (used on detach).            */
-static void hw_bp_clear_all(RspContext *ctx)
+void rsp_hw_bp_clear_all(RspContext *ctx)
 {
     for (int i = 0; i < 2; i++) {
         if (ctx->hw_bp_addr[i] != HW_BP_SLOT_EMPTY) {
@@ -247,7 +247,7 @@ static void hw_bp_clear_all(RspContext *ctx)
 
 /* HLR-056: clear all OCD data-address watchpoints in silicon and
  * reset the local shadow.  Idempotent; used on detach.               */
-static void hw_wp_clear_all(RspContext *ctx)
+void rsp_hw_wp_clear_all(RspContext *ctx)
 {
     for (int i = 0; i < 2; i++) {
         if (ctx->hw_wp[i].kind != '\0') {
@@ -258,6 +258,9 @@ static void hw_wp_clear_all(RspContext *ctx)
         }
     }
 }
+
+#define hw_bp_clear_all rsp_hw_bp_clear_all
+#define hw_wp_clear_all rsp_hw_wp_clear_all
 
 /* HLR-056: scan halt-status for a data-watchpoint trigger and, if
  * found, append the GDB stop-key (`watch:`, `rwatch:`, or `awatch:`)
@@ -828,8 +831,13 @@ static int dh_monitor(int fd, const char *pkt, void *vctx)
     const char *p = strchr(pkt, ',');
     if (p == NULL) return reply_empty(fd);
     ++p;
-    int rc = monitor_dispatch(fd, ctx->updi_fd, ctx->idx, p);
+    int rc = monitor_dispatch_ex(fd, ctx, p);
     if (rc == 0) return reply_ok(fd);
+    if (rc == -3) {
+        /* monitor verb already emitted its own packet (stop-reply or
+         * E-packet) — do not send a trailing OK.                     */
+        return 0;
+    }
     if (rc == -1) {
         /* O-packet error message hex-encoded */
         static const char err[] = "monitor: UPDI failure\n";

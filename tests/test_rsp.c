@@ -172,6 +172,7 @@ int __wrap_updi_run (int fd)        { (void)fd; ++mock_run_calls;  log_event(EV_
 int __wrap_updi_step(int fd)        { (void)fd; ++mock_step_calls; log_event(EV_STEP); return 0; }
 int __wrap_updi_console_poll(int u, int r) { (void)u; (void)r; return 0; }
 int __wrap_updi_enter_debug(int fd) { (void)fd; return 0; }
+int __wrap_updi_chip_erase(int fd) { (void)fd; return 0; }
 
 int __wrap_updi_ocd_poll_halted(int fd, int timeout_ms)
 {
@@ -314,6 +315,19 @@ int __wrap_monitor_dispatch(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx
                             const char *hex_body)
 {
     (void)rsp_fd; (void)updi_fd; (void)idx;
+    ++mock_monitor_calls;
+    strncpy(mock_monitor_last_body, hex_body, sizeof mock_monitor_last_body - 1u);
+    mock_monitor_last_body[sizeof mock_monitor_last_body - 1u] = '\0';
+    return mock_monitor_rc;
+}
+
+/* HLR-055: dh_monitor now calls monitor_dispatch_ex.  Route through the
+ * same mock state so the existing tests still observe the call.  ctx
+ * is ignored — the dispatcher passes whatever RspContext dh_monitor
+ * built.                                                              */
+int __wrap_monitor_dispatch_ex(int rsp_fd, RspContext *ctx, const char *hex_body)
+{
+    (void)rsp_fd; (void)ctx;
     ++mock_monitor_calls;
     strncpy(mock_monitor_last_body, hex_body, sizeof mock_monitor_last_body - 1u);
     mock_monitor_last_body[sizeof mock_monitor_last_body - 1u] = '\0';

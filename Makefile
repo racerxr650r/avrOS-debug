@@ -111,6 +111,7 @@ CFLAGS := -std=c99 -D_POSIX_C_SOURCE=200809L \
            -Wstrict-prototypes -Wmissing-prototypes \
            -Wshadow \
            -O2 -g \
+           -DAVROSDB_VERSION='"$(VERSION)"' \
            $(SAN_FLAGS) $(COV_CFLAGS)
 
 # Test builds: suppress warnings on __wrap_* stubs (no header declares them),
@@ -198,7 +199,11 @@ TEST_EXTRA_LDFLAGS_test_fsm :=
 TEST_SRCS_test_monitor := $(TESTDIR)/test_monitor.c \
                            $(SRCDIR)/monitor.c \
                            $(SRCDIR)/elf_parser.c
-TEST_WRAP_test_monitor  := updi_mem_read rsp_send_packet
+TEST_WRAP_test_monitor  := updi_mem_read rsp_send_packet \
+                            updi_enter_debug updi_halt updi_run \
+                            updi_chip_erase \
+                            fsm_invalidate fsm_get_active_thread \
+                            rsp_hw_bp_clear_all rsp_hw_wp_clear_all
 TEST_EXTRA_LDFLAGS_test_monitor :=
 
 # test_rsp
@@ -208,7 +213,7 @@ TEST_SRCS_test_rsp := $(TESTDIR)/test_rsp.c \
                        $(SRCDIR)/monitor.c
 TEST_WRAP_test_rsp  := updi_mem_read updi_mem_write updi_halt updi_run updi_step \
                        updi_nvm_write_flash updi_console_poll \
-                       updi_enter_debug \
+                       updi_enter_debug updi_chip_erase \
                        updi_ocd_poll_halted updi_ocd_read_halt_status \
                        updi_ocd_read_gpr updi_ocd_write_gpr \
                        updi_ocd_read_sreg updi_ocd_write_sreg \
@@ -218,7 +223,7 @@ TEST_WRAP_test_rsp  := updi_mem_read updi_mem_write updi_halt updi_run updi_step
                        updi_ocd_set_data_bp updi_ocd_clear_data_bp \
                        fsm_build_thread_list fsm_get_registers \
                        fsm_get_active_thread fsm_invalidate \
-                       monitor_dispatch
+                       monitor_dispatch monitor_dispatch_ex
 TEST_EXTRA_LDFLAGS_test_rsp :=
 
 # test_main — test_main.c #includes src/main.c so it can reach the

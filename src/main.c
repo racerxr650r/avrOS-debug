@@ -41,6 +41,8 @@ typedef struct {
     bool        no_verify;     /* --no-verify: skip read-back verify
                                 *  after --load / --prog (LLR-MAIN-14)  */
     bool        no_autobaud;   /* --no-autobaud: skip --device autobaud */
+    bool        allow_erase;   /* --allow-erase: HLR-055 gate for the
+                                *  monitor erase / chip-erase verbs   */
     const char *force_device;    /* --force-device=<family>: skip SIGROW
                                   *  autodetect and use the named family  */
     /* fds owned by main; -1 = closed/unset */
@@ -89,6 +91,9 @@ static void usage(const char *prog)
         "  --allow-lock-updi  Permit a lockbit write that disables UPDI.\n"
         "                     Without this flag, only the UPDI-unlock pattern\n"
         "                     0x5CC5C55C is accepted in the LOCK window.\n"
+        "  --allow-erase      Permit the GDB-side `monitor erase` /\n"
+        "                     `monitor chip-erase` verbs to issue a chip\n"
+        "                     erase at runtime.  Off by default.\n"
         "  --force-device=F   Skip SIGROW autodetect and use family F\n"
         "                     (AVR-DA|AVR-DB|AVR-DD|AVR-DU|AVR-SD).\n"
         "                     Only AVR-DA is hardware-validated; the other\n"
@@ -175,6 +180,7 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
     cfg->no_verify     = false;
     cfg->no_autobaud   = false;
     cfg->force_device  = NULL;
+    cfg->allow_erase   = false;
     cfg->listen_fd     = -1;
     cfg->gdb_fd        = -1;
     cfg->updi_fd       = -1;
@@ -211,6 +217,8 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
             cfg->no_verify = true;
         } else if (strcmp(a, "--no-autobaud") == 0) {
             cfg->no_autobaud = true;
+        } else if (strcmp(a, "--allow-erase") == 0) {
+            cfg->allow_erase = true;
         } else if (a[0] == '-' && a[1] != '\0') {
             fprintf(stderr, "%s: unrecognised option '%s'\n", argv[0], a);
             usage(argv[0]);
@@ -1156,6 +1164,8 @@ int MAIN_NAME(int argc, char *argv[])
         .g_thread_p = &g_thread,
         .c_thread_p = &c_thread,
         .quit_p     = &g_quit,
+        .allow_erase = cfg.allow_erase ? 1 : 0,
+        .bp_mode    = RSP_BP_MODE_SW,
     };
     RspHandlers handlers;
     rsp_default_handlers(&handlers, &rctx);

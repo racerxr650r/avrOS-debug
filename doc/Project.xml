@@ -1798,6 +1798,13 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="HLR" ref="HLR-052" name="Auto-Baud Link-Quality Probe in Device Mode"/>
         </traces>
       </llr>
+
+      <llr id="LLR-MAIN-21">
+        <text><![CDATA[`parse_args()` shall recognise `--allow-erase` as a boolean flag (no argument) and set `cfg->allow_erase = true` when present. The default initialiser shall set the flag to `false`. The `usage()` help text shall include a one-paragraph description naming the verbs it unlocks (`monitor erase`, `monitor chip-erase`) so operators see the gating relationship without consulting the man page. The flag value shall be propagated to the constructed `RspContext` at server start by assigning `ctx.allow_erase = cfg->allow_erase ? 1 : 0;`, and the default breakpoint mode shall be set to `RSP_BP_MODE_SW` in the same initialiser block.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-055" name="avarice-Compatible Monitor Commands"/>
+        </traces>
+      </llr>
     </function>
 
     <function number="3" title="src/updi.c — UPDI Physical Layer" name="updi" source="src/updi.c">
@@ -2429,6 +2436,63 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="HLR" ref="HLR-032" name="Introspection Reliability"/>
         </traces>
       </llr>
+
+      <llr id="LLR-MON-08">
+        <text><![CDATA[`monitor_dispatch_ex(int rsp_fd, RspContext *ctx, const char *cmd)` shall be the top-level entry for `qRcmd` packets and shall hex-decode `cmd` into a writable buffer of at least 256 bytes, then dispatch on the first whitespace-stripped token. If the token is `avros` followed by a space the call shall be forwarded verbatim to the legacy `monitor_dispatch()` so all pre-existing `monitor avros …` sub-commands keep working unchanged. Recognised top-level verbs are `reset`, `halt`, `go`, `erase`, `chip-erase`, `version`, `bp-mode`, and `help`. Any other first token shall emit an O-packet `"usage: monitor <reset|halt|go|erase|chip-erase|version|bp-mode|help|avros …>\n"` and return -2.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-055" name="avarice-Compatible Monitor Commands"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MON-09">
+        <text><![CDATA[The `monitor reset` verb shall call `updi_enter_debug(ctx->updi_fd)` (issuing the OCD KEY + ASI_RESET_REQ pulse and waiting for the STOPPED bit so the CPU is halted at the reset vector), discard all hardware-breakpoint and data-breakpoint shadow entries via `rsp_hw_bp_clear_all(ctx)` and `rsp_hw_wp_clear_all(ctx)`, invalidate the FSM thread cache via `fsm_invalidate(ctx->fsm)` when `ctx->fsm` is non-NULL, emit one diagnostic O-packet line `"target reset, halted at reset vector\n"`, and return 0 so `dh_monitor` appends the trailing `OK`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-055" name="avarice-Compatible Monitor Commands"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MON-10">
+        <text><![CDATA[The `monitor halt` verb shall call `updi_halt(ctx->updi_fd)` and then emit the same stop-reply packet shape used by the step/continue paths — `T05thread:<id>;` where `<id>` is `fsm_get_active_thread(ctx->fsm)` (or 1 when no FSM mapping is available) — via `rsp_send_packet()`. The verb shall return -3 so `dh_monitor` suppresses the trailing `OK` and the GDB client sees exactly one packet per halt.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-055" name="avarice-Compatible Monitor Commands"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MON-11">
+        <text><![CDATA[The `monitor go` verb shall call `updi_run(ctx->updi_fd)`, emit a diagnostic O-packet `"target running\n"`, and return 0. The subsequent stop-reply is emitted by the existing poll loop when the CPU next halts; the verb itself does not synthesise one.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-055" name="avarice-Compatible Monitor Commands"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MON-12">
+        <text><![CDATA[The `monitor erase` verb (alias `monitor chip-erase`) shall consult `ctx->allow_erase` before issuing any UPDI traffic. When the flag is zero, the verb shall emit one diagnostic O-packet `"monitor erase: refused — launch the server with --allow-erase to enable.\n"` and return -1 so `dh_monitor` sends an `E22` error packet. When the flag is set the verb shall call `updi_chip_erase(ctx->updi_fd)`, then re-enter OCD via `updi_enter_debug()`, discard all BP/WP shadow entries, invalidate the FSM thread cache, emit a confirmation O-packet, and return 0.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-055" name="avarice-Compatible Monitor Commands"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MON-13">
+        <text><![CDATA[The `monitor version` verb shall emit one O-packet of the form `"avrOSdb <version> (built <date>)\n"` where `<version>` is the compile-time string `AVROSDB_VERSION` (supplied by the Makefile via `-DAVROSDB_VERSION='"$(VERSION)"'`) and `<date>` is the standard `__DATE__` macro. It shall return 0.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-055" name="avarice-Compatible Monitor Commands"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MON-14">
+        <text><![CDATA[The `monitor bp-mode <arg>` verb shall accept exactly two argument tokens: `sw` (sets `ctx->bp_mode = RSP_BP_MODE_SW`, the default) and `hw-only` (sets `ctx->bp_mode = RSP_BP_MODE_HW_ONLY`). With no argument it shall report the current setting. Any other argument shall emit an error O-packet and return -2. The mode persists for the lifetime of the server process and influences how `Z0` packets are routed (HLR-054).]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-054" name="True Software Breakpoints via FLASH BREAK Opcode"/>
+          <trace target="HLR" ref="HLR-055" name="avarice-Compatible Monitor Commands"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MON-15">
+        <text><![CDATA[The `monitor help` verb shall emit one O-packet per recognised verb, each line briefly summarising the verb's syntax and side-effects, in the order: `reset`, `halt`, `go`, `erase`, `chip-erase`, `version`, `bp-mode`, `help`, `avros events`, `avros queues`. After the last line it shall return 0 so `dh_monitor` terminates the output with `OK`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-055" name="avarice-Compatible Monitor Commands"/>
+        </traces>
+      </llr>
     </function>
 
     <function number="8" title="Makefile and Documentation" name="inst">
@@ -2559,7 +2623,7 @@ Errors are propagated upward through the module stack without retrying:
     <!-- ============================================================ -->
     <!-- src/main.c unit tests                                        -->
     <!-- ============================================================ -->
-    <file path="tests/test_main.c" role="unit" count="32">
+    <file path="tests/test_main.c" role="unit" count="34">
       <header><![CDATA[Unit tests for `src/main.c`: argument parsing, event loop, signal handling, and resource teardown. Uses `fork()`/`waitpid()` to test `exit()` paths and a mock UPDI/RSP layer to exercise the event loop without real hardware.]]></header>
 
       <test name="parse_args_valid_positional_args_populate_config">
@@ -2720,6 +2784,16 @@ Errors are propagated upward through the module stack without retrying:
       <test name="parse_args_no_autobaud_sets_flag">
         <purpose><![CDATA[Call `parse_args()` with argv `{ "prog", "--device", "--no-autobaud", "/dev/x" }` and assert `cfg.no_autobaud == true` — confirming the autobaud-suppression flag is recognised and stored on `AppConfig` so `run_device_mode()` can gate its probe call accordingly.]]></purpose>
         <traces><trace target="LLR" ref="LLR-MAIN-17"/></traces>
+      </test>
+
+      <test name="parse_args_allow_erase_sets_flag">
+        <purpose><![CDATA[Call `parse_args()` with argv `{ "prog", "--allow-erase", "/dev/x", "a.elf" }` and assert `cfg.allow_erase == true` — confirming the destructive-erase gate is recognised by the option parser.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-21"/></traces>
+      </test>
+
+      <test name="parse_args_allow_erase_defaults_false">
+        <purpose><![CDATA[Call `parse_args()` with argv that omits `--allow-erase` and assert `cfg.allow_erase == false` — confirming the safety default refuses destructive erase verbs unless the operator explicitly opts in.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-21"/></traces>
       </test>
     </file>
 
@@ -3395,7 +3469,7 @@ Errors are propagated upward through the module stack without retrying:
     <!-- ============================================================ -->
     <!-- src/monitor.c unit tests                                     -->
     <!-- ============================================================ -->
-    <file path="tests/test_monitor.c" role="unit" count="10">
+    <file path="tests/test_monitor.c" role="unit" count="20">
       <header><![CDATA[Unit tests for `src/monitor.c`: hex command decoding, prefix matching, per-sub-command UPDI reads, O-packet output formatting, 512-byte buffer constraint, and the no-halt guarantee. All UPDI calls are intercepted by a mock layer that records calls and returns injected data.]]></header>
 
       <test name="monitor_dispatch_hex_decodes_cmd_before_prefix_matching">
@@ -3446,6 +3520,56 @@ Errors are propagated upward through the module stack without retrying:
       <test name="monitor_dispatch_and_helpers_never_call_updi_halt">
         <purpose><![CDATA[Execute both sub-commands (`events`, `queues`) through `monitor_dispatch()` and verify that `updi_halt()` is never called by inspecting the mock call log.]]></purpose>
         <traces><trace target="LLR" ref="LLR-MON-07"/></traces>
+      </test>
+
+      <test name="verb_reset_pulses_updi_and_clears_shadows">
+        <purpose><![CDATA[Hex-encode `"reset"` through `monitor_dispatch_ex()` with a stub `RspContext` and verify that `updi_enter_debug()`, `rsp_hw_bp_clear_all()`, and `rsp_hw_wp_clear_all()` are each called exactly once and that `updi_halt()` is not called.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-09"/></traces>
+      </test>
+
+      <test name="verb_halt_emits_T05_stop_reply_and_suppresses_OK">
+        <purpose><![CDATA[Hex-encode `"halt"` through `monitor_dispatch_ex()` and verify the captured `rsp_send_packet()` payload starts with the literal three characters `T05`, and that the dispatcher returns -3 so the caller suppresses the trailing `OK`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-10"/></traces>
+      </test>
+
+      <test name="verb_go_calls_updi_run_and_returns_OK">
+        <purpose><![CDATA[Hex-encode `"go"` through `monitor_dispatch_ex()` and verify `updi_run()` is invoked exactly once and the dispatcher returns 0 so the caller emits `OK`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-11"/></traces>
+      </test>
+
+      <test name="verb_erase_refused_without_allow_erase_flag">
+        <purpose><![CDATA[Dispatch `"erase"` with `ctx.allow_erase = 0` and verify `updi_chip_erase()` is NOT called, the captured O-packet text mentions `--allow-erase`, and the dispatcher returns -1 so the caller emits `E22`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-12"/></traces>
+      </test>
+
+      <test name="verb_erase_allowed_when_flag_set_clears_shadows">
+        <purpose><![CDATA[Dispatch `"chip-erase"` with `ctx.allow_erase = 1` and verify `updi_chip_erase()`, `updi_enter_debug()`, `rsp_hw_bp_clear_all()`, and `rsp_hw_wp_clear_all()` are each called exactly once.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-12"/></traces>
+      </test>
+
+      <test name="verb_version_emits_o_packet_with_version_and_date">
+        <purpose><![CDATA[Dispatch `"version"` and verify the captured O-packet decodes to a string containing both `"avrOSdb"` and `"built"`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-13"/></traces>
+      </test>
+
+      <test name="verb_bp_mode_sw_and_hw_only_mutate_ctx">
+        <purpose><![CDATA[Dispatch `"bp-mode hw-only"` then `"bp-mode sw"` on the same `RspContext` and verify `ctx.bp_mode` cycles through `RSP_BP_MODE_HW_ONLY` and back to `RSP_BP_MODE_SW`; an invalid argument returns -2.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-14"/></traces>
+      </test>
+
+      <test name="verb_help_emits_one_line_per_recognised_verb">
+        <purpose><![CDATA[Dispatch `"help"` and verify that at least 8 O-packets are sent (one per documented top-level verb) before the dispatcher returns 0.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-15"/></traces>
+      </test>
+
+      <test name="unknown_top_level_verb_emits_usage_hint">
+        <purpose><![CDATA[Dispatch a token that is neither a known verb nor `avros …` and verify the captured O-packet text contains `"usage:"` and the dispatcher returns -2.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-08"/></traces>
+      </test>
+
+      <test name="avros_prefix_still_routed_to_legacy_dispatch">
+        <purpose><![CDATA[Dispatch `"avros events"` through `monitor_dispatch_ex()` and verify the call is forwarded to `monitor_dispatch()` (none of the top-level verb side-effects fire: `updi_enter_debug`, `updi_chip_erase`, and `updi_halt` all remain at zero invocations).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-08"/></traces>
       </test>
     </file>
 
