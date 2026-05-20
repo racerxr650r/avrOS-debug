@@ -104,6 +104,7 @@ These principles are the tie-breakers when requirements conflict.
 
 These are *themes* — not committed features — that frame future investment. Specific work items live in HLRs/LLRs as they are adopted.
 
+* **avarice Feature Parity.** Bringing the GDB Remote Serial Protocol surface up to functional parity with the legacy `avarice` JTAG/dW stub for the AVR-Dx UPDI use case: `(gdb) load` over `vFlash*`, true software breakpoints, hardware data watchpoints, an expanded `monitor` verb set, and extended-remote lifecycle (`vRun`/`vAttach`/`vKill`). Wire-level drop-in compatibility with `avarice`-specific scripts is an explicit non-goal — individual `.gdbinit` files, IDE launch configurations, and CI invocations may need targeted edits to reach the same outcome.
 * **Native DAP Translation.** Developing a direct Debug Adapter Protocol (DAP) interface to bypass `avr-gdb` entirely, optimizing integration for ultra-fast editors like Zed.
 * **Live Profiling.** Utilizing non-intrusive UPDI reads to sample FSM execution times and queue depths over time, outputting a data stream suitable for visual performance profiling. 
 
