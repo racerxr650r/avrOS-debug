@@ -2229,6 +2229,41 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="HLR" ref="HLR-058" name="Extended-remote — multiprocess+, vRun, vAttach, vKill"/>
         </traces>
       </llr>
+
+      <llr id="LLR-RSP-27">
+        <text><![CDATA[`updi_ocd_set_data_bp(fd, slot, addr, length, kind)` shall program one of the two OCD data-address breakpoint comparators (`slot` ∈ {0,1}) by writing the 16-bit `addr` to `OCD_DABP0`/`OCD_DABP1` and then read-modify-writing `OCD_CTRL2` to clear that slot's `EN/R/W` bits and OR in `EN` plus the `R` bit (for `kind=='r'` or `'a'`) and/or the `W` bit (for `kind=='w'` or `'a'`). The function shall return -1 on an invalid slot or any UPDI bus error and 0 on success. `length` is recorded by callers for stop-reply formatting only; the silicon comparator matches the configured address regardless of access width.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-056" name="GDB watchpoints (Z2/Z3/Z4)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-28">
+        <text><![CDATA[`updi_ocd_clear_data_bp(fd, slot)` shall disable one DABP comparator by read-modify-writing `OCD_CTRL2` to clear the slot's `EN/R/W` bits. The address registers (`OCD_DABPx`) are left untouched. The operation is idempotent: clearing an already-cleared slot returns 0. Returns -1 on UPDI bus error.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-056" name="GDB watchpoints (Z2/Z3/Z4)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-29">
+        <text><![CDATA[The `dh_insert_bp()` handler shall accept GDB watchpoint requests of the form `Z[234],<addr>[,<length>]` where `Z2` is a write watchpoint (`kind='w'`), `Z3` is a read watchpoint (`kind='r'`), and `Z4` is an access watchpoint (`kind='a'`). The handler shall be idempotent — if `RspContext.hw_wp[]` already contains a slot whose `addr` and `kind` both match the request, it replies `OK` without re-programming silicon. Otherwise it searches for a free slot (`kind=='\0'`); if both slots are occupied it replies `E08`. On a free slot it calls `updi_ocd_set_data_bp(slot, addr & GDB_AVR_ADDR_MASK, length, kind)`, updates `ctx->hw_wp[slot]` shadow, and replies `OK`. A UPDI failure replies `E01`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-056" name="GDB watchpoints (Z2/Z3/Z4)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-30">
+        <text><![CDATA[The `dh_remove_bp()` handler shall accept `z[234],<addr>[,<length>]`, locate the matching `RspContext.hw_wp[]` slot by `addr`, call `updi_ocd_clear_data_bp(slot)`, clear the shadow entry (`kind='\0'`), and reply `OK`. An unknown address shall also reply `OK` to tolerate GDB re-sync. The `dh_detach()` handler shall additionally invoke `hw_wp_clear_all(ctx)` for the `D` branch so the silicon DABP comparators are released along with the HW BPs before the CPU is resumed.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-056" name="GDB watchpoints (Z2/Z3/Z4)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-31">
+        <text><![CDATA[After a halt, `dh_halt_reason()` and the post-halt stop-reply branch of `dh_continue()` shall call `append_watch_suffix()`, which reads `OCD_STATUS1` and tests `OCD_STATUS1_DABP0` / `OCD_STATUS1_DABP1`. If a DABP bit is set, the function selects the corresponding `ctx->hw_wp[]` slot and appends `watch:<hex>;`, `rwatch:<hex>;`, or `awatch:<hex>;` (per slot `kind` `'w'`/`'r'`/`'a'`) to the reply payload, where `<hex>` is the GDB-side address (UPDI byte address ORed with `GDB_AVR_DATA_FLAG`). If neither DABP bit is set the suffix is omitted so the existing `Sxx`/`Txx` shape is preserved for ordinary breakpoints and ctrl-C halts.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-056" name="GDB watchpoints (Z2/Z3/Z4)"/>
+        </traces>
+      </llr>
     </function>
 
     <function number="5" title="src/elf_parser.c — ELF Binary Parser" name="elf" source="src/elf_parser.c">
@@ -2938,7 +2973,7 @@ Errors are propagated upward through the module stack without retrying:
     <!-- ============================================================ -->
     <!-- src/gdb_rsp.c unit tests                                     -->
     <!-- ============================================================ -->
-    <file path="tests/test_rsp.c" role="unit" count="44">
+    <file path="tests/test_rsp.c" role="unit" count="52">
       <header><![CDATA[Unit tests for `src/gdb_rsp.c`: socket configuration, RSP packet framing, register and memory handlers, hardware-breakpoint comparator management, OCD-based execution control, async Ctrl-C interrupt, detach cleanup, session lifecycle packets, and monitor relay. Uses a `socketpair()` as a drop-in socket substitute and replaces every `updi_*`, `fsm_*`, and `monitor_dispatch` call site with `ld --wrap` mocks so all tests run without real silicon.]]></header>
 
       <test name="rsp_listen_sets_so_reuseaddr_before_bind">
@@ -3164,6 +3199,47 @@ Errors are propagated upward through the module stack without retrying:
       <test name="qSupported_advertises_multiprocess_vRun_vAttach_vKill">
         <purpose><![CDATA[Dispatch `qSupported:multiprocess+` and verify the reply contains the substrings `multiprocess+`, `vRun+`, `vAttach+`, and `vKill+`, and does NOT contain `multiprocess-`.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-26"/></traces>
+      </test>
+
+      <test name="Z2_write_watchpoint_calls_updi_ocd_set_data_bp_with_kind_w">
+        <purpose><![CDATA[Dispatch `Z2,800100,1` and verify the reply is `OK`, `updi_ocd_set_data_bp` was invoked once with `kind='w'`, `addr=0x100` (host byte address), and `length=1`.]]></purpose>
+        <traces>
+          <trace target="LLR" ref="LLR-RSP-29"/>
+          <trace target="LLR" ref="LLR-RSP-27"/>
+        </traces>
+      </test>
+
+      <test name="Z3_read_watchpoint_uses_kind_r">
+        <purpose><![CDATA[Dispatch `Z3,800200,2` and verify `updi_ocd_set_data_bp` was invoked with `kind='r'` and the address-flag-stripped byte address `0x200`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-29"/></traces>
+      </test>
+
+      <test name="Z4_access_watchpoint_uses_kind_a">
+        <purpose><![CDATA[Dispatch `Z4,800300,4` and verify `updi_ocd_set_data_bp` was invoked with `kind='a'` and the address-flag-stripped byte address `0x300`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-29"/></traces>
+      </test>
+
+      <test name="Z2_returns_E08_when_both_wp_slots_full">
+        <purpose><![CDATA[Dispatch three distinct `Z2,...` requests and verify the third reply is `E08` and `updi_ocd_set_data_bp` was invoked exactly twice.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-29"/></traces>
+      </test>
+
+      <test name="z2_remove_calls_clear_and_clears_shadow">
+        <purpose><![CDATA[Install a Z2 then dispatch its `z2,...` peer and verify the reply is `OK`, `updi_ocd_clear_data_bp` was invoked once, and both the silicon-side mock and the `RspContext.hw_wp[0].kind` shadow are cleared to `'\0'`.]]></purpose>
+        <traces>
+          <trace target="LLR" ref="LLR-RSP-30"/>
+          <trace target="LLR" ref="LLR-RSP-28"/>
+        </traces>
+      </test>
+
+      <test name="halt_with_DABP0_bit_appends_watch_suffix">
+        <purpose><![CDATA[Pre-load `ctx.hw_wp[0]` as if a Z2 had been installed at GDB-side address `0x800100`, raise the mock `OCD_STATUS1_DABP0` bit, dispatch `?`, and verify the stop-reply payload contains the substring `watch:800100;`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-31"/></traces>
+      </test>
+
+      <test name="detach_clears_data_watchpoints_in_silicon">
+        <purpose><![CDATA[Install a Z3 watchpoint, dispatch `D`, and verify `updi_ocd_clear_data_bp` was invoked at least once and the silicon-side mock for slot 0 has `kind='\0'`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-30"/></traces>
       </test>
     </file>
 

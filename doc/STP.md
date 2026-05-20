@@ -109,7 +109,7 @@ Role: **unit**. **47 test(s).**
 
 ### 3.3. [tests/test_rsp.c](../tests/test_rsp.c)
 
-Role: **unit**. **44 test(s).**
+Role: **unit**. **52 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -158,6 +158,13 @@ Role: **unit**. **44 test(s).**
 | 43 | <a id="vAttach_halts_target_and_emits_stop_reply"></a>`vAttach_halts_target_and_emits_stop_reply` | `LLR-RSP-24` | Dispatch `vAttach;1` and verify that `updi_run()` and `updi_step()` are NOT called, that `fsm_invalidate()` and `fsm_build_thread_list()` are called, and that the reply is a `T05` stop packet containing a `thread:<hex>;` suffix. |
 | 44 | <a id="vKill_sets_quit_and_replies_ok"></a>`vKill_sets_quit_and_replies_ok` | `LLR-RSP-25` | Dispatch `vKill;1` and verify that the context's `*quit_p` flag is raised and the reply is the literal `OK`. |
 | 45 | <a id="qSupported_advertises_multiprocess_vRun_vAttach_vKill"></a>`qSupported_advertises_multiprocess_vRun_vAttach_vKill` | `LLR-RSP-26` | Dispatch `qSupported:multiprocess+` and verify the reply contains the substrings `multiprocess+`, `vRun+`, `vAttach+`, and `vKill+`, and does NOT contain `multiprocess-`. |
+| 46 | <a id="Z2_write_watchpoint_calls_updi_ocd_set_data_bp_with_kind_w"></a>`Z2_write_watchpoint_calls_updi_ocd_set_data_bp_with_kind_w` | `LLR-RSP-29`, `LLR-RSP-27` | Dispatch `Z2,800100,1` and verify the reply is `OK`, `updi_ocd_set_data_bp` was invoked once with `kind='w'`, `addr=0x100` (host byte address), and `length=1`. |
+| 47 | <a id="Z3_read_watchpoint_uses_kind_r"></a>`Z3_read_watchpoint_uses_kind_r` | `LLR-RSP-29` | Dispatch `Z3,800200,2` and verify `updi_ocd_set_data_bp` was invoked with `kind='r'` and the address-flag-stripped byte address `0x200`. |
+| 48 | <a id="Z4_access_watchpoint_uses_kind_a"></a>`Z4_access_watchpoint_uses_kind_a` | `LLR-RSP-29` | Dispatch `Z4,800300,4` and verify `updi_ocd_set_data_bp` was invoked with `kind='a'` and the address-flag-stripped byte address `0x300`. |
+| 49 | <a id="Z2_returns_E08_when_both_wp_slots_full"></a>`Z2_returns_E08_when_both_wp_slots_full` | `LLR-RSP-29` | Dispatch three distinct `Z2,...` requests and verify the third reply is `E08` and `updi_ocd_set_data_bp` was invoked exactly twice. |
+| 50 | <a id="z2_remove_calls_clear_and_clears_shadow"></a>`z2_remove_calls_clear_and_clears_shadow` | `LLR-RSP-30`, `LLR-RSP-28` | Install a Z2 then dispatch its `z2,...` peer and verify the reply is `OK`, `updi_ocd_clear_data_bp` was invoked once, and both the silicon-side mock and the `RspContext.hw_wp[0].kind` shadow are cleared to `'\0'`. |
+| 51 | <a id="halt_with_DABP0_bit_appends_watch_suffix"></a>`halt_with_DABP0_bit_appends_watch_suffix` | `LLR-RSP-31` | Pre-load `ctx.hw_wp[0]` as if a Z2 had been installed at GDB-side address `0x800100`, raise the mock `OCD_STATUS1_DABP0` bit, dispatch `?`, and verify the stop-reply payload contains the substring `watch:800100;`. |
+| 52 | <a id="detach_clears_data_watchpoints_in_silicon"></a>`detach_clears_data_watchpoints_in_silicon` | `LLR-RSP-30` | Install a Z3 watchpoint, dispatch `D`, and verify `updi_ocd_clear_data_bp` was invoked at least once and the silicon-side mock for slot 0 has `kind='\0'`. |
 
 ### 3.4. [tests/test_elf.c](../tests/test_elf.c)
 
@@ -369,6 +376,11 @@ verified by code review — see
 | `LLR-RSP-24` | `rsp` | `HLR-058` | `vAttach_halts_target_and_emits_stop_reply` |
 | `LLR-RSP-25` | `rsp` | `HLR-058` | `vKill_sets_quit_and_replies_ok` |
 | `LLR-RSP-26` | `rsp` | `HLR-058` | `qSupported_advertises_multiprocess_vRun_vAttach_vKill` |
+| `LLR-RSP-27` | `rsp` | `HLR-056` | `Z2_write_watchpoint_calls_updi_ocd_set_data_bp_with_kind_w` |
+| `LLR-RSP-28` | `rsp` | `HLR-056` | `z2_remove_calls_clear_and_clears_shadow` |
+| `LLR-RSP-29` | `rsp` | `HLR-056` | `Z2_write_watchpoint_calls_updi_ocd_set_data_bp_with_kind_w`, `Z3_read_watchpoint_uses_kind_r`, `Z4_access_watchpoint_uses_kind_a`, `Z2_returns_E08_when_both_wp_slots_full` |
+| `LLR-RSP-30` | `rsp` | `HLR-056` | `z2_remove_calls_clear_and_clears_shadow`, `detach_clears_data_watchpoints_in_silicon` |
+| `LLR-RSP-31` | `rsp` | `HLR-056` | `halt_with_DABP0_bit_appends_watch_suffix` |
 | `LLR-ELF-01` | `elf` | `HLR-021` | `elf_open_accepts_valid_avr_elf32_binary`, `elf_open_returns_minus1_on_invalid_elf_magic`, `elf_open_returns_minus1_on_wrong_machine_type` |
 | `LLR-ELF-02` | `elf` | `HLR-021`, `HLR-040` | `elf_open_loads_symtab_and_strtab_into_heap_buffers`, `elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure` |
 | `LLR-ELF-03` | `elf` | `HLR-021` | `elf_find_avros_tables_performs_single_linear_scan`, `elf_find_avros_tables_populates_all_7_avros_sentinel_fields` |

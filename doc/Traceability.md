@@ -124,7 +124,7 @@ catalogue is in [STP.md §3](STP.md#3-test-catalogue).
 | [`HLR-053`](HLRs.md#HLR-053) | Flash Programming via GDB load | — | **(no test)** |
 | [`HLR-054`](HLRs.md#HLR-054) | True Software Breakpoints via Flash BREAK Opcode | — | **(no test)** |
 | [`HLR-055`](HLRs.md#HLR-055) | avarice-Compatible Monitor Commands | — | **(no test)** |
-| [`HLR-056`](HLRs.md#HLR-056) | Hardware Data Watchpoints | — | **(no test)** |
+| [`HLR-056`](HLRs.md#HLR-056) | Hardware Data Watchpoints | [`LLR-RSP-27`](LLRs.md#LLR-RSP-27), [`LLR-RSP-28`](LLRs.md#LLR-RSP-28), [`LLR-RSP-29`](LLRs.md#LLR-RSP-29), [`LLR-RSP-30`](LLRs.md#LLR-RSP-30), [`LLR-RSP-31`](LLRs.md#LLR-RSP-31) | [`detach_clears_data_watchpoints_in_silicon`](STP.md#detach_clears_data_watchpoints_in_silicon), [`halt_with_DABP0_bit_appends_watch_suffix`](STP.md#halt_with_DABP0_bit_appends_watch_suffix), [`z2_remove_calls_clear_and_clears_shadow`](STP.md#z2_remove_calls_clear_and_clears_shadow), [`Z2_returns_E08_when_both_wp_slots_full`](STP.md#Z2_returns_E08_when_both_wp_slots_full), [`Z2_write_watchpoint_calls_updi_ocd_set_data_bp_with_kind_w`](STP.md#Z2_write_watchpoint_calls_updi_ocd_set_data_bp_with_kind_w), [`Z3_read_watchpoint_uses_kind_r`](STP.md#Z3_read_watchpoint_uses_kind_r), [`Z4_access_watchpoint_uses_kind_a`](STP.md#Z4_access_watchpoint_uses_kind_a) |
 | [`HLR-058`](HLRs.md#HLR-058) | Extended-Remote Lifecycle Packets | [`LLR-RSP-23`](LLRs.md#LLR-RSP-23), [`LLR-RSP-24`](LLRs.md#LLR-RSP-24), [`LLR-RSP-25`](LLRs.md#LLR-RSP-25), [`LLR-RSP-26`](LLRs.md#LLR-RSP-26) | [`qSupported_advertises_multiprocess_vRun_vAttach_vKill`](STP.md#qSupported_advertises_multiprocess_vRun_vAttach_vKill), [`vAttach_halts_target_and_emits_stop_reply`](STP.md#vAttach_halts_target_and_emits_stop_reply), [`vKill_sets_quit_and_replies_ok`](STP.md#vKill_sets_quit_and_replies_ok), [`vRun_invalidates_fsm_runs_and_emits_stop`](STP.md#vRun_invalidates_fsm_runs_and_emits_stop) |
 | [`HLR-059`](HLRs.md#HLR-059) | Protocol Cleanup — qC, qOffsets, T, R | [`LLR-RSP-19`](LLRs.md#LLR-RSP-19), [`LLR-RSP-20`](LLRs.md#LLR-RSP-20), [`LLR-RSP-21`](LLRs.md#LLR-RSP-21), [`LLR-RSP-22`](LLRs.md#LLR-RSP-22) | [`qC_returns_QC0_when_no_c_thread_selected`](STP.md#qC_returns_QC0_when_no_c_thread_selected), [`qC_returns_selected_c_thread_in_hex`](STP.md#qC_returns_selected_c_thread_in_hex), [`qOffsets_returns_text_data_bss_all_zero`](STP.md#qOffsets_returns_text_data_bss_all_zero), [`R_packet_invalidates_fsm_runs_and_emits_stop`](STP.md#R_packet_invalidates_fsm_runs_and_emits_stop), [`T_packet_returns_E01_for_unknown_thread`](STP.md#T_packet_returns_E01_for_unknown_thread), [`T_packet_returns_OK_for_live_thread`](STP.md#T_packet_returns_OK_for_live_thread) |
 
@@ -146,7 +146,7 @@ locating areas of the spec that may need additional tests.
 | §9 Diagnostics and Bring-up | 1 | 4 | 13 | — |
 | §10 Hardware Integration Testing | 4 | 17 | 49 | — |
 | §11 CI-Grade Loader and Link Diagnostics | 4 | 9 | 9 | — |
-| §12 GDB Protocol Completion (avarice Feature Parity) | 6 | 8 | 10 | [`HLR-053`](HLRs.md#HLR-053), [`HLR-054`](HLRs.md#HLR-054), [`HLR-055`](HLRs.md#HLR-055), [`HLR-056`](HLRs.md#HLR-056) |
+| §12 GDB Protocol Completion (avarice Feature Parity) | 6 | 13 | 17 | [`HLR-053`](HLRs.md#HLR-053), [`HLR-054`](HLRs.md#HLR-054), [`HLR-055`](HLRs.md#HLR-055) |
 
 ## 4. LLR Coverage
 
@@ -233,6 +233,11 @@ with **(no test)**; see
 | [`LLR-RSP-24`](LLRs.md#LLR-RSP-24) | `rsp` | [`HLR-058`](HLRs.md#HLR-058) | [`vAttach_halts_target_and_emits_stop_reply`](STP.md#vAttach_halts_target_and_emits_stop_reply) |
 | [`LLR-RSP-25`](LLRs.md#LLR-RSP-25) | `rsp` | [`HLR-058`](HLRs.md#HLR-058) | [`vKill_sets_quit_and_replies_ok`](STP.md#vKill_sets_quit_and_replies_ok) |
 | [`LLR-RSP-26`](LLRs.md#LLR-RSP-26) | `rsp` | [`HLR-058`](HLRs.md#HLR-058) | [`qSupported_advertises_multiprocess_vRun_vAttach_vKill`](STP.md#qSupported_advertises_multiprocess_vRun_vAttach_vKill) |
+| [`LLR-RSP-27`](LLRs.md#LLR-RSP-27) | `rsp` | [`HLR-056`](HLRs.md#HLR-056) | [`Z2_write_watchpoint_calls_updi_ocd_set_data_bp_with_kind_w`](STP.md#Z2_write_watchpoint_calls_updi_ocd_set_data_bp_with_kind_w) |
+| [`LLR-RSP-28`](LLRs.md#LLR-RSP-28) | `rsp` | [`HLR-056`](HLRs.md#HLR-056) | [`z2_remove_calls_clear_and_clears_shadow`](STP.md#z2_remove_calls_clear_and_clears_shadow) |
+| [`LLR-RSP-29`](LLRs.md#LLR-RSP-29) | `rsp` | [`HLR-056`](HLRs.md#HLR-056) | [`Z2_returns_E08_when_both_wp_slots_full`](STP.md#Z2_returns_E08_when_both_wp_slots_full), [`Z2_write_watchpoint_calls_updi_ocd_set_data_bp_with_kind_w`](STP.md#Z2_write_watchpoint_calls_updi_ocd_set_data_bp_with_kind_w), [`Z3_read_watchpoint_uses_kind_r`](STP.md#Z3_read_watchpoint_uses_kind_r), [`Z4_access_watchpoint_uses_kind_a`](STP.md#Z4_access_watchpoint_uses_kind_a) |
+| [`LLR-RSP-30`](LLRs.md#LLR-RSP-30) | `rsp` | [`HLR-056`](HLRs.md#HLR-056) | [`detach_clears_data_watchpoints_in_silicon`](STP.md#detach_clears_data_watchpoints_in_silicon), [`z2_remove_calls_clear_and_clears_shadow`](STP.md#z2_remove_calls_clear_and_clears_shadow) |
+| [`LLR-RSP-31`](LLRs.md#LLR-RSP-31) | `rsp` | [`HLR-056`](HLRs.md#HLR-056) | [`halt_with_DABP0_bit_appends_watch_suffix`](STP.md#halt_with_DABP0_bit_appends_watch_suffix) |
 | [`LLR-ELF-01`](LLRs.md#LLR-ELF-01) | `elf` | [`HLR-021`](HLRs.md#HLR-021) | [`elf_open_accepts_valid_avr_elf32_binary`](STP.md#elf_open_accepts_valid_avr_elf32_binary), [`elf_open_returns_minus1_on_invalid_elf_magic`](STP.md#elf_open_returns_minus1_on_invalid_elf_magic), [`elf_open_returns_minus1_on_wrong_machine_type`](STP.md#elf_open_returns_minus1_on_wrong_machine_type) |
 | [`LLR-ELF-02`](LLRs.md#LLR-ELF-02) | `elf` | [`HLR-021`](HLRs.md#HLR-021), [`HLR-040`](HLRs.md#HLR-040) | [`elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure`](STP.md#elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure), [`elf_open_loads_symtab_and_strtab_into_heap_buffers`](STP.md#elf_open_loads_symtab_and_strtab_into_heap_buffers) |
 | [`LLR-ELF-03`](LLRs.md#LLR-ELF-03) | `elf` | [`HLR-021`](HLRs.md#HLR-021) | [`elf_find_avros_tables_performs_single_linear_scan`](STP.md#elf_find_avros_tables_performs_single_linear_scan), [`elf_find_avros_tables_populates_all_7_avros_sentinel_fields`](STP.md#elf_find_avros_tables_populates_all_7_avros_sentinel_fields) |
@@ -393,6 +398,12 @@ the [Software Test Plan](STP.md) catalogue.
 | [tests/test_rsp.c](../tests/test_rsp.c) | [`R_packet_invalidates_fsm_runs_and_emits_stop`](STP.md#R_packet_invalidates_fsm_runs_and_emits_stop) | [`LLR-RSP-22`](LLRs.md#LLR-RSP-22) | — |
 | [tests/test_rsp.c](../tests/test_rsp.c) | [`T_packet_returns_E01_for_unknown_thread`](STP.md#T_packet_returns_E01_for_unknown_thread) | [`LLR-RSP-21`](LLRs.md#LLR-RSP-21) | — |
 | [tests/test_rsp.c](../tests/test_rsp.c) | [`T_packet_returns_OK_for_live_thread`](STP.md#T_packet_returns_OK_for_live_thread) | [`LLR-RSP-21`](LLRs.md#LLR-RSP-21) | — |
+| [tests/test_rsp.c](../tests/test_rsp.c) | [`Z2_returns_E08_when_both_wp_slots_full`](STP.md#Z2_returns_E08_when_both_wp_slots_full) | [`LLR-RSP-29`](LLRs.md#LLR-RSP-29) | — |
+| [tests/test_rsp.c](../tests/test_rsp.c) | [`Z2_write_watchpoint_calls_updi_ocd_set_data_bp_with_kind_w`](STP.md#Z2_write_watchpoint_calls_updi_ocd_set_data_bp_with_kind_w) | [`LLR-RSP-27`](LLRs.md#LLR-RSP-27), [`LLR-RSP-29`](LLRs.md#LLR-RSP-29) | — |
+| [tests/test_rsp.c](../tests/test_rsp.c) | [`Z3_read_watchpoint_uses_kind_r`](STP.md#Z3_read_watchpoint_uses_kind_r) | [`LLR-RSP-29`](LLRs.md#LLR-RSP-29) | — |
+| [tests/test_rsp.c](../tests/test_rsp.c) | [`Z4_access_watchpoint_uses_kind_a`](STP.md#Z4_access_watchpoint_uses_kind_a) | [`LLR-RSP-29`](LLRs.md#LLR-RSP-29) | — |
+| [tests/test_rsp.c](../tests/test_rsp.c) | [`detach_clears_data_watchpoints_in_silicon`](STP.md#detach_clears_data_watchpoints_in_silicon) | [`LLR-RSP-30`](LLRs.md#LLR-RSP-30) | — |
+| [tests/test_rsp.c](../tests/test_rsp.c) | [`halt_with_DABP0_bit_appends_watch_suffix`](STP.md#halt_with_DABP0_bit_appends_watch_suffix) | [`LLR-RSP-31`](LLRs.md#LLR-RSP-31) | — |
 | [tests/test_rsp.c](../tests/test_rsp.c) | [`on_continue_calls_updi_run_then_fsm_invalidate`](STP.md#on_continue_calls_updi_run_then_fsm_invalidate) | [`LLR-RSP-11`](LLRs.md#LLR-RSP-11) | — |
 | [tests/test_rsp.c](../tests/test_rsp.c) | [`on_continue_ctrl_c_returns_T02`](STP.md#on_continue_ctrl_c_returns_T02) | [`LLR-RSP-11`](LLRs.md#LLR-RSP-11) | — |
 | [tests/test_rsp.c](../tests/test_rsp.c) | [`on_continue_rebuilds_thread_list_after_halt_and_sends_stop`](STP.md#on_continue_rebuilds_thread_list_after_halt_and_sends_stop) | [`LLR-RSP-11`](LLRs.md#LLR-RSP-11) | — |
@@ -433,6 +444,7 @@ the [Software Test Plan](STP.md) catalogue.
 | [tests/test_rsp.c](../tests/test_rsp.c) | [`vAttach_halts_target_and_emits_stop_reply`](STP.md#vAttach_halts_target_and_emits_stop_reply) | [`LLR-RSP-24`](LLRs.md#LLR-RSP-24) | — |
 | [tests/test_rsp.c](../tests/test_rsp.c) | [`vKill_sets_quit_and_replies_ok`](STP.md#vKill_sets_quit_and_replies_ok) | [`LLR-RSP-25`](LLRs.md#LLR-RSP-25) | — |
 | [tests/test_rsp.c](../tests/test_rsp.c) | [`vRun_invalidates_fsm_runs_and_emits_stop`](STP.md#vRun_invalidates_fsm_runs_and_emits_stop) | [`LLR-RSP-23`](LLRs.md#LLR-RSP-23) | — |
+| [tests/test_rsp.c](../tests/test_rsp.c) | [`z2_remove_calls_clear_and_clears_shadow`](STP.md#z2_remove_calls_clear_and_clears_shadow) | [`LLR-RSP-28`](LLRs.md#LLR-RSP-28), [`LLR-RSP-30`](LLRs.md#LLR-RSP-30) | — |
 | [tests/test_updi.c](../tests/test_updi.c) | [`updi_console_poll_returns_0_when_output_buffer_empty`](STP.md#updi_console_poll_returns_0_when_output_buffer_empty) | [`LLR-UPDI-12`](LLRs.md#LLR-UPDI-12) | — |
 | [tests/test_updi.c](../tests/test_updi.c) | [`updi_console_poll_returns_pending_bytes_without_halting`](STP.md#updi_console_poll_returns_pending_bytes_without_halting) | [`LLR-UPDI-11`](LLRs.md#LLR-UPDI-11), [`LLR-UPDI-12`](LLRs.md#LLR-UPDI-12) | — |
 | [tests/test_updi.c](../tests/test_updi.c) | [`updi_crc32_matches_known_vector_for_123456789`](STP.md#updi_crc32_matches_known_vector_for_123456789) | [`LLR-UPDI-30`](LLRs.md#LLR-UPDI-30) | — |
@@ -505,7 +517,6 @@ LLR-bound test in their implementation chain.
 | [`HLR-053`](HLRs.md#HLR-053) | Flash Programming via GDB load |
 | [`HLR-054`](HLRs.md#HLR-054) | True Software Breakpoints via Flash BREAK Opcode |
 | [`HLR-055`](HLRs.md#HLR-055) | avarice-Compatible Monitor Commands |
-| [`HLR-056`](HLRs.md#HLR-056) | Hardware Data Watchpoints |
 
 ---
 

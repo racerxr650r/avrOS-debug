@@ -103,6 +103,18 @@
 #define OCD_BASE        0x0F80u
 #define OCD_BP0A        (OCD_BASE + 0x00u)  /* 3 bytes: BP0 byte address    */
 #define OCD_BP1A        (OCD_BASE + 0x04u)  /* 3 bytes: BP1 byte address    */
+/* ── Data-address breakpoint pair (DABP0/DABP1) — HLR-056 ────────────
+ * AVR-Dx OCD documents a single 16-bit DSB; for the GDB Z2/Z3/Z4
+ * watchpoint surface we model a pair of comparators using two unused
+ * 16-bit slots in the OCD memory window.  Each slot carries a 16-bit
+ * data-space byte address (data RAM never exceeds 64 KiB on the
+ * AVR-Dx family).  CTRL2 holds the per-slot enable and read/write/
+ * access kind selector.  Real silicon may host a single DSB only —
+ * the second slot is allocated for protocol parity and refused with
+ * E08 by the dispatcher when both slots are occupied.               */
+#define OCD_DABP0       (OCD_BASE + 0x0Au)  /* 2 bytes: DABP0 byte address  */
+#define OCD_DABP1       (OCD_BASE + 0x0Eu)  /* 2 bytes: DABP1 byte address  */
+#define OCD_CTRL2       (OCD_BASE + 0x07u)  /* DABP0/DABP1 enable + kind    */
 #define OCD_CTRL0       (OCD_BASE + 0x08u)  /* PCHOLD/HWBP/STEP             */
 #define OCD_CTRL1       (OCD_BASE + 0x09u)  /* BP0/BP1/EXTBRK/SWBP/JMP/INT  */
 #define OCD_STATUS0     (OCD_BASE + 0x0Cu)  /* STOPPED/EXT/RESET            */
@@ -133,10 +145,22 @@
 #define OCD_STATUS0_RESET   0x80u
 #define OCD_STATUS1_BP0STEP 0x01u
 #define OCD_STATUS1_BP1     0x02u
+#define OCD_STATUS1_DABP0   0x04u   /* data-watchpoint slot 0 fired  */
+#define OCD_STATUS1_DABP1   0x08u   /* data-watchpoint slot 1 fired  */
 #define OCD_STATUS1_EXTBRK  0x10u
 #define OCD_STATUS1_SWBP    0x20u
 #define OCD_STATUS1_JMP     0x40u
 #define OCD_STATUS1_INT     0x80u
+
+/* OCD CTRL2 bits — data-watchpoint configuration (HLR-056).
+ * Two slots × {enable, read-on-hit, write-on-hit}.  When both kind
+ * bits are set the slot triggers on any access (Z4 / awatch).      */
+#define OCD_CTRL2_DABP0_EN   0x01u
+#define OCD_CTRL2_DABP0_R    0x02u
+#define OCD_CTRL2_DABP0_W    0x04u
+#define OCD_CTRL2_DABP1_EN   0x10u
+#define OCD_CTRL2_DABP1_R    0x20u
+#define OCD_CTRL2_DABP1_W    0x40u
 
 int  updi_open(const char *device, int baud);
 void updi_close(int fd);
@@ -170,6 +194,15 @@ int  updi_ocd_write_sreg(int fd, uint8_t val);
 /* Hardware breakpoints. idx is 0 or 1. */
 int  updi_ocd_set_hw_bp  (int fd, int idx, uint32_t byte_addr);
 int  updi_ocd_clear_hw_bp(int fd, int idx);
+
+/* Data-watchpoint comparators (HLR-056).  `slot` is 0 or 1.  `length`
+ * is informational on AVR-Dx (silicon matches a single byte); the
+ * value is preserved in the per-session shadow so detach can restore
+ * the comparator and the GDB stop-key carries the requested span.
+ * `kind` is 'r' (read), 'w' (write), or 'a' (access — any).         */
+int  updi_ocd_set_data_bp  (int fd, int slot, uint32_t addr,
+                            uint8_t length, char kind);
+int  updi_ocd_clear_data_bp(int fd, int slot);
 
 int  updi_nvm_write_flash(int fd, uint32_t word_addr, const uint8_t *data, size_t len);
 int  updi_nvm_flash_patch(int fd, uint32_t addr, const uint8_t *data, size_t len);

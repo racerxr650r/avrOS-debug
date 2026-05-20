@@ -215,6 +215,7 @@ TEST_WRAP_test_rsp  := updi_mem_read updi_mem_write updi_halt updi_run updi_step
                        updi_ocd_read_sp updi_ocd_write_sp \
                        updi_ocd_read_pc updi_ocd_write_pc \
                        updi_ocd_set_hw_bp updi_ocd_clear_hw_bp \
+                       updi_ocd_set_data_bp updi_ocd_clear_data_bp \
                        fsm_build_thread_list fsm_get_registers \
                        fsm_get_active_thread fsm_invalidate \
                        monitor_dispatch

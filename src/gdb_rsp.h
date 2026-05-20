@@ -33,6 +33,16 @@ typedef struct {
      * it (designated initialiser leaves both = 0, then handler init
      * marks them empty on first use).                                */
     uint32_t                  hw_bp_addr[2];
+    /* Shadow of the two AVR-Dx OCD data-address comparators
+     * (DABP0/DABP1, HLR-056).  `kind` is '\0' for an empty slot,
+     * else one of 'r' (read), 'w' (write), 'a' (access).  `addr`
+     * is the GDB-side data-space address (UPDI byte address ORed
+     * with 0x800000).                                              */
+    struct {
+        uint32_t addr;
+        uint8_t  length;
+        char     kind;
+    }                         hw_wp[2];
 } RspContext;
 
 /* Each handler returns 0 on success or -1 on error. The handler is

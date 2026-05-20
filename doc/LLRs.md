@@ -245,6 +245,21 @@ Requirements for RSP packet framing, dispatch, GDB packet handlers, session life
 *   <a id="LLR-RSP-26"></a>**LLR-RSP-26** — The inline `qSupported` reply shall be the literal string `PacketSize=800;QStartNoAckMode+;multiprocess+;vContSupported+;vRun+;vAttach+;vKill+`. The `multiprocess+` feature is advertised even though the AVR target supports only a single process — it informs GDB that the server understands `<pid>.<tid>` thread-id syntax and accepts the extended-remote `v*` packets. `vRun+`, `vAttach+`, and `vKill+` advertise the corresponding handlers added by HLR-058. The inbound `vAttach?` capability probe shall be answered with `OK`.
     *Trace:* HLR-058 (Extended-remote — multiprocess+, vRun, vAttach, vKill).
 
+*   <a id="LLR-RSP-27"></a>**LLR-RSP-27** — `updi_ocd_set_data_bp(fd, slot, addr, length, kind)` shall program one of the two OCD data-address breakpoint comparators (`slot` ∈ {0,1}) by writing the 16-bit `addr` to `OCD_DABP0`/`OCD_DABP1` and then read-modify-writing `OCD_CTRL2` to clear that slot's `EN/R/W` bits and OR in `EN` plus the `R` bit (for `kind=='r'` or `'a'`) and/or the `W` bit (for `kind=='w'` or `'a'`). The function shall return -1 on an invalid slot or any UPDI bus error and 0 on success. `length` is recorded by callers for stop-reply formatting only; the silicon comparator matches the configured address regardless of access width.
+    *Trace:* HLR-056 (GDB watchpoints (Z2/Z3/Z4)).
+
+*   <a id="LLR-RSP-28"></a>**LLR-RSP-28** — `updi_ocd_clear_data_bp(fd, slot)` shall disable one DABP comparator by read-modify-writing `OCD_CTRL2` to clear the slot's `EN/R/W` bits. The address registers (`OCD_DABPx`) are left untouched. The operation is idempotent: clearing an already-cleared slot returns 0. Returns -1 on UPDI bus error.
+    *Trace:* HLR-056 (GDB watchpoints (Z2/Z3/Z4)).
+
+*   <a id="LLR-RSP-29"></a>**LLR-RSP-29** — The `dh_insert_bp()` handler shall accept GDB watchpoint requests of the form `Z[234],<addr>[,<length>]` where `Z2` is a write watchpoint (`kind='w'`), `Z3` is a read watchpoint (`kind='r'`), and `Z4` is an access watchpoint (`kind='a'`). The handler shall be idempotent — if `RspContext.hw_wp[]` already contains a slot whose `addr` and `kind` both match the request, it replies `OK` without re-programming silicon. Otherwise it searches for a free slot (`kind=='\0'`); if both slots are occupied it replies `E08`. On a free slot it calls `updi_ocd_set_data_bp(slot, addr & GDB_AVR_ADDR_MASK, length, kind)`, updates `ctx->hw_wp[slot]` shadow, and replies `OK`. A UPDI failure replies `E01`.
+    *Trace:* HLR-056 (GDB watchpoints (Z2/Z3/Z4)).
+
+*   <a id="LLR-RSP-30"></a>**LLR-RSP-30** — The `dh_remove_bp()` handler shall accept `z[234],<addr>[,<length>]`, locate the matching `RspContext.hw_wp[]` slot by `addr`, call `updi_ocd_clear_data_bp(slot)`, clear the shadow entry (`kind='\0'`), and reply `OK`. An unknown address shall also reply `OK` to tolerate GDB re-sync. The `dh_detach()` handler shall additionally invoke `hw_wp_clear_all(ctx)` for the `D` branch so the silicon DABP comparators are released along with the HW BPs before the CPU is resumed.
+    *Trace:* HLR-056 (GDB watchpoints (Z2/Z3/Z4)).
+
+*   <a id="LLR-RSP-31"></a>**LLR-RSP-31** — After a halt, `dh_halt_reason()` and the post-halt stop-reply branch of `dh_continue()` shall call `append_watch_suffix()`, which reads `OCD_STATUS1` and tests `OCD_STATUS1_DABP0` / `OCD_STATUS1_DABP1`. If a DABP bit is set, the function selects the corresponding `ctx->hw_wp[]` slot and appends `watch:<hex>;`, `rwatch:<hex>;`, or `awatch:<hex>;` (per slot `kind` `'w'`/`'r'`/`'a'`) to the reply payload, where `<hex>` is the GDB-side address (UPDI byte address ORed with `GDB_AVR_DATA_FLAG`). If neither DABP bit is set the suffix is omitted so the existing `Sxx`/`Txx` shape is preserved for ordinary breakpoints and ctrl-C halts.
+    *Trace:* HLR-056 (GDB watchpoints (Z2/Z3/Z4)).
+
 ## 5. src/elf_parser.c — ELF Binary Parser
 
 Requirements for `elf_open()`, `elf_close()`, `elf_find_avros_tables()`, and `elf_flash_addr()`.
