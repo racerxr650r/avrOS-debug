@@ -13,7 +13,7 @@
 > Delivery section as work progresses. Link phase names in the Status
 > table to their detailed descriptions in §8.
 
-**Status:** Phases 0–7 complete. Phase 8 (non-FLASH NVM programming) planned.
+**Status:** Phases 0–7 complete. Phase 8 (non-FLASH NVM programming), Phase 9 (CI-grade loader & link diagnostics), and Phase 10 (GDB protocol completion / avarice drop-in parity) planned.
 
 ## Status
 
@@ -28,6 +28,7 @@
 | [6](#phase-6--installation-targets--documentation) | `make install/uninstall/check-tools/bundle` + user manual + man page + 8 install tests | 🔲 Not started |
 | [7](#phase-7--device-signature-diagnostic-mode) | `--device` flag + `updi_read_device_info()` + family lookup + 6 tests | 🔲 Not started |
 | [8](#phase-8--non-flash-nvm-programming) | EEPROM / FUSE / USERROW / LOCKBIT programming from ELF segments | 🔲 Not started |
+| [10](#phase-10--gdb-protocol-completion--avarice-drop-in-parity) | `vFlash*` + true SW breakpoints + watchpoints + `qXfer` maps + monitor verbs + extended-remote | 🔲 Not started |
 
 ## 0. Required Tools for Development
 
@@ -671,6 +672,72 @@ Exact base addresses are part-specific; the dispatcher classifies segments by ad
 - **AVR-Dx variant address-window differences.** AVR DA / DB / DD have the same EEPROM / USERROW / FUSE / LOCK base addresses but differ in EEPROM size. The window-size constants in `src/updi.h` must use the smallest common size and reject over-large segments rather than silently truncating.
 - **Post-write OCD state.** Some NVM commands leave the CPU in an indeterminate state. The post-load `updi_enter_debug()` re-issue (item 4) is the chosen mitigation; tests must verify it fires on every non-FLASH path.
 
+---
+
+### Phase 10 — GDB Protocol Completion / avarice Drop-In Parity
+
+**Motivation.** Phases 1–8 implement the minimum subset of GDB RSP needed to attach, read state, single-step, set up to two hardware breakpoints, continue, interrupt, and detach. The legacy `avarice` JTAG/dW stub — which `avrOSdb` is intended to replace for AVR-Dx UPDI targets — supports a substantially larger protocol surface, and any `.gdbinit`, IDE configuration, or CI script written against `avarice` will break when pointed at `avrOSdb`. Phase 10 closes that gap so the swap is a true drop-in replacement: same monitor verbs, same `gdb load` behaviour, same watchpoint and software-breakpoint experience, same memory-map auto-detection. Tracked as GitHub issue #31; bound to HLR-053 … HLR-059 in Project.xml §12.
+
+**Scope summary.**
+
+| Feature | GDB packets / verbs | Source file(s) | HLR |
+| ------- | ------------------- | -------------- | --- |
+| Flash programming from GDB session | `vFlashErase`, `vFlashWrite`, `vFlashDone` | `gdb_rsp.c`, `updi.c` (reuse Phase 8 NVM path) | HLR-053 |
+| True software breakpoints via flash `BREAK` opcode | `Z0`/`z0` (real, not aliased) | `gdb_rsp.c`, `updi.c` | HLR-054 |
+| `avarice`-compatible monitor verbs | `monitor reset/halt/go/erase/chip-erase/version/bp-mode/help` | `monitor.c` | HLR-055 |
+| Hardware data watchpoints | `Z2`/`Z3`/`Z4` + matching `z*` | `gdb_rsp.c`, `updi.c` (new `updi_ocd_set_data_bp()`) | HLR-056 |
+| Memory-map and target description XML | `qXfer:memory-map:read`, `qXfer:features:read:target.xml` | `gdb_rsp.c` (reads `g_device_table[]`) | HLR-057 |
+| Extended-remote lifecycle | `vRun`, `vAttach`, `vKill` + `multiprocess+` | `gdb_rsp.c` | HLR-058 |
+| Protocol cleanup | `qC`, `qOffsets`, `T<tid>`, `R<XX>` | `gdb_rsp.c` | HLR-059 |
+
+1. **`src/gdb_rsp.c` — `vFlash*` handlers (HLR-053).** Add three new handler entries to the RSP dispatcher table: `on_v_flash_erase`, `on_v_flash_write`, `on_v_flash_done`. Reject any erase range outside the FLASH window of the runtime-selected device (HLR-048) with reply `E22`; accumulate `vFlashWrite` payload into the existing page buffer; flush on `vFlashDone` and call `updi_enter_debug()` to leave the CPU halted at reset. Both HW and SW breakpoint shadows shall be cleared on `vFlashDone`. While a `vFlash*` transaction is in progress the server shall reply `E22` to any `g`/`G`/`m`/`M`/`c`/`s` packet and discard pending page buffers. Advertise `qXfer:memory-map:read+` in `qSupported` only after HLR-057 is wired up.
+
+2. **`src/gdb_rsp.c` + `src/updi.c` — true SW breakpoints (HLR-054).** Add per-session shadow map `RspContext.sw_bp[N_SW_BP_MAX]` recording `(gdb_addr, flash_byte_addr, original_lo, original_hi, page_aligned_base)`. On `Z0` patch `0x9598` (little-endian) into the FLASH word at the target address; on `z0` restore the original opcode. Patch sequence: snapshot R0–R31, SREG, SP, PC via OCD register file → enter NVMPROG → page-aligned read-modify-write → re-enter OCD → restore registers. Refuse `Z0` in non-FLASH windows with `E22`. Operator opt-out via `monitor avros bp-mode hw-only` (HLR-055) reverts `Z0` to the Phase 1–8 HW-alias behaviour for the server-process lifetime.
+
+3. **`src/monitor.c` — `avarice`-compatible monitor verbs (HLR-055).** Extend `monitor_dispatch()` to recognise the top-level verbs `reset`, `halt`, `go`, `erase`, `chip-erase`, `version`, `bp-mode`, and `help` in addition to the existing `avros` namespace. `monitor erase` / `chip-erase` require a new `--allow-erase` server-launch flag; without it the verb shall reply with an O-packet diagnostic followed by `E22`. `monitor reset` and `monitor chip-erase` shall invalidate the FSM thread cache before issuing silicon side-effects so `qfThreadInfo` is coherent on the next query. `monitor version` emits one O-packet carrying server version, git short SHA, build date, and active family name from HLR-048. `monitor help` emits one O-packet per recognised verb plus a closing `OK`.
+
+4. **`src/gdb_rsp.c` + `src/updi.c` — hardware data watchpoints (HLR-056).** Add `updi_ocd_set_data_bp(int fd, int slot, uint32_t addr, uint32_t length, char kind)` and `updi_ocd_clear_data_bp(int fd, int slot)` mirroring the existing HW-instruction-BP primitives. New `on_insert_wp` / `on_remove_wp` dispatcher slots handle `Z2`/`z2`, `Z3`/`z3`, `Z4`/`z4`. Two simultaneous watchpoints supported (mirrors the two `DABP*` comparators); a third unique-address insert returns `E08`. Stop-reply packets shall append the standard `watch:<addr>;` / `rwatch:<addr>;` / `awatch:<addr>;` key with bit 23 set on the data-space address.
+
+5. **`src/gdb_rsp.c` — memory-map and target-description XML (HLR-057).** Implement `qXfer:memory-map:read` and `qXfer:features:read:target.xml`. Both payloads are generated lazily on first request from `g_device_table[]` and cached for the session. Memory map declares FLASH (`type="flash" blocksize=<page_size>`), SRAM (`type="ram"`), EEPROM, USERROW, FUSES, LOCK, SIGROW (`type="rom"`) regions in the GDB unified address space (bit 23 set for data-space windows). Target description declares one `<feature name="org.gnu.gdb.avr.cpu">` enumerating R0–R31, SREG, SP, PC with their canonical sizes. Extend `qSupported` reply with `qXfer:memory-map:read+;qXfer:features:read+`.
+
+6. **`src/gdb_rsp.c` — extended-remote lifecycle (HLR-058).** Implement `vRun;<elf-path>;...` (re-parse the ELF, rebuild the FSM context, reply with a `T05` at the reset vector), `vAttach;<pid>` (reply `OK` + standard stop-reply; `pid` informational), `vKill;<pid>` (call `updi_run()`, close the GDB client fd, return to listen state without exiting the server). Existing `D` and `k` handlers unchanged. Extend `qSupported` with `multiprocess+;vRun+;vAttach+;vKill+`; remove the `multiprocess-` entry.
+
+7. **`src/gdb_rsp.c` — protocol cleanup (HLR-059).** Add four small handlers: `qC` → `QC<tid>` (or `0` when no selected thread); `qOffsets` → `Text=0;Data=0;Bss=0`; `T<tid>` → `OK` when present in `FsmContext.threads[]`, else `E01`; `R<XX>` → behaves as `monitor reset` followed by `c` and reports the resulting stop packet. No execution-state changes beyond those explicit semantics.
+
+8. **CLI surface.** Add `--allow-erase` to `parse_args()` (gates `monitor erase` / `chip-erase` per item 3). Help and synopsis updated accordingly. The `monitor avros bp-mode hw-only` runtime toggle (item 2) is per-session, not a CLI flag.
+
+9. **Tests — `tests/test_rsp.c`.** Add cases for: vFlashErase rejection of out-of-window addresses; vFlashWrite page accumulation; vFlashDone re-arms OCD and clears both BP shadows; SW-BP install patches the right two bytes and removes restore the originals; HW watchpoint Z2/Z3/Z4 insert/remove path with the two-slot cap returning `E08` on the third; `qXfer:memory-map:read` payload parses as valid XML and lists the expected regions for two different device families; `qXfer:features:read:target.xml` payload validates against the AVR feature schema; `vRun` / `vAttach` / `vKill` lifecycle sequence; `qC` / `qOffsets` / `T<tid>` / `R` minimal handlers.
+
+10. **Tests — `tests/test_monitor.c`.** Add cases for each new verb in HLR-055: `reset`, `halt`, `go`, `chip-erase` (refused without `--allow-erase`, accepted with), `version` (O-packet content), `bp-mode hw-only` and `bp-mode sw` (state toggle visible to subsequent `Z0`), and `help` (one O-packet per known verb plus `OK`).
+
+11. **Tests — `tests/test_updi.c`.** Add cases for `updi_ocd_set_data_bp()` / `_clear_data_bp()` covering both slots, kind=`w`/`r`/`a`, and the OUT-of-data-space rejection path.
+
+12. **Tests — `tests/test_main.c`.** Add a case verifying that `--allow-erase` is parsed into `AppConfig` and forwarded to the monitor dispatcher.
+
+13. **Documentation updates.**
+    - `doc/UserManual.md` — new subsection "Drop-in replacement for `avarice`" listing the supported monitor verbs and the `--allow-erase` flag. Update the breakpoint section: explain HW vs SW BP modes and the `monitor avros bp-mode` toggle.
+    - `doc/avr-updi-gdb.1` — add `--allow-erase` under OPTIONS; document the new monitor verbs under MONITOR COMMANDS.
+    - `README.md` — add "drop-in replacement for `avarice`" to the feature bullets.
+    - SDD §5.x (gdb_rsp.c) and §8.x (monitor.c) — extend the function-interface tables with the new handler entries and the new monitor verbs; SDD overview Phase 10 paragraph already in place.
+
+**Acceptance:**
+- `make test` runs all suites including the extended `test_rsp`, `test_monitor`, `test_updi`, `test_main`; new tests pass.
+- `python3 tools/lint_project.py` reports 0 errors, 0 warnings after every HLR-053 … HLR-059 is traced from at least one new LLR and one new test.
+- Against real hardware: `(gdb) load` from inside an `avr-gdb` session reflashes the target and resumes at the reset vector cleanly. `(gdb) break <func>` × 5 (more than two simultaneous breakpoints) all hit independently. `(gdb) watch <var>` halts on the next write. `(gdb) info mem` shows the FLASH / SRAM / EEPROM / FUSES regions discovered from `qXfer:memory-map:read`. `monitor reset`, `monitor halt`, `monitor version` all behave as documented. A `.gdbinit` written for `avarice` connects to `avrOSdb` and runs to completion with no unsupported-feature warnings.
+
+**Out of scope (explicit, deferred to a later phase):**
+- Non-stop / asynchronous-execution mode (`vCont` already supports the synchronous subset).
+- TLS or authenticated GDB transport.
+- Tracepoints (`QTDP`, `QTStart`, `qTBuffer`).
+- Reverse execution (`bs`, `bc`).
+- Multi-target debugging of more than one physical AVR per server instance.
+
+**Risks.**
+- **SW-breakpoint save/restore correctness across NVMPROG.** Entering NVMPROG resets the CPU; if register snapshot/restore is incomplete the user's execution state is silently corrupted. Mitigation: cover R0–R31, SREG, SP, and PC in the snapshot, and add a Phase-10 regression test that single-steps across a SW-BP install/remove and asserts every GPR is unchanged.
+- **FLASH wear from `Z0` storms.** Some IDEs install and remove the same breakpoint on every step. Mitigation: cache the shadow entry across remove → insert at the same address, performing the FLASH write only on the first install. Document the wear consideration in the user manual.
+- **Memory-map / target-description XML drift.** GDB silently ignores malformed XML and falls back to defaults, so a regression goes undetected. Mitigation: `test_rsp.c` parses both payloads with `libxml2` (or a hand-rolled validator) and asserts the expected regions and registers.
+- **`vRun` semantics on a single-target stub.** GDB's `vRun` expects a fresh process; we re-parse the ELF in place. If the operator passes a fundamentally different ELF (e.g. wrong AVR family) the post-`vRun` register frame will be incoherent. Mitigation: `vRun` shall validate the ELF's e_machine and the per-family family code before accepting the swap, replying `E22` on mismatch.
+
 ## 9. Risks & Open Questions
 
 *   **Half-duplex echo cancellation in UPDI tests.** Every byte transmitted over the UPDI UART is echoed back on the RX line by the hardware. PTY pairs do not auto-echo, so the PTY test harness must explicitly write back the echo bytes before injecting each simulated AVR response. If this is omitted, UPDI functions will block waiting to drain echoes that never arrive, causing PTY tests to time out even though the production logic is correct.
@@ -696,6 +763,7 @@ T-shirt sizes relative to Phase 0.
 | 6 | Installation Targets + Documentation | S/M — Makefile targets are ~30 lines each; RPM spec and `.deb` control boilerplate add moderate complexity; Homebrew formula is straightforward Ruby; most effort is writing user manual and man page prose |
 | 7 | Device-Signature Diagnostic Mode | S — one new UPDI helper, one new CLI flag, a family-name lookup table, a PTY-driven test file; touches only `main.c` and `updi.c`, no protocol changes |
 | 8 | Non-FLASH NVM Programming | M — four new `updi_nvm_write_*` routines mirroring the existing FLASH path, a window-classifier dispatcher in `main.c`, one new CLI flag (`--allow-lock-updi`), and a multi-section ELF fixture; touches `updi.c`, `main.c`, and the test build only |
+| 10 | GDB Protocol Completion (avarice Drop-In Parity) | L — seven new HLRs spanning `vFlash*` flash-load handlers, a true SW-breakpoint path with FLASH save/restore across NVMPROG, two HW data-watchpoint primitives, a runtime memory-map / target-description XML generator, six new generic `monitor` verbs in `src/monitor.c`, extended-remote lifecycle packets (`vRun`/`vAttach`/`vKill`), and four small-protocol cleanup handlers; touches `gdb_rsp.c`, `monitor.c`, `updi.c`, and main wiring |
 
 ## 11. Out-of-Scope Follow-ups
 
