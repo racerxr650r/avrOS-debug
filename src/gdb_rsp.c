@@ -136,6 +136,13 @@ int rsp_accept(int listen_fd)
 
     int one = 1;
     (void)setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+
+    /* Each new GDB session starts in ack mode and must explicitly
+     * negotiate QStartNoAckMode again.  Without this reset, a second
+     * client inherits the previous session's no-ack state, causing
+     * gdb to retry qSupported (no '+' arrives) and eventually parse
+     * its own internal "timeout" token as a feature item.            */
+    g_noack = false;
     return cfd;
 }
 
