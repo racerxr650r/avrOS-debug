@@ -85,7 +85,6 @@ static int g_chip_erase_calls;
 static int g_chip_erase_rc;
 static int g_fsm_invalidate_calls;
 static int g_hw_bp_clear_calls;
-static int g_hw_wp_clear_calls;
 static int g_sw_bp_clear_calls;
 
 int __wrap_updi_enter_debug(int fd)
@@ -109,10 +108,6 @@ void __wrap_rsp_hw_bp_clear_all(struct RspContext *c)
 {
     (void)c; g_hw_bp_clear_calls++;
 }
-void __wrap_rsp_hw_wp_clear_all(struct RspContext *c)
-{
-    (void)c; g_hw_wp_clear_calls++;
-}
 void __wrap_rsp_sw_bp_clear_all(struct RspContext *c)
 {
     (void)c; g_sw_bp_clear_calls++;
@@ -126,7 +121,7 @@ static void hlr055_mock_reset(void)
     g_run_calls = 0;         g_run_rc = 0;
     g_chip_erase_calls = 0;  g_chip_erase_rc = 0;
     g_fsm_invalidate_calls = 0;
-    g_hw_bp_clear_calls = 0; g_hw_wp_clear_calls = 0;
+    g_hw_bp_clear_calls = 0;
     g_sw_bp_clear_calls = 0;
     g_halt_rc = 0;
 }
@@ -453,7 +448,6 @@ void test_verb_reset_pulses_updi_and_clears_shadows(void)
     TEST_ASSERT_EQUAL_INT(0, rc);
     TEST_ASSERT_EQUAL_INT(1, g_enter_debug_calls);
     TEST_ASSERT_EQUAL_INT(1, g_hw_bp_clear_calls);
-    TEST_ASSERT_EQUAL_INT(1, g_hw_wp_clear_calls);
     TEST_ASSERT_EQUAL_INT(0, g_halt_calls);
     free(hex);
 }
@@ -464,15 +458,16 @@ void test_verb_halt_emits_T05_stop_reply_and_suppresses_OK(void)
     RspContext ctx = make_ctx();
     char *hex = hexify("halt");
     int rc = monitor_dispatch_ex(1, &ctx, hex);
-    /* -3 tells the dh_monitor caller to NOT send a trailing OK. */
-    TEST_ASSERT_EQUAL_INT(-3, rc);
+    /* Returns 0 so the dh_monitor caller appends the standard OK reply.
+     * T05 is *not* a valid response to qRcmd — the previous behaviour
+     * caused "Invalid hex digit" parse errors in real avr-gdb. The
+     * `target halted` line is emitted as an O-packet for the user. */
+    TEST_ASSERT_EQUAL_INT(0, rc);
     TEST_ASSERT_EQUAL_INT(1, g_halt_calls);
-    /* Last captured packet must be a T05 stop-reply, not an O-packet. */
+    /* Last captured packet must be an O-packet, not a T05 stop reply. */
     TEST_ASSERT_GREATER_THAN(0, g_packet_count);
     const char *last = g_packets[g_packet_count - 1];
-    TEST_ASSERT_EQUAL_CHAR('T', last[0]);
-    TEST_ASSERT_EQUAL_CHAR('0', last[1]);
-    TEST_ASSERT_EQUAL_CHAR('5', last[2]);
+    TEST_ASSERT_EQUAL_CHAR('O', last[0]);
     free(hex);
 }
 
@@ -514,7 +509,6 @@ void test_verb_erase_allowed_when_flag_set_clears_shadows(void)
     TEST_ASSERT_EQUAL_INT(1, g_chip_erase_calls);
     TEST_ASSERT_EQUAL_INT(1, g_enter_debug_calls);
     TEST_ASSERT_EQUAL_INT(1, g_hw_bp_clear_calls);
-    TEST_ASSERT_EQUAL_INT(1, g_hw_wp_clear_calls);
     free(hex);
 }
 

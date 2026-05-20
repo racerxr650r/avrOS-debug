@@ -86,12 +86,6 @@ static uint32_t mock_hw_bp_silicon[2];
 static int      mock_hw_bp_set_calls;
 static int      mock_hw_bp_clear_calls;
 
-/* HLR-056: OCD data-watchpoint shadow (silicon side). */
-typedef struct { uint32_t addr; uint8_t length; char kind; } MockDataBp;
-static MockDataBp mock_data_bp_silicon[2];
-static int        mock_data_bp_set_calls;
-static int        mock_data_bp_clear_calls;
-
 /* Call-order tracker so we can prove e.g. clear_hw_bp happens before
  * updi_run inside dh_detach.  Records an opaque tag per event. */
 typedef enum {
@@ -281,30 +275,6 @@ int __wrap_updi_ocd_clear_hw_bp(int fd, int idx)
     return 0;
 }
 
-int __wrap_updi_ocd_set_data_bp(int fd, int slot, uint32_t addr,
-                                uint8_t length, char kind)
-{
-    (void)fd;
-    if (slot >= 0 && slot < 2) {
-        mock_data_bp_silicon[slot].addr   = addr;
-        mock_data_bp_silicon[slot].length = length;
-        mock_data_bp_silicon[slot].kind   = kind;
-    }
-    ++mock_data_bp_set_calls;
-    return 0;
-}
-
-int __wrap_updi_ocd_clear_data_bp(int fd, int slot)
-{
-    (void)fd;
-    if (slot >= 0 && slot < 2) {
-        mock_data_bp_silicon[slot].kind = '\0';
-        mock_data_bp_silicon[slot].addr = 0;
-    }
-    ++mock_data_bp_clear_calls;
-    return 0;
-}
-
 int __wrap_fsm_build_thread_list(FsmContext *ctx, const AvrOsSymbolIndex *idx, int updi_fd)
 {
     (void)idx; (void)updi_fd;
@@ -432,8 +402,6 @@ static void reset_mocks(void)
     mock_ocd_status0 = mock_ocd_status1 = 0;
     mock_hw_bp_silicon[0] = mock_hw_bp_silicon[1] = 0xFFFFFFFFu;
     mock_hw_bp_set_calls = mock_hw_bp_clear_calls = 0;
-    memset(mock_data_bp_silicon, 0, sizeof mock_data_bp_silicon);
-    mock_data_bp_set_calls = mock_data_bp_clear_calls = 0;
     mock_event_count = 0;
     mock_ocd_poll_script_idx = mock_ocd_poll_script_len = 0;
     mock_ocd_poll_default = 0;
@@ -661,14 +629,18 @@ static void on_write_mem_M_calls_updi_mem_write_for_sram_address(void)
 static void on_write_mem_X_calls_nvm_write_flash_for_flash_address(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
-    /* GDB FLASH addr 0x100 → updi_nvm_write_flash(0x800100). */
+    /* GDB FLASH addr 0x100 → updi_nvm_flash_patch(0x800100). The X/M
+     * handler routes FLASH writes through the read-modify-write helper
+     * so `(gdb) load` works without page-aligned chunks, matching the
+     * Phase-10 acceptance harness (tests/hw/gdb_acceptance.py G2). */
     rsp_dispatch(sock_pair[1], "X100,2:\x98\x95", &h);
     char stream[64]; drain(sock_pair[0], stream, sizeof stream);
     char payload[64];
     TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
     TEST_ASSERT_EQUAL_STRING("OK", payload);
-    TEST_ASSERT_EQUAL(1, mock_flash_write_count);
-    TEST_ASSERT_EQUAL(0x800100u, mock_flash_writes[0].addr);
+    TEST_ASSERT_EQUAL(1, mock_flash_patch_count);
+    TEST_ASSERT_EQUAL(0x800100u, mock_flash_patches[0].addr);
+    TEST_ASSERT_EQUAL(0, mock_flash_write_count);
 }
 
 /* ── LLR-RSP-07: insert bp (HW comparator) ─────────────────────────── */
@@ -1126,100 +1098,29 @@ static void qSupported_advertises_multiprocess_vRun_vAttach_vKill(void)
     TEST_ASSERT_NULL(strstr(payload, "multiprocess-"));
 }
 
-/* ── HLR-056: Z2/Z3/Z4 data watchpoints (DABP) ───────────────────── */
+/* ── HLR-056: Z2/Z3/Z4 data watchpoints — silicon does not expose
+ *           the hardware over UPDI (see src/updi.h and
+ *           doc/reference/guesswork.md).  Server replies the empty
+ *           packet so GDB falls back to software watchpoints.       */
 
-static void Z2_write_watchpoint_calls_updi_ocd_set_data_bp_with_kind_w(void)
+static void Z2_replies_empty_packet_so_gdb_falls_back_to_sw_watch(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
     rsp_dispatch(sock_pair[1], "Z2,800100,1", &h);
     char stream[64]; drain(sock_pair[0], stream, sizeof stream);
     char payload[32];
     TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
-    TEST_ASSERT_EQUAL_STRING("OK", payload);
-    TEST_ASSERT_EQUAL(1, mock_data_bp_set_calls);
-    TEST_ASSERT_EQUAL('w', mock_data_bp_silicon[0].kind);
-    TEST_ASSERT_EQUAL(0x100u, mock_data_bp_silicon[0].addr);
-    TEST_ASSERT_EQUAL(1, mock_data_bp_silicon[0].length);
+    TEST_ASSERT_EQUAL_STRING("", payload);
 }
 
-static void Z3_read_watchpoint_uses_kind_r(void)
+static void z3_remove_also_replies_empty_packet(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
-    rsp_dispatch(sock_pair[1], "Z3,800200,2", &h);
+    rsp_dispatch(sock_pair[1], "z3,800200,1", &h);
     char stream[64]; drain(sock_pair[0], stream, sizeof stream);
     char payload[32];
     TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
-    TEST_ASSERT_EQUAL_STRING("OK", payload);
-    TEST_ASSERT_EQUAL('r', mock_data_bp_silicon[0].kind);
-    TEST_ASSERT_EQUAL(0x200u, mock_data_bp_silicon[0].addr);
-}
-
-static void Z4_access_watchpoint_uses_kind_a(void)
-{
-    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
-    rsp_dispatch(sock_pair[1], "Z4,800300,4", &h);
-    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
-    char payload[32];
-    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
-    TEST_ASSERT_EQUAL_STRING("OK", payload);
-    TEST_ASSERT_EQUAL('a', mock_data_bp_silicon[0].kind);
-    TEST_ASSERT_EQUAL(0x300u, mock_data_bp_silicon[0].addr);
-}
-
-static void Z2_returns_E08_when_both_wp_slots_full(void)
-{
-    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
-    rsp_dispatch(sock_pair[1], "Z2,800100,1", &h);
-    rsp_dispatch(sock_pair[1], "Z2,800200,1", &h);
-    rsp_dispatch(sock_pair[1], "Z2,800300,1", &h);
-    char stream[256]; drain(sock_pair[0], stream, sizeof stream);
-    /* third reply is the last packet on the wire */
-    char payload[32];
-    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
-    TEST_ASSERT_EQUAL_STRING("E08", payload);
-    TEST_ASSERT_EQUAL(2, mock_data_bp_set_calls);
-}
-
-static void z2_remove_calls_clear_and_clears_shadow(void)
-{
-    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
-    rsp_dispatch(sock_pair[1], "Z2,800100,1", &h);
-    char tmp[64]; drain(sock_pair[0], tmp, sizeof tmp);
-    rsp_dispatch(sock_pair[1], "z2,800100,1", &h);
-    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
-    char payload[32];
-    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
-    TEST_ASSERT_EQUAL_STRING("OK", payload);
-    TEST_ASSERT_EQUAL(1, mock_data_bp_clear_calls);
-    TEST_ASSERT_EQUAL('\0', mock_data_bp_silicon[0].kind);
-    TEST_ASSERT_EQUAL('\0', ctx.hw_wp[0].kind);
-}
-
-static void halt_with_DABP0_bit_appends_watch_suffix(void)
-{
-    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
-    /* Pre-load shadow as if a Z2 had been installed at GDB-side 0x800100. */
-    ctx.hw_wp[0].addr   = 0x800100u;
-    ctx.hw_wp[0].length = 1;
-    ctx.hw_wp[0].kind   = 'w';
-    mock_ocd_status1 = OCD_STATUS1_DABP0;
-    rsp_dispatch(sock_pair[1], "?", &h);
-    char stream[128]; drain(sock_pair[0], stream, sizeof stream);
-    char payload[128];
-    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
-    TEST_ASSERT_NOT_NULL(strstr(payload, "watch:800100;"));
-}
-
-static void detach_clears_data_watchpoints_in_silicon(void)
-{
-    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
-    rsp_dispatch(sock_pair[1], "Z3,800400,1", &h);
-    char tmp[64]; drain(sock_pair[0], tmp, sizeof tmp);
-    int set_before_detach = mock_data_bp_set_calls;
-    rsp_dispatch(sock_pair[1], "D", &h);
-    TEST_ASSERT_EQUAL(1, set_before_detach);
-    TEST_ASSERT_GREATER_THAN(0, mock_data_bp_clear_calls);
-    TEST_ASSERT_EQUAL('\0', mock_data_bp_silicon[0].kind);
+    TEST_ASSERT_EQUAL_STRING("", payload);
 }
 
 /* ── HLR-053: vFlashErase / vFlashWrite / vFlashDone — (gdb) load ─── */
@@ -1535,13 +1436,8 @@ int main(void)
     RUN_TEST(vAttach_halts_target_and_emits_stop_reply);
     RUN_TEST(vKill_sets_quit_and_replies_ok);
     RUN_TEST(qSupported_advertises_multiprocess_vRun_vAttach_vKill);
-    RUN_TEST(Z2_write_watchpoint_calls_updi_ocd_set_data_bp_with_kind_w);
-    RUN_TEST(Z3_read_watchpoint_uses_kind_r);
-    RUN_TEST(Z4_access_watchpoint_uses_kind_a);
-    RUN_TEST(Z2_returns_E08_when_both_wp_slots_full);
-    RUN_TEST(z2_remove_calls_clear_and_clears_shadow);
-    RUN_TEST(halt_with_DABP0_bit_appends_watch_suffix);
-    RUN_TEST(detach_clears_data_watchpoints_in_silicon);
+    RUN_TEST(Z2_replies_empty_packet_so_gdb_falls_back_to_sw_watch);
+    RUN_TEST(z3_remove_also_replies_empty_packet);
     /* HLR-053: vFlashErase / vFlashWrite / vFlashDone (`gdb load`). */
     RUN_TEST(vFlashErase_allocates_buffer_and_replies_ok_for_flash_range);
     RUN_TEST(vFlashErase_E22_for_data_space_address);

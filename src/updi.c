@@ -1121,66 +1121,12 @@ int updi_ocd_clear_hw_bp(int fd, int idx)
     return 0;
 }
 
-/* HLR-056: data-watchpoint comparator pair.  Two slots, each driven
- * by a 16-bit data-space byte address in OCD_DABPx and an enable /
- * kind selector in OCD_CTRL2.  `length` is informational on AVR-Dx
- * silicon (a single byte triggers); we pass it through unchanged so
- * the GDB stop-key reflects the requested span.                     */
-int updi_ocd_set_data_bp(int fd, int slot, uint32_t addr,
-                         uint8_t length, char kind)
-{
-    (void)length;
-    uint32_t base;
-    uint8_t  en_bit, r_bit, w_bit;
-    if (slot == 0) {
-        base = OCD_DABP0;
-        en_bit = OCD_CTRL2_DABP0_EN;
-        r_bit  = OCD_CTRL2_DABP0_R;
-        w_bit  = OCD_CTRL2_DABP0_W;
-    } else if (slot == 1) {
-        base = OCD_DABP1;
-        en_bit = OCD_CTRL2_DABP1_EN;
-        r_bit  = OCD_CTRL2_DABP1_R;
-        w_bit  = OCD_CTRL2_DABP1_W;
-    } else {
-        return -1;
-    }
-
-    /* Data-space addresses on AVR-Dx fit in 16 bits. */
-    if (updi_sts8(fd, base,     (uint8_t)( addr        & 0xFFu)) < 0) return -1;
-    if (updi_sts8(fd, base + 1, (uint8_t)((addr >> 8u) & 0xFFu)) < 0) return -1;
-
-    uint8_t c2 = 0;
-    if (updi_lds8(fd, OCD_CTRL2, &c2) < 0) return -1;
-    /* Clear this slot's previous configuration, then set enable + kind. */
-    c2 = (uint8_t)(c2 & (uint8_t)~(en_bit | r_bit | w_bit));
-    c2 = (uint8_t)(c2 | en_bit);
-    if (kind == 'r' || kind == 'a') c2 = (uint8_t)(c2 | r_bit);
-    if (kind == 'w' || kind == 'a') c2 = (uint8_t)(c2 | w_bit);
-    if (updi_sts8(fd, OCD_CTRL2, c2) < 0) return -1;
-    return 0;
-}
-
-int updi_ocd_clear_data_bp(int fd, int slot)
-{
-    uint8_t en_bit, r_bit, w_bit;
-    if (slot == 0) {
-        en_bit = OCD_CTRL2_DABP0_EN;
-        r_bit  = OCD_CTRL2_DABP0_R;
-        w_bit  = OCD_CTRL2_DABP0_W;
-    } else if (slot == 1) {
-        en_bit = OCD_CTRL2_DABP1_EN;
-        r_bit  = OCD_CTRL2_DABP1_R;
-        w_bit  = OCD_CTRL2_DABP1_W;
-    } else {
-        return -1;
-    }
-    uint8_t c2 = 0;
-    if (updi_lds8(fd, OCD_CTRL2, &c2) < 0) return -1;
-    c2 = (uint8_t)(c2 & (uint8_t)~(en_bit | r_bit | w_bit));
-    if (updi_sts8(fd, OCD_CTRL2, c2) < 0) return -1;
-    return 0;
-}
+/* NOTE: AVR-Dx OCD over UPDI does not expose data-address watchpoint
+ * hardware.  The previous updi_ocd_{set,clear}_data_bp() entry points
+ * wrote to fabricated registers (OCD+0x07/0x0A/0x0E) that the
+ * exhaustive FF-bomb in doc/reference/guesswork.md proved are not
+ * backed by silicon.  GDB Z2/Z3/Z4 packets now reply with the empty
+ * packet and avr-gdb transparently uses software watchpoints.       */
 
 /* Forward decl: defined later in this file, used by updi_nvm_write_flash. */
 static int nvm_erase_page(int fd, uint32_t page_addr);

@@ -18,6 +18,10 @@
 #                HW_TEST_NVM_CONFIRM=YES
 #   hw-test-rsp  Spawn the RSP server and probe it over TCP; requires
 #                HW_TEST_ELF=path/to/fw.elf
+#   hw-test-gdb  Full-stack acceptance: spawn avrOSdb, drive avr-gdb
+#                through load/break/watch/monitor/detach. Destructive
+#                (reflashes the target); requires HW_TEST_NVM_CONFIRM=YES
+#                and a working `avr-gdb` on PATH.
 #   hw-test-all  Run all hw-test groups (needs both opt-ins above)
 #   clean        Remove all build artefacts
 #   check-tools  Verify all required host tools are present on PATH
@@ -159,7 +163,8 @@ AVR_CFLAGS := -mmcu=$(AVR_MCU) $(DFP_FLAGS) -Os -g
 FIXTURE_SRCS   := $(FIXTUREDIR)/avros_full.c \
                   $(FIXTUREDIR)/avros_partial.c \
                   $(FIXTUREDIR)/avros_break.c \
-                  $(FIXTUREDIR)/all_nvm.c
+                  $(FIXTUREDIR)/all_nvm.c \
+                  $(FIXTUREDIR)/gdb_target.c
 FIXTURE_ELFS   := $(patsubst $(FIXTUREDIR)/%.c,$(FIXBINDIR)/%.elf,$(FIXTURE_SRCS))
 
 # LLR-MAIN-13 hardware fixture — built with -mmcu=avr64dd32 so the ELF
@@ -203,7 +208,7 @@ TEST_WRAP_test_monitor  := updi_mem_read rsp_send_packet \
                             updi_enter_debug updi_halt updi_run \
                             updi_chip_erase \
                             fsm_invalidate fsm_get_active_thread \
-                            rsp_hw_bp_clear_all rsp_hw_wp_clear_all \
+                            rsp_hw_bp_clear_all \
                             rsp_sw_bp_clear_all
 TEST_EXTRA_LDFLAGS_test_monitor :=
 
@@ -222,7 +227,6 @@ TEST_WRAP_test_rsp  := updi_mem_read updi_mem_write updi_halt updi_run updi_step
                        updi_ocd_read_sp updi_ocd_write_sp \
                        updi_ocd_read_pc updi_ocd_write_pc \
                        updi_ocd_set_hw_bp updi_ocd_clear_hw_bp \
-                       updi_ocd_set_data_bp updi_ocd_clear_data_bp \
                        fsm_build_thread_list fsm_get_registers \
                        fsm_get_active_thread fsm_invalidate \
                        monitor_dispatch monitor_dispatch_ex
@@ -240,7 +244,7 @@ TEST_WRAP_test_main  := updi_open updi_close updi_console_poll \
                         updi_nvm_read updi_probe_baud updi_crc32 \
                         updi_format_fuses updi_set_nvm_progress \
                         rsp_listen rsp_accept rsp_close \
-                        rsp_recv_packet rsp_dispatch \
+                        rsp_recv_packet rsp_dispatch rsp_dispatch_n \
                         rsp_default_handlers \
                         elf_open elf_find_avros_tables elf_close \
                         fsm_build_thread_list select
@@ -266,7 +270,7 @@ TEST_WRAP_test_device  := select updi_open updi_close \
                           updi_nvm_write_flash updi_console_poll \
                           updi_probe_baud updi_nvm_read \
                           rsp_listen rsp_accept rsp_close \
-                          rsp_recv_packet rsp_dispatch \
+                          rsp_recv_packet rsp_dispatch rsp_dispatch_n \
                           rsp_default_handlers \
                           elf_open elf_close elf_find_avros_tables \
                           fsm_build_thread_list
@@ -505,7 +509,7 @@ $(HW_TEST_BIN): $(HW_TEST_SRC) $(BUILDDIR)/updi.o
 	$(Q)$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $^ $(LUTIL)
 	@echo "  LD  $@"
 
-.PHONY: hw-test hw-test-nvm hw-test-rsp hw-test-all
+.PHONY: hw-test hw-test-nvm hw-test-rsp hw-test-gdb hw-test-all
 hw-test: $(HW_TEST_BIN)
 	$(Q)$(HW_ENV) $(HW_TEST_BIN)
 
@@ -529,6 +533,28 @@ hw-test-rsp: $(HW_TEST_BIN) all
 	    exit 1; \
 	fi
 	$(Q)$(HW_ENV) $(HW_TEST_BIN) --with-rsp
+
+# Full-stack GDB acceptance (Group G, Phase 10 — avarice feature parity).
+# Spawns build/avrOSdb, drives a real avr-gdb -batch session through the
+# acceptance script, validates load/break/watch/monitor/detach. DESTRUCTIVE:
+# `(gdb) load` reprograms FLASH from build/fixtures/gdb_target.elf.
+HW_GDB_ELF ?= $(FIXBINDIR)/gdb_target.elf
+hw-test-gdb: $(FIXBINDIR)/gdb_target.elf all
+	@if [ "$(HW_TEST_NVM_CONFIRM)" != "YES" ]; then \
+	    echo "hw-test-gdb: refused — set HW_TEST_NVM_CONFIRM=YES to confirm"; \
+	    echo "             (this reflashes the target via `(gdb) load`)"; \
+	    exit 1; \
+	fi
+	@if ! command -v avr-gdb >/dev/null 2>&1; then \
+	    echo "hw-test-gdb: required tool not found: avr-gdb" >&2; \
+	    exit 1; \
+	fi
+	$(Q)HW_PORT='$(HW_PORT)' HW_RSP_PORT='$(if $(HW_RSP_PORT),$(HW_RSP_PORT),1234)' \
+	    python3 tests/hw/gdb_acceptance.py \
+	        --port      '$(HW_PORT)' \
+	        --rsp-port  '$(if $(HW_RSP_PORT),$(HW_RSP_PORT),1234)' \
+	        --elf       '$(HW_GDB_ELF)' \
+	        --avros-bin '$(BUILDDIR)/$(TARGET)'
 
 # Run Groups A + B + C + D in one go. NVM still requires explicit confirm.
 hw-test-all: $(HW_TEST_BIN) $(FIXBINDIR)/all_nvm.elf all

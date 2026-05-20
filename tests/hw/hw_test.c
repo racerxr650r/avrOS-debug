@@ -1275,7 +1275,9 @@ static void run_groupD(const HwCfg *cfg)
         }
     }
 
-    /* D7: Z2/z2 SRAM data-access watchpoint set+clear (HLR-056). */
+    /* D7: Z2/z2 must reply the empty packet — UPDI silicon does not expose
+     *     data watchpoints (HLR-056). GDB then falls back to software
+     *     watchpoints transparently. */
     drain_socket(sock);
     t0 = now_ms();
     {
@@ -1288,16 +1290,18 @@ static void run_groupD(const HwCfg *cfg)
         if (send_rsp(sock, z2pkt) == 0) {
             n = read_rsp_packet(sock, buf, sizeof buf, 1500);
             if (n > 0 && rsp_payload(buf, n, &pay, &paylen) == 0 &&
-                paylen == 2 && memcmp(pay, "OK", 2) == 0) ok = 1;
+                paylen == 0) ok = 1;
         }
         drain_socket(sock);
         if (ok && send_rsp(sock, zz2pkt) == 0) {
             n = read_rsp_packet(sock, buf, sizeof buf, 1500);
             if (!(n > 0 && rsp_payload(buf, n, &pay, &paylen) == 0 &&
-                  paylen == 2 && memcmp(pay, "OK", 2) == 0)) ok = 0;
+                  paylen == 0)) ok = 0;
         }
-        if (ok) report_pass("D7", "Z2/z2 SRAM watchpoint", now_ms() - t0);
-        else    report_fail("D7", "Z2/z2 SRAM watchpoint", "non-OK reply");
+        if (ok) report_pass("D7", "Z2/z2 replies empty (unsupported)",
+                            now_ms() - t0);
+        else    report_fail("D7", "Z2/z2 replies empty (unsupported)",
+                            "non-empty reply");
     }
 
     /* D8: vRun reload returns a T-stop packet (HLR-058). */

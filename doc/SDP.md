@@ -685,7 +685,7 @@ Exact base addresses are part-specific; the dispatcher classifies segments by ad
 | Flash programming from GDB session | `vFlashErase`, `vFlashWrite`, `vFlashDone` | `gdb_rsp.c`, `updi.c` (reuse Phase 8 NVM path) | HLR-053 |
 | True software breakpoints via flash `BREAK` opcode | `Z0`/`z0` (real, not aliased) | `gdb_rsp.c`, `updi.c` | HLR-054 |
 | `avarice`-compatible monitor verbs | `monitor reset/halt/go/erase/chip-erase/version/bp-mode/help` | `monitor.c` | HLR-055 |
-| Hardware data watchpoints | `Z2`/`Z3`/`Z4` (+ matching `z*`) | `gdb_rsp.c`, `updi.c` (new `updi_ocd_set_data_bp()`) | HLR-056 |
+| Hardware data watchpoints | `Z2`/`Z3`/`Z4` (+ matching `z*`) | `gdb_rsp.c` (empty-packet reply; silicon does not expose data-WPs) | HLR-056 |
 | Extended-remote lifecycle | `vRun`, `vAttach`, `vKill` + `multiprocess+` | `gdb_rsp.c` | HLR-058 |
 | Protocol cleanup | `qC`, `qOffsets`, `T<tid>`, `R<XX>` | `gdb_rsp.c` | HLR-059 |
 
@@ -695,7 +695,7 @@ Exact base addresses are part-specific; the dispatcher classifies segments by ad
 
 3. **`src/monitor.c` — `avarice`-compatible monitor verbs (HLR-055).** Extend `monitor_dispatch()` to recognise the top-level verbs `reset`, `halt`, `go`, `erase`, `chip-erase`, `version`, `bp-mode`, and `help` in addition to the existing `avros` namespace. `monitor erase` / `chip-erase` require a new `--allow-erase` server-launch flag; without it the verb shall reply with an O-packet diagnostic followed by `E22`. `monitor reset` and `monitor chip-erase` shall invalidate the FSM thread cache before issuing silicon side-effects so `qfThreadInfo` is coherent on the next query. `monitor version` emits one O-packet carrying server version, git short SHA, build date, and active family name from HLR-048. `monitor help` emits one O-packet per recognised verb plus a closing `OK`.
 
-4. **`src/gdb_rsp.c` + `src/updi.c` — hardware data watchpoints (HLR-056).** Add `updi_ocd_set_data_bp(int fd, int slot, uint32_t addr, uint32_t length, char kind)` and `updi_ocd_clear_data_bp(int fd, int slot)` mirroring the existing HW-instruction-BP primitives. New `on_insert_wp` / `on_remove_wp` dispatcher slots handle `Z2`/`z2`, `Z3`/`z3`, `Z4`/`z4`. Two simultaneous watchpoints supported (mirrors the two `DABP*` comparators); a third unique-address insert returns `E08`. Stop-reply packets shall append the standard `watch:<addr>;` / `rwatch:<addr>;` / `awatch:<addr>;` key with bit 23 set on the data-space address.
+4. **`src/gdb_rsp.c` — data watchpoints reply empty packet (HLR-056).** During Phase-10 hardware bring-up the planned `updi_ocd_set_data_bp()` / `_clear_data_bp()` primitives and the speculative `OCD_DABP*` / `OCD_CTRL2` register addresses were demonstrated to be ineffective: writes succeed at the UPDI level but the silicon never halts on a matching access. An exhaustive FF-bomb (see `doc/reference/guesswork.md`) finds no writable bits at the fabricated offsets, and three independent reference debuggers — Bloom, `feline-felicity/avr-absurd` (same SerialUPDI architecture), and Microchip's own `mraardvark/pyavrdebug` (CMSIS-DAP / Atmel-ICE stack) — all confirm no data-watchpoint hardware is exposed over UPDI. `pyavrdebug` in particular replies the empty packet (`$#00`) to Z2/Z3/Z4 in its `Z`-packet handler, which is the exact behaviour adopted here. The `dh_insert_bp()` / `dh_remove_bp()` handlers therefore reply the empty packet for `Z[234]` / `z[234]`; GDB transparently falls back to software watchpoints (single-step + memory poll). No watchpoint capability is advertised in `qSupported`. The fabricated `DABP0` / `DABP1` / `CTRL2` register defines and the two UPDI primitives are removed.
 
 5. **`src/gdb_rsp.c` — extended-remote lifecycle (HLR-058).** Implement `vRun;<elf-path>;...` (re-parse the ELF, rebuild the FSM context, reply with a `T05` at the reset vector), `vAttach;<pid>` (reply `OK` + standard stop-reply; `pid` informational), `vKill;<pid>` (call `updi_run()`, close the GDB client fd, return to listen state without exiting the server). Existing `D` and `k` handlers unchanged. Extend `qSupported` with `multiprocess+;vRun+;vAttach+;vKill+`; remove the `multiprocess-` entry.
 
@@ -703,11 +703,11 @@ Exact base addresses are part-specific; the dispatcher classifies segments by ad
 
 7. **CLI surface.** Add `--allow-erase` to `parse_args()` (gates `monitor erase` / `chip-erase` per item 3). Help and synopsis updated accordingly. The `monitor avros bp-mode hw-only` runtime toggle (item 2) is per-session, not a CLI flag.
 
-8. **Tests — `tests/test_rsp.c`.** Add cases for: vFlashErase rejection of out-of-window addresses; vFlashWrite page accumulation; vFlashDone re-arms OCD and clears both BP shadows; SW-BP install patches the right two bytes and removes restore the originals; HW watchpoint Z2/Z3/Z4 insert/remove path with the two-slot cap returning `E08` on the third; `vRun` / `vAttach` / `vKill` lifecycle sequence; `qC` / `qOffsets` / `T<tid>` / `R` minimal handlers.
+8. **Tests — `tests/test_rsp.c`.** Add cases for: vFlashErase rejection of out-of-window addresses; vFlashWrite page accumulation; vFlashDone re-arms OCD and clears the BP shadow; SW-BP install patches the right two bytes and removes restore the originals; `Z2`/`z3` reply the empty RSP packet (unsupported — HLR-056); `vRun` / `vAttach` / `vKill` lifecycle sequence; `qC` / `qOffsets` / `T<tid>` / `R` minimal handlers.
 
 9. **Tests — `tests/test_monitor.c`.** Add cases for each new verb in HLR-055: `reset`, `halt`, `go`, `chip-erase` (refused without `--allow-erase`, accepted with), `version` (O-packet content), `bp-mode hw-only` and `bp-mode sw` (state toggle visible to subsequent `Z0`), and `help` (one O-packet per known verb plus `OK`).
 
-10. **Tests — `tests/test_updi.c`.** Add cases for `updi_ocd_set_data_bp()` / `_clear_data_bp()` covering both slots, kind=`w`/`r`/`a`, and the OUT-of-data-space rejection path.
+10. **Tests — `tests/test_updi.c`.** No new cases for data watchpoints (HLR-056 is implemented entirely in `gdb_rsp.c` as an empty-packet reply; no UPDI primitive exists).
 
 11. **Tests — `tests/test_main.c`.** Add a case verifying that `--allow-erase` is parsed into `AppConfig` and forwarded to the monitor dispatcher.
 
@@ -720,7 +720,7 @@ Exact base addresses are part-specific; the dispatcher classifies segments by ad
 **Acceptance:**
 - `make test` runs all suites including the extended `test_rsp`, `test_monitor`, `test_updi`, `test_main`; new tests pass.
 - `python3 tools/lint_project.py` reports 0 errors, 0 warnings after every HLR-053 … HLR-059 is traced from at least one new LLR and one new test.
-- Against real hardware: `(gdb) load` from inside an `avr-gdb` session reflashes the target and resumes at the reset vector cleanly. `(gdb) break <func>` × 5 (more than two simultaneous breakpoints) all hit independently. `(gdb) watch <var>` halts on the next write. `monitor reset`, `monitor halt`, `monitor version` all behave as documented. An `avr-gdb` session targeting `avrOSdb` exercises the same workflow (attach → load → run → break → watch → monitor → detach) that an `avarice`-based session does, even if the literal `.gdbinit` text differs.
+- Against real hardware: `(gdb) load` from inside an `avr-gdb` session reflashes the target and resumes at the reset vector cleanly. `(gdb) break <func>` × 5 (more than two simultaneous breakpoints) all hit independently. `(gdb) watch <var>` halts on the next write — GDB transparently uses software watchpoints (single-step + memory poll) because UPDI silicon exposes no data-watchpoint hardware (HLR-056). `monitor reset`, `monitor halt`, `monitor version` all behave as documented. An `avr-gdb` session targeting `avrOSdb` exercises the same workflow (attach → load → run → break → watch → monitor → detach) that an `avarice`-based session does, even if the literal `.gdbinit` text differs.
 
 **Out of scope (explicit, deferred to a later phase):**
 - Non-stop / asynchronous-execution mode (`vCont` already supports the synchronous subset).
@@ -759,7 +759,7 @@ T-shirt sizes relative to Phase 0.
 | 6 | Installation Targets + Documentation | S/M — Makefile targets are ~30 lines each; RPM spec and `.deb` control boilerplate add moderate complexity; Homebrew formula is straightforward Ruby; most effort is writing user manual and man page prose |
 | 7 | Device-Signature Diagnostic Mode | S — one new UPDI helper, one new CLI flag, a family-name lookup table, a PTY-driven test file; touches only `main.c` and `updi.c`, no protocol changes |
 | 8 | Non-FLASH NVM Programming | M — four new `updi_nvm_write_*` routines mirroring the existing FLASH path, a window-classifier dispatcher in `main.c`, one new CLI flag (`--allow-lock-updi`), and a multi-section ELF fixture; touches `updi.c`, `main.c`, and the test build only |
-| 10 | GDB Protocol Completion (avarice Feature Parity) | L — six new HLRs spanning `vFlash*` flash-load handlers, a true SW-breakpoint path with FLASH save/restore across NVMPROG, two HW data-watchpoint primitives, six new generic `monitor` verbs in `src/monitor.c`, extended-remote lifecycle packets (`vRun`/`vAttach`/`vKill`), and four small-protocol cleanup handlers; touches `gdb_rsp.c`, `monitor.c`, `updi.c`, and main wiring |
+| 10 | GDB Protocol Completion (avarice Feature Parity) | L — six new HLRs spanning `vFlash*` flash-load handlers, a true SW-breakpoint path with FLASH save/restore across NVMPROG, empty-packet reply for data watchpoints (silicon does not expose the hardware — HLR-056), six new generic `monitor` verbs in `src/monitor.c`, extended-remote lifecycle packets (`vRun`/`vAttach`/`vKill`), and four small-protocol cleanup handlers; touches `gdb_rsp.c`, `monitor.c`, `updi.c`, and main wiring |
 
 ## 11. Out-of-Scope Follow-ups
 

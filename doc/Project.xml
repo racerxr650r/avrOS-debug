@@ -62,7 +62,7 @@ The following protocol features and monitor commands are in scope; each is justi
 
 * **Flash programming from the GDB session (`vFlashErase`, `vFlashWrite`, `vFlashDone`).** Implements `(gdb) load` so a developer can rebuild and reflash without exiting `avr-gdb`. The handlers shall reuse the existing `updi_nvm_*` page primitives in `src/updi.c`; on `vFlashDone` the application shall re-enter OCD via `updi_enter_debug()` and present the post-load CPU as halted at reset for the next `c`/`s`. `vFlashErase` requests outside the on-target FLASH window (i.e. into EEPROM/USERROW/FUSES) shall be rejected with `E22` rather than silently corrupting non-FLASH NVM, because `gdb load` has no per-section verb to disambiguate.
 * **Software breakpoints via flash `BREAK` opcode (`Z0`/`z0` true SW BP).** Phase 1–8 aliases `Z0` to the two OCD hardware comparators (HLR-016), capping the user at two simultaneous breakpoints. Phase 10 adds a true software-breakpoint path that patches the AVR `BREAK` opcode (`0x9598`) into the affected FLASH page, with a per-session shadow map of `(address, original 2-byte opcode)` so `z0` restores the original instruction on remove. The save/patch/restore sequence shall preserve live register, SREG, and SP state across the unavoidable NVMPROG enter/exit (which issues a CPU reset). Implementation shall reuse the page-aligned read-modify-write helper from `src/updi.c`. When the operator opts out via `monitor avros bp-mode hw-only`, `Z0` continues to alias to the HW comparators (the Phase 1–8 behaviour).
-* **Hardware data watchpoints (`Z2`/`Z3`/`Z4`, `z2`/`z3`/`z4`).** Exposes the AVR-Dx OCD data-address comparators (`DABP0`, `DABP1`) as GDB write (`Z2`), read (`Z3`), and access (`Z4`) watchpoints. Implementation lives in `src/updi.c` (new `updi_ocd_set_data_bp()` / `_clear_data_bp()` primitives) and `src/gdb_rsp.c` (new `on_insert_wp`/`on_remove_wp` handler slots). Watchpoint hits shall be reported in the stop-reply packet with the standard `T05watch:<addr>;` / `rwatch` / `awatch` keys so the IDE displays the offending address.
+* **Hardware data watchpoints (`Z2`/`Z3`/`Z4`, `z2`/`z3`/`z4`).** Originally scoped to expose on-silicon data-address comparators, but the FF-bomb experiment in `doc/reference/guesswork.md` and cross-checks against Bloom, `feline-felicity/avr-absurd`, and Microchip's own `pyavrdebug` (CMSIS-DAP stack) all confirm the AVR-Dx UPDI OCD exposes no data-watchpoint hardware. The server therefore replies the empty RSP packet (`$#00`) to Z2/Z3/Z4 — the documented "unsupported" signal — and GDB falls back transparently to software watchpoints (single-step + memory poll). The user-visible `watch <expr>` command continues to work; no `qSupported` capability is advertised.
 * **Standard GDB monitor commands.** The `monitor avros` namespace is kept (and remains the home for FSM-specific introspection); Phase 10 adds an `avarice`-compatible top-level set of monitor verbs: `monitor reset` (issue `updi_reset()` and halt), `monitor halt` (call `updi_halt()`), `monitor go` (call `updi_run()`), `monitor erase` / `monitor chip-erase` (CHIPERASE via `updi_chip_erase()`, refused unless the session was opened with `--allow-erase`), `monitor version` (print server version, git hash, and target family), and `monitor help` (list every known verb). Implementation lives in `src/monitor.c`; the dispatcher shall continue to route the `avros` prefix to the existing avrOS-specific handlers, falling through to the new generic handlers for any other verb.
 * **Extended-remote lifecycle and protocol cleanup.** Implements `vRun`/`vAttach`/`vKill` so an IDE can launch and relaunch the debug target from one persistent GDB session (`target extended-remote` semantics), and fills in the small standard packets that `avarice` answers but Phase 1–8 leaves as empty replies: `qC` (current thread), `qOffsets` (returns zeros for our position-independent reset vector), `T<tid>` (is-thread-alive), and `R` (RCmd restart, equivalent to `monitor reset` + `c`). These are individually trivial but cumulatively eliminate the "selected thread is gone" and "unsupported feature" spurious warnings that some IDE configurations promote to errors.
 
@@ -1633,10 +1633,9 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-056" name="Hardware Data Watchpoints">
-        <text><![CDATA[The application shall implement GDB watchpoint packets `Z2`/`z2` (write), `Z3`/`z3` (read), and `Z4`/`z4` (access) by programming the AVR-Dx OCD data-address comparator pair `DABP0`/`DABP1`. Up to two simultaneous watchpoints shall be supported, mirroring the two-comparator hardware limit; a third unique-address insert shall reply `E08`. A per-session shadow array `RspContext.hw_wp[]` shall record `(addr, length, kind)` for each programmed comparator so `z*` is exact and detach restores silicon to the unarmed state. The new UPDI primitives `updi_ocd_set_data_bp(slot, addr, length, kind)` and `updi_ocd_clear_data_bp(slot)` shall live alongside the existing `updi_ocd_set_hw_bp()` / `_clear_hw_bp()` so the OCD register accesses are kept in one module. On a watchpoint trigger the stop-reply packet shall carry the standard GDB stop-key `watch:<addr>;` (write), `rwatch:<addr>;` (read), or `awatch:<addr>;` (access) appended to the `T05thread:<id>;` payload so the IDE highlights the responsible address; the address shall be the GDB-side data-space address (UPDI byte address ORed with `0x800000`).]]></text>
+        <text><![CDATA[The application shall reply with the empty RSP packet (`$#00`) to the GDB watchpoint requests `Z2`/`z2` (write), `Z3`/`z3` (read), and `Z4`/`z4` (access). The empty reply is the documented RSP signal for "feature unsupported" and causes GDB to fall back transparently to software watchpoints (single-step + memory poll), so the user-visible `watch <expr>` command continues to work. The empty-packet behaviour reflects a silicon constraint: the AVR-Dx OCD exposed over UPDI provides only the program-counter breakpoint comparators (`OCD_BP0A` / `OCD_BP1A`) and does NOT expose any data-address comparator hardware. The conclusion is confirmed by four independent sources: (1) the FF-bomb experiment in `doc/reference/guesswork.md`, which finds writable bits only at `BP0A`, `BP1A`, `CTRL0`, `CTRL1`, `STATUS0/1`, `INSN0/1`, `PC`, `SP`, `SREG`, and the register file; (2) the canonical open-source AVR debugger Bloom, whose UPDI driver declares `hardwareBreakpoints=1` and exposes no `setDataWatchpoint` method; (3) the sibling SerialUPDI debugger `feline-felicity/avr-absurd`, whose feature list documents "Two hardware breakpoints" and no watchpoints; and (4) Microchip's own `mraardvark/pyavrdebug` (CMSIS-DAP / Atmel-ICE stack), whose Z-packet handler explicitly replies the empty packet for Z2/Z3/Z4 — i.e. even the proprietary EDBG protocol over a debugger pod does not expose data watchpoints. The server shall not advertise any watchpoint-related capability in its `qSupported` reply.]]></text>
         <traces>
           <trace target="SDD" ref="5.3.1"/>
-          <trace target="SDD" ref="4.3.1"/>
         </traces>
       </hlr>
 
@@ -2238,35 +2237,7 @@ Errors are propagated upward through the module stack without retrying:
       </llr>
 
       <llr id="LLR-RSP-27">
-        <text><![CDATA[`updi_ocd_set_data_bp(fd, slot, addr, length, kind)` shall program one of the two OCD data-address breakpoint comparators (`slot` ∈ {0,1}) by writing the 16-bit `addr` to `OCD_DABP0`/`OCD_DABP1` and then read-modify-writing `OCD_CTRL2` to clear that slot's `EN/R/W` bits and OR in `EN` plus the `R` bit (for `kind=='r'` or `'a'`) and/or the `W` bit (for `kind=='w'` or `'a'`). The function shall return -1 on an invalid slot or any UPDI bus error and 0 on success. `length` is recorded by callers for stop-reply formatting only; the silicon comparator matches the configured address regardless of access width.]]></text>
-        <traces>
-          <trace target="HLR" ref="HLR-056" name="GDB watchpoints (Z2/Z3/Z4)"/>
-        </traces>
-      </llr>
-
-      <llr id="LLR-RSP-28">
-        <text><![CDATA[`updi_ocd_clear_data_bp(fd, slot)` shall disable one DABP comparator by read-modify-writing `OCD_CTRL2` to clear the slot's `EN/R/W` bits. The address registers (`OCD_DABPx`) are left untouched. The operation is idempotent: clearing an already-cleared slot returns 0. Returns -1 on UPDI bus error.]]></text>
-        <traces>
-          <trace target="HLR" ref="HLR-056" name="GDB watchpoints (Z2/Z3/Z4)"/>
-        </traces>
-      </llr>
-
-      <llr id="LLR-RSP-29">
-        <text><![CDATA[The `dh_insert_bp()` handler shall accept GDB watchpoint requests of the form `Z[234],<addr>[,<length>]` where `Z2` is a write watchpoint (`kind='w'`), `Z3` is a read watchpoint (`kind='r'`), and `Z4` is an access watchpoint (`kind='a'`). The handler shall be idempotent — if `RspContext.hw_wp[]` already contains a slot whose `addr` and `kind` both match the request, it replies `OK` without re-programming silicon. Otherwise it searches for a free slot (`kind=='\0'`); if both slots are occupied it replies `E08`. On a free slot it calls `updi_ocd_set_data_bp(slot, addr & GDB_AVR_ADDR_MASK, length, kind)`, updates `ctx->hw_wp[slot]` shadow, and replies `OK`. A UPDI failure replies `E01`.]]></text>
-        <traces>
-          <trace target="HLR" ref="HLR-056" name="GDB watchpoints (Z2/Z3/Z4)"/>
-        </traces>
-      </llr>
-
-      <llr id="LLR-RSP-30">
-        <text><![CDATA[The `dh_remove_bp()` handler shall accept `z[234],<addr>[,<length>]`, locate the matching `RspContext.hw_wp[]` slot by `addr`, call `updi_ocd_clear_data_bp(slot)`, clear the shadow entry (`kind='\0'`), and reply `OK`. An unknown address shall also reply `OK` to tolerate GDB re-sync. The `dh_detach()` handler shall additionally invoke `hw_wp_clear_all(ctx)` for the `D` branch so the silicon DABP comparators are released along with the HW BPs before the CPU is resumed.]]></text>
-        <traces>
-          <trace target="HLR" ref="HLR-056" name="GDB watchpoints (Z2/Z3/Z4)"/>
-        </traces>
-      </llr>
-
-      <llr id="LLR-RSP-31">
-        <text><![CDATA[After a halt, `dh_halt_reason()` and the post-halt stop-reply branch of `dh_continue()` shall call `append_watch_suffix()`, which reads `OCD_STATUS1` and tests `OCD_STATUS1_DABP0` / `OCD_STATUS1_DABP1`. If a DABP bit is set, the function selects the corresponding `ctx->hw_wp[]` slot and appends `watch:<hex>;`, `rwatch:<hex>;`, or `awatch:<hex>;` (per slot `kind` `'w'`/`'r'`/`'a'`) to the reply payload, where `<hex>` is the GDB-side address (UPDI byte address ORed with `GDB_AVR_DATA_FLAG`). If neither DABP bit is set the suffix is omitted so the existing `Sxx`/`Txx` shape is preserved for ordinary breakpoints and ctrl-C halts.]]></text>
+        <text><![CDATA[The `dh_insert_bp()` handler shall recognise the GDB watchpoint request prefixes `Z2`, `Z3`, and `Z4` and reply with the empty RSP packet (payload of length zero, on-the-wire `$#00`). The `dh_remove_bp()` handler shall do the same for `z2`, `z3`, and `z4`. The empty reply is the documented RSP signal for "feature unsupported" and causes GDB to silently fall back to software watchpoints. No call into the UPDI layer is made; no shadow state is consulted or updated; and no `qSupported` capability advertises watchpoints.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-056" name="GDB watchpoints (Z2/Z3/Z4)"/>
         </traces>
@@ -2501,7 +2472,7 @@ Errors are propagated upward through the module stack without retrying:
       </llr>
 
       <llr id="LLR-MON-09">
-        <text><![CDATA[The `monitor reset` verb shall call `updi_enter_debug(ctx->updi_fd)` (issuing the OCD KEY + ASI_RESET_REQ pulse and waiting for the STOPPED bit so the CPU is halted at the reset vector), discard all hardware-breakpoint and data-breakpoint shadow entries via `rsp_hw_bp_clear_all(ctx)` and `rsp_hw_wp_clear_all(ctx)`, invalidate the FSM thread cache via `fsm_invalidate(ctx->fsm)` when `ctx->fsm` is non-NULL, emit one diagnostic O-packet line `"target reset, halted at reset vector\n"`, and return 0 so `dh_monitor` appends the trailing `OK`.]]></text>
+        <text><![CDATA[The `monitor reset` verb shall call `updi_enter_debug(ctx->updi_fd)` (issuing the OCD KEY + ASI_RESET_REQ pulse and waiting for the STOPPED bit so the CPU is halted at the reset vector), discard all hardware-breakpoint shadow entries via `rsp_hw_bp_clear_all(ctx)`, invalidate the FSM thread cache via `fsm_invalidate(ctx->fsm)` when `ctx->fsm` is non-NULL, emit one diagnostic O-packet line `"target reset, halted at reset vector\n"`, and return 0 so `dh_monitor` appends the trailing `OK`.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-055" name="avarice-Compatible Monitor Commands"/>
         </traces>
@@ -2672,7 +2643,7 @@ Errors are propagated upward through the module stack without retrying:
       </llr>
 
       <llr id="LLR-HWTEST-08">
-        <text><![CDATA[Group D's RSP-server smoke checks shall, after the existing D1–D3 (TCP accept, qSupported, Ctrl-C interrupt) pass, additionally exercise the Phase-10 RSP surface against the same spawned `build/avrOSdb` child over the same TCP socket: **D4** issue a framed `qC` packet and PASS if the reply payload begins with `QC` followed by a thread id; **D5** issue `qOffsets` and PASS if the reply payload begins with `Text=`; **D6** issue `qRcmd,696e666f` (the hex-encoded `monitor info` verb) and PASS if the reply payload is non-empty and does not begin with `E` (an error code); **D7** issue `Z2,<sram_addr|0x800000>,1` then `z2,<sram_addr|0x800000>,1` and PASS if both replies are `OK`; **D8** issue `vRun;` and PASS if the reply payload begins with `T` (any stop signal); **D9** (destructive, opt-in via `--with-nvm`) issue `vFlashErase:<flash_page>,200` followed by `vFlashDone` and PASS if both replies are `OK`; **D10** (destructive, opt-in via `--with-nvm`, must be ordered after D9 so the page baseline is 0xFF) issue `Z0,<flash_page>,2`, then read back with `m<flash_page>,2` expecting the 4-character hex literal `9895` (AVR `BREAK` opcode little-endian), then issue `z0,<flash_page>,2`, and PASS only when all three exchanges produce the expected replies. When `--with-rsp` is not set, D4–D10 shall be skipped together with D1–D3; when `--with-nvm` is not set, only D9–D10 shall be reported as SKIP. A short helper `send_rsp(fd, payload)` shall compute the modulo-256 RSP checksum and ship `+$<payload>#XX`; a companion `rsp_payload(buf, n, &p, &len)` shall locate the `$…#` payload in a raw reply buffer.]]></text>
+        <text><![CDATA[Group D's RSP-server smoke checks shall, after the existing D1–D3 (TCP accept, qSupported, Ctrl-C interrupt) pass, additionally exercise the Phase-10 RSP surface against the same spawned `build/avrOSdb` child over the same TCP socket: **D4** issue a framed `qC` packet and PASS if the reply payload begins with `QC` followed by a thread id; **D5** issue `qOffsets` and PASS if the reply payload begins with `Text=`; **D6** issue `qRcmd,696e666f` (the hex-encoded `monitor info` verb) and PASS if the reply payload is non-empty and does not begin with `E` (an error code); **D7** issue `Z2,<sram_addr|0x800000>,1` then `z2,<sram_addr|0x800000>,1` and PASS only if both replies are the empty packet (`$#00`, payload length zero) — the silicon has no data-watchpoint hardware (HLR-056); **D8** issue `vRun;` and PASS if the reply payload begins with `T` (any stop signal); **D9** (destructive, opt-in via `--with-nvm`) issue `vFlashErase:<flash_page>,200` followed by `vFlashDone` and PASS if both replies are `OK`; **D10** (destructive, opt-in via `--with-nvm`, must be ordered after D9 so the page baseline is 0xFF) issue `Z0,<flash_page>,2`, then read back with `m<flash_page>,2` expecting the 4-character hex literal `9895` (AVR `BREAK` opcode little-endian), then issue `z0,<flash_page>,2`, and PASS only when all three exchanges produce the expected replies. When `--with-rsp` is not set, D4–D10 shall be skipped together with D1–D3; when `--with-nvm` is not set, only D9–D10 shall be reported as SKIP. A short helper `send_rsp(fd, payload)` shall compute the modulo-256 RSP checksum and ship `+$<payload>#XX`; a companion `rsp_payload(buf, n, &p, &len)` shall locate the `$…#` payload in a raw reply buffer.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-053" name="Flash Programming via GDB load"/>
           <trace target="HLR" ref="HLR-054" name="True Software Breakpoints via Flash BREAK Opcode"/>
@@ -3115,7 +3086,7 @@ Errors are propagated upward through the module stack without retrying:
     <!-- ============================================================ -->
     <!-- src/gdb_rsp.c unit tests                                     -->
     <!-- ============================================================ -->
-    <file path="tests/test_rsp.c" role="unit" count="68">
+    <file path="tests/test_rsp.c" role="unit" count="63">
       <header><![CDATA[Unit tests for `src/gdb_rsp.c`: socket configuration, RSP packet framing, register and memory handlers, hardware-breakpoint comparator management, OCD-based execution control, async Ctrl-C interrupt, detach cleanup, session lifecycle packets, and monitor relay. Uses a `socketpair()` as a drop-in socket substitute and replaces every `updi_*`, `fsm_*`, and `monitor_dispatch` call site with `ld --wrap` mocks so all tests run without real silicon.]]></header>
 
       <test name="rsp_listen_sets_so_reuseaddr_before_bind">
@@ -3343,45 +3314,14 @@ Errors are propagated upward through the module stack without retrying:
         <traces><trace target="LLR" ref="LLR-RSP-26"/></traces>
       </test>
 
-      <test name="Z2_write_watchpoint_calls_updi_ocd_set_data_bp_with_kind_w">
-        <purpose><![CDATA[Dispatch `Z2,800100,1` and verify the reply is `OK`, `updi_ocd_set_data_bp` was invoked once with `kind='w'`, `addr=0x100` (host byte address), and `length=1`.]]></purpose>
-        <traces>
-          <trace target="LLR" ref="LLR-RSP-29"/>
-          <trace target="LLR" ref="LLR-RSP-27"/>
-        </traces>
+      <test name="Z2_replies_empty_packet_so_gdb_falls_back_to_sw_watch">
+        <purpose><![CDATA[Dispatch `Z2,800100,1` and verify the reply is the empty RSP packet (payload length zero), proving the server signals \"unsupported\" so GDB transparently falls back to software watchpoints. No call into the UPDI layer is made.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-27"/></traces>
       </test>
 
-      <test name="Z3_read_watchpoint_uses_kind_r">
-        <purpose><![CDATA[Dispatch `Z3,800200,2` and verify `updi_ocd_set_data_bp` was invoked with `kind='r'` and the address-flag-stripped byte address `0x200`.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-RSP-29"/></traces>
-      </test>
-
-      <test name="Z4_access_watchpoint_uses_kind_a">
-        <purpose><![CDATA[Dispatch `Z4,800300,4` and verify `updi_ocd_set_data_bp` was invoked with `kind='a'` and the address-flag-stripped byte address `0x300`.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-RSP-29"/></traces>
-      </test>
-
-      <test name="Z2_returns_E08_when_both_wp_slots_full">
-        <purpose><![CDATA[Dispatch three distinct `Z2,...` requests and verify the third reply is `E08` and `updi_ocd_set_data_bp` was invoked exactly twice.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-RSP-29"/></traces>
-      </test>
-
-      <test name="z2_remove_calls_clear_and_clears_shadow">
-        <purpose><![CDATA[Install a Z2 then dispatch its `z2,...` peer and verify the reply is `OK`, `updi_ocd_clear_data_bp` was invoked once, and both the silicon-side mock and the `RspContext.hw_wp[0].kind` shadow are cleared to `'\0'`.]]></purpose>
-        <traces>
-          <trace target="LLR" ref="LLR-RSP-30"/>
-          <trace target="LLR" ref="LLR-RSP-28"/>
-        </traces>
-      </test>
-
-      <test name="halt_with_DABP0_bit_appends_watch_suffix">
-        <purpose><![CDATA[Pre-load `ctx.hw_wp[0]` as if a Z2 had been installed at GDB-side address `0x800100`, raise the mock `OCD_STATUS1_DABP0` bit, dispatch `?`, and verify the stop-reply payload contains the substring `watch:800100;`.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-RSP-31"/></traces>
-      </test>
-
-      <test name="detach_clears_data_watchpoints_in_silicon">
-        <purpose><![CDATA[Install a Z3 watchpoint, dispatch `D`, and verify `updi_ocd_clear_data_bp` was invoked at least once and the silicon-side mock for slot 0 has `kind='\0'`.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-RSP-30"/></traces>
+      <test name="z3_remove_also_replies_empty_packet">
+        <purpose><![CDATA[Dispatch `z3,800200,1` and verify the reply is the empty RSP packet (payload length zero); the `z` form must behave identically to the `Z` form for the unsupported Z2/Z3/Z4 family.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-27"/></traces>
       </test>
 
       <test name="vFlashErase_allocates_buffer_and_replies_ok_for_flash_range">
@@ -3671,7 +3611,7 @@ Errors are propagated upward through the module stack without retrying:
       </test>
 
       <test name="verb_reset_pulses_updi_and_clears_shadows">
-        <purpose><![CDATA[Hex-encode `"reset"` through `monitor_dispatch_ex()` with a stub `RspContext` and verify that `updi_enter_debug()`, `rsp_hw_bp_clear_all()`, and `rsp_hw_wp_clear_all()` are each called exactly once and that `updi_halt()` is not called.]]></purpose>
+        <purpose><![CDATA[Hex-encode `"reset"` through `monitor_dispatch_ex()` with a stub `RspContext` and verify that `updi_enter_debug()` and `rsp_hw_bp_clear_all()` are each called exactly once and that `updi_halt()` is not called.]]></purpose>
         <traces><trace target="LLR" ref="LLR-MON-09"/></traces>
       </test>
 
@@ -3691,7 +3631,7 @@ Errors are propagated upward through the module stack without retrying:
       </test>
 
       <test name="verb_erase_allowed_when_flag_set_clears_shadows">
-        <purpose><![CDATA[Dispatch `"chip-erase"` with `ctx.allow_erase = 1` and verify `updi_chip_erase()`, `updi_enter_debug()`, `rsp_hw_bp_clear_all()`, and `rsp_hw_wp_clear_all()` are each called exactly once.]]></purpose>
+        <purpose><![CDATA[Dispatch `"chip-erase"` with `ctx.allow_erase = 1` and verify `updi_chip_erase()`, `updi_enter_debug()`, and `rsp_hw_bp_clear_all()` are each called exactly once.]]></purpose>
         <traces><trace target="LLR" ref="LLR-MON-12"/></traces>
       </test>
 
@@ -3951,9 +3891,9 @@ Errors are propagated upward through the module stack without retrying:
         <traces><trace target="LLR" ref="LLR-HWTEST-08"/><trace target="LLR" ref="LLR-MON-01"/></traces>
       </test>
 
-      <test name="D7_rsp_Z2_z2_sram_watchpoint_round_trip">
-        <purpose><![CDATA[Send `Z2,<sram_addr|0x800000>,1` (set 1-byte data-access watchpoint on the configured SRAM scratch address) followed by `z2,<sram_addr|0x800000>,1`. Assert both replies are `OK`. Validates HLR-056's DABP set+clear path end-to-end against live silicon.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-HWTEST-08"/><trace target="LLR" ref="LLR-RSP-26"/></traces>
+      <test name="D7_rsp_Z2_z2_replies_empty_packet_unsupported">
+        <purpose><![CDATA[Send `Z2,<sram_addr|0x800000>,1` (request a 1-byte write watchpoint on the configured SRAM scratch address) followed by `z2,<sram_addr|0x800000>,1`. Assert both replies are the empty RSP packet (`$#00`, payload length zero), proving the server signals "unsupported" so GDB falls back to software watchpoints. Validates HLR-056 against live silicon — AVR-Dx UPDI exposes no data-watchpoint hardware.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-HWTEST-08"/><trace target="LLR" ref="LLR-RSP-27"/></traces>
       </test>
 
       <test name="D8_rsp_vRun_reload_returns_Tstop">

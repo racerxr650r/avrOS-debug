@@ -254,18 +254,6 @@ static int o_line(int rsp_fd, const char *line)
     return send_text_as_o_packet(rsp_fd, line, strlen(line));
 }
 
-/* Emit a T05 stop-reply on a halted CPU (LLR-RSP family).  Builds the
- * payload `T05thread:<id>;` where <id> is the currently active FSM
- * thread (or 1 if no FSM mapping is available). */
-static int send_halt_stop_reply(int rsp_fd, RspContext *ctx)
-{
-    int tid = (ctx->fsm != NULL) ? fsm_get_active_thread(ctx->fsm) : 1;
-    if (tid <= 0) tid = 1;
-    char reply[32];
-    snprintf(reply, sizeof reply, "T05thread:%x;", (unsigned)tid);
-    return rsp_send_packet(rsp_fd, reply);
-}
-
 static int verb_reset(int rsp_fd, RspContext *ctx)
 {
     /* updi_enter_debug() applies an ASI_RESET pulse and re-enters OCD
@@ -273,7 +261,6 @@ static int verb_reset(int rsp_fd, RspContext *ctx)
      * semantic mandated by HLR-055.                                  */
     if (updi_enter_debug(ctx->updi_fd) < 0) return -1;
     rsp_hw_bp_clear_all(ctx);
-    rsp_hw_wp_clear_all(ctx);
     rsp_sw_bp_clear_all(ctx);   /* HLR-054 */
     if (ctx->fsm != NULL) fsm_invalidate(ctx->fsm);
     (void)o_line(rsp_fd, "target reset, halted at reset vector\n");
@@ -283,11 +270,14 @@ static int verb_reset(int rsp_fd, RspContext *ctx)
 static int verb_halt(int rsp_fd, RspContext *ctx)
 {
     if (updi_halt(ctx->updi_fd) < 0) return -1;
-    /* Emit the same stop-reply shape the step/continue paths use so a
-     * GDB script can rely on a parseable reply, then suppress the
-     * default OK from dh_monitor by returning -3.                    */
-    if (send_halt_stop_reply(rsp_fd, ctx) < 0) return -1;
-    return -3;
+    /* Stay within qRcmd protocol: emit a human-readable O-packet line
+     * and let dh_monitor send the default `OK`. GDB will re-fetch
+     * registers on the next `info`/`print` command via $g, so PC will
+     * reflect the post-halt state. (T05 is *not* a valid reply to
+     * qRcmd — sending it here triggers "Invalid hex digit" parse
+     * errors in the gdb client.) */
+    (void)o_line(rsp_fd, "target halted\n");
+    return 0;
 }
 
 static int verb_go(int rsp_fd, RspContext *ctx)
@@ -311,7 +301,6 @@ static int verb_erase(int rsp_fd, RspContext *ctx)
      * entries because FLASH no longer holds any patched instructions. */
     if (updi_enter_debug(ctx->updi_fd) < 0) return -1;
     rsp_hw_bp_clear_all(ctx);
-    rsp_hw_wp_clear_all(ctx);
     rsp_sw_bp_clear_all(ctx);   /* HLR-054 */
     if (ctx->fsm != NULL) fsm_invalidate(ctx->fsm);
     (void)o_line(rsp_fd, "chip-erase complete; target halted\n");

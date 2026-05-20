@@ -266,22 +266,7 @@ void rsp_hw_bp_clear_all(RspContext *ctx)
     }
 }
 
-/* HLR-056: clear all OCD data-address watchpoints in silicon and
- * reset the local shadow.  Idempotent; used on detach.               */
-void rsp_hw_wp_clear_all(RspContext *ctx)
-{
-    for (int i = 0; i < 2; i++) {
-        if (ctx->hw_wp[i].kind != '\0') {
-            (void)updi_ocd_clear_data_bp(ctx->updi_fd, i);
-            ctx->hw_wp[i].kind   = '\0';
-            ctx->hw_wp[i].addr   = 0;
-            ctx->hw_wp[i].length = 0;
-        }
-    }
-}
-
 #define hw_bp_clear_all rsp_hw_bp_clear_all
-#define hw_wp_clear_all rsp_hw_wp_clear_all
 
 /* HLR-054: drop every SW-BP shadow entry.  Callers (vFlashDone,
  * monitor reset, monitor chip-erase) have already destroyed the
@@ -361,30 +346,11 @@ static int sw_bp_patch_flash(int updi_fd, uint32_t byte_addr,
     return sw_bp_restore_cpu(updi_fd, gpr, sreg, sp, pc);
 }
 
-/* HLR-056: scan halt-status for a data-watchpoint trigger and, if
- * found, append the GDB stop-key (`watch:`, `rwatch:`, or `awatch:`)
- * followed by the GDB-side address.  Idempotent — writes nothing
- * when no DABP* bit is set or no shadow slot matches.                */
-static void append_watch_suffix(RspContext *ctx, char *dst, size_t cap)
-{
-    uint8_t st0 = 0, st1 = 0;
-    if (updi_ocd_read_halt_status(ctx->updi_fd, &st0, &st1) < 0) return;
-    int slot = -1;
-    if      (st1 & OCD_STATUS1_DABP0) slot = 0;
-    else if (st1 & OCD_STATUS1_DABP1) slot = 1;
-    if (slot < 0) return;
-    if (ctx->hw_wp[slot].kind == '\0') return;
-    const char *key = "watch";
-    switch (ctx->hw_wp[slot].kind) {
-        case 'r': key = "rwatch"; break;
-        case 'a': key = "awatch"; break;
-        case 'w': default: key = "watch"; break;
-    }
-    size_t n = strlen(dst);
-    if (n >= cap) return;
-    (void)snprintf(dst + n, cap - n, "%s:%x;", key,
-                   (unsigned)ctx->hw_wp[slot].addr);
-}
+/* HLR-056: data-address watchpoints over UPDI are not implemented in
+ * silicon.  See src/updi.h and doc/reference/guesswork.md.  The Z2/
+ * Z3/Z4 dispatchers reply with the empty packet so GDB falls back to
+ * software watchpoints; consequently there is no DABP* halt cause to
+ * decode here.                                                       */
 
 /* These handlers each call rsp_send_packet() exactly once. */
 
@@ -401,7 +367,6 @@ static int dh_halt_reason(int fd, const char *pkt, void *vctx)
     char reply[64];
     snprintf(reply, sizeof reply, "%sthread:%x;",
              signal_for_halt_status(ctx->updi_fd), (unsigned)aid);
-    append_watch_suffix(ctx, reply, sizeof reply);
     return rsp_send_packet(fd, reply);
 }
 
@@ -620,13 +585,20 @@ static int dh_write_mem(int fd, const char *pkt, void *vctx)
     /* GDB AVR memory map: 0x000000-0x7FFFFF = FLASH, 0x800000+ = SRAM/IO.
      * AVR-Dx UPDI memory map: FLASH at UPDI 0x800000+, SRAM at UPDI 0x4000+.
      * SRAM writes go via mem_write (low UPDI addr); FLASH writes go via
-     * the NVM controller using the UPDI 24-bit FLASH-base address. */
+     * the NVM controller's read-modify-write path so that arbitrary
+     * `M`/`X` chunks (which need not be page-aligned nor page-multiple,
+     * e.g. those emitted by `(gdb) load` against a stub that does not
+     * advertise qXfer:memory-map) succeed without the strict alignment
+     * required by the bulk page programmer. `updi_nvm_flash_patch` exits
+     * leaving the chip in NVMPROG, so re-enter OCD mode before reply
+     * so any follow-up register/memory query sees a live CPU. */
     int rc;
     if (addr & GDB_AVR_DATA_FLAG) {
         rc = updi_mem_write(ctx->updi_fd, addr & GDB_AVR_ADDR_MASK, data, len);
     } else {
-        rc = updi_nvm_write_flash(ctx->updi_fd, addr | UPDI_FLASH_BASE,
+        rc = updi_nvm_flash_patch(ctx->updi_fd, addr | UPDI_FLASH_BASE,
                                   data, len);
+        if (rc >= 0) (void)updi_enter_debug(ctx->updi_fd);
     }
     return (rc < 0) ? reply_err(fd, "E01") : reply_ok(fd);
 }
@@ -705,7 +677,6 @@ static int dh_continue(int fd, const char *pkt, void *vctx)
         const char *sig = got_ctrl_c ? "T02" : "T05";
         char reply[64];
         snprintf(reply, sizeof reply, "%sthread:%x;", sig, (unsigned)aid);
-        append_watch_suffix(ctx, reply, sizeof reply);
         return rsp_send_packet(fd, reply);
     }
 }
@@ -743,38 +714,12 @@ static int dh_insert_bp(int fd, const char *pkt, void *vctx)
      * same silicon.  When all slots are full we return E08 so GDB
      * surfaces the limit to the user.                                */
     char kind = pkt[1];
-    /* HLR-056: Z2/Z3/Z4 — data watchpoints (write/read/access). */
+    /* HLR-056: Z2/Z3/Z4 — AVR-Dx OCD over UPDI exposes no data-address
+     * watchpoint hardware (see src/updi.h, doc/reference/guesswork.md).
+     * Reply with the empty packet so GDB transparently falls back to
+     * software watchpoints.                                            */
     if (kind == '2' || kind == '3' || kind == '4') {
-        const char *p = pkt + 2;
-        if (*p != ',') return reply_err(fd, "E01");
-        ++p;
-        uint32_t addr;
-        if (parse_hex_u32(&p, &addr) < 0) return reply_err(fd, "E01");
-        uint32_t length = 1;
-        if (*p == ',') { ++p; if (parse_hex_u32(&p, &length) < 0) return reply_err(fd, "E01"); }
-        char wkind = (kind == '2') ? 'w' : (kind == '3') ? 'r' : 'a';
-        /* Idempotent re-insert on same (addr,kind): reply OK. */
-        for (int i = 0; i < 2; i++) {
-            if (ctx->hw_wp[i].kind != '\0' &&
-                ctx->hw_wp[i].addr == addr &&
-                ctx->hw_wp[i].kind == wkind) {
-                return reply_ok(fd);
-            }
-        }
-        int slot_i = -1;
-        for (int i = 0; i < 2; i++) {
-            if (ctx->hw_wp[i].kind == '\0') { slot_i = i; break; }
-        }
-        if (slot_i < 0) return reply_err(fd, "E08");      /* both slots used */
-        /* Strip the GDB data-space flag (0x800000) for the silicon. */
-        uint32_t data_byte = addr & GDB_AVR_ADDR_MASK;
-        if (updi_ocd_set_data_bp(ctx->updi_fd, slot_i, data_byte,
-                                 (uint8_t)length, wkind) < 0)
-            return reply_err(fd, "E01");
-        ctx->hw_wp[slot_i].addr   = addr;
-        ctx->hw_wp[slot_i].length = (uint8_t)length;
-        ctx->hw_wp[slot_i].kind   = wkind;
-        return reply_ok(fd);
+        return reply_empty(fd);
     }
     if (kind != '0' && kind != '1') return reply_empty(fd);
     const char *p = pkt + 2;
@@ -834,24 +779,9 @@ static int dh_remove_bp(int fd, const char *pkt, void *vctx)
 {
     RspContext *ctx = (RspContext *)vctx;
     char kind = pkt[1];
-    /* HLR-056: z2/z3/z4 — data watchpoints. */
+    /* HLR-056: z2/z3/z4 — see dh_insert_bp.  Hardware not present. */
     if (kind == '2' || kind == '3' || kind == '4') {
-        const char *p = pkt + 2;
-        if (*p != ',') return reply_err(fd, "E01");
-        ++p;
-        uint32_t addr;
-        if (parse_hex_u32(&p, &addr) < 0) return reply_err(fd, "E01");
-        for (int i = 0; i < 2; i++) {
-            if (ctx->hw_wp[i].kind != '\0' && ctx->hw_wp[i].addr == addr) {
-                if (updi_ocd_clear_data_bp(ctx->updi_fd, i) < 0)
-                    return reply_err(fd, "E01");
-                ctx->hw_wp[i].kind   = '\0';
-                ctx->hw_wp[i].addr   = 0;
-                ctx->hw_wp[i].length = 0;
-                return reply_ok(fd);
-            }
-        }
-        return reply_ok(fd);   /* unknown — be tolerant for resync */
+        return reply_empty(fd);
     }
     /* Z0 and Z1 both map to HW comparators (see dh_insert_bp). */
     if (kind != '0' && kind != '1') return reply_empty(fd);
@@ -1014,7 +944,6 @@ static int dh_detach(int fd, const char *pkt, void *vctx)
      * next session inherits stale BPs from a different GDB process)
      * and resume the CPU before closing the GDB socket.              */
     hw_bp_clear_all(ctx);
-    hw_wp_clear_all(ctx);
     (void)updi_run(ctx->updi_fd);
     (void)reply_ok(fd);
     if (ctx->gdb_fd_p) {
@@ -1278,9 +1207,6 @@ void rsp_default_handlers(RspHandlers *h, RspContext *ctx)
      * RspContext to zero, but the slot-empty sentinel is 0xFFFFFFFF.  */
     ctx->hw_bp_addr[0] = HW_BP_SLOT_EMPTY;
     ctx->hw_bp_addr[1] = HW_BP_SLOT_EMPTY;
-    /* HLR-056: mark both DABP watchpoint comparators empty (kind='\0'). */
-    ctx->hw_wp[0].kind = '\0';
-    ctx->hw_wp[1].kind = '\0';
     /* HLR-054: drop any SW-BP shadow that survived memset(). */
     rsp_sw_bp_clear_all(ctx);
 

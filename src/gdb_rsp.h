@@ -52,16 +52,6 @@ typedef struct {
      * it (designated initialiser leaves both = 0, then handler init
      * marks them empty on first use).                                */
     uint32_t                  hw_bp_addr[2];
-    /* Shadow of the two AVR-Dx OCD data-address comparators
-     * (DABP0/DABP1, HLR-056).  `kind` is '\0' for an empty slot,
-     * else one of 'r' (read), 'w' (write), 'a' (access).  `addr`
-     * is the GDB-side data-space address (UPDI byte address ORed
-     * with 0x800000).                                              */
-    struct {
-        uint32_t addr;
-        uint8_t  length;
-        char     kind;
-    }                         hw_wp[2];
     /* HLR-055: monitor verbs.  `allow_erase` mirrors the --allow-erase
      * CLI flag and gates `monitor erase` / `monitor chip-erase`.
      * `bp_mode` is 0 = "sw" (true SW BPs via FLASH BREAK, HLR-054) or
@@ -144,7 +134,7 @@ void rsp_default_handlers(RspHandlers *h, RspContext *ctx);
 
 /* ── Helpers exposed for HLR-055 monitor verbs ───────────────────────── */
 void rsp_hw_bp_clear_all(RspContext *ctx);
-void rsp_hw_wp_clear_all(RspContext *ctx);
+
 /* HLR-054: drop every SW-BP shadow entry (no silicon I/O — used by
  * the callers that have already destroyed the underlying FLASH).      */
 void rsp_sw_bp_clear_all(RspContext *ctx);
