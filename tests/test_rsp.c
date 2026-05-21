@@ -1386,6 +1386,186 @@ static void vFlashDone_also_clears_sw_bp_shadow(void)
     TEST_ASSERT_FALSE(ctx.sw_bp[0].in_use);
 }
 
+/* ── Phase 11 — HLR-060/061 multiprocess thread-id parsing ─────────── */
+
+/* Decode a 2-char-per-byte hex payload back to a NUL-terminated string. */
+static void hex_decode(const char *hex, char *out, size_t cap)
+{
+    size_t n = strlen(hex) / 2;
+    if (n >= cap) n = cap - 1;
+    for (size_t i = 0; i < n; ++i) {
+        unsigned b;
+        sscanf(hex + i * 2, "%2x", &b);
+        out[i] = (char)b;
+    }
+    out[n] = '\0';
+}
+
+/* Extract the OK/Exx payload from the last RSP packet on the wire. */
+static void dispatch_and_capture(RspHandlers *h, const char *pkt,
+                                 char *payload, size_t cap)
+{
+    rsp_dispatch(sock_pair[1], pkt, h);
+    char stream[512]; drain(sock_pair[0], stream, sizeof stream);
+    last_packet_payload(stream, payload, cap);
+}
+
+/* D11 — parse_mp_thread_id round-trip via Hg, exercising every
+ *       legal/illegal form documented in LLR-RSP-40.                  */
+static void parse_mp_thread_id_accepts_legacy_and_multiprocess_forms(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    fake_fsm.thread_count = 2;
+    fake_fsm.threads[1].gdb_id = 2; strcpy(fake_fsm.threads[1].name, "B");
+    mock_active_thread = 1;
+
+    char p[64];
+
+    /* Bare hex. */
+    dispatch_and_capture(&h, "Hg2", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+    TEST_ASSERT_EQUAL(2, g_tid_var);
+
+    /* Multiprocess form. */
+    dispatch_and_capture(&h, "Hgpa410.2", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+    TEST_ASSERT_EQUAL(2, g_tid_var);
+
+    /* Multiprocess form with TID not in table is still accepted —
+     * membership is enforced only by T<tid>, not by Hg/Hc.            */
+    dispatch_and_capture(&h, "Hgpa410.5", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+    TEST_ASSERT_EQUAL(5, g_tid_var);
+
+    /* Any-thread shorthand → resolves to active thread (mock = 1). */
+    dispatch_and_capture(&h, "Hgp0.0", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+    TEST_ASSERT_EQUAL(1, g_tid_var);
+
+    dispatch_and_capture(&h, "Hgp-1.-1", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+    TEST_ASSERT_EQUAL(1, g_tid_var);
+
+    dispatch_and_capture(&h, "Hg-1", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+    TEST_ASSERT_EQUAL(1, g_tid_var);
+
+    /* Malformed forms reply E01. */
+    dispatch_and_capture(&h, "Hgp", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("E01", p);
+    dispatch_and_capture(&h, "Hgp1", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("E01", p);
+    dispatch_and_capture(&h, "Hgp1.", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("E01", p);
+    dispatch_and_capture(&h, "Hgp.5", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("E01", p);
+}
+
+/* D12 — Hgpa410.<TID> returns OK and stores TID. */
+static void Hg_accepts_multiprocess_thread_id_form(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    fake_fsm.thread_count = 3;
+    fake_fsm.threads[1].gdb_id = 2; strcpy(fake_fsm.threads[1].name, "B");
+    fake_fsm.threads[2].gdb_id = 3; strcpy(fake_fsm.threads[2].name, "C");
+    char p[32];
+
+    dispatch_and_capture(&h, "Hgpa410.2", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+    TEST_ASSERT_EQUAL(2, g_tid_var);
+
+    /* Reproduces live-trace P0 finding (issue #34): pre-fix this
+     * returned E01 because parse_h_tid did not recognise `pPID.TID`. */
+    dispatch_and_capture(&h, "Hgpa410.3", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+    TEST_ASSERT_EQUAL(3, g_tid_var);
+}
+
+/* D13 — Hcpa410.<TID> returns OK and stores TID in c_thread. */
+static void Hc_accepts_multiprocess_thread_id_form(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    fake_fsm.thread_count = 3;
+    fake_fsm.threads[1].gdb_id = 2; strcpy(fake_fsm.threads[1].name, "B");
+    fake_fsm.threads[2].gdb_id = 3; strcpy(fake_fsm.threads[2].name, "C");
+    char p[32];
+
+    dispatch_and_capture(&h, "Hcpa410.3", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+    TEST_ASSERT_EQUAL(3, c_tid_var);
+
+    dispatch_and_capture(&h, "Hcp-1.-1", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+    TEST_ASSERT_EQUAL(mock_active_thread, c_tid_var);
+
+    dispatch_and_capture(&h, "Hc-1", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+    TEST_ASSERT_EQUAL(mock_active_thread, c_tid_var);
+}
+
+/* D14 — T<tid> accepts multiprocess form per LLR-RSP-41. */
+static void T_thread_alive_accepts_multiprocess_form(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    fake_fsm.thread_count = 2;
+    fake_fsm.threads[1].gdb_id = 2; strcpy(fake_fsm.threads[1].name, "B");
+    char p[32];
+
+    dispatch_and_capture(&h, "Tpa410.1", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+
+    dispatch_and_capture(&h, "Tpa410.99", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("E01", p);
+
+    /* Any-thread: parser short-circuits to OK without membership. */
+    dispatch_and_capture(&h, "Tp0.0", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+
+    dispatch_and_capture(&h, "Tpa410.", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("E01", p);
+}
+
+/* D15 — qThreadExtraInfo emits "FSM <name> [active|quiescent] state=0xNNNN". */
+static void qThreadExtraInfo_returns_FSM_label_with_state_and_active_flag(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    fake_fsm.thread_count = 2;
+    strcpy(fake_fsm.threads[0].name, "sched");
+    fake_fsm.threads[0].gdb_id = 1;
+    fake_fsm.threads[0].state_fn = 0x0140u;
+    fake_fsm.threads[0].is_active = true;
+    fake_fsm.threads[1].gdb_id = 2;
+    strcpy(fake_fsm.threads[1].name, "blinker");
+    fake_fsm.threads[1].state_fn = 0x01A4u;
+    fake_fsm.threads[1].is_active = false;
+
+    char p[256], txt[128];
+
+    dispatch_and_capture(&h, "qThreadExtraInfo,pa410.1", p, sizeof p);
+    hex_decode(p, txt, sizeof txt);
+    TEST_ASSERT_EQUAL_STRING("FSM sched [active] state=0x0140", txt);
+
+    dispatch_and_capture(&h, "qThreadExtraInfo,pa410.2", p, sizeof p);
+    hex_decode(p, txt, sizeof txt);
+    TEST_ASSERT_EQUAL_STRING("FSM blinker [quiescent] state=0x01a4", txt);
+}
+
+/* D16 — qThreadExtraInfo for unknown TID replies empty packet. */
+static void qThreadExtraInfo_unknown_tid_replies_empty_packet(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    fake_fsm.thread_count = 2;
+    fake_fsm.threads[1].gdb_id = 2; strcpy(fake_fsm.threads[1].name, "B");
+    char p[64];
+
+    dispatch_and_capture(&h, "qThreadExtraInfo,pa410.99", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("", p);
+
+    /* Any-thread also yields empty (no aggregate label). */
+    dispatch_and_capture(&h, "qThreadExtraInfo,p0.0", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("", p);
+}
+
 /* ── Runner ─────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -1455,5 +1635,12 @@ int main(void)
     RUN_TEST(Z0_in_hw_only_mode_falls_back_to_HW_BP_path);
     RUN_TEST(Z0_in_sw_mode_idempotent_on_same_address);
     RUN_TEST(vFlashDone_also_clears_sw_bp_shadow);
+    /* Phase 11 — HLR-060/061 multiprocess thread-id parsing. */
+    RUN_TEST(parse_mp_thread_id_accepts_legacy_and_multiprocess_forms);
+    RUN_TEST(Hg_accepts_multiprocess_thread_id_form);
+    RUN_TEST(Hc_accepts_multiprocess_thread_id_form);
+    RUN_TEST(T_thread_alive_accepts_multiprocess_form);
+    RUN_TEST(qThreadExtraInfo_returns_FSM_label_with_state_and_active_flag);
+    RUN_TEST(qThreadExtraInfo_unknown_tid_replies_empty_packet);
     return UNITY_END();
 }

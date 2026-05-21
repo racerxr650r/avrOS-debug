@@ -13,7 +13,7 @@
 > Delivery section as work progresses. Link phase names in the Status
 > table to their detailed descriptions in §8.
 
-**Status:** Phases 0–7 complete. Phase 8 (non-FLASH NVM programming), Phase 9 (CI-grade loader & link diagnostics), and Phase 10 (GDB protocol completion / avarice feature parity) planned.
+**Status:** Phases 0–7 complete. Phase 8 (non-FLASH NVM programming), Phase 9 (CI-grade loader & link diagnostics), Phase 10 (GDB protocol completion / avarice feature parity), and Phase 11 (RSP capability honesty & multiprocess+ correctness) planned.
 
 ## Status
 
@@ -29,6 +29,7 @@
 | [7](#phase-7--device-signature-diagnostic-mode) | `--device` flag + `updi_read_device_info()` + family lookup + 6 tests | 🔲 Not started |
 | [8](#phase-8--non-flash-nvm-programming) | EEPROM / FUSE / USERROW / LOCKBIT programming from ELF segments | 🔲 Not started |
 | [10](#phase-10--gdb-protocol-completion--avarice-feature-parity) | `vFlash*` + true SW breakpoints + watchpoints + monitor verbs + extended-remote | 🔲 Not started |
+| [11](#phase-11--rsp-capability-honesty--multiprocess-correctness) | Proper `multiprocess+` thread-ID parsing, `qThreadExtraInfo` FSM labels, `swbreak+`/`hwbreak+` stop tags, richer `qSupported`, `vKill` listener-survival, exit/disconnect logging, `vCont;r` range-step | 🔲 Not started |
 
 ## 0. Required Tools for Development
 
@@ -733,6 +734,147 @@ Exact base addresses are part-specific; the dispatcher classifies segments by ad
 - **SW-breakpoint save/restore correctness across NVMPROG.** Entering NVMPROG resets the CPU; if register snapshot/restore is incomplete the user's execution state is silently corrupted. Mitigation: cover R0–R31, SREG, SP, and PC in the snapshot, and add a Phase-10 regression test that single-steps across a SW-BP install/remove and asserts every GPR is unchanged.
 - **FLASH wear from `Z0` storms.** Some IDEs install and remove the same breakpoint on every step. Mitigation: cache the shadow entry across remove → insert at the same address, performing the FLASH write only on the first install. Document the wear consideration in the user manual.
 - **`vRun` semantics on a single-target stub.** GDB's `vRun` expects a fresh process; we re-parse the ELF in place. If the operator passes a fundamentally different ELF (e.g. wrong AVR family) the post-`vRun` register frame will be incoherent. Mitigation: `vRun` shall validate the ELF's e_machine and the per-family family code before accepting the swap, replying `E22` on mismatch.
+
+---
+
+### Phase 11 — RSP Capability Honesty & `multiprocess+` Correctness
+
+**Motivation.** A live-wire packet trace of `avr-gdb` (VS Code `cppdbg`) attaching to `avrOSdb` after Phase 10 (`/tmp/rsp.transcript`, captured 2026-05-20) uncovered several places where the server's advertised capabilities and its actual packet handling disagree, plus several quality-of-life gaps. Most importantly, the server advertises `multiprocess+` in its `qSupported` reply but rejects every `Hgp<PID>.<TID>` / `Hcp<PID>.<TID>` and every `qThreadExtraInfo,p<PID>.<TID>` packet with `E01`. The visible consequence in VS Code is that the avrOS-FSM-as-GDB-thread feature — the headline product differentiator documented in `doc/UserManual.md` §5.6 — silently fails: the Call Stack view shows ten numbered threads with no labels, no state names, and no working thread switch. Several other smaller issues (missing `swbreak:` / `hwbreak:` stop tags, missing `qXfer:memory-map:read+`, no range-step support, `vKill` killing the server itself, silent shutdown) compound to make the stub feel less polished than its protocol surface implies. Phase 11 closes this honesty gap. Tracked as GitHub issue [#34](https://github.com/racerxr650r/avrOS-debug/issues/34); bound to **HLR-060 … HLR-066** in `doc/Project.xml` §12 (to be authored via the `tracer` skill before any source change lands).
+
+**Architectural constraint.** The design and implementation of every Phase 11 work item shall meet the **Layered Architecture** requirement defined in `doc/SDD.md` §2.2 and `doc/PVD.md` §6: source modules remain organised into the four protocol layers (entry/event-loop, transport/hardware (UPDI), protocol (GDB RSP), and application (ELF/FSM/monitor)) with strictly downward call direction; no lower-layer header shall `#include` a higher-layer header, and no lower-layer function shall call a higher-layer function. The single permitted upward path remains dependency-inversion via the `RspHandlers` callback table in `src/gdb_rsp.h`. Concretely for Phase 11: the multiprocess parser, stop-cause classifier, memory-map XML emitter, range-step driver, and lifecycle logger all live in the layer that owns their concern (RSP-layer for parsing/XML/logging, UPDI-layer for stop-cause and range-step primitives, application-layer for FSM-label formatting). Any work item that appears to require a layer-crossing call shall instead be implemented by extending the `RspHandlers` table — never by upward `#include` or by reaching across modules. Compliance is verified by the `.h` include-graph check in `tools/lint_project.py` and by code review per `doc/SDP.md` §5.2.
+
+**Runtime constraint — single shared stack.** avrOS is a **cooperative, run-to-completion FSM scheduler**: every FSM executes on the **same hardware stack** — the one set up by the C-runtime init code (`__stack` symbol from the linker map, growing down from `RAMEND`). There is no per-FSM stack, no context-switch save area, and no preempted register frame stored anywhere in SRAM. At any halt, **only the currently-running FSM has a live call stack**; the other N−1 FSMs are quiescent between dispatches and have no meaningful frame to unwind. This shapes the entire multiprocess / `qThreadExtraInfo` design and is a hard correctness constraint:
+  - The `g`-packet for the *running* TID returns the real OCD register file (R0–R31, SREG, SP, PC) verbatim. The `g`-packet for every *non-running* TID shall return a synthesised frame whose **PC = the FSM's `state` function pointer** (next dispatch entry), **SP = the live shared SP**, **R0–R31 = 0x00** (no preserved context exists), and **SREG = 0x00**. This matches what the user actually sees on the next dispatch and avoids the invariant-violating alternative of fabricating a per-FSM register frame.
+  - The `m`-packet (memory read) is **always served from live silicon** at the requested address — it shall *not* be filtered or rewritten per selected thread. Stack-walking by GDB will therefore read the same shared stack regardless of which TID is selected; the selected TID only changes which `g`-packet frame seeds the unwind, not the memory it walks through. **Backtraces of non-running FSMs are intentionally shallow** (one frame: the FSM `state` function). This is documented behaviour, not a bug, and shall be called out in the `qThreadExtraInfo` label as a `(quiescent)` suffix and in `doc/UserManual.md` §5.6.
+  - `Hgp<PID>.<TID>` for a non-running TID **shall not** synthesise a fake SP from any per-FSM control block (there is no such SP to read — the FSM was last entered and exited via the shared stack and any stack frame it once had has been unwound). Implementations shall not invent pointers into the shared stack on behalf of quiescent FSMs.
+  - The stop-cause classifier (HLR-062) reports the cause only against the **running** TID. Quiescent FSMs are never the proximate cause of a halt and shall never appear as the `thread:` of a `T05swbreak:` / `T05hwbreak:` reply.
+  - **Acceptance test for `tests/test_fsm.c`:** `fsm_mapper_synth_frame(quiescent_tid)` returns PC = `fsm.state`, SP = live SP, all GPRs and SREG zero; the running TID's frame is byte-for-byte equal to the OCD register-file dump; no path in `gdb_rsp.c` or `fsm_mapper.c` ever reads from or writes to a fabricated per-FSM stack region.
+
+**Scope summary.**
+
+| # | Area | GDB packets / behaviour | Source file(s) | HLR |
+| - | ---- | ----------------------- | -------------- | --- |
+| 1 | Multiprocess thread-ID parsing | `Hgp<PID>.<TID>`, `Hcp<PID>.<TID>`, `T<pPID.TID>`, accept `p0.0`/`p-1.-1` as "any" | `gdb_rsp.c`, `fsm_mapper.c` | HLR-060 |
+| 2 | FSM thread labels | `qThreadExtraInfo,p<PID>.<TID>` returns hex-encoded `"FSM <name> (state=<sym>)"` | `monitor.c` (or new `fsm_extra.c`), `fsm_mapper.c` | HLR-061 |
+| 3 | Stop-reason tags | `qSupported` reply gains `swbreak+;hwbreak+`; halt replies become `T05swbreak:;thread:pPID.TID;` / `T05hwbreak:;…;` | `gdb_rsp.c`, `updi.c` (stop-cause classifier) | HLR-062 |
+| 4 | Memory-map advertisement | `qXfer:memory-map:read+`; static XML built from the runtime-selected device-table entry | `gdb_rsp.c`, `updi.c` (device-table accessor) | HLR-063 |
+| 5 | `vKill` listener survival | `vKill;<pid>` halts target, closes client socket, **returns to `accept()` loop** (does not `exit(0)`) | `main.c`, `gdb_rsp.c` | HLR-064 |
+| 6 | Lifecycle logging | One stderr line on each: client-connect, client-disconnect (with reason: `D`/`vKill`/EOF/error), graceful server exit, fatal error | `gdb_rsp.c`, `main.c` | HLR-065 |
+| 7 | Range-step | Advertise `vCont;c;C;s;S;r;t`; implement `vCont;r<start>,<end>:<tid>` as repeated OCD single-step bounded by the half-open range | `gdb_rsp.c`, `updi.c` | HLR-066 |
+| 8 | Soft quality fixes | Accept `Hg p0.0` / `Hc p0.0` without `E01`; cache `qfThreadInfo` result between halts; cosmetic `qC` reply tied to selected thread | `gdb_rsp.c` | rolls into HLR-060 / HLR-061 |
+| 9 | VS Code `launch.json` recommendation | Research and publish a recommended `cppdbg` `launch.json` block that exercises Phase 11 features end-to-end (FSM threads visible in Call Stack, memory-map honoured, range-step active) | `doc/UserManual.md`, sample under `doc/reference/launch.json` | HLR-067 |
+
+1. **`src/gdb_rsp.c` — multiprocess thread-ID parsing (HLR-060).** Replace the current scalar `parse_thread_id()` with `parse_mp_thread_id(const char *s, uint32_t *pid_out, uint32_t *tid_out, bool *any_out)` that recognises:
+   - bare decimal `0` or `-1`  → `any = true`
+   - bare hex `<TID>` (legacy)  → `pid = g_pid`, `tid = …`
+   - multiprocess `p<PID>.<TID>` with `p0.0`, `p-1.-1`, `p<PID>.0`, `p<PID>.-1` all mapped to `any = true` (i.e. "any thread in that process")
+   Update `dh_h_packet()` (handles `Hg`/`Hc`/`Hs`), `dh_t_alive()` (`T<tid>`), the `?` / `c` / `s` stop replies, `vCont` action targets, and `vAttach;<pid>` / `vKill;<pid>` to use the new parser. The server's process ID shall be a fixed compile-time constant exposed as `RSP_PID` (currently observed by GDB as `0xa410`) — formalise this and stop reading the value from uninitialised stack. **Acceptance test:** an `Hgp<RSP_PID>.<TID>` for every TID in `FsmContext.threads[]` returns `OK`, and every subsequent `g` returns the per-thread frame built by `fsm_mapper`.
+
+2. **`src/monitor.c` (or new `src/fsm_extra.c`) — `qThreadExtraInfo` FSM labels (HLR-061).** Implement a `qThreadExtraInfo,p<PID>.<TID>` handler that resolves `TID` through `fsm_mapper_thread_to_fsm()`, formats `"FSM <fsm_name> (state=<state_sym>) ticks=<n>"` (≤ 64 bytes), and replies with the ASCII bytes hex-encoded per the RSP spec. TID 1 (the CPU thread) shall return `"CPU"`. Unknown TIDs return the empty packet (not `E01`). Add a corresponding entry to the RSP dispatch table.
+
+3. **`src/gdb_rsp.c` — stop-reason tags (HLR-062).** Extend `qSupported` reply with `swbreak+;hwbreak+`. Add `RspContext.last_stop_cause` of type `enum { SC_NONE, SC_SWBREAK, SC_HWBREAK, SC_STEP, SC_INTR, SC_VFLASH }` set by the OCD post-halt classifier in `updi_wait_halt()` (BREAK opcode at PC ⇒ SC_SWBREAK; HW comparator match ⇒ SC_HWBREAK; single-step counter exhausted ⇒ SC_STEP; STOP issued by host ⇒ SC_INTR). `format_stop_reply()` emits `T05swbreak:;thread:pPID.TID;` / `T05hwbreak:;…;` accordingly; SC_INTR maps to `T02` (SIGINT). **Acceptance test:** a SW-BP hit produces `T05swbreak:;thread:p<PID>.1;`; a `hbreak` hit produces `T05hwbreak:;…;`.
+
+4. **`src/gdb_rsp.c` — memory-map advertisement (HLR-063).** Add `qXfer:memory-map:read+` to the `qSupported` reply and implement the `qXfer:memory-map:read::<offset>,<length>` handler. The XML body is generated once at server start from the active device-table entry (Phase 7 / HLR-048) and pinned in a static buffer:
+   ```xml
+   <memory-map>
+     <memory type="flash"  start="0x000000" length="N"><property name="blocksize">512</property></memory>
+     <memory type="ram"    start="0x800000" length="M"/>
+     <memory type="rom"    start="0x810080" length="0x80"/>   <!-- USERROW -->
+     <memory type="rom"    start="0x811080" length="0x80"/>   <!-- SIGROW  -->
+     <memory type="ram"    start="0x814000" length="0x400"/>  <!-- EEPROM  -->
+     <memory type="rom"    start="0x820000" length="0x20"/>   <!-- FUSES   -->
+     <memory type="rom"    start="0x820040" length="0x04"/>   <!-- LOCK    -->
+   </memory-map>
+   ```
+   The standard `qXfer` chunking protocol (`m<data>` / `l<data>`) shall be honoured with the existing `PacketSize=800` budget.
+
+5. **`src/main.c` + `src/gdb_rsp.c` — `vKill` listener survival (HLR-064).** `dh_v_kill()` shall: (a) `updi_halt()` the target, (b) clear all SW-BP shadows and release both HW comparators, (c) reply `OK`, (d) close the client `fd`, (e) **return** to the `select()` loop instead of calling `quit_main_loop()`. The server shall continue to listen on the configured TCP port. The `--prog` mode (HLR / Phase 8) is unaffected: it never opens a listener. Document the new lifecycle in `doc/UserManual.md` §5.6 step 11. **Acceptance test:** an integration test connects, sends `vKill;<pid>`, observes `OK`, the socket close, and then reconnects successfully and runs `vAttach` without restarting the server.
+
+6. **`src/gdb_rsp.c` + `src/main.c` — lifecycle logging (HLR-065).** Add one-line stderr emissions at each lifecycle transition:
+   - `avrOSdb: listening on :%u\n` (server ready, after `--load` completes)
+   - `avrOSdb: client connected from %s:%u\n` (after `accept()`)
+   - `avrOSdb: client disconnected (%s)\n` where reason is one of `D`, `vKill`, `EOF`, or `read error: <errno-text>`
+   - `avrOSdb: shutting down (%s)\n` where reason is `SIGINT`, `SIGTERM`, or `fatal: <text>`
+   No new flag is added; emissions go to stderr at always-on level. Replace the current silent post-`verify: OK` quiescence with the explicit `listening` line.
+
+7. **`src/gdb_rsp.c` + `src/updi.c` — `vCont;r` range-step (HLR-066).** Replace the current `vCont?` reply (`vCont;c;s`) with `vCont;c;C;s;S;r;t`. Implement `vCont;r<start>,<end>:<tid>` by issuing OCD single-steps in a tight loop while `start ≤ PC < end`, with an upper bound of `N_RANGE_STEP_MAX` steps (e.g. 4096) to prevent runaway. `vCont;t` (stop) maps to `updi_halt()`. `vCont;C`/`S` accept-then-ignore the signal byte (AVR has no Unix signals to deliver), preserving the targeted execution semantics.
+
+8. **CLI surface.** No new flags. Phase 11 is purely protocol-side.
+
+8a. **VS Code `launch.json` recommendation (HLR-067).** Research and publish a known-good `cppdbg` configuration that exercises every Phase 11 feature end-to-end against `avrOSdb`, replacing the current minimal block in active use:
+   ```json
+   {
+     "version": "0.2.0",
+     "configurations": [
+       {
+         "name": "Debug AVR via avrOSdb",
+         "type": "cppdbg",
+         "request": "launch",
+         "program": "${workspaceFolder}/build/firmware.elf",
+         "miDebuggerPath": "/usr/bin/avr-gdb",
+         "miDebuggerServerAddress": "localhost:1234",
+         "cwd": "${workspaceFolder}",
+         "MIMode": "gdb",
+         "externalConsole": false,
+         "setupCommands": [
+           { "text": "set architecture avr" },
+           { "text": "set print pretty on" }
+         ]
+       }
+     ]
+   }
+   ```
+   Items to investigate, justify, and either include or explicitly reject in the recommended block:
+   - `"request"`: `"launch"` vs `"attach"`. `launch` re-runs the target on every F5 (re-issues `vRun` if the server advertised it, else resets via `monitor reset`); `attach` connects without disturbing the running target. Decide which is the better default for Phase-11 avrOSdb (the server is long-lived after HLR-064, so `attach` may now be more honest); document both with a "when to use which" guide.
+   - `"setupCommands"`: add `{"text": "set remotetimeout 30"}` (UPDI flash erase can exceed the default 2 s); add `{"text": "set mem inaccessible-by-default off"}` once HLR-063 ships the memory-map (then GDB will know I/O regions are valid); add `{"text": "set non-stop off"}` (Phase 11 is stop-mode only — see Out-of-Scope).
+   - `"customLaunchSetupCommands"` vs `"setupCommands"`: `launch` configs need the former when the server already manages flashing (suppresses `cppdbg` issuing its own `load`); document the distinction.
+   - `"stopAtEntry"` / `"stopAtConnect"`: `stopAtConnect: true` ensures the IDE pauses at the reset vector after attach so the user can set breakpoints before `continue`. Recommend on by default.
+   - `"logging"`: `{"engineLogging": true, "trace": true, "traceResponse": true}` for the user-facing troubleshooting recipe (currently absent from the manual).
+   - `"preLaunchTask"`: optional `tasks.json` entry that builds the ELF and starts `avrOSdb` if not already running; document but mark optional.
+   - `"miDebuggerArgs"`: investigate whether passing `--nx` is needed to suppress per-user `.gdbinit` interference on shared dev hosts.
+   - `"targetArchitecture"`: VS Code-specific hint; verify whether it adds value beyond `set architecture avr` in `setupCommands`.
+   - `"avoidWindowsConsoleRedirection"`, `"externalConsole"`: confirm the headless-Linux default and whether any change is needed for WSL/macOS hosts.
+   - **Phase-11-specific verification:** with the recommended block, confirm that VS Code's Call Stack view shows all FSMs with their `qThreadExtraInfo` labels, that the Memory view obeys the advertised memory-map regions, and that source-level `next` uses range-step (engine log shows `vCont;r`).
+   - **Deliverable:** a fully-commented `doc/reference/launch.json` sample, a copy-pasteable block in `doc/UserManual.md` §6, and a one-paragraph rationale per non-default setting. The result must work unchanged against an unmodified VS Code + `cppdbg` install on Linux; macOS / Windows-host caveats documented separately.
+
+9. **Tests — `tests/test_rsp.c`.** Add cases for: (a) `parse_mp_thread_id()` accepting every bare-decimal, bare-hex, and `p<PID>.<TID>` form including `p0.0` / `p-1.-1`; (b) `Hgp<PID>.<TID>` selecting the right thread and the subsequent `g` returning the matching synthesised frame; (c) `qThreadExtraInfo` returning a hex-encoded label for every known TID and the empty packet for unknown TIDs; (d) `qSupported` reply containing `swbreak+;hwbreak+;qXfer:memory-map:read+`; (e) `qXfer:memory-map:read::0,800` returning a well-formed `<memory-map>` body; (f) a simulated SW-BP halt emitting `T05swbreak:;thread:p<PID>.1;`; (g) `vKill;<pid>` closing the client socket but leaving the listener live (assert the listener `fd` is still in the `select()` set); (h) `vCont?` advertising `r` and a `vCont;r<lo>,<hi>:p<PID>.1` driving repeated single-steps until PC leaves the range.
+
+10. **Tests — `tests/test_monitor.c`.** Add a case that the new `qThreadExtraInfo` path renders the active FSM `state=` symbol name correctly when the state pointer points at a function with debug info, and renders `state=0x????` (raw hex) when symbol resolution fails.
+
+11. **Tests — `tests/test_fsm.c`.** Add a case asserting that `fsm_mapper_thread_to_fsm()` is keyed by TID alone (the PID component is informational), so future PID changes do not silently regress.
+
+12. **Tests — `tests/test_main.c`.** Add a case asserting the lifecycle log lines from item 6 are emitted in order on a connect → `vKill` → reconnect sequence.
+
+13. **Documentation updates.**
+    - `doc/UserManual.md` §5.6 — step 11 rewritten to reflect that `vKill` no longer exits the server; the troubleshooting table gains "Server exits immediately after VS Code stop" → "fixed in Phase 11; before that, restart `avrOSdb` after every `kill`". The `info threads` example output is verified against an actual capture and updated if the FSM-label format changed.
+    - `doc/avrOSdb.1` — `qSupported` capability list updated under `PROTOCOL`; `vCont` action list updated.
+    - `doc/SDD.md` §5 (gdb_rsp.c) — new handler entries in the dispatch table; the multiprocess parser and the `qThreadExtraInfo` handler get §5.x subsections.
+    - `doc/Project.xml` §12 — author HLR-060 … HLR-066 via the `tracer` skill, link each to its LLRs and to the new tests above.
+    - `doc/SDP.md` — flip the Phase 11 row in the Status table from "🔲 Not started" to "🚧 In progress" / "✅ Complete" as work lands.
+
+**Acceptance:**
+- `make test` runs all suites including the extended `test_rsp`, `test_monitor`, `test_fsm`, `test_main`; new tests pass.
+- `python3 tools/lint_project.py` reports 0 errors, 0 warnings after every HLR-060 … HLR-066 is traced from at least one new LLR and one new test.
+- Re-running the 2026-05-20 packet-trace experiment (avrOSdb under socat, VS Code `cppdbg` attached) yields:
+  - zero `E01` replies to any `Hg`, `Hc`, or `qThreadExtraInfo` packet;
+  - VS Code's Call Stack view shows each FSM with its name and current state symbol;
+  - the server's stderr emits one `listening`, one `client connected`, one `client disconnected (vKill)` line per session and stays alive across `vKill`;
+  - stop replies for SW-BP hits carry `swbreak:;` and for `hbreak` hits carry `hwbreak:;`;
+  - `(gdb) info mem` shows the device's FLASH / SRAM / EEPROM regions sourced from the server's memory-map XML;
+  - source-level `next` over a tight loop runs measurably faster than against Phase 10 (range-step in action).
+
+**Out of scope (explicit, deferred to a later phase):**
+- Non-stop / asynchronous-execution mode (still requires substantial reentrancy work in the UPDI layer).
+- `QXfer:features:read+` (target-description XML) — the AVR built-in description in GDB is adequate for AVR-Dx; revisit when a non-stock register set is exposed.
+- `QPassSignals+` / `QProgramSignals+` / `ConditionalBreakpoints+` — no compelling user demand on a bare-metal target.
+- `QNonStop+` — deferred until the UPDI run-control state machine supports asynchronous stop replies.
+- Multi-client GDB support (still a Phase-0 non-goal).
+
+**Risks.**
+- **Backward compatibility of stop replies.** Older `avr-gdb` builds (≤ 10) may not understand `swbreak:`/`hwbreak:` tags. Mitigation: only emit the tags when the client advertised the matching `swbreak+`/`hwbreak+` in its own `qSupported` (the spec requires this gating anyway); fall back to bare `T05thread:…;` otherwise.
+- **Memory-map XML drift vs. real silicon.** The XML is generated from the device table; if the table is wrong (e.g. EEPROM size for a part variant), GDB will refuse legitimate memory accesses with "memory not available". Mitigation: cover every device-table entry with a `tests/test_updi.c` case that round-trips the generated XML through a strict parser; fail CI on any drift.
+- **Range-step runaway.** A pathologically tight `vCont;r` with a bad upper bound would step the target indefinitely. Mitigation: hard cap at `N_RANGE_STEP_MAX` steps with a defensive `T05` halt-and-report if the cap is hit; expose the count in a new `monitor diag last-range-step` verb.
+- **`vKill` listener survival vs. resource leaks.** Keeping the server alive across many connect / disconnect cycles risks leaking SW-BP shadow entries, file descriptors, or NVMPROG state. Mitigation: a dedicated `rsp_session_reset()` called from `dh_v_kill()` zeroes every per-session structure; a Phase-11 stress test connects-disconnects 100× and asserts the process RSS and open-fd count are unchanged.
 
 ## 9. Risks & Open Questions
 

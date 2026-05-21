@@ -111,7 +111,7 @@ Role: **unit**. **47 test(s).**
 
 ### 3.3. [tests/test_rsp.c](../tests/test_rsp.c)
 
-Role: **unit**. **63 test(s).**
+Role: **unit**. **69 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -178,6 +178,12 @@ Role: **unit**. **63 test(s).**
 | 61 | <a id="Z0_in_hw_only_mode_falls_back_to_HW_BP_path"></a>`Z0_in_hw_only_mode_falls_back_to_HW_BP_path` | `LLR-RSP-36` | Set `ctx.bp_mode = RSP_BP_MODE_HW_ONLY`, dispatch `Z0,800,2`, and verify `mock_hw_bp_set_calls == 1`, `mock_flash_patch_count == 0`, and `ctx.sw_bp[0].in_use == false` — preserving the Phase 1–8 legacy semantics. |
 | 62 | <a id="Z0_in_sw_mode_idempotent_on_same_address"></a>`Z0_in_sw_mode_idempotent_on_same_address` | `LLR-RSP-36` | Dispatch `Z0,900,2` twice and verify `mock_flash_patch_count == 1` — the second install on a shadowed address shall reply `OK` without re-patching FLASH. |
 | 63 | <a id="vFlashDone_also_clears_sw_bp_shadow"></a>`vFlashDone_also_clears_sw_bp_shadow` | `LLR-RSP-39` | Install a SW breakpoint via `Z0,A00,2`, run a `vFlashErase:0,200` / `vFlashDone` cycle, and verify `ctx.sw_bp[0].in_use == false` afterward — the BREAK opcode is no longer in FLASH so the shadow must be dropped. |
+| 64 | <a id="parse_mp_thread_id_accepts_legacy_and_multiprocess_forms"></a>`parse_mp_thread_id_accepts_legacy_and_multiprocess_forms` | `LLR-RSP-40` | Drive the new thread-id parser indirectly through `Hg<...>` dispatch (the helper is `static`). For each legal form — bare hex (`Hg2`), multiprocess (`Hgpa410.2`), unknown-TID multiprocess (`Hgpa410.5`), any-thread shorthand (`Hgp0.0`, `Hgp-1.-1`, `Hg-1`) — assert reply `OK` and that `g_thread` ends up at the expected value (parsed TID, or active TID for any-thread). For each malformed form (`Hgp`, `Hgp1`, `Hgp1.`, `Hgp.5`) assert reply `E01`. Exercises every branch of LLR-RSP-40. |
+| 65 | <a id="Hg_accepts_multiprocess_thread_id_form"></a>`Hg_accepts_multiprocess_thread_id_form` | `LLR-RSP-41` | Build a 3-thread `FsmContext` with `gdb_id` 1/2/3, dispatch `Hgpa410.2`, verify the reply is `OK` and `g_thread == 2`. Then dispatch `Hgpa410.3` (live-trace P0 input from issue #34, which previously returned `E01`) and verify reply `OK` and `g_thread == 3`. Per LLR-RSP-41. |
+| 66 | <a id="Hc_accepts_multiprocess_thread_id_form"></a>`Hc_accepts_multiprocess_thread_id_form` | `LLR-RSP-41` | Equivalent to `Hg_accepts_multiprocess_thread_id_form` for the `Hc` packet: drives `Hcpa410.3`, `Hcp-1.-1`, and `Hc-1`, asserting reply `OK` and the expected value in `c_thread` (parsed TID for explicit forms, active TID for any-thread). Per LLR-RSP-41. |
+| 67 | <a id="T_thread_alive_accepts_multiprocess_form"></a>`T_thread_alive_accepts_multiprocess_form` | `LLR-RSP-41` | Build a 2-thread FsmContext (TIDs 1, 2). Dispatch `Tpa410.1` → `OK`. Dispatch `Tpa410.99` → `E01`. Dispatch `Tp0.0` → `OK` (any-thread). Dispatch malformed `Tpa410.` → `E01`. Per LLR-RSP-41. |
+| 68 | <a id="qThreadExtraInfo_returns_FSM_label_with_state_and_active_flag"></a>`qThreadExtraInfo_returns_FSM_label_with_state_and_active_flag` | `LLR-RSP-42` | Build an FsmContext with thread 1 = `{name:"sched", state_fn:0x0140, is_active:true}`, thread 2 = `{name:"blinker", state_fn:0x01A4, is_active:false}`. Dispatch `qThreadExtraInfo,pa410.1` and assert the reply hex-decodes to exactly `"FSM sched [active] state=0x0140"`. Dispatch `qThreadExtraInfo,pa410.2` and assert hex-decodes to `"FSM blinker [quiescent] state=0x01a4"`. Per LLR-RSP-42. |
+| 69 | <a id="qThreadExtraInfo_unknown_tid_replies_empty_packet"></a>`qThreadExtraInfo_unknown_tid_replies_empty_packet` | `LLR-RSP-42` | Dispatch `qThreadExtraInfo,pa410.99` against a 2-thread FsmContext and assert the reply is the empty RSP packet (zero-length payload), not `E01`. Then dispatch `qThreadExtraInfo,p0.0` and assert empty packet (no aggregate label exists for the any-thread form). Confirms LLR-RSP-41 / LLR-RSP-42 unknown-TID and any-thread semantics. |
 
 ### 3.4. [tests/test_elf.c](../tests/test_elf.c)
 
@@ -416,6 +422,9 @@ verified by code review — see
 | `LLR-RSP-37` | `rsp` | `HLR-054` | `Z0_in_sw_mode_records_original_opcode_from_flash`, `Z0_in_sw_mode_snapshots_and_restores_cpu_state`, `D10_rsp_Z0_z0_sw_bp_flash_break_round_trip` |
 | `LLR-RSP-38` | `rsp` | `HLR-054` | `z0_in_sw_mode_restores_original_opcode`, `D10_rsp_Z0_z0_sw_bp_flash_break_round_trip` |
 | `LLR-RSP-39` | `rsp` | `HLR-054` | `vFlashDone_also_clears_sw_bp_shadow` |
+| `LLR-RSP-40` | `rsp` | `HLR-060` | `parse_mp_thread_id_accepts_legacy_and_multiprocess_forms` |
+| `LLR-RSP-41` | `rsp` | `HLR-060` | `Hg_accepts_multiprocess_thread_id_form`, `Hc_accepts_multiprocess_thread_id_form`, `T_thread_alive_accepts_multiprocess_form` |
+| `LLR-RSP-42` | `rsp` | `HLR-061` | `qThreadExtraInfo_returns_FSM_label_with_state_and_active_flag`, `qThreadExtraInfo_unknown_tid_replies_empty_packet` |
 | `LLR-ELF-01` | `elf` | `HLR-021` | `elf_open_accepts_valid_avr_elf32_binary`, `elf_open_returns_minus1_on_invalid_elf_magic`, `elf_open_returns_minus1_on_wrong_machine_type` |
 | `LLR-ELF-02` | `elf` | `HLR-021`, `HLR-040` | `elf_open_loads_symtab_and_strtab_into_heap_buffers`, `elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure` |
 | `LLR-ELF-03` | `elf` | `HLR-021` | `elf_find_avros_tables_performs_single_linear_scan`, `elf_find_avros_tables_populates_all_7_avros_sentinel_fields` |

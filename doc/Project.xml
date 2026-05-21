@@ -1653,6 +1653,20 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="SDD" ref="5.3.1"/>
         </traces>
       </hlr>
+
+      <hlr id="HLR-060" name="Multiprocess Thread-ID Parsing">
+        <text><![CDATA[Because the application advertises `multiprocess+` in its `qSupported` reply (HLR-058), every RSP packet whose payload contains a thread-id field shall accept the GDB multiprocess form `p<PID>.<TID>` in addition to the legacy bare-hex form. Specifically: `Hg<tid>`, `Hc<tid>`, `Hs<tid>`, `T<tid>` (is-thread-alive), `qThreadExtraInfo,<tid>`, and any `:<tid>` action target inside a `vCont` packet shall be parsed by a single helper that recognises (a) bare hex `<TID>` (the GDB process id is implied to be the server's process id), (b) signed `-1` decoded as "all threads" / "any thread", (c) bare `0` decoded as "any thread", (d) `p<PID>.<TID>` with both fields hex, (e) `p0.0`, `p-1.-1`, `p<PID>.0`, and `p<PID>.-1` all decoded as "any thread in that process". The application shall use a fixed compile-time process-id constant `RSP_PID` (currently `0xa410`) for every reply that needs to emit a `<pid>` field; the value shall not be read from any uninitialised storage. Packets that fail this expanded parse shall reply `E01` exactly as before; packets that parse successfully but reference a TID not present in `FsmContext.threads[]` shall reply `E01` for `Hg`/`Hc`/`Hs`/`T` and the empty packet for `qThreadExtraInfo`. The implementation shall preserve the layered architecture (`SDD` §2.2): the parser lives entirely in `src/gdb_rsp.c` and the FSM-context lookup goes through the existing `RspContext.fsm` pointer.]]></text>
+        <traces>
+          <trace target="SDD" ref="5.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-061" name="qThreadExtraInfo with FSM Name and State">
+        <text><![CDATA[The `qThreadExtraInfo,<tid>` reply shall encode a human-readable label that lets a GDB front-end (e.g. VS Code's Call Stack view) distinguish individual avrOS FSMs at a glance. The label payload shall be the ASCII string `"FSM <name> [<active|quiescent>] state=0x<state_fn_hex>"` where `<name>` is the `FsmThread.name` field populated by `fsm_build_thread_list()` from the avrOS FSM table (HLR-013), `<active|quiescent>` reflects the `FsmThread.is_active` flag at the time the FSM context was last built, and `<state_fn_hex>` is the four-hex-digit FLASH word address of the FSM's next dispatch entry-point read from FSM_TABLE+offset (LLR-FSM-09). The label shall be hex-encoded byte-by-byte per the RSP spec and replied as a normal packet. The avrOS runtime is a cooperative run-to-completion FSM scheduler: every FSM executes on the **single shared hardware stack** set up by the C-runtime init code (`__stack` symbol from the linker map, growing down from `RAMEND`). At any halt, only the currently-running FSM has a live call stack; the other N−1 FSMs are quiescent between dispatches and have no preserved register frame anywhere in SRAM. The `[quiescent]` suffix therefore signals to the user that GDB will produce a one-frame backtrace for that FSM — the FSM `state` function — which is documented behaviour, not a bug. Unknown TIDs shall reply with the empty packet (signalling "unknown" per the RSP spec) rather than `E01`. The total reply payload shall not exceed `PacketSize=800`/2 = 400 bytes; FSM names longer than 32 bytes shall be silently truncated.]]></text>
+        <traces>
+          <trace target="SDD" ref="5.3.1"/>
+        </traces>
+      </hlr>
     </section>
 
   </hlrs>
@@ -2296,6 +2310,27 @@ Errors are propagated upward through the module stack without retrying:
         <text><![CDATA[The helper `rsp_sw_bp_clear_all(RspContext *ctx)` shall clear every entry in `ctx->sw_bp[]` (`in_use=false`, `addr=0`, `orig[0]=orig[1]=0`) without issuing any UPDI I/O. It shall be invoked by `dh_vflash_done()` (HLR-053) on successful flush, and by the `monitor reset` / `monitor erase` / `monitor chip-erase` verbs (HLR-055) immediately after their UPDI side-effect, because the underlying FLASH instruction (and therefore the `BREAK` opcode that would otherwise persist) is no longer present.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-054" name="True Software Breakpoints via Flash BREAK Opcode"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-40">
+        <text><![CDATA[A static helper `parse_mp_thread_id(const char *s, uint32_t *pid_out, uint32_t *tid_out, bool *any_out)` shall parse a GDB thread-id field at `s` and return 0 on success, -1 on syntax error. It shall accept five forms: (a) bare hex `<TID>` → `*pid_out = RSP_PID`, `*tid_out = parsed`, `*any_out = false`; (b) bare `0` → `*any_out = true`, `*pid_out = RSP_PID`, `*tid_out = 0`; (c) bare `-1` → `*any_out = true`, `*pid_out = RSP_PID`, `*tid_out = (uint32_t)-1`; (d) `p<PID>.<TID>` with both fields hex (or each independently `0` / `-1`) → `*pid_out = parsed_pid` (or `RSP_PID` if `0` / `-1`), `*tid_out = parsed_tid`, `*any_out = (pid_zero || pid_neg1 || tid_zero || tid_neg1)`; (e) `pPID.0` / `pPID.-1` → `any = true`. The compile-time constant `RSP_PID` shall equal `0xa410` and shall be the only value the server emits in any `<pid>` field. The helper shall not write its outputs unless it returns 0. The helper shall not allocate memory and shall not call into UPDI or FSM-mapper layers.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-060" name="Multiprocess Thread-ID Parsing"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-41">
+        <text><![CDATA[The handlers `dh_set_thread_g()` (`Hg<tid>`), `dh_set_thread_c()` (`Hc<tid>`), `dh_thread_alive()` (`T<tid>`), and `dh_thread_extra()` (`qThreadExtraInfo,<tid>`) shall use `parse_mp_thread_id()` (LLR-RSP-40) to decode their thread-id argument. For `Hg`/`Hc`, on `any = true` the selected thread shall be `fsm_get_active_thread(ctx->fsm)` (or `1` when no FSM context is built); on `any = false` the parsed `tid` shall be stored verbatim in `*ctx->g_thread_p` / `*ctx->c_thread_p`. Reply `OK` on success, `E01` on syntax error. For `T`, on `any = true` the reply shall be `OK` (every-thread query is a no-op success); on `any = false` the existing membership test against `FsmContext.threads[]` shall apply with reply `OK` / `E01`. For `qThreadExtraInfo`, on `any = true` the reply shall be the empty packet (no aggregate label exists for "any thread"); on `any = false` the existing TID lookup shall apply but unknown TIDs shall reply with the empty packet rather than `E01` (LLR-RSP-42 details the new label format).]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-060" name="Multiprocess Thread-ID Parsing"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-42">
+        <text><![CDATA[The `dh_thread_extra()` handler shall format its reply as the ASCII string `"FSM <name> [<active|quiescent>] state=0x<state_fn_hex>"` and hex-encode it byte-by-byte for the RSP wire. `<name>` is `FsmThread.name` (truncated at 32 bytes), `<active|quiescent>` is `"active"` when `FsmThread.is_active == true` and `"quiescent"` otherwise, and `<state_fn_hex>` is `FsmThread.state_fn` printed as four lowercase hex digits via `%04x`. The total ASCII length shall not exceed 80 bytes; the hex-encoded reply shall not exceed 160 bytes which fits inside `PacketSize=800` with substantial headroom. When `ctx->fsm` is NULL or `ctx->fsm->valid` is false the handler shall reply with the empty packet for every TID. The handler shall not call into the UPDI layer (no live silicon access is required — the `FsmThread.state_fn` field is populated by `fsm_build_thread_list()` at the previous halt).]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-061" name="qThreadExtraInfo with FSM Name and State"/>
         </traces>
       </llr>
     </function>
@@ -3086,7 +3121,7 @@ Errors are propagated upward through the module stack without retrying:
     <!-- ============================================================ -->
     <!-- src/gdb_rsp.c unit tests                                     -->
     <!-- ============================================================ -->
-    <file path="tests/test_rsp.c" role="unit" count="63">
+    <file path="tests/test_rsp.c" role="unit" count="69">
       <header><![CDATA[Unit tests for `src/gdb_rsp.c`: socket configuration, RSP packet framing, register and memory handlers, hardware-breakpoint comparator management, OCD-based execution control, async Ctrl-C interrupt, detach cleanup, session lifecycle packets, and monitor relay. Uses a `socketpair()` as a drop-in socket substitute and replaces every `updi_*`, `fsm_*`, and `monitor_dispatch` call site with `ld --wrap` mocks so all tests run without real silicon.]]></header>
 
       <test name="rsp_listen_sets_so_reuseaddr_before_bind">
@@ -3402,6 +3437,36 @@ Errors are propagated upward through the module stack without retrying:
       <test name="vFlashDone_also_clears_sw_bp_shadow">
         <purpose><![CDATA[Install a SW breakpoint via `Z0,A00,2`, run a `vFlashErase:0,200` / `vFlashDone` cycle, and verify `ctx.sw_bp[0].in_use == false` afterward — the BREAK opcode is no longer in FLASH so the shadow must be dropped.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-39"/></traces>
+      </test>
+
+      <test name="parse_mp_thread_id_accepts_legacy_and_multiprocess_forms">
+        <purpose><![CDATA[Drive the new thread-id parser indirectly through `Hg<...>` dispatch (the helper is `static`). For each legal form — bare hex (`Hg2`), multiprocess (`Hgpa410.2`), unknown-TID multiprocess (`Hgpa410.5`), any-thread shorthand (`Hgp0.0`, `Hgp-1.-1`, `Hg-1`) — assert reply `OK` and that `g_thread` ends up at the expected value (parsed TID, or active TID for any-thread). For each malformed form (`Hgp`, `Hgp1`, `Hgp1.`, `Hgp.5`) assert reply `E01`. Exercises every branch of LLR-RSP-40.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-40"/></traces>
+      </test>
+
+      <test name="Hg_accepts_multiprocess_thread_id_form">
+        <purpose><![CDATA[Build a 3-thread `FsmContext` with `gdb_id` 1/2/3, dispatch `Hgpa410.2`, verify the reply is `OK` and `g_thread == 2`. Then dispatch `Hgpa410.3` (live-trace P0 input from issue #34, which previously returned `E01`) and verify reply `OK` and `g_thread == 3`. Per LLR-RSP-41.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-41"/></traces>
+      </test>
+
+      <test name="Hc_accepts_multiprocess_thread_id_form">
+        <purpose><![CDATA[Equivalent to `Hg_accepts_multiprocess_thread_id_form` for the `Hc` packet: drives `Hcpa410.3`, `Hcp-1.-1`, and `Hc-1`, asserting reply `OK` and the expected value in `c_thread` (parsed TID for explicit forms, active TID for any-thread). Per LLR-RSP-41.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-41"/></traces>
+      </test>
+
+      <test name="T_thread_alive_accepts_multiprocess_form">
+        <purpose><![CDATA[Build a 2-thread FsmContext (TIDs 1, 2). Dispatch `Tpa410.1` → `OK`. Dispatch `Tpa410.99` → `E01`. Dispatch `Tp0.0` → `OK` (any-thread). Dispatch malformed `Tpa410.` → `E01`. Per LLR-RSP-41.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-41"/></traces>
+      </test>
+
+      <test name="qThreadExtraInfo_returns_FSM_label_with_state_and_active_flag">
+        <purpose><![CDATA[Build an FsmContext with thread 1 = `{name:"sched", state_fn:0x0140, is_active:true}`, thread 2 = `{name:"blinker", state_fn:0x01A4, is_active:false}`. Dispatch `qThreadExtraInfo,pa410.1` and assert the reply hex-decodes to exactly `"FSM sched [active] state=0x0140"`. Dispatch `qThreadExtraInfo,pa410.2` and assert hex-decodes to `"FSM blinker [quiescent] state=0x01a4"`. Per LLR-RSP-42.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-42"/></traces>
+      </test>
+
+      <test name="qThreadExtraInfo_unknown_tid_replies_empty_packet">
+        <purpose><![CDATA[Dispatch `qThreadExtraInfo,pa410.99` against a 2-thread FsmContext and assert the reply is the empty RSP packet (zero-length payload), not `E01`. Then dispatch `qThreadExtraInfo,p0.0` and assert empty packet (no aggregate label exists for the any-thread form). Confirms LLR-RSP-41 / LLR-RSP-42 unknown-TID and any-thread semantics.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-42"/></traces>
       </test>
     </file>
 

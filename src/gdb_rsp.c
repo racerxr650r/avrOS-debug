@@ -99,6 +99,83 @@ static int parse_hex_u32(const char **pp, uint32_t *out)
     return n;
 }
 
+/* HLR-060 / LLR-RSP-40: server-wide GDB process id used in every reply
+ * that carries a `<pid>` field.  Fixed at compile time so quiescent and
+ * synthesised frames reference a stable namespace.  Value historically
+ * observed by GDB on the wire (avrOS run-time pid).                    */
+#define RSP_PID  0xa410u
+
+/* HLR-060 / LLR-RSP-40: parse a GDB thread-id field at *pp.
+ *
+ * Recognises five forms:
+ *   - bare hex `<TID>`            → pid=RSP_PID, tid=parsed,    any=false
+ *   - bare `0`                    → pid=RSP_PID, tid=0,         any=true
+ *   - bare `-1`                   → pid=RSP_PID, tid=(uint32_t)-1, any=true
+ *   - `p<PID>.<TID>`              → pid/tid as parsed, any=any field-is-0/-1
+ *   - `p<PID>.0` / `p<PID>.-1`    → any=true
+ *   - `p0.<TID>` / `p-1.<TID>`    → pid mapped to RSP_PID, any=true
+ *
+ * Returns 0 on success, -1 on syntax error.  On error the *_out pointers
+ * are not modified.  Advances *pp past the parsed field on success.    */
+static int parse_mp_thread_id(const char **pp,
+                              uint32_t *pid_out,
+                              uint32_t *tid_out,
+                              bool *any_out)
+{
+    const char *p = *pp;
+    uint32_t pid = RSP_PID;
+    uint32_t tid = 0;
+    bool any = false;
+    bool pid_special = false;          /* pid = 0 or -1 */
+    bool tid_special = false;
+
+    if (*p == 'p') {
+        /* Multiprocess form: p<PID>.<TID>. */
+        ++p;
+        if (*p == '-' && *(p + 1) == '1') {
+            pid = RSP_PID;
+            pid_special = true;
+            p += 2;
+        } else {
+            uint32_t v;
+            if (parse_hex_u32(&p, &v) < 0) return -1;
+            if (v == 0u) { pid = RSP_PID; pid_special = true; }
+            else         { pid = v; }
+        }
+        if (*p != '.') return -1;
+        ++p;
+        if (*p == '-' && *(p + 1) == '1') {
+            tid = (uint32_t)-1;
+            tid_special = true;
+            p += 2;
+        } else {
+            uint32_t v;
+            if (parse_hex_u32(&p, &v) < 0) return -1;
+            tid = v;
+            if (v == 0u) tid_special = true;
+        }
+        any = pid_special || tid_special;
+    } else if (*p == '-') {
+        /* Bare `-1` shorthand. */
+        if (*(p + 1) != '1') return -1;
+        tid = (uint32_t)-1;
+        any = true;
+        p += 2;
+    } else {
+        /* Bare hex tid. */
+        uint32_t v;
+        if (parse_hex_u32(&p, &v) < 0) return -1;
+        tid = v;
+        any = (v == 0u);
+    }
+
+    *pp = p;
+    if (pid_out) *pid_out = pid;
+    if (tid_out) *tid_out = tid;
+    if (any_out) *any_out = any;
+    return 0;
+}
+
 static ssize_t write_all(int fd, const void *buf, size_t len)
 {
     const char *p = buf;
@@ -845,41 +922,75 @@ static int dh_thread_info(int fd, const char *pkt, void *vctx)
     return rsp_send_packet(fd, reply);
 }
 
+/* HLR-061 / LLR-RSP-42: qThreadExtraInfo,<tid> — return a
+ * human-readable label for the FSM identified by <tid>:
+ *   "FSM <name> [active|quiescent] state=0x<state_fn>"
+ * The label is hex-encoded byte-by-byte per the RSP spec.  Unknown
+ * TIDs reply with the empty packet; "any-thread" forms (p0.0 / p-1.-1)
+ * also reply empty — no aggregate label exists.                       */
 static int dh_thread_extra(int fd, const char *pkt, void *vctx)
 {
     RspContext *ctx = (RspContext *)vctx;
     const char *p = strchr(pkt, ',');
     if (p == NULL) return reply_err(fd, "E01");
     ++p;
-    uint32_t tid;
-    if (parse_hex_u32(&p, &tid) < 0) return reply_err(fd, "E01");
+    uint32_t pid, tid;
+    bool any;
+    if (parse_mp_thread_id(&p, &pid, &tid, &any) < 0) return reply_err(fd, "E01");
+    (void)pid;
+    if (any) return reply_empty(fd);
+    if (ctx->fsm == NULL || !ctx->fsm->valid) return reply_empty(fd);
 
-    const char *name = "<unknown>";
-    if (ctx->fsm) {
-        for (int i = 0; i < ctx->fsm->thread_count; ++i) {
-            if ((uint32_t)ctx->fsm->threads[i].gdb_id == tid) {
-                name = ctx->fsm->threads[i].name;
-                break;
-            }
+    const FsmThread *match = NULL;
+    for (int i = 0; i < ctx->fsm->thread_count; ++i) {
+        if ((uint32_t)ctx->fsm->threads[i].gdb_id == tid) {
+            match = &ctx->fsm->threads[i];
+            break;
         }
     }
-    size_t nlen = strlen(name);
-    char reply[80];
-    if (nlen * 2u + 1u > sizeof reply) nlen = (sizeof reply - 1u) / 2u;
-    for (size_t i = 0; i < nlen; ++i) byte_to_hex((uint8_t)name[i], &reply[i * 2]);
-    reply[nlen * 2] = '\0';
+    if (match == NULL) return reply_empty(fd);
+
+    /* Render label "FSM <name> [active|quiescent] state=0xNNNN".
+     * Truncate the FSM name to 32 bytes so the assembled string fits
+     * the 80-byte budget noted in LLR-RSP-42.                          */
+    char name_buf[33];
+    size_t nl = strnlen(match->name, sizeof name_buf - 1);
+    memcpy(name_buf, match->name, nl);
+    name_buf[nl] = '\0';
+
+    char label[96];
+    int lab_len = snprintf(label, sizeof label,
+                           "FSM %s [%s] state=0x%04x",
+                           name_buf,
+                           match->is_active ? "active" : "quiescent",
+                           (unsigned)match->state_fn);
+    if (lab_len < 0) return reply_empty(fd);
+    if ((size_t)lab_len >= sizeof label) lab_len = (int)sizeof label - 1;
+
+    char reply[2 * sizeof label + 1];
+    for (int i = 0; i < lab_len; ++i) byte_to_hex((uint8_t)label[i], &reply[i * 2]);
+    reply[lab_len * 2] = '\0';
     return rsp_send_packet(fd, reply);
 }
 
-static int parse_h_tid(const char *pkt, int *out_tid)
+/* HLR-060 / LLR-RSP-41: parse the thread-id payload of an Hg/Hc/Hs
+ * packet via parse_mp_thread_id().  *out_tid is set to the resolved
+ * tid (the parsed value, or fsm_get_active_thread() when any=true).   */
+static int parse_h_tid(const RspContext *ctx, const char *pkt, int *out_tid)
 {
-    /* Hg<tid> or Hc<tid>; tid is hex; -1 means all threads */
+    /* Hg<tid> / Hc<tid> / Hs<tid> — skip the H<op> prefix. */
     const char *p = pkt + 2;
-    bool neg = false;
-    if (*p == '-') { neg = true; ++p; }
-    uint32_t v;
-    if (parse_hex_u32(&p, &v) < 0) return -1;
-    *out_tid = neg ? -(int)v : (int)v;
+    uint32_t pid, tid;
+    bool any;
+    if (parse_mp_thread_id(&p, &pid, &tid, &any) < 0) return -1;
+    (void)pid;
+    if (any) {
+        int active = (ctx != NULL && ctx->fsm) ? fsm_get_active_thread(ctx->fsm) : 1;
+        if (active <= 0) active = 1;
+        *out_tid = active;
+    } else {
+        *out_tid = (int)tid;
+    }
     return 0;
 }
 
@@ -887,7 +998,7 @@ static int dh_set_thread_g(int fd, const char *pkt, void *vctx)
 {
     RspContext *ctx = (RspContext *)vctx;
     int tid;
-    if (parse_h_tid(pkt, &tid) < 0) return reply_err(fd, "E01");
+    if (parse_h_tid(ctx, pkt, &tid) < 0) return reply_err(fd, "E01");
     if (tid <= 0) tid = ctx->fsm ? fsm_get_active_thread(ctx->fsm) : 1;
     if (tid <= 0) tid = 1;
     if (ctx->g_thread_p) *ctx->g_thread_p = tid;
@@ -898,7 +1009,7 @@ static int dh_set_thread_c(int fd, const char *pkt, void *vctx)
 {
     RspContext *ctx = (RspContext *)vctx;
     int tid;
-    if (parse_h_tid(pkt, &tid) < 0) return reply_err(fd, "E01");
+    if (parse_h_tid(ctx, pkt, &tid) < 0) return reply_err(fd, "E01");
     if (tid <= 0) tid = ctx->fsm ? fsm_get_active_thread(ctx->fsm) : 1;
     if (tid <= 0) tid = 1;
     if (ctx->c_thread_p) *ctx->c_thread_p = tid;
@@ -982,12 +1093,19 @@ static int dh_query_offsets(int fd, const char *pkt, void *vctx)
  * decoded thread id is present in FsmContext.threads[], else E01. When
  * the FSM context has not yet been built the active thread id (1) is
  * the only live tid; this mirrors the default empty thread list. */
+/* HLR-060 / LLR-RSP-41: T<tid> — is-thread-alive.  Accepts both legacy
+ * bare-hex and multiprocess `p<PID>.<TID>` thread-id forms via
+ * parse_mp_thread_id(); any-thread forms (p0.0 / p-1.-1 / -1) reply OK
+ * without a membership check.                                         */
 static int dh_thread_alive(int fd, const char *pkt, void *vctx)
 {
     RspContext *ctx = (RspContext *)vctx;
     const char *p = pkt + 1;            /* skip 'T' */
-    uint32_t tid = 0;
-    if (parse_hex_u32(&p, &tid) < 0) return reply_err(fd, "E01");
+    uint32_t pid, tid;
+    bool any;
+    if (parse_mp_thread_id(&p, &pid, &tid, &any) < 0) return reply_err(fd, "E01");
+    (void)pid;
+    if (any) return reply_ok(fd);
     if (ctx->fsm != NULL && ctx->fsm->valid) {
         for (int i = 0; i < ctx->fsm->thread_count; ++i) {
             if ((uint32_t)ctx->fsm->threads[i].gdb_id == tid) {
