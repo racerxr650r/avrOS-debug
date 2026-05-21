@@ -1377,6 +1377,72 @@ static void qXfer_memory_map_read_replies_l_when_no_elf_loaded(void)
     TEST_ASSERT_EQUAL_STRING("l", payload);
 }
 
+/* HLR-067: `m`-reads outside the advertised memory map must reply E14
+ * so GDB's `finish` / `step-out` (which reads return addresses off the
+ * stack via DWARF CFI) reports an honest "unreliable frame" error
+ * rather than receiving garbage filler and jumping to a fabricated
+ * address.  Reproduces the silicon scenario captured on 2026-05-20
+ * where SP was uninitialised at the entry stop, GDB read 0x807ff8
+ * (well past the advertised SRAM end of 0x80410e), got 0xffff back,
+ * and planted a temp breakpoint at 0x1fffe.                          */
+static void on_read_mem_returns_E14_for_address_outside_advertised_map(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    ctx.flash_size = 0x4740u;        /* mirrors the captured ELF       */
+    ctx.sram_base  = 0x804000u;
+    ctx.sram_size  = 0x10eu;
+    /* 0x807ff8 is 0x3eea bytes past the advertised SRAM end. */
+    rsp_dispatch(sock_pair[1], "m807ff8,2", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[16];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("E14", payload);
+    /* UPDI must NOT have been touched. */
+    TEST_ASSERT_EQUAL(0, mock_read_count);
+}
+
+/* HLR-067 / LLR-RSP-48: positive — a read landing inside one of the
+ * non-FLASH NVM bands (EEPROM here) is accepted and routed through
+ * UPDI.  Confirms the bounds-check whitelist includes all five
+ * non-FLASH device-class regions, not just FLASH and SRAM.           */
+static void on_read_mem_allows_address_inside_eeprom_band(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    ctx.flash_size = 0x4740u;
+    ctx.sram_base  = 0x804000u;
+    ctx.sram_size  = 0x10eu;
+    mock_read_canned_len = 2;
+    mock_read_canned[0] = 0xCA; mock_read_canned[1] = 0xFE;
+    /* EEPROM at GDB 0x810000; bit-23 flip yields UPDI 0x010000. */
+    rsp_dispatch(sock_pair[1], "m810000,2", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[16];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("cafe", payload);
+    TEST_ASSERT_EQUAL(1, mock_read_count);
+    TEST_ASSERT_EQUAL(0x10000u, mock_reads[0].addr);
+}
+
+/* HLR-067: when no ELF was supplied (qXfer:memory-map:read replies
+ * `l` with no document — see HLR-063), the bounds check is bypassed
+ * so the historical permissive behaviour of `m` is preserved.  This
+ * is the regression guard for the existing
+ * `on_read_mem_m_calls_updi_mem_read_and_returns_hex` test and the
+ * no-ELF startup mode used by `tests/hw/gdb_acceptance.py`.          */
+static void on_read_mem_permissive_when_no_memory_map_advertised(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    /* All sizing zero ⇒ no map advertised ⇒ no bounds enforcement. */
+    mock_read_canned_len = 1;
+    mock_read_canned[0] = 0x5A;
+    rsp_dispatch(sock_pair[1], "m807ff8,1", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[16];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("5a", payload);
+    TEST_ASSERT_EQUAL(1, mock_read_count);
+}
+
 /* ── HLR-056: Z2/Z3/Z4 data watchpoints — silicon does not expose
  *           the hardware over UPDI (see src/updi.h and
  *           doc/reference/guesswork.md).  Server replies the empty
@@ -1911,6 +1977,9 @@ int main(void)
     RUN_TEST(qXfer_memory_map_read_includes_eeprom_fuses_lock_sigrow_userrow);
     RUN_TEST(qXfer_memory_map_read_supports_chunked_offset_length);
     RUN_TEST(qXfer_memory_map_read_replies_l_when_no_elf_loaded);
+    RUN_TEST(on_read_mem_returns_E14_for_address_outside_advertised_map);
+    RUN_TEST(on_read_mem_allows_address_inside_eeprom_band);
+    RUN_TEST(on_read_mem_permissive_when_no_memory_map_advertised);
     RUN_TEST(Z2_replies_empty_packet_so_gdb_falls_back_to_sw_watch);
     RUN_TEST(z3_remove_also_replies_empty_packet);
     /* HLR-053: vFlashErase / vFlashWrite / vFlashDone (`gdb load`). */

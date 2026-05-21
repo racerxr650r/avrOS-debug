@@ -658,6 +658,40 @@ static int dh_write_regs(int fd, const char *pkt, void *vctx)
     return reply_ok(fd);
 }
 
+/* HLR-067 / LLR-RSP-48: return true iff [addr, addr+len) lies entirely
+ * within one of the seven memory regions advertised by HLR-063's
+ * `qXfer:memory-map:read+` document.  When `flash_size` and `sram_size`
+ * are both zero the server published no map (no ELF was loaded) and
+ * GDB is using its built-in defaults — fall back to permissive behaviour
+ * so this path remains compatible with the no-ELF startup mode.  The
+ * range must not wrap or straddle a region boundary.                  */
+static bool mm_range_in_advertised_region(const RspContext *ctx,
+                                          uint32_t addr, uint32_t len)
+{
+    if (len == 0u) return false;
+    if (addr + len < addr) return false;  /* arithmetic wrap */
+    if (ctx->flash_size == 0u && ctx->sram_size == 0u) return true;
+
+    const uint32_t end = addr + len;
+    struct { uint32_t base; uint32_t size; } regions[] = {
+        { 0u,                ctx->flash_size      },  /* FLASH   */
+        { ctx->sram_base,    ctx->sram_size       },  /* SRAM    */
+        { ELF_VMA_EEPROM,    UPDI_EEPROM_SIZE     },  /* EEPROM  */
+        { ELF_VMA_FUSES,     UPDI_FUSES_SIZE      },  /* FUSES   */
+        { ELF_VMA_LOCK,      UPDI_LOCK_SIZE       },  /* LOCK    */
+        { ELF_VMA_SIGROW,    UPDI_SIGROW_SIZE     },  /* SIGROW  */
+        { ELF_VMA_USERROW,   UPDI_USERROW_SIZE    },  /* USERROW */
+    };
+    for (size_t i = 0; i < sizeof regions / sizeof regions[0]; ++i) {
+        if (regions[i].size == 0u) continue;
+        if (addr >= regions[i].base &&
+            end  <= regions[i].base + regions[i].size) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int dh_read_mem(int fd, const char *pkt, void *vctx)
 {
     RspContext *ctx = (RspContext *)vctx;
@@ -668,6 +702,16 @@ static int dh_read_mem(int fd, const char *pkt, void *vctx)
     ++p;
     if (parse_hex_u32(&p, &len) < 0) return reply_err(fd, "E01");
     if (len == 0 || len > 512u) return reply_err(fd, "E01");
+
+    /* HLR-067: refuse reads outside the advertised memory map so GDB's
+     * `finish` / `step-out` (which reads the return address off the
+     * stack via DWARF CFI) reports an honest "unreliable" error
+     * rather than receiving filler from a no-such-memory UPDI probe
+     * and jumping to a fabricated address.  E14 = EFAULT per the
+     * Linux errno convention GDB documents for memory faults.        */
+    if (!mm_range_in_advertised_region(ctx, addr, len)) {
+        return reply_err(fd, "E14");
+    }
 
     /* GDB AVR memory map: 0x000000-0x7FFFFF = FLASH (program memory),
      * 0x800000+ = SRAM/IO (data memory).  AVR-Dx UPDI memory map: FLASH at

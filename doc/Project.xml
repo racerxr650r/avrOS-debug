@@ -1713,6 +1713,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
           <trace target="SDD" ref="5.3.1"/>
         </traces>
       </hlr>
+
+      <hlr id="HLR-067" name="Memory-Map Honesty for `m`-Reads">
+        <text><![CDATA[The RSP server's `m<addr>,<len>` read handler shall enforce that every read request lies entirely within one of the memory regions it advertised via `qXfer:memory-map:read+` (HLR-063), and shall reply with the GDB error code `E14` (the conventional `EFAULT` mapping for "memory inaccessible") whenever any byte of the requested range falls outside every advertised region. This honesty contract exists because GDB's stack-unwind logic — used by `finish`, `step-out`, and frame-walking — reads the saved return address off the target's stack via DWARF CFI and then plants a temporary breakpoint at the address it reads; if the server fabricates filler bytes (e.g. `0xff`) for an out-of-range address, GDB will install a temp breakpoint at a fabricated location and hang waiting for it to fire. The check shall be performed against the same `RspContext.flash_size` / `.sram_base` / `.sram_size` fields HLR-063 uses to build its advertisement and shall include all seven advertised regions (Flash, SRAM, EEPROM, FUSES, LOCK, SIGROW, USERROW) using the AVR-Dx device-class constants and ELF VMA bands defined in HLR-063. Backward-compatibility: when both `flash_size` and `sram_size` are zero — the same condition under which HLR-063 publishes no map and GDB falls back to its built-in defaults — the bounds check shall be bypassed and the historical permissive behaviour of `m` shall be preserved (so the no-ELF startup mode and `tests/hw/gdb_acceptance.py` continue to work). Validation: the check shall be implemented in `dh_read_mem` only; symmetric enforcement on `M` / `X` writes is deliberately deferred to a future requirement because writes do not feed GDB's stack-unwind path. The arithmetic shall reject `len == 0` and shall detect 32-bit address-plus-length wrap-around so a malicious or malformed packet cannot bypass the check by overflow.]]></text>
+        <traces>
+          <trace target="SDD" ref="5.3.1"/>
+        </traces>
+      </hlr>
     </section>
 
   </hlrs>
@@ -2420,6 +2427,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <text><![CDATA[`rsp_dispatch()` shall recognise packets that begin with the literal prefix `qXfer:memory-map:read::` (23 bytes) and route them to a new private handler `static int dh_qxfer_memory_map(int fd, const char *pkt, void *vctx)`. The qSupported reply (currently `"PacketSize=800;QStartNoAckMode+;multiprocess+;vContSupported+;vRun+;vAttach+;vKill+;vFlashErase+;vFlashWrite+;vFlashDone+;swbreak+;hwbreak+"`) shall be extended with the suffix `";qXfer:memory-map:read+"`. The handler shall: (1) `strtoul()` two hex fields `<offset>,<length>` immediately after the prefix and reply `E00` on a missing comma or non-hex digits; (2) when both `ctx->flash_size == 0` and `ctx->sram_size == 0`, reply `l` (end-of-transfer with no data) so GDB falls back to its built-in defaults; (3) otherwise render an XML document into a stack `char xml[1024]` via a `snprintf()`-driven append loop, emitting the regions in this order — wrapped in `<memory-map>...</memory-map>`: `<memory type="flash" start="0x0" length="<flash_size>"><property name="blocksize">0x200</property></memory>` (Flash, only when `ctx->flash_size != 0`); `<memory type="ram" start="<sram_base>" length="<sram_size>"/>` (SRAM, only when `ctx->sram_size != 0`); EEPROM at `ELF_VMA_EEPROM = 0x810000` length `UPDI_EEPROM_SIZE = 0x200` typed `flash` blocksize `0x1`; FUSES at `ELF_VMA_FUSES = 0x820000` length `UPDI_FUSES_SIZE = 0x10` typed `flash` blocksize `0x1`; LOCK at `ELF_VMA_LOCK = 0x830000` length `UPDI_LOCK_SIZE = 0x4` typed `flash` blocksize `0x1`; SIGROW at `ELF_VMA_SIGROW = 0x840000` length `UPDI_SIGROW_SIZE = 0x40` typed `rom` (no blocksize child); USERROW at `ELF_VMA_USERROW = 0x850000` length `UPDI_USERROW_SIZE = 0x20` typed `flash` blocksize `0x20`. The five non-FLASH NVM regions are emitted unconditionally whenever the all-zero short-circuit at step (2) does not fire. On `snprintf` overflow the handler shall reply `E01`. (4) Slice `xml[offset, offset+length)` into the reply, prefix with `'l'` when the slice reaches end-of-document or `'m'` otherwise, and emit via `rsp_send_packet()`; offsets at or past the document length shall reply `l` with no payload. `RspContext` shall gain three sibling fields `uint32_t flash_size; uint32_t sram_base; uint32_t sram_size;` (declared adjacent to `last_stop_cause` in `src/gdb_rsp.h`); `src/main.c` shall populate them from `elf_ctx.flash_size` / `.sram_base` / `.sram_size` at the same designated-initialiser site that already sets `.idx`. The handler shall be inlined into `rsp_dispatch()` (sibling of the `qSupported` / `qAttached` inline routes, before the `case 'q':` switch arm) and shall not consume a `RspHandlers` vtable slot.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-063" name="qXfer:memory-map:read+ Advertisement"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-48">
+        <text><![CDATA[`dh_read_mem()` shall, immediately after parsing and length-validating the `m<addr>,<len>` packet (and before the GDB↔UPDI bit-23 address translation), call a new file-private helper `static bool mm_range_in_advertised_region(const RspContext *ctx, uint32_t addr, uint32_t len)` and, when the helper returns `false`, return `reply_err(fd, "E14")` instead of invoking `updi_mem_read()`. The helper shall return `false` for `len == 0` or when the 32-bit sum `addr + len` wraps; it shall return `true` when both `ctx->flash_size == 0` and `ctx->sram_size == 0` (no memory map advertised — permissive fallback for HLR-063's no-ELF case); otherwise it shall return `true` iff the half-open range `[addr, addr+len)` lies entirely within one of these seven regions (using the same constants HLR-063's advertisement emits): `[0, ctx->flash_size)` when `flash_size != 0`; `[ctx->sram_base, ctx->sram_base + ctx->sram_size)` when `sram_size != 0`; `[ELF_VMA_EEPROM, ELF_VMA_EEPROM + UPDI_EEPROM_SIZE)`; `[ELF_VMA_FUSES, ELF_VMA_FUSES + UPDI_FUSES_SIZE)`; `[ELF_VMA_LOCK, ELF_VMA_LOCK + UPDI_LOCK_SIZE)`; `[ELF_VMA_SIGROW, ELF_VMA_SIGROW + UPDI_SIGROW_SIZE)`; `[ELF_VMA_USERROW, ELF_VMA_USERROW + UPDI_USERROW_SIZE)`. The helper shall be defined immediately above `dh_read_mem()` in `src/gdb_rsp.c` and shall be `static` (file scope) so it is exclusively callable from the `m`-read path. The check shall NOT be wired into `dh_write_mem()` for this requirement — symmetric write enforcement is deferred. UPDI shall not be touched on a bounds rejection (`mock_read_count` MUST remain 0 in the negative unit test).]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-067" name="Memory-Map Honesty for `m`-Reads"/>
         </traces>
       </llr>
     </function>
@@ -3220,7 +3234,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/gdb_rsp.c unit tests                                     -->
     <!-- ============================================================ -->
-    <file path="tests/test_rsp.c" role="unit" count="85">
+    <file path="tests/test_rsp.c" role="unit" count="88">
       <header><![CDATA[Unit tests for `src/gdb_rsp.c`: socket configuration, RSP packet framing, register and memory handlers, hardware-breakpoint comparator management, OCD-based execution control, async Ctrl-C interrupt, detach cleanup, session lifecycle packets, and monitor relay. Uses a `socketpair()` as a drop-in socket substitute and replaces every `updi_*`, `fsm_*`, and `monitor_dispatch` call site with `ld --wrap` mocks so all tests run without real silicon.]]></header>
 
       <test name="rsp_listen_sets_so_reuseaddr_before_bind">
@@ -3646,6 +3660,21 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="qXfer_memory_map_read_replies_l_when_no_elf_loaded">
         <purpose><![CDATA[Build the context with all three sizing fields zero (no ELF supplied), dispatch `qXfer:memory-map:read::0,200`, and assert the reply payload is exactly `l` (end-of-transfer with no document). Confirms the server declines to fabricate a memory map when it cannot derive one from the ELF. Per LLR-RSP-47.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-47"/></traces>
+      </test>
+
+      <test name="on_read_mem_returns_E14_for_address_outside_advertised_map">
+        <purpose><![CDATA[Negative bounds-check test reproducing the silicon scenario captured on 2026-05-20. Set `ctx.flash_size = 0x4740`, `ctx.sram_base = 0x804000`, `ctx.sram_size = 0x10e` (so the memory map is advertised); dispatch `m807ff8,2` — an address 0x3eea bytes past the advertised SRAM end and inside none of the seven advertised regions. Drain and assert the reply payload is exactly `E14`. Also assert `mock_read_count == 0` to prove the bounds check short-circuits before any UPDI transaction is issued. Per LLR-RSP-48.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-48"/></traces>
+      </test>
+
+      <test name="on_read_mem_allows_address_inside_eeprom_band">
+        <purpose><![CDATA[Positive whitelist test confirming the bounds check accepts addresses that lie inside any of the five non-FLASH NVM bands, not just FLASH and SRAM. Set the same Flash/SRAM sizing as above so the advertisement is active; prime the UPDI mock with two canned bytes `0xCA 0xFE`; dispatch `m810000,2` (EEPROM base, GDB-side VMA — bit-23 flip yields UPDI 0x010000). Drain and assert the reply payload is exactly `cafe`, `mock_read_count == 1`, and `mock_reads[0].addr == 0x10000`. Confirms the EEPROM/FUSES/LOCK/SIGROW/USERROW ELF VMA bands are part of the whitelist. Per LLR-RSP-48.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-48"/></traces>
+      </test>
+
+      <test name="on_read_mem_permissive_when_no_memory_map_advertised">
+        <purpose><![CDATA[Regression guard for the no-ELF startup mode (where HLR-063 replies `l` with no map and GDB falls back to its built-in defaults). Leave all three sizing fields zero (`build_ctx` default); prime the UPDI mock with one canned byte `0x5A`; dispatch `m807ff8,1` — an address that would be rejected if the bounds check were active. Drain and assert the reply payload is exactly `5a` and `mock_read_count == 1`, proving the bounds check is correctly bypassed when no map was advertised. Per LLR-RSP-48.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-48"/></traces>
       </test>
     </file>
 
