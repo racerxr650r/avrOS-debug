@@ -84,18 +84,21 @@ static int send_text_as_o_packet(int rsp_fd, const char *text, size_t text_len)
     return rsp_send_packet(rsp_fd, pkt);
 }
 
-/* Read a NUL-terminated string from the target starting at `addr` via
- * background UPDI reads. Reads one byte at a time (cheap; names are short).
- * Returns the number of payload bytes copied into `out` (excluding NUL), or
- * -1 on UPDI failure. The output is always NUL-terminated when len >= 1. */
+/* Read a NUL-terminated string from the target starting at GDB-AVR
+ * byte address `addr` via background UPDI reads.  String literals on
+ * AVR-Dx live in the mapped-flash window (>= 0x8000); we route through
+ * UPDI's flash mirror so the chip resolves FLMAP transparently.
+ * Returns the number of payload bytes copied into `out` (excluding
+ * NUL), or -1 on UPDI failure.  Always NUL-terminates when len >= 1. */
 static int read_target_string(int updi_fd, uint32_t addr,
                               char *out, size_t out_max)
 {
     if (out_max == 0) return -1;
+    uint32_t base = flash_to_updi(addr);
     size_t n = 0;
     while (n + 1u < out_max) {
         uint8_t b;
-        if (updi_mem_read(updi_fd, addr + (uint32_t)n, &b, 1u) < 0) return -1;
+        if (updi_mem_read(updi_fd, base + (uint32_t)n, &b, 1u) < 0) return -1;
         if (b == 0u) break;
         if (!isprint((unsigned char)b)) b = '?';
         out[n++] = (char)b;
@@ -120,7 +123,8 @@ static int cmd_events(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx)
 
     static uint8_t descr[EVNT_DESCR_SIZE * 256u];
     size_t total = (size_t)idx->event_count * EVNT_DESCR_SIZE;
-    if (updi_mem_read(updi_fd, idx->event_table_addr, descr, total) < 0) {
+    if (updi_mem_read(updi_fd, flash_to_updi(idx->event_table_addr),
+                      descr, total) < 0) {
         return -1;
     }
 
@@ -169,7 +173,8 @@ static int cmd_queues(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx)
 
     static uint8_t descr[QUE_DESCR_SIZE * 256u];
     size_t total = (size_t)idx->queue_count * QUE_DESCR_SIZE;
-    if (updi_mem_read(updi_fd, idx->queue_table_addr, descr, total) < 0) {
+    if (updi_mem_read(updi_fd, flash_to_updi(idx->queue_table_addr),
+                      descr, total) < 0) {
         return -1;
     }
 

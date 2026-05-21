@@ -183,7 +183,10 @@ int __wrap_updi_nvm_flash_patch(int fd, uint32_t addr,
 
 int __wrap_updi_halt(int fd)        { (void)fd; ++mock_halt_calls; log_event(EV_HALT); return 0; }
 int __wrap_updi_run (int fd)        { (void)fd; ++mock_run_calls;  log_event(EV_RUN);  return 0; }
-int __wrap_updi_step(int fd)        { (void)fd; ++mock_step_calls; log_event(EV_STEP); return 0; }
+/* HLR-066: per-step PC advance for vCont;r tests.  Default 0 leaves
+ * mock_ocd_pc untouched (preserves pre-existing test expectations). */
+static uint32_t mock_step_pc_delta;
+int __wrap_updi_step(int fd)        { (void)fd; ++mock_step_calls; mock_ocd_pc += mock_step_pc_delta; log_event(EV_STEP); return 0; }
 int __wrap_updi_console_poll(int u, int r) { (void)u; (void)r; return 0; }
 int __wrap_updi_enter_debug(int fd) { (void)fd; return 0; }
 int __wrap_updi_chip_erase(int fd) { (void)fd; return 0; }
@@ -382,6 +385,7 @@ static void reset_mocks(void)
 {
     mock_run_calls = mock_step_calls = mock_invalidate_calls = 0;
     mock_halt_calls = mock_build_calls = 0;
+    mock_step_pc_delta = 0;
     mock_write_count = mock_flash_write_count = mock_read_count = 0;
     mock_flash_patch_count = 0;
     memset(mock_writes, 0, sizeof mock_writes);
@@ -850,6 +854,18 @@ static void on_detach_D_resumes_target_closes_socket_resets_gdb_fd(void)
     sock_pair[1] = -1;
 }
 
+/* ── HLR-065 / LLR-RSP-43 ───────────────────────────────────────────── */
+
+static void on_detach_D_sets_disconnect_reason_to_D(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    TEST_ASSERT_NULL(ctx.disconnect_reason);
+    rsp_dispatch(sock_pair[1], "D", &h);
+    TEST_ASSERT_NOT_NULL(ctx.disconnect_reason);
+    TEST_ASSERT_EQUAL_STRING("D", ctx.disconnect_reason);
+    sock_pair[1] = -1;
+}
+
 static void on_detach_clears_hw_bps_before_run(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
@@ -1069,19 +1085,46 @@ static void vAttach_halts_target_and_emits_stop_reply(void)
     TEST_ASSERT_NOT_NULL(strstr(payload, "thread:"));
 }
 
-/* ── LLR-RSP-25: vKill;<pid> ────────────────────────────────────────── */
+/* ── LLR-RSP-25 / HLR-064: vKill;<pid> ─────────────────────────────── */
 
-static void vKill_sets_quit_and_replies_ok(void)
+static void vKill_replies_ok_closes_socket_does_not_set_quit(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    /* Install one HW breakpoint so we can verify rsp_hw_bp_clear_all
+     * is called on the vKill path.                                   */
+    ctx.bp_mode = RSP_BP_MODE_HW_ONLY;
+    rsp_dispatch(sock_pair[1], "Z0,200,2", &h);
+    char drain_buf[256]; drain(sock_pair[0], drain_buf, sizeof drain_buf);
+    int clears_before = mock_hw_bp_clear_calls;
+    int halts_before  = mock_halt_calls;
+
     TEST_ASSERT_EQUAL(0, g_quit_var);
     rsp_dispatch(sock_pair[1], "vKill;1", &h);
 
-    TEST_ASSERT_EQUAL(1, (int)g_quit_var);
+    /* HLR-064: vKill is a per-session disconnect, not a server shutdown. */
+    TEST_ASSERT_EQUAL(0, (int)g_quit_var);
+    /* Target halted, HW comparator released. */
+    TEST_ASSERT_GREATER_THAN(halts_before, mock_halt_calls);
+    TEST_ASSERT_GREATER_THAN(clears_before, mock_hw_bp_clear_calls);
+    /* GDB socket fd reset to -1 (handler closed it). */
+    TEST_ASSERT_EQUAL(-1, g_gdb_fd_var);
+    /* Reply was OK (last packet on the wire). */
     char stream[64]; drain(sock_pair[0], stream, sizeof stream);
     char payload[64];
     TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
     TEST_ASSERT_EQUAL_STRING("OK", payload);
+    sock_pair[1] = -1; /* handler closed it */
+}
+
+/* HLR-065 / LLR-RSP-43: vKill records the disconnect reason. */
+static void vKill_sets_disconnect_reason_to_vKill(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    TEST_ASSERT_NULL(ctx.disconnect_reason);
+    rsp_dispatch(sock_pair[1], "vKill;1", &h);
+    TEST_ASSERT_NOT_NULL(ctx.disconnect_reason);
+    TEST_ASSERT_EQUAL_STRING("vKill", ctx.disconnect_reason);
+    sock_pair[1] = -1; /* handler closed it */
 }
 
 static void qSupported_advertises_multiprocess_vRun_vAttach_vKill(void)
@@ -1096,6 +1139,308 @@ static void qSupported_advertises_multiprocess_vRun_vAttach_vKill(void)
     TEST_ASSERT_NOT_NULL(strstr(payload, "vAttach+"));
     TEST_ASSERT_NOT_NULL(strstr(payload, "vKill+"));
     TEST_ASSERT_NULL(strstr(payload, "multiprocess-"));
+}
+
+/* ── HLR-062 (LLR-RSP-44/45): swbreak/hwbreak stop-cause tags ─────── */
+
+static void qSupported_advertises_swbreak_and_hwbreak(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    rsp_dispatch(sock_pair[1], "qSupported:multiprocess+;swbreak+;hwbreak+", &h);
+    char stream[256]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[256];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_NOT_NULL(strstr(payload, "swbreak+"));
+    TEST_ASSERT_NOT_NULL(strstr(payload, "hwbreak+"));
+}
+
+static void continue_emits_swbreak_when_pc_matches_sw_bp_shadow(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    /* Default bp_mode is RSP_BP_MODE_SW; Z0,100,2 patches the BREAK
+     * shadow at GDB addr 0x100.                                     */
+    rsp_dispatch(sock_pair[1], "Z0,100,2", &h);
+    char tmp[64]; drain(sock_pair[0], tmp, sizeof tmp);
+    /* Park PC on the BREAK shadow and let dh_continue see an
+     * immediate halt on first poll.                                 */
+    mock_ocd_pc = 0x100u;
+    mock_ocd_poll_default = 0;
+    rsp_dispatch(sock_pair[1], "vCont;c", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL(0, strncmp(payload, "T05swbreak:;thread:", 19));
+}
+
+static void continue_emits_hwbreak_when_pc_matches_hw_bp_shadow(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    ctx.bp_mode = RSP_BP_MODE_HW_ONLY;
+    rsp_dispatch(sock_pair[1], "Z0,200,2", &h);
+    char tmp[64]; drain(sock_pair[0], tmp, sizeof tmp);
+    mock_ocd_pc = 0x200u;
+    mock_ocd_poll_default = 0;
+    rsp_dispatch(sock_pair[1], "vCont;c", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL(0, strncmp(payload, "T05hwbreak:;thread:", 19));
+}
+
+static void continue_emits_bare_T05_when_pc_matches_no_breakpoint(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    /* No breakpoints installed — shadow scan returns SC_NONE. */
+    mock_ocd_pc = 0xCAFEu;
+    mock_ocd_poll_default = 0;
+    rsp_dispatch(sock_pair[1], "vCont;c", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL(0, strncmp(payload, "T05thread:", 10));
+    TEST_ASSERT_NULL(strstr(payload, "swbreak"));
+    TEST_ASSERT_NULL(strstr(payload, "hwbreak"));
+}
+
+/* ── HLR-066 (LLR-RSP-46): vCont;r range-step ─────────────────────── */
+
+static void vCont_probe_advertises_range_step(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    rsp_dispatch(sock_pair[1], "vCont?", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("vCont;c;s;r", payload);
+}
+
+static void vCont_range_step_steps_until_pc_leaves_range(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    /* Start PC at 0x100, advance by 2 per step.  After ~80 steps PC
+     * crosses 0x200 and the loop exits.                             */
+    mock_ocd_pc = 0x100u;
+    mock_step_pc_delta = 2;
+    rsp_dispatch(sock_pair[1], "vCont;r100,200", &h);
+    TEST_ASSERT_GREATER_OR_EQUAL(1, mock_step_calls);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL(0, strncmp(payload, "T05", 3));
+}
+
+static void vCont_range_step_returns_immediately_when_pc_already_outside(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    mock_ocd_pc = 0x500u;   /* outside [0x100, 0x200) */
+    rsp_dispatch(sock_pair[1], "vCont;r100,200", &h);
+    TEST_ASSERT_EQUAL(0, mock_step_calls);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL(0, strncmp(payload, "T05thread:", 10));
+}
+
+static void vCont_range_step_emits_T02_on_ctrl_c(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    /* PC starts inside range and __wrap_updi_step does not move it
+     * (mock_step_pc_delta == 0) — would loop until RSP_RANGE_STEP_MAX
+     * but for the queued Ctrl-C byte on the GDB-side socket.        */
+    mock_ocd_pc = 0x100u;
+    char ctrlc = '\x03';
+    ssize_t n = write(sock_pair[0], &ctrlc, 1);
+    TEST_ASSERT_EQUAL(1, n);
+    rsp_dispatch(sock_pair[1], "vCont;r100,200", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL(0, strncmp(payload, "T02thread:", 10));
+}
+
+static void vCont_range_step_rejects_malformed_packet_with_E22(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    rsp_dispatch(sock_pair[1], "vCont;rZZ,200", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("E22", payload);
+}
+
+/* ── HLR-063 (LLR-RSP-47): qXfer:memory-map:read+ ─────────────────── */
+
+static void qSupported_advertises_qXfer_memory_map_read(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    rsp_dispatch(sock_pair[1], "qSupported:multiprocess+;swbreak+;hwbreak+", &h);
+    char stream[1024]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[1024];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_NOT_NULL(strstr(payload, "qXfer:memory-map:read+"));
+}
+
+static void qXfer_memory_map_read_returns_xml_with_flash_and_ram_regions(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    ctx.flash_size = 0x20000u;
+    ctx.sram_base  = 0x803000u;
+    ctx.sram_size  = 0x4000u;
+    rsp_dispatch(sock_pair[1], "qXfer:memory-map:read::0,800", &h);
+    char stream[2048]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[2048];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL('l', payload[0]);
+    TEST_ASSERT_NOT_NULL(strstr(payload, "<memory-map>"));
+    TEST_ASSERT_NOT_NULL(strstr(payload,
+        "<memory type=\"flash\" start=\"0x0\" length=\"0x20000\">"));
+    TEST_ASSERT_NOT_NULL(strstr(payload,
+        "<property name=\"blocksize\">0x200</property>"));
+    TEST_ASSERT_NOT_NULL(strstr(payload,
+        "<memory type=\"ram\" start=\"0x803000\" length=\"0x4000\"/>"));
+}
+
+/* HLR-063: the memory-map must also describe the five non-FLASH NVM
+ * regions (EEPROM, FUSES, LOCK, SIGROW, USERROW) at their GDB-visible
+ * ELF VMA bands so `info mem` reports them and M-packet writes route
+ * via load_segments() to the correct silicon UPDI address.            */
+static void qXfer_memory_map_read_includes_eeprom_fuses_lock_sigrow_userrow(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    ctx.flash_size = 0x20000u;
+    ctx.sram_base  = 0x803000u;
+    ctx.sram_size  = 0x4000u;
+    rsp_dispatch(sock_pair[1], "qXfer:memory-map:read::0,800", &h);
+    char stream[2048]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[2048];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL('l', payload[0]);
+    /* EEPROM at ELF_VMA_EEPROM=0x810000, size UPDI_EEPROM_SIZE=0x200. */
+    TEST_ASSERT_NOT_NULL(strstr(payload,
+        "<memory type=\"flash\" start=\"0x810000\" length=\"0x200\">"));
+    /* FUSES at 0x820000, size 0x10. */
+    TEST_ASSERT_NOT_NULL(strstr(payload,
+        "<memory type=\"flash\" start=\"0x820000\" length=\"0x10\">"));
+    /* LOCK at 0x830000, size 0x4. */
+    TEST_ASSERT_NOT_NULL(strstr(payload,
+        "<memory type=\"flash\" start=\"0x830000\" length=\"0x4\">"));
+    /* SIGROW at 0x840000, size 0x40, read-only ⇒ type=rom. */
+    TEST_ASSERT_NOT_NULL(strstr(payload,
+        "<memory type=\"rom\" start=\"0x840000\" length=\"0x40\"/>"));
+    /* USERROW at 0x850000, size 0x20, blocksize=0x20 (whole-row write). */
+    TEST_ASSERT_NOT_NULL(strstr(payload,
+        "<memory type=\"flash\" start=\"0x850000\" length=\"0x20\">"));
+}
+
+static void qXfer_memory_map_read_supports_chunked_offset_length(void)
+{
+    /* First window: 0,10 — should be a non-last `m` chunk of 0x10
+     * bytes.  Second window: 10,800 — should be a final `l` chunk
+     * containing the remainder.  Concatenation must reproduce the
+     * full document.                                                 */
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    ctx.flash_size = 0x20000u;
+    ctx.sram_base  = 0x803000u;
+    ctx.sram_size  = 0x4000u;
+
+    rsp_dispatch(sock_pair[1], "qXfer:memory-map:read::0,10", &h);
+    char stream1[2048]; drain(sock_pair[0], stream1, sizeof stream1);
+    char p1[2048];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream1, p1, sizeof p1));
+    TEST_ASSERT_EQUAL('m', p1[0]);
+    TEST_ASSERT_EQUAL(0x10u, strlen(p1) - 1u);
+
+    rsp_dispatch(sock_pair[1], "qXfer:memory-map:read::10,800", &h);
+    char stream2[2048]; drain(sock_pair[0], stream2, sizeof stream2);
+    char p2[2048];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream2, p2, sizeof p2));
+    TEST_ASSERT_EQUAL('l', p2[0]);
+
+    /* Concatenate p1[1:] + p2[1:] and confirm the document is intact. */
+    char combined[4096];
+    int  c1 = snprintf(combined, sizeof combined, "%s%s", p1 + 1, p2 + 1);
+    TEST_ASSERT_GREATER_THAN(0, c1);
+    TEST_ASSERT_NOT_NULL(strstr(combined, "<memory-map>"));
+    TEST_ASSERT_NOT_NULL(strstr(combined, "</memory-map>"));
+    TEST_ASSERT_NOT_NULL(strstr(combined,
+        "<memory type=\"ram\" start=\"0x803000\" length=\"0x4000\"/>"));
+}
+
+static void qXfer_memory_map_read_replies_l_when_no_elf_loaded(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    /* All three sizing fields zeroed by build_ctx() — no ELF. */
+    rsp_dispatch(sock_pair[1], "qXfer:memory-map:read::0,200", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("l", payload);
+}
+
+/* HLR-067: `m`-reads outside the advertised memory map must reply E14
+ * so GDB's `finish` / `step-out` (which reads return addresses off the
+ * stack via DWARF CFI) reports an honest "unreliable frame" error
+ * rather than receiving garbage filler and jumping to a fabricated
+ * address.  Reproduces the silicon scenario captured on 2026-05-20
+ * where SP was uninitialised at the entry stop, GDB read 0x807ff8
+ * (well past the advertised SRAM end of 0x80410e), got 0xffff back,
+ * and planted a temp breakpoint at 0x1fffe.                          */
+static void on_read_mem_returns_E14_for_address_outside_advertised_map(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    ctx.flash_size = 0x4740u;        /* mirrors the captured ELF       */
+    ctx.sram_base  = 0x804000u;
+    ctx.sram_size  = 0x10eu;
+    /* 0x807ff8 is 0x3eea bytes past the advertised SRAM end. */
+    rsp_dispatch(sock_pair[1], "m807ff8,2", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[16];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("E14", payload);
+    /* UPDI must NOT have been touched. */
+    TEST_ASSERT_EQUAL(0, mock_read_count);
+}
+
+/* HLR-067 / LLR-RSP-48: positive — a read landing inside one of the
+ * non-FLASH NVM bands (EEPROM here) is accepted and routed through
+ * UPDI.  Confirms the bounds-check whitelist includes all five
+ * non-FLASH device-class regions, not just FLASH and SRAM.           */
+static void on_read_mem_allows_address_inside_eeprom_band(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    ctx.flash_size = 0x4740u;
+    ctx.sram_base  = 0x804000u;
+    ctx.sram_size  = 0x10eu;
+    mock_read_canned_len = 2;
+    mock_read_canned[0] = 0xCA; mock_read_canned[1] = 0xFE;
+    /* EEPROM at GDB 0x810000; bit-23 flip yields UPDI 0x010000. */
+    rsp_dispatch(sock_pair[1], "m810000,2", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[16];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("cafe", payload);
+    TEST_ASSERT_EQUAL(1, mock_read_count);
+    TEST_ASSERT_EQUAL(0x10000u, mock_reads[0].addr);
+}
+
+/* HLR-067: when no ELF was supplied (qXfer:memory-map:read replies
+ * `l` with no document — see HLR-063), the bounds check is bypassed
+ * so the historical permissive behaviour of `m` is preserved.  This
+ * is the regression guard for the existing
+ * `on_read_mem_m_calls_updi_mem_read_and_returns_hex` test and the
+ * no-ELF startup mode used by `tests/hw/gdb_acceptance.py`.          */
+static void on_read_mem_permissive_when_no_memory_map_advertised(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    /* All sizing zero ⇒ no map advertised ⇒ no bounds enforcement. */
+    mock_read_canned_len = 1;
+    mock_read_canned[0] = 0x5A;
+    rsp_dispatch(sock_pair[1], "m807ff8,1", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[16];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("5a", payload);
+    TEST_ASSERT_EQUAL(1, mock_read_count);
 }
 
 /* ── HLR-056: Z2/Z3/Z4 data watchpoints — silicon does not expose
@@ -1386,6 +1731,186 @@ static void vFlashDone_also_clears_sw_bp_shadow(void)
     TEST_ASSERT_FALSE(ctx.sw_bp[0].in_use);
 }
 
+/* ── Phase 11 — HLR-060/061 multiprocess thread-id parsing ─────────── */
+
+/* Decode a 2-char-per-byte hex payload back to a NUL-terminated string. */
+static void hex_decode(const char *hex, char *out, size_t cap)
+{
+    size_t n = strlen(hex) / 2;
+    if (n >= cap) n = cap - 1;
+    for (size_t i = 0; i < n; ++i) {
+        unsigned b;
+        sscanf(hex + i * 2, "%2x", &b);
+        out[i] = (char)b;
+    }
+    out[n] = '\0';
+}
+
+/* Extract the OK/Exx payload from the last RSP packet on the wire. */
+static void dispatch_and_capture(RspHandlers *h, const char *pkt,
+                                 char *payload, size_t cap)
+{
+    rsp_dispatch(sock_pair[1], pkt, h);
+    char stream[512]; drain(sock_pair[0], stream, sizeof stream);
+    last_packet_payload(stream, payload, cap);
+}
+
+/* D11 — parse_mp_thread_id round-trip via Hg, exercising every
+ *       legal/illegal form documented in LLR-RSP-40.                  */
+static void parse_mp_thread_id_accepts_legacy_and_multiprocess_forms(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    fake_fsm.thread_count = 2;
+    fake_fsm.threads[1].gdb_id = 2; strcpy(fake_fsm.threads[1].name, "B");
+    mock_active_thread = 1;
+
+    char p[64];
+
+    /* Bare hex. */
+    dispatch_and_capture(&h, "Hg2", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+    TEST_ASSERT_EQUAL(2, g_tid_var);
+
+    /* Multiprocess form. */
+    dispatch_and_capture(&h, "Hgpa410.2", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+    TEST_ASSERT_EQUAL(2, g_tid_var);
+
+    /* Multiprocess form with TID not in table is still accepted —
+     * membership is enforced only by T<tid>, not by Hg/Hc.            */
+    dispatch_and_capture(&h, "Hgpa410.5", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+    TEST_ASSERT_EQUAL(5, g_tid_var);
+
+    /* Any-thread shorthand → resolves to active thread (mock = 1). */
+    dispatch_and_capture(&h, "Hgp0.0", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+    TEST_ASSERT_EQUAL(1, g_tid_var);
+
+    dispatch_and_capture(&h, "Hgp-1.-1", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+    TEST_ASSERT_EQUAL(1, g_tid_var);
+
+    dispatch_and_capture(&h, "Hg-1", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+    TEST_ASSERT_EQUAL(1, g_tid_var);
+
+    /* Malformed forms reply E01. */
+    dispatch_and_capture(&h, "Hgp", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("E01", p);
+    dispatch_and_capture(&h, "Hgp1", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("E01", p);
+    dispatch_and_capture(&h, "Hgp1.", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("E01", p);
+    dispatch_and_capture(&h, "Hgp.5", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("E01", p);
+}
+
+/* D12 — Hgpa410.<TID> returns OK and stores TID. */
+static void Hg_accepts_multiprocess_thread_id_form(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    fake_fsm.thread_count = 3;
+    fake_fsm.threads[1].gdb_id = 2; strcpy(fake_fsm.threads[1].name, "B");
+    fake_fsm.threads[2].gdb_id = 3; strcpy(fake_fsm.threads[2].name, "C");
+    char p[32];
+
+    dispatch_and_capture(&h, "Hgpa410.2", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+    TEST_ASSERT_EQUAL(2, g_tid_var);
+
+    /* Reproduces live-trace P0 finding (issue #34): pre-fix this
+     * returned E01 because parse_h_tid did not recognise `pPID.TID`. */
+    dispatch_and_capture(&h, "Hgpa410.3", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+    TEST_ASSERT_EQUAL(3, g_tid_var);
+}
+
+/* D13 — Hcpa410.<TID> returns OK and stores TID in c_thread. */
+static void Hc_accepts_multiprocess_thread_id_form(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    fake_fsm.thread_count = 3;
+    fake_fsm.threads[1].gdb_id = 2; strcpy(fake_fsm.threads[1].name, "B");
+    fake_fsm.threads[2].gdb_id = 3; strcpy(fake_fsm.threads[2].name, "C");
+    char p[32];
+
+    dispatch_and_capture(&h, "Hcpa410.3", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+    TEST_ASSERT_EQUAL(3, c_tid_var);
+
+    dispatch_and_capture(&h, "Hcp-1.-1", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+    TEST_ASSERT_EQUAL(mock_active_thread, c_tid_var);
+
+    dispatch_and_capture(&h, "Hc-1", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+    TEST_ASSERT_EQUAL(mock_active_thread, c_tid_var);
+}
+
+/* D14 — T<tid> accepts multiprocess form per LLR-RSP-41. */
+static void T_thread_alive_accepts_multiprocess_form(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    fake_fsm.thread_count = 2;
+    fake_fsm.threads[1].gdb_id = 2; strcpy(fake_fsm.threads[1].name, "B");
+    char p[32];
+
+    dispatch_and_capture(&h, "Tpa410.1", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+
+    dispatch_and_capture(&h, "Tpa410.99", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("E01", p);
+
+    /* Any-thread: parser short-circuits to OK without membership. */
+    dispatch_and_capture(&h, "Tp0.0", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+
+    dispatch_and_capture(&h, "Tpa410.", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("E01", p);
+}
+
+/* D15 — qThreadExtraInfo emits "FSM <name> [active|quiescent] state=0xNNNN". */
+static void qThreadExtraInfo_returns_FSM_label_with_state_and_active_flag(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    fake_fsm.thread_count = 2;
+    strcpy(fake_fsm.threads[0].name, "sched");
+    fake_fsm.threads[0].gdb_id = 1;
+    fake_fsm.threads[0].state_fn = 0x0140u;
+    fake_fsm.threads[0].is_active = true;
+    fake_fsm.threads[1].gdb_id = 2;
+    strcpy(fake_fsm.threads[1].name, "blinker");
+    fake_fsm.threads[1].state_fn = 0x01A4u;
+    fake_fsm.threads[1].is_active = false;
+
+    char p[256], txt[128];
+
+    dispatch_and_capture(&h, "qThreadExtraInfo,pa410.1", p, sizeof p);
+    hex_decode(p, txt, sizeof txt);
+    TEST_ASSERT_EQUAL_STRING("FSM sched [active] state=0x0140", txt);
+
+    dispatch_and_capture(&h, "qThreadExtraInfo,pa410.2", p, sizeof p);
+    hex_decode(p, txt, sizeof txt);
+    TEST_ASSERT_EQUAL_STRING("FSM blinker [quiescent] state=0x01a4", txt);
+}
+
+/* D16 — qThreadExtraInfo for unknown TID replies empty packet. */
+static void qThreadExtraInfo_unknown_tid_replies_empty_packet(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    fake_fsm.thread_count = 2;
+    fake_fsm.threads[1].gdb_id = 2; strcpy(fake_fsm.threads[1].name, "B");
+    char p[64];
+
+    dispatch_and_capture(&h, "qThreadExtraInfo,pa410.99", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("", p);
+
+    /* Any-thread also yields empty (no aggregate label). */
+    dispatch_and_capture(&h, "qThreadExtraInfo,p0.0", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("", p);
+}
+
 /* ── Runner ─────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -1419,8 +1944,8 @@ int main(void)
     RUN_TEST(rsp_dispatch_qsupported_returns_feature_string_no_target_access);
     RUN_TEST(rsp_dispatch_qattached_returns_1_no_target_access);
     RUN_TEST(on_detach_D_resumes_target_closes_socket_resets_gdb_fd);
-    RUN_TEST(on_detach_clears_hw_bps_before_run);
-    RUN_TEST(on_kill_k_sets_g_quit_to_1);
+    RUN_TEST(on_detach_D_sets_disconnect_reason_to_D);
+    RUN_TEST(on_detach_clears_hw_bps_before_run);    RUN_TEST(on_kill_k_sets_g_quit_to_1);
     RUN_TEST(on_monitor_qRcmd_passes_hex_body_to_monitor_dispatch);
     RUN_TEST(on_monitor_returns_ok_when_monitor_dispatch_succeeds);
     RUN_TEST(on_monitor_sends_o_packet_error_on_updi_failure);
@@ -1434,8 +1959,27 @@ int main(void)
     RUN_TEST(R_packet_invalidates_fsm_runs_and_emits_stop);
     RUN_TEST(vRun_invalidates_fsm_runs_and_emits_stop);
     RUN_TEST(vAttach_halts_target_and_emits_stop_reply);
-    RUN_TEST(vKill_sets_quit_and_replies_ok);
+    RUN_TEST(vKill_replies_ok_closes_socket_does_not_set_quit);
+    RUN_TEST(vKill_sets_disconnect_reason_to_vKill);
     RUN_TEST(qSupported_advertises_multiprocess_vRun_vAttach_vKill);
+    RUN_TEST(qSupported_advertises_swbreak_and_hwbreak);
+    RUN_TEST(continue_emits_swbreak_when_pc_matches_sw_bp_shadow);
+    RUN_TEST(continue_emits_hwbreak_when_pc_matches_hw_bp_shadow);
+    RUN_TEST(continue_emits_bare_T05_when_pc_matches_no_breakpoint);
+    RUN_TEST(vCont_probe_advertises_range_step);
+    RUN_TEST(vCont_range_step_steps_until_pc_leaves_range);
+    RUN_TEST(vCont_range_step_returns_immediately_when_pc_already_outside);
+    RUN_TEST(vCont_range_step_emits_T02_on_ctrl_c);
+    RUN_TEST(vCont_range_step_rejects_malformed_packet_with_E22);
+    /* HLR-063: qXfer:memory-map:read+ */
+    RUN_TEST(qSupported_advertises_qXfer_memory_map_read);
+    RUN_TEST(qXfer_memory_map_read_returns_xml_with_flash_and_ram_regions);
+    RUN_TEST(qXfer_memory_map_read_includes_eeprom_fuses_lock_sigrow_userrow);
+    RUN_TEST(qXfer_memory_map_read_supports_chunked_offset_length);
+    RUN_TEST(qXfer_memory_map_read_replies_l_when_no_elf_loaded);
+    RUN_TEST(on_read_mem_returns_E14_for_address_outside_advertised_map);
+    RUN_TEST(on_read_mem_allows_address_inside_eeprom_band);
+    RUN_TEST(on_read_mem_permissive_when_no_memory_map_advertised);
     RUN_TEST(Z2_replies_empty_packet_so_gdb_falls_back_to_sw_watch);
     RUN_TEST(z3_remove_also_replies_empty_packet);
     /* HLR-053: vFlashErase / vFlashWrite / vFlashDone (`gdb load`). */
@@ -1455,5 +1999,12 @@ int main(void)
     RUN_TEST(Z0_in_hw_only_mode_falls_back_to_HW_BP_path);
     RUN_TEST(Z0_in_sw_mode_idempotent_on_same_address);
     RUN_TEST(vFlashDone_also_clears_sw_bp_shadow);
+    /* Phase 11 — HLR-060/061 multiprocess thread-id parsing. */
+    RUN_TEST(parse_mp_thread_id_accepts_legacy_and_multiprocess_forms);
+    RUN_TEST(Hg_accepts_multiprocess_thread_id_form);
+    RUN_TEST(Hc_accepts_multiprocess_thread_id_form);
+    RUN_TEST(T_thread_alive_accepts_multiprocess_form);
+    RUN_TEST(qThreadExtraInfo_returns_FSM_label_with_state_and_active_flag);
+    RUN_TEST(qThreadExtraInfo_unknown_tid_replies_empty_packet);
     return UNITY_END();
 }

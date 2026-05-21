@@ -356,79 +356,307 @@ console.
 
 ---
 
-### 5.6 Phase-10 GDB protocol surface (avarice parity)
+### 5.6 GDB tutorial — end-to-end walkthrough
 
-`avrOSdb` implements the GDB Remote Serial Protocol packets needed by
-modern `avr-gdb` builds, giving feature parity with `avarice` for the
-common day-to-day operations.
+This section is a hands-on tour of the most common debugging tasks
+against an AVR-Dx target running `avrOS`. It assumes you have a built
+ELF (`build/firmware.elf`), a UPDI-wired adapter on `/dev/ttyUSB0`,
+and that both `avrOSdb` and `avr-gdb` are on your `PATH`.
 
-#### Flashing from inside GDB (`load`)
+`avrOSdb` implements the full GDB Remote Serial Protocol surface used
+by modern `avr-gdb` builds — `vFlashErase`/`vFlashWrite`/`vFlashDone`
+for `load`, `Z0`/`Z1` for breakpoints, `Z2`/`Z3`/`Z4` for watchpoints
+(software fallback, see step 9), `vRun`/`vAttach`/`vKill` for process
+control, and the `qRcmd` monitor verbs documented below — giving
+feature parity with `avarice` for day-to-day operations.
 
-`vFlashErase` / `vFlashWrite` / `vFlashDone` are advertised in
-`qSupported`, so `(gdb) load` writes the current symbol file straight
-into FLASH via the running server — no need to restart with `--load`:
+#### 1. Launch the server
 
+Open a terminal and start `avrOSdb`. The simplest invocation attaches
+to a target that is already programmed and just opens a GDB listener
+on the default port (`1234`):
+
+```bash
+$ avrOSdb /dev/ttyUSB0 build/firmware.elf
+avrOSdb: listening on :1234, target halted at reset vector
 ```
+
+To program the part from cold *and* drop into a debug session, add
+`--load`:
+
+```bash
+$ avrOSdb --load /dev/ttyUSB0 build/firmware.elf
+avrOSdb: load .text  7424 B  verify: OK
+avrOSdb: load .data   128 B  verify: OK
+avrOSdb: listening on :1234, target halted at reset vector
+```
+
+Leave this terminal open — `avrOSdb` stays in the foreground and
+prints diagnostics while a GDB client is attached.
+
+#### 2. Launch `avr-gdb` and connect
+
+In a **second** terminal, start `avr-gdb` against the same ELF and
+attach to the server over TCP:
+
+```bash
+$ avr-gdb build/firmware.elf
+GNU gdb (GDB) 14.1
+Reading symbols from build/firmware.elf...
 (gdb) target remote :1234
+Remote debugging using :1234
+0x00000000 in __vectors ()
+(gdb)
+```
+
+`target remote` is the canonical attach verb; `target extended-remote`
+also works and additionally enables `run` / `kill` (see §5.6 step 11
+below). The PC is at the reset vector because the server halts the
+CPU before opening the listener.
+
+A quick sanity check after attaching:
+
+```
+(gdb) monitor version
+avrOSdb 0.1.0  (built 2026-05-20)
+(gdb) monitor info
+Family:    AVR128DA28
+Signature: 1E 97 0A   Rev: A6
+Flash:     128 KiB    SRAM: 16 KiB
+(gdb) info threads
+  Id   Target Id                    Frame
+* 1    CPU                          __vectors ()
+  2    FSM blink     (state=BLINK)  fsm_blink_state ()
+  3    FSM uart_rx   (state=IDLE)   fsm_uart_state ()
+```
+
+Each registered avrOS FSM appears as its own GDB virtual thread; the
+state-function name in the `Target Id` column is the current state
+pointer read from the FSM table.
+
+#### 3. Load (or reload) firmware from inside GDB
+
+If you started `avrOSdb` *without* `--load`, you can still flash the
+part without restarting the server:
+
+```
 (gdb) load
-Loading section .text, size 0x1c80 lma 0x0
-...
-Start address 0x0000, load size 7424
+Loading section .text, size 0x1d00 lma 0x0
+Loading section .data, size 0x80  lma 0x1d00
+Start address 0x0000, load size 7552
+Transfer rate: 18 KB/sec.
 (gdb) monitor reset
-(gdb) continue
+(gdb)
 ```
 
-#### Software breakpoints by default (`Z0`)
+`load` uses the `vFlashErase` / `vFlashWrite` / `vFlashDone` packets
+advertised in `qSupported` and writes the current symbol file directly
+to FLASH via the running UPDI session.
 
-Plain `Z0,<addr>,2` packets install **true software breakpoints** —
-the original FLASH word is read out, the AVR `BREAK` opcode
-(`0x9598`, little-endian) is patched in via the NVM controller, and
-the originals are kept in an in-memory shadow so `z0` can restore
-them. CPU state (R0–R31, SREG, SP, PC) is snapshotted across the
-NVMPROG transition. Up to 64 SW breakpoints may be live at once.
-
-The legacy “Z0 aliases to one of the two OCD hardware comparators”
-behaviour is still available — switch with:
+#### 4. Reset the target
 
 ```
-(gdb) monitor bp-mode hw-only    # Z0 → HW comparator (2 slots)
-(gdb) monitor bp-mode sw         # Z0 → FLASH BREAK   (default, 64 slots)
+(gdb) monitor reset
 ```
 
-`Z1` always uses an OCD hardware comparator regardless of mode.
+Issues a UPDI system reset and leaves the CPU halted at the reset
+vector. This is the cleanest way to restart a session after a load,
+after a runaway, or whenever you want to begin from PC = 0 again.
 
-#### Data-access watchpoints (`Z2/Z3/Z4`)
-
-Watchpoints on SRAM are wired to the OCD DABP comparator:
-
-```
-(gdb) watch  myvar      # Z2 — write
-(gdb) rwatch myvar      # Z3 — read
-(gdb) awatch myvar      # Z4 — read/write
-```
-
-#### Process control (`vRun` / `vAttach` / `vKill`)
-
-`(gdb) run`, `(gdb) start`, and `(gdb) kill` are supported — `vRun;`
-re-applies the ELF, resets the CPU, and halts at entry; `vAttach`
-returns the current PC; `vKill` detaches cleanly.
-
-#### avarice-compatible monitor verbs
-
-In addition to the `monitor avros …` family (§5.4):
+The `monitor halt` and `monitor go` verbs are also available for
+fine-grained run control without changing PC:
 
 ```
-(gdb) monitor info          # device-info report
-(gdb) monitor flush         # discard any pending NVM transaction
-(gdb) monitor reset         # UPDI reset, halt at entry
-(gdb) monitor halt          # UPDI halt
-(gdb) monitor erase         # full chip-erase (requires --allow-erase)
-(gdb) monitor chip-erase    # alias for monitor erase
-(gdb) monitor bp-mode sw    # see SW breakpoints above
+(gdb) monitor halt    # stop the CPU now
+(gdb) monitor go      # resume (equivalent to `continue`)
+(gdb) monitor flush   # discard any pending NVM transaction
 ```
 
-`monitor erase` and `monitor chip-erase` will refuse with an `E11`
-error code unless the server was started with `--allow-erase`.
+#### 5. Set breakpoints
+
+The OCD provides 2 **hardware** comparators; `avrOSdb` additionally
+implements up to 64 **software** breakpoints by patching the AVR
+`BREAK` opcode (`0x9598`, little-endian) into FLASH via the NVM
+controller. The original FLASH word is kept in an in-memory shadow
+so `z0` packets restore it cleanly, and CPU state (R0–R31, SREG, SP,
+PC) is snapshotted across the NVMPROG transition. `hbreak` (`Z1`)
+always uses an OCD hardware comparator regardless of mode. By
+default, plain `break` installs a SW breakpoint:
+
+```
+(gdb) break main                       # SW breakpoint at main
+Breakpoint 1 at 0x0148: file src/main.c, line 42.
+(gdb) break src/main.c:88              # by file:line
+(gdb) break fsm_blink_state            # by function name
+(gdb) break *0x02a0                    # by raw address
+(gdb) tbreak fsm_uart_state            # one-shot (auto-deleted after hit)
+(gdb) hbreak my_isr_handler            # explicit HW breakpoint (Z1)
+(gdb) info breakpoints
+Num Type           Disp Enb Address    What
+1   breakpoint     keep y   0x00000148 in main at src/main.c:42
+2   hw breakpoint  keep y   0x00000310 in my_isr_handler
+```
+
+To switch all `break` requests to the legacy 2-slot HW-only policy:
+
+```
+(gdb) monitor bp-mode hw-only
+(gdb) monitor bp-mode sw          # back to the default
+```
+
+Deleting and disabling breakpoints uses the standard GDB verbs:
+
+```
+(gdb) disable 1
+(gdb) enable 1
+(gdb) clear main                  # remove by location
+(gdb) delete 2                    # remove by number
+(gdb) delete                      # remove all
+```
+
+#### 6. Run, stop, and step
+
+```
+(gdb) continue            # or `c` — resume the CPU
+Continuing.
+^C                        # Ctrl-C halts the running target
+Program received signal SIGINT, Interrupt.
+0x00000482 in fsm_blink_state () at src/fsm_blink.c:57
+(gdb) step                # source-level step into
+(gdb) next                # source-level step over
+(gdb) stepi               # single instruction
+(gdb) nexti               # single instruction, step over calls
+(gdb) finish              # run until current function returns
+(gdb) until 91            # run until source line 91 of current frame
+```
+
+Ctrl-C is wired through the server as an OCD STOP; the next
+instruction boundary halts and a `SIGINT` is reported back to GDB.
+
+#### 7. Inspect variables, memory, and registers
+
+```
+(gdb) print my_counter             # value of a global / local
+$1 = 17
+(gdb) print/x PORTA.OUT             # hex format
+$2 = 0x40
+(gdb) print *task                   # dereference a pointer
+(gdb) print sizeof(struct fsm)      # any C expression
+(gdb) info locals                   # all locals in selected frame
+(gdb) info args                     # function arguments
+(gdb) info registers                # R0..R31, SREG, SP, PC
+(gdb) info reg pc sreg sp
+(gdb) x/16xb 0x3F00                 # 16 bytes hex at SRAM addr
+(gdb) x/4hw &message_table          # 4 16-bit words
+(gdb) x/s greeting                  # null-terminated string
+```
+
+To keep an expression pinned in the UI / auto-printed on every halt:
+
+```
+(gdb) display/x PORTA.OUT
+(gdb) display my_counter
+(gdb) info display
+(gdb) undisplay 1
+```
+
+Modifying state from the prompt works too:
+
+```
+(gdb) set var my_counter = 0
+(gdb) set {uint8_t}0x0400 = 0xFF    # poke a raw address
+(gdb) set $pc = &main               # rewrite PC
+```
+
+#### 8. Backtrace and frames
+
+```
+(gdb) backtrace                     # or `bt`
+#0 fsm_blink_state () at src/fsm_blink.c:57
+#1 0x00000128 in scheduler_tick ()  at src/sched.c:88
+#2 0x00000054 in main ()            at src/main.c:42
+(gdb) frame 2                       # select a frame
+(gdb) info frame                    # details of selected frame
+(gdb) up / down                     # walk the stack
+```
+
+#### 9. Watchpoints (software only)
+
+The AVR-Dx OCD over UPDI exposes **no** data-address watchpoint
+hardware, so `avrOSdb` replies to the GDB `Z2`/`Z3`/`Z4` packets with
+the empty packet. `avr-gdb` then transparently falls back to
+**software watchpoints**: it single-steps the CPU and re-reads the
+watched location after every instruction. The verbs are the usual
+ones —
+
+```
+(gdb) watch my_counter              # break on write
+(gdb) rwatch sensor_reading         # break on read
+(gdb) awatch flag                   # break on read or write
+(gdb) info watchpoints
+(gdb) delete 3
+```
+
+— but expect each `continue` to advance at instruction-stepping speed
+(tens to hundreds of instructions per second over UPDI) for as long
+as a watchpoint is armed. Disable or delete watchpoints before
+resuming normal execution. For a one-off check, prefer a breakpoint
+at the writer/reader site combined with `print` over an active
+watchpoint.
+
+#### 10. avrOS FSM threads
+
+Switch to an FSM context to inspect its locals and state:
+
+```
+(gdb) info threads
+(gdb) thread 3                      # switch to FSM "uart_rx"
+[Switching to thread 3 (FSM uart_rx)]
+#0 fsm_uart_state () at src/fsm_uart.c:112
+(gdb) backtrace
+(gdb) print rx_buffer[0]@8
+```
+
+The avrOS-specific monitor verbs dump runtime state for the whole
+system, independent of which thread is selected:
+
+```
+(gdb) monitor avros events          # global event mask
+(gdb) monitor avros queues          # message-queue depths
+(gdb) monitor avros mempool         # memory-pool free-block counts
+```
+
+#### 11. Restart, detach, and quit
+
+```
+(gdb) run                           # vRun — re-applies ELF, resets, halts at entry
+(gdb) kill                          # vKill — halt target, drop GDB connection, keep server alive
+(gdb) detach                        # release HW comparators, let CPU run free, drop socket
+(gdb) quit                          # exit avr-gdb (also detaches)
+```
+
+After `kill`, `detach`, or `quit` the `avrOSdb` server keeps running
+and is ready to accept the next `target remote :1234` (HLR-064 — the
+GDB extended-remote contract: `vKill` ends the *session*, not the
+*debugger*). To stop the server itself, press Ctrl-C in its terminal
+(or send `SIGTERM` from another shell). The server logs each
+lifecycle transition on `stderr` (HLR-065): `listening on :<port>`,
+`client connected from <ip>:<port>`, `client disconnected (<reason>)`,
+and `shutting down (<reason>)`.
+
+#### 12. Getting help inside GDB
+
+```
+(gdb) help                          # GDB's own help system
+(gdb) help breakpoints
+(gdb) monitor help                  # list every `monitor` verb avrOSdb implements
+```
+
+`monitor help` is the authoritative, always-up-to-date list of
+server-side verbs — refer to it if a verb mentioned here is ever out
+of step with the installed build. `monitor erase` and `monitor
+chip-erase` will refuse with an `E11` error code unless the server
+was started with `--allow-erase`.
 
 ---
 

@@ -211,12 +211,13 @@ void test_elf_find_avros_tables_performs_single_linear_scan(void)
 
     TEST_ASSERT_EQUAL_INT(0, r);
 
-    /* flash_base=0, so elf_flash_addr(vma) = vma/2 */
-    TEST_ASSERT_EQUAL_UINT32(0x0800U,     idx.fsm_table_addr);
+    /* No PT_LOAD entries were installed on this synthetic ctx, so
+     * elf_phys_flash_byte_addr() returns the raw VMA unchanged. */
+    TEST_ASSERT_EQUAL_UINT32(0x1000U,     idx.fsm_table_addr);
     TEST_ASSERT_EQUAL_UINT8 (2U,          idx.fsm_table_count);
-    TEST_ASSERT_EQUAL_UINT32(0x1000U,     idx.queue_table_addr);
+    TEST_ASSERT_EQUAL_UINT32(0x2000U,     idx.queue_table_addr);
     TEST_ASSERT_EQUAL_UINT8 (2U,          idx.queue_count);
-    TEST_ASSERT_EQUAL_UINT32(0x1800U,     idx.event_table_addr);
+    TEST_ASSERT_EQUAL_UINT32(0x3000U,     idx.event_table_addr);
     TEST_ASSERT_EQUAL_UINT8 (4U,          idx.event_count);
     TEST_ASSERT_EQUAL_UINT32(0x00802100U, idx.current_fsm_addr);
 
@@ -260,7 +261,7 @@ void test_elf_flash_addr_applies_vma_minus_base_over_2_formula(void)
     TEST_ASSERT_EQUAL_UINT32(0x0001U, elf_flash_addr(&ctx, 0x1002U));
 }
 
-/* ── Test 9: FLASH-resident idx fields computed via elf_flash_addr ───── */
+/* ── Test 9: FLASH-resident idx fields use phys-byte (LMA) translation ─ */
 void test_elf_flash_addr_all_avros_symbol_addresses_use_word_formula(void)
 {
     ElfContext ctx;
@@ -284,11 +285,14 @@ void test_elf_flash_addr_all_avros_symbol_addresses_use_word_formula(void)
         else if (!strcmp(nm, "currStateMachine"))   curr_vma  = s->st_value;
     }
 
-    /* FLASH-resident: must equal (vma - flash_base) / 2 */
+    /* FLASH-resident: must equal elf_phys_flash_byte_addr(vma). */
     TEST_ASSERT_NOT_EQUAL(0U, fsm_vma);
-    TEST_ASSERT_EQUAL_UINT32(elf_flash_addr(&ctx, fsm_vma),   idx.fsm_table_addr);
-    TEST_ASSERT_EQUAL_UINT32(elf_flash_addr(&ctx, queue_vma), idx.queue_table_addr);
-    TEST_ASSERT_EQUAL_UINT32(elf_flash_addr(&ctx, event_vma), idx.event_table_addr);
+    TEST_ASSERT_EQUAL_UINT32(elf_phys_flash_byte_addr(&ctx, fsm_vma),
+                             idx.fsm_table_addr);
+    TEST_ASSERT_EQUAL_UINT32(elf_phys_flash_byte_addr(&ctx, queue_vma),
+                             idx.queue_table_addr);
+    TEST_ASSERT_EQUAL_UINT32(elf_phys_flash_byte_addr(&ctx, event_vma),
+                             idx.event_table_addr);
 
     /* SRAM-resident: must be the raw VMA, not a word address */
     TEST_ASSERT_EQUAL_UINT32(curr_vma, idx.current_fsm_addr);

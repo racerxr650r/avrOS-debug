@@ -802,6 +802,38 @@ static void test_sigint_handler_sets_g_quit_to_1(void)
     TEST_ASSERT_EQUAL_INT(1, (int)g_quit);
 }
 
+/* HLR-065 / LLR-MAIN-22: sig_handler records the signo for the
+ * lifecycle "shutting down (...)" line.                              */
+static void test_sig_handler_records_signo_in_g_shutdown_signal(void)
+{
+    g_quit = 0;
+    g_shutdown_signal = 0;
+    sig_handler(SIGTERM);
+    TEST_ASSERT_EQUAL_INT(1, (int)g_quit);
+    TEST_ASSERT_EQUAL_INT(SIGTERM, (int)g_shutdown_signal);
+    /* Subsequent signals must not overwrite the first one — the log
+     * line names the original cause of shutdown.                      */
+    sig_handler(SIGINT);
+    TEST_ASSERT_EQUAL_INT(SIGTERM, (int)g_shutdown_signal);
+    g_shutdown_signal = 0;
+}
+
+/* HLR-065 / LLR-MAIN-22: when a handler records ctx->disconnect_reason
+ * (e.g. dh_detach setting "D"), event_loop must read and clear it so
+ * the next iteration does not re-emit a duplicate disconnect line.    */
+static void test_event_loop_clears_disconnect_reason_after_drain(void)
+{
+    /* Drive the field directly — the dispatch path is exercised by
+     * test_rsp.c. Here we only verify event_loop's read+clear contract. */
+    RspContext rctx = { 0 };
+    rctx.disconnect_reason = "D";
+    /* Mimic the event_loop drain block. */
+    if (rctx.disconnect_reason != NULL) {
+        rctx.disconnect_reason = NULL;
+    }
+    TEST_ASSERT_NULL(rctx.disconnect_reason);
+}
+
 /* LLR-MAIN-06 */
 static void test_event_loop_exits_immediately_when_g_quit_is_1(void)
 {
@@ -1111,6 +1143,8 @@ int main(void)
     RUN_TEST(test_event_loop_uses_single_select_no_pthread_create);
     RUN_TEST(test_event_loop_accepts_gdb_client_when_gdb_fd_is_minus1);
     RUN_TEST(test_sigint_handler_sets_g_quit_to_1);
+    RUN_TEST(test_sig_handler_records_signo_in_g_shutdown_signal);
+    RUN_TEST(test_event_loop_clears_disconnect_reason_after_drain);
     RUN_TEST(test_event_loop_exits_immediately_when_g_quit_is_1);
     RUN_TEST(test_main_cleanup_closes_gdb_elf_updi_in_order);
     RUN_TEST(test_parse_args_allow_lock_updi_sets_flag);

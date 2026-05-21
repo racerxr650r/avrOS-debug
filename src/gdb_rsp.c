@@ -34,12 +34,8 @@ static bool g_noack = false;
 void rsp_set_noack(bool e) { g_noack = e; }
 bool rsp_get_noack(void)   { return g_noack; }
 
-/* GDB AVR address-space split: addresses < 0x800000 are program memory
- * (FLASH); addresses >= 0x800000 are data space (SRAM/IO).  AVR-Dx UPDI
- * uses the opposite convention — FLASH lives at UPDI 0x800000+ and SRAM
- * at UPDI 0x000000+.  Translate by flipping bit 23.                    */
-#define GDB_AVR_DATA_FLAG   0x800000u
-#define GDB_AVR_ADDR_MASK   0x7FFFFFu
+/* GDB AVR ↔ UPDI address-space translation helpers live in updi.h
+ * (GDB_AVR_DATA_FLAG, GDB_AVR_ADDR_MASK, sram_to_updi, flash_to_updi). */
 
 /* Sentinel: no breakpoint installed in this HW comparator slot. */
 #define HW_BP_SLOT_EMPTY    0xFFFFFFFFu
@@ -97,6 +93,83 @@ static int parse_hex_u32(const char **pp, uint32_t *out)
     *out = v;
     *pp = p;
     return n;
+}
+
+/* HLR-060 / LLR-RSP-40: server-wide GDB process id used in every reply
+ * that carries a `<pid>` field.  Fixed at compile time so quiescent and
+ * synthesised frames reference a stable namespace.  Value historically
+ * observed by GDB on the wire (avrOS run-time pid).                    */
+#define RSP_PID  0xa410u
+
+/* HLR-060 / LLR-RSP-40: parse a GDB thread-id field at *pp.
+ *
+ * Recognises five forms:
+ *   - bare hex `<TID>`            → pid=RSP_PID, tid=parsed,    any=false
+ *   - bare `0`                    → pid=RSP_PID, tid=0,         any=true
+ *   - bare `-1`                   → pid=RSP_PID, tid=(uint32_t)-1, any=true
+ *   - `p<PID>.<TID>`              → pid/tid as parsed, any=any field-is-0/-1
+ *   - `p<PID>.0` / `p<PID>.-1`    → any=true
+ *   - `p0.<TID>` / `p-1.<TID>`    → pid mapped to RSP_PID, any=true
+ *
+ * Returns 0 on success, -1 on syntax error.  On error the *_out pointers
+ * are not modified.  Advances *pp past the parsed field on success.    */
+static int parse_mp_thread_id(const char **pp,
+                              uint32_t *pid_out,
+                              uint32_t *tid_out,
+                              bool *any_out)
+{
+    const char *p = *pp;
+    uint32_t pid = RSP_PID;
+    uint32_t tid = 0;
+    bool any = false;
+    bool pid_special = false;          /* pid = 0 or -1 */
+    bool tid_special = false;
+
+    if (*p == 'p') {
+        /* Multiprocess form: p<PID>.<TID>. */
+        ++p;
+        if (*p == '-' && *(p + 1) == '1') {
+            pid = RSP_PID;
+            pid_special = true;
+            p += 2;
+        } else {
+            uint32_t v;
+            if (parse_hex_u32(&p, &v) < 0) return -1;
+            if (v == 0u) { pid = RSP_PID; pid_special = true; }
+            else         { pid = v; }
+        }
+        if (*p != '.') return -1;
+        ++p;
+        if (*p == '-' && *(p + 1) == '1') {
+            tid = (uint32_t)-1;
+            tid_special = true;
+            p += 2;
+        } else {
+            uint32_t v;
+            if (parse_hex_u32(&p, &v) < 0) return -1;
+            tid = v;
+            if (v == 0u) tid_special = true;
+        }
+        any = pid_special || tid_special;
+    } else if (*p == '-') {
+        /* Bare `-1` shorthand. */
+        if (*(p + 1) != '1') return -1;
+        tid = (uint32_t)-1;
+        any = true;
+        p += 2;
+    } else {
+        /* Bare hex tid. */
+        uint32_t v;
+        if (parse_hex_u32(&p, &v) < 0) return -1;
+        tid = v;
+        any = (v == 0u);
+    }
+
+    *pp = p;
+    if (pid_out) *pid_out = pid;
+    if (tid_out) *tid_out = tid;
+    if (any_out) *any_out = any;
+    return 0;
 }
 
 static ssize_t write_all(int fd, const void *buf, size_t len)
@@ -254,6 +327,57 @@ static const char *signal_for_halt_status(int updi_fd)
     return "T05";
 }
 
+/* HLR-062 / LLR-RSP-44: stop-cause classification.  Returned from
+ * classify_stop_cause() and stored in RspContext.last_stop_cause for
+ * the formatter (LLR-RSP-45).                                        */
+enum RspStopCause {
+    SC_NONE    = 0,
+    SC_SWBREAK = 1,
+    SC_HWBREAK = 2,
+    SC_STEP    = 3,
+    SC_INTR    = 4
+};
+
+/* Read the live PC and decide whether the halt is a SW-BP hit, a
+ * HW-BP hit, or something else (in which case the caller's `hint` is
+ * returned unchanged).  No PC adjustment — GDB rewinds itself when it
+ * sees `swbreak:;`.                                                  */
+static int classify_stop_cause(RspContext *ctx, int hint)
+{
+    uint32_t pc = 0;
+    if (ctx == NULL) return hint;
+    if (updi_ocd_read_pc(ctx->updi_fd, &pc) < 0) return hint;
+    for (int i = 0; i < RSP_MAX_SW_BREAKPOINTS; i++) {
+        if (ctx->sw_bp[i].in_use && ctx->sw_bp[i].addr == pc) {
+            return SC_SWBREAK;
+        }
+    }
+    for (int i = 0; i < 2; i++) {
+        if (ctx->hw_bp_addr[i] != HW_BP_SLOT_EMPTY &&
+            ctx->hw_bp_addr[i] == pc) {
+            return SC_HWBREAK;
+        }
+    }
+    return hint;
+}
+
+/* HLR-062 / LLR-RSP-45: render `<sig><tag>thread:<hex_tid>;` into a
+ * single packet.  `sig` is "T05" or "T02"; `tag` is "swbreak:;"
+ * for SC_SWBREAK, "hwbreak:;" for SC_HWBREAK, empty otherwise.       */
+static int format_stop_reply(int fd, RspContext *ctx,
+                             const char *sig, int cause)
+{
+    const char *tag = "";
+    if (cause == SC_SWBREAK) tag = "swbreak:;";
+    else if (cause == SC_HWBREAK) tag = "hwbreak:;";
+    int aid = (ctx && ctx->fsm) ? fsm_get_active_thread(ctx->fsm) : 0;
+    if (aid <= 0) aid = 1;
+    char reply[64];
+    snprintf(reply, sizeof reply, "%s%sthread:%x;",
+             sig, tag, (unsigned)aid);
+    return rsp_send_packet(fd, reply);
+}
+
 /* Clear all OCD HW breakpoints in silicon and reset the local shadow.
  * Idempotent and tolerant of UPDI errors (used on detach).            */
 void rsp_hw_bp_clear_all(RspContext *ctx)
@@ -362,12 +486,14 @@ static int dh_halt_reason(int fd, const char *pkt, void *vctx)
 {
     (void)pkt;
     RspContext *ctx = (RspContext *)vctx;
-    int aid = ctx->fsm ? fsm_get_active_thread(ctx->fsm) : 0;
-    if (aid <= 0) aid = 1;
-    char reply[64];
-    snprintf(reply, sizeof reply, "%sthread:%x;",
-             signal_for_halt_status(ctx->updi_fd), (unsigned)aid);
-    return rsp_send_packet(fd, reply);
+    /* HLR-062: classify (PC vs SW/HW BP shadow) when the previous
+     * resume path has not already set a more specific cause.        */
+    if (ctx->last_stop_cause == SC_NONE) {
+        ctx->last_stop_cause = classify_stop_cause(ctx, SC_NONE);
+    }
+    return format_stop_reply(fd, ctx,
+                             signal_for_halt_status(ctx->updi_fd),
+                             ctx->last_stop_cause);
 }
 
 /* Hex-encode one byte into *p (advances p by 2 chars). */
@@ -528,6 +654,40 @@ static int dh_write_regs(int fd, const char *pkt, void *vctx)
     return reply_ok(fd);
 }
 
+/* HLR-067 / LLR-RSP-48: return true iff [addr, addr+len) lies entirely
+ * within one of the seven memory regions advertised by HLR-063's
+ * `qXfer:memory-map:read+` document.  When `flash_size` and `sram_size`
+ * are both zero the server published no map (no ELF was loaded) and
+ * GDB is using its built-in defaults — fall back to permissive behaviour
+ * so this path remains compatible with the no-ELF startup mode.  The
+ * range must not wrap or straddle a region boundary.                  */
+static bool mm_range_in_advertised_region(const RspContext *ctx,
+                                          uint32_t addr, uint32_t len)
+{
+    if (len == 0u) return false;
+    if (addr + len < addr) return false;  /* arithmetic wrap */
+    if (ctx->flash_size == 0u && ctx->sram_size == 0u) return true;
+
+    const uint32_t end = addr + len;
+    struct { uint32_t base; uint32_t size; } regions[] = {
+        { 0u,                ctx->flash_size      },  /* FLASH   */
+        { ctx->sram_base,    ctx->sram_size       },  /* SRAM    */
+        { ELF_VMA_EEPROM,    UPDI_EEPROM_SIZE     },  /* EEPROM  */
+        { ELF_VMA_FUSES,     UPDI_FUSES_SIZE      },  /* FUSES   */
+        { ELF_VMA_LOCK,      UPDI_LOCK_SIZE       },  /* LOCK    */
+        { ELF_VMA_SIGROW,    UPDI_SIGROW_SIZE     },  /* SIGROW  */
+        { ELF_VMA_USERROW,   UPDI_USERROW_SIZE    },  /* USERROW */
+    };
+    for (size_t i = 0; i < sizeof regions / sizeof regions[0]; ++i) {
+        if (regions[i].size == 0u) continue;
+        if (addr >= regions[i].base &&
+            end  <= regions[i].base + regions[i].size) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int dh_read_mem(int fd, const char *pkt, void *vctx)
 {
     RspContext *ctx = (RspContext *)vctx;
@@ -538,6 +698,16 @@ static int dh_read_mem(int fd, const char *pkt, void *vctx)
     ++p;
     if (parse_hex_u32(&p, &len) < 0) return reply_err(fd, "E01");
     if (len == 0 || len > 512u) return reply_err(fd, "E01");
+
+    /* HLR-067: refuse reads outside the advertised memory map so GDB's
+     * `finish` / `step-out` (which reads the return address off the
+     * stack via DWARF CFI) reports an honest "unreliable" error
+     * rather than receiving filler from a no-such-memory UPDI probe
+     * and jumping to a fabricated address.  E14 = EFAULT per the
+     * Linux errno convention GDB documents for memory faults.        */
+    if (!mm_range_in_advertised_region(ctx, addr, len)) {
+        return reply_err(fd, "E14");
+    }
 
     /* GDB AVR memory map: 0x000000-0x7FFFFF = FLASH (program memory),
      * 0x800000+ = SRAM/IO (data memory).  AVR-Dx UPDI memory map: FLASH at
@@ -608,6 +778,9 @@ static int dh_continue(int fd, const char *pkt, void *vctx)
     (void)pkt;
     RspContext *ctx = (RspContext *)vctx;
 
+    /* HLR-062: clear the previous-halt cause hint so a stale tag
+     * never bleeds across resumes.                                  */
+    ctx->last_stop_cause = SC_NONE;
     if (updi_run(ctx->updi_fd) < 0) return reply_err(fd, "E01");
     fsm_invalidate(ctx->fsm);
 
@@ -670,14 +843,17 @@ static int dh_continue(int fd, const char *pkt, void *vctx)
     if (ctx->fsm) {
         (void)fsm_build_thread_list(ctx->fsm, ctx->idx, ctx->updi_fd);
     }
-    /* Signal: SIGINT (T02) for user-Ctrl-C, SIGTRAP (T05) otherwise. */
+    /* HLR-062 / LLR-RSP-44/45: classify (PC vs SW/HW BP shadow) and
+     * route through the single stop-reply formatter so the client
+     * sees `T05swbreak:;...` / `T05hwbreak:;...` / bare `T05` as
+     * appropriate.  Ctrl-C wins over BP-shadow match: a user
+     * interrupt is reported as SIGINT regardless of where the PC
+     * happened to land.                                              */
     {
-        int aid = ctx->fsm ? fsm_get_active_thread(ctx->fsm) : 0;
-        if (aid <= 0) aid = 1;
         const char *sig = got_ctrl_c ? "T02" : "T05";
-        char reply[64];
-        snprintf(reply, sizeof reply, "%sthread:%x;", sig, (unsigned)aid);
-        return rsp_send_packet(fd, reply);
+        int hint = got_ctrl_c ? SC_INTR : SC_NONE;
+        ctx->last_stop_cause = classify_stop_cause(ctx, hint);
+        return format_stop_reply(fd, ctx, sig, ctx->last_stop_cause);
     }
 }
 
@@ -685,12 +861,83 @@ static int dh_step(int fd, const char *pkt, void *vctx)
 {
     (void)pkt;
     RspContext *ctx = (RspContext *)vctx;
+    /* HLR-062: a step that lands on a SW/HW BP shadow is still
+     * a breakpoint hit; otherwise the cause is `step`.  Seed the
+     * hint with SC_STEP so classify_stop_cause() returns it when
+     * neither shadow matches.                                       */
+    ctx->last_stop_cause = SC_NONE;
     if (updi_step(ctx->updi_fd) < 0) return reply_err(fd, "E01");
     fsm_invalidate(ctx->fsm);
     if (ctx->fsm) {
         (void)fsm_build_thread_list(ctx->fsm, ctx->idx, ctx->updi_fd);
     }
+    ctx->last_stop_cause = classify_stop_cause(ctx, SC_STEP);
     return dh_halt_reason(fd, "?", vctx);
+}
+
+/* HLR-066 / LLR-RSP-46: vCont;r<start>,<end>[:<thread>] — keep
+ * single-stepping while the live PC remains inside the half-open
+ * range [start, end).  Mirrors GDB's range-step optimisation so the
+ * front-end does not have to round-trip a `vCont;s` per instruction
+ * during source-stepping over a multi-statement line.  The handler
+ * does not install breakpoints; it is a host-driven step loop.       */
+#define RSP_RANGE_STEP_MAX 100000
+
+static int dh_range_step(int fd, const char *pkt, void *vctx)
+{
+    RspContext *ctx = (RspContext *)vctx;
+    /* Skip the literal "vCont;r" prefix. */
+    const char *p = pkt + 7;
+    uint32_t start = 0, end = 0;
+    if (parse_hex_u32(&p, &start) < 0) return reply_err(fd, "E22");
+    if (*p != ',') return reply_err(fd, "E22");
+    ++p;
+    if (parse_hex_u32(&p, &end) < 0) return reply_err(fd, "E22");
+    /* Optional `:<thread>` suffix is accepted but ignored — single-
+     * core target, the active thread is implicit.                    */
+
+    ctx->last_stop_cause = SC_NONE;
+    bool got_ctrl_c = false;
+    int  iter = 0;
+    for (;;) {
+        uint32_t pc = 0;
+        if (updi_ocd_read_pc(ctx->updi_fd, &pc) < 0) break;
+        if (pc < start || pc >= end) break;
+        if (++iter > RSP_RANGE_STEP_MAX) break;
+
+        if (updi_step(ctx->updi_fd) < 0) {
+            (void)updi_halt(ctx->updi_fd);
+            return reply_err(fd, "E01");
+        }
+
+        /* Non-blocking peek for Ctrl-C from the GDB client. */
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        struct timeval tv = { 0, 0 };
+        int sel = select(fd + 1, &rfds, NULL, NULL, &tv);
+        if (sel > 0 && FD_ISSET(fd, &rfds)) {
+            char c;
+            ssize_t n;
+            do { n = read(fd, &c, 1); } while (n < 0 && errno == EINTR);
+            if (n <= 0) {
+                (void)updi_halt(ctx->updi_fd);
+                return -1;
+            }
+            if (c == '\x03') { got_ctrl_c = true; break; }
+            /* Liberal: discard any other stray byte mid-range-step. */
+        }
+    }
+
+    fsm_invalidate(ctx->fsm);
+    if (ctx->fsm) {
+        (void)fsm_build_thread_list(ctx->fsm, ctx->idx, ctx->updi_fd);
+    }
+    ctx->last_stop_cause =
+        classify_stop_cause(ctx, got_ctrl_c ? SC_INTR : SC_STEP);
+    return format_stop_reply(fd, ctx,
+                             got_ctrl_c ? "T02" : "T05",
+                             ctx->last_stop_cause);
 }
 
 /* AVR-Dx OCD provides exactly two hardware breakpoint comparators
@@ -845,41 +1092,188 @@ static int dh_thread_info(int fd, const char *pkt, void *vctx)
     return rsp_send_packet(fd, reply);
 }
 
+/* HLR-063 / LLR-RSP-47: qXfer:memory-map:read::<offset>,<length> —
+ * advertise the AVR-Dx memory map to GDB so the client routes
+ * M-packet writes correctly and stops short-reading past device
+ * boundaries.  The map covers seven regions:
+ *
+ *   Region   | GDB address    | Length              | type / blocksize
+ *   FLASH    | 0x000000       | RspContext.flash_size | flash / 512
+ *   RAM      | ctx->sram_base | ctx->sram_size      | ram (no blocksize)
+ *   EEPROM   | ELF_VMA_EEPROM | UPDI_EEPROM_SIZE    | flash / 1
+ *   FUSES    | ELF_VMA_FUSES  | UPDI_FUSES_SIZE     | flash / 1
+ *   LOCK     | ELF_VMA_LOCK   | UPDI_LOCK_SIZE      | flash / 1
+ *   SIGROW   | ELF_VMA_SIGROW | UPDI_SIGROW_SIZE    | rom
+ *   USERROW  | ELF_VMA_USERROW| UPDI_USERROW_SIZE   | flash / 32
+ *
+ * FLASH and RAM sizes are sourced verbatim from the loaded ELF; the
+ * five non-FLASH NVM regions are device-class constants (AVR-Dx) and
+ * therefore appear in the map whenever a FLASH or RAM region is
+ * present.  All-zero FLASH+RAM context ⇒ no ELF was supplied at
+ * startup ⇒ reply `l` (end-of-transfer, no data) so GDB falls back
+ * to its built-in defaults rather than rendering a wrong map.  The
+ * XML payload is rebuilt per request into a stack buffer;
+ * offset/length slicing is then applied with `m`/`l` framing.
+ * Malformed offset/length ⇒ E00 per qXfer error convention.          */
+static int dh_qxfer_memory_map(int fd, const char *pkt, void *vctx)
+{
+    RspContext *ctx = (RspContext *)vctx;
+
+    /* Skip the prefix "qXfer:memory-map:read::" (23 chars). */
+    const char *p = pkt + 23;
+    char       *end = NULL;
+    unsigned long offset = strtoul(p, &end, 16);
+    if (end == NULL || *end != ',') return reply_err(fd, "E00");
+    p = end + 1;
+    unsigned long length = strtoul(p, &end, 16);
+    if (end == NULL) return reply_err(fd, "E00");
+
+    /* All-zero sizes ⇒ no ELF available ⇒ end-of-transfer with no
+     * data.  GDB then uses its built-in defaults.                    */
+    if (ctx->flash_size == 0u && ctx->sram_size == 0u) {
+        return rsp_send_packet(fd, "l");
+    }
+
+    /* Build the XML document into a stack buffer.  1 KiB comfortably
+     * holds all seven regions (~700 B); on overflow reply E01.       */
+    char   xml[1024];
+    size_t off = 0;
+    #define MM_APPEND(...)                                                 \
+        do {                                                               \
+            int _w = snprintf(xml + off, sizeof xml - off, __VA_ARGS__);   \
+            if (_w < 0 || (size_t)_w >= sizeof xml - off)                  \
+                return reply_err(fd, "E01");                               \
+            off += (size_t)_w;                                             \
+        } while (0)
+
+    MM_APPEND("<memory-map>");
+    if (ctx->flash_size != 0u) {
+        MM_APPEND("<memory type=\"flash\" start=\"0x0\" length=\"0x%lx\">"
+                  "<property name=\"blocksize\">0x%lx</property>"
+                  "</memory>",
+                  (unsigned long)ctx->flash_size,
+                  (unsigned long)UPDI_FLASH_PAGE_SIZE);
+    }
+    if (ctx->sram_size != 0u) {
+        MM_APPEND("<memory type=\"ram\" start=\"0x%lx\" length=\"0x%lx\"/>",
+                  (unsigned long)ctx->sram_base,
+                  (unsigned long)ctx->sram_size);
+    }
+    /* Non-FLASH NVM regions — AVR-Dx device-class constants.  Address
+     * each at its GDB-visible ELF VMA band (avr-libc convention) so
+     * `M`-writes initiated by GDB land in the correct band and the
+     * `load_segments()` path translates them to silicon UPDI.        */
+    MM_APPEND("<memory type=\"flash\" start=\"0x%lx\" length=\"0x%lx\">"
+              "<property name=\"blocksize\">0x1</property>"
+              "</memory>",
+              (unsigned long)ELF_VMA_EEPROM,
+              (unsigned long)UPDI_EEPROM_SIZE);
+    MM_APPEND("<memory type=\"flash\" start=\"0x%lx\" length=\"0x%lx\">"
+              "<property name=\"blocksize\">0x1</property>"
+              "</memory>",
+              (unsigned long)ELF_VMA_FUSES,
+              (unsigned long)UPDI_FUSES_SIZE);
+    MM_APPEND("<memory type=\"flash\" start=\"0x%lx\" length=\"0x%lx\">"
+              "<property name=\"blocksize\">0x1</property>"
+              "</memory>",
+              (unsigned long)ELF_VMA_LOCK,
+              (unsigned long)UPDI_LOCK_SIZE);
+    MM_APPEND("<memory type=\"rom\" start=\"0x%lx\" length=\"0x%lx\"/>",
+              (unsigned long)ELF_VMA_SIGROW,
+              (unsigned long)UPDI_SIGROW_SIZE);
+    MM_APPEND("<memory type=\"flash\" start=\"0x%lx\" length=\"0x%lx\">"
+              "<property name=\"blocksize\">0x%lx</property>"
+              "</memory>",
+              (unsigned long)ELF_VMA_USERROW,
+              (unsigned long)UPDI_USERROW_SIZE,
+              (unsigned long)UPDI_USERROW_SIZE);
+    MM_APPEND("</memory-map>");
+    #undef MM_APPEND
+
+    size_t total = off;
+    if (offset >= total) {
+        return rsp_send_packet(fd, "l");
+    }
+    size_t avail = total - offset;
+    size_t take  = (length < avail) ? length : avail;
+    bool   last  = (offset + take >= total);
+
+    char reply[1 + sizeof xml];
+    reply[0] = last ? 'l' : 'm';
+    memcpy(&reply[1], xml + offset, take);
+    reply[1 + take] = '\0';
+    return rsp_send_packet(fd, reply);
+}
+
+/* HLR-061 / LLR-RSP-42: qThreadExtraInfo,<tid> — return a
+ * human-readable label for the FSM identified by <tid>:
+ *   "FSM <name> [active|quiescent] state=0x<state_fn>"
+ * The label is hex-encoded byte-by-byte per the RSP spec.  Unknown
+ * TIDs reply with the empty packet; "any-thread" forms (p0.0 / p-1.-1)
+ * also reply empty — no aggregate label exists.                       */
 static int dh_thread_extra(int fd, const char *pkt, void *vctx)
 {
     RspContext *ctx = (RspContext *)vctx;
     const char *p = strchr(pkt, ',');
     if (p == NULL) return reply_err(fd, "E01");
     ++p;
-    uint32_t tid;
-    if (parse_hex_u32(&p, &tid) < 0) return reply_err(fd, "E01");
+    uint32_t pid, tid;
+    bool any;
+    if (parse_mp_thread_id(&p, &pid, &tid, &any) < 0) return reply_err(fd, "E01");
+    (void)pid;
+    if (any) return reply_empty(fd);
+    if (ctx->fsm == NULL || !ctx->fsm->valid) return reply_empty(fd);
 
-    const char *name = "<unknown>";
-    if (ctx->fsm) {
-        for (int i = 0; i < ctx->fsm->thread_count; ++i) {
-            if ((uint32_t)ctx->fsm->threads[i].gdb_id == tid) {
-                name = ctx->fsm->threads[i].name;
-                break;
-            }
+    const FsmThread *match = NULL;
+    for (int i = 0; i < ctx->fsm->thread_count; ++i) {
+        if ((uint32_t)ctx->fsm->threads[i].gdb_id == tid) {
+            match = &ctx->fsm->threads[i];
+            break;
         }
     }
-    size_t nlen = strlen(name);
-    char reply[80];
-    if (nlen * 2u + 1u > sizeof reply) nlen = (sizeof reply - 1u) / 2u;
-    for (size_t i = 0; i < nlen; ++i) byte_to_hex((uint8_t)name[i], &reply[i * 2]);
-    reply[nlen * 2] = '\0';
+    if (match == NULL) return reply_empty(fd);
+
+    /* Render label "FSM <name> [active|quiescent] state=0xNNNN".
+     * Truncate the FSM name to 32 bytes so the assembled string fits
+     * the 80-byte budget noted in LLR-RSP-42.                          */
+    char name_buf[33];
+    size_t nl = strnlen(match->name, sizeof name_buf - 1);
+    memcpy(name_buf, match->name, nl);
+    name_buf[nl] = '\0';
+
+    char label[96];
+    int lab_len = snprintf(label, sizeof label,
+                           "FSM %s [%s] state=0x%04x",
+                           name_buf,
+                           match->is_active ? "active" : "quiescent",
+                           (unsigned)match->state_fn);
+    if (lab_len < 0) return reply_empty(fd);
+    if ((size_t)lab_len >= sizeof label) lab_len = (int)sizeof label - 1;
+
+    char reply[2 * sizeof label + 1];
+    for (int i = 0; i < lab_len; ++i) byte_to_hex((uint8_t)label[i], &reply[i * 2]);
+    reply[lab_len * 2] = '\0';
     return rsp_send_packet(fd, reply);
 }
 
-static int parse_h_tid(const char *pkt, int *out_tid)
+/* HLR-060 / LLR-RSP-41: parse the thread-id payload of an Hg/Hc/Hs
+ * packet via parse_mp_thread_id().  *out_tid is set to the resolved
+ * tid (the parsed value, or fsm_get_active_thread() when any=true).   */
+static int parse_h_tid(const RspContext *ctx, const char *pkt, int *out_tid)
 {
-    /* Hg<tid> or Hc<tid>; tid is hex; -1 means all threads */
+    /* Hg<tid> / Hc<tid> / Hs<tid> — skip the H<op> prefix. */
     const char *p = pkt + 2;
-    bool neg = false;
-    if (*p == '-') { neg = true; ++p; }
-    uint32_t v;
-    if (parse_hex_u32(&p, &v) < 0) return -1;
-    *out_tid = neg ? -(int)v : (int)v;
+    uint32_t pid, tid;
+    bool any;
+    if (parse_mp_thread_id(&p, &pid, &tid, &any) < 0) return -1;
+    (void)pid;
+    if (any) {
+        int active = (ctx != NULL && ctx->fsm) ? fsm_get_active_thread(ctx->fsm) : 1;
+        if (active <= 0) active = 1;
+        *out_tid = active;
+    } else {
+        *out_tid = (int)tid;
+    }
     return 0;
 }
 
@@ -887,7 +1281,7 @@ static int dh_set_thread_g(int fd, const char *pkt, void *vctx)
 {
     RspContext *ctx = (RspContext *)vctx;
     int tid;
-    if (parse_h_tid(pkt, &tid) < 0) return reply_err(fd, "E01");
+    if (parse_h_tid(ctx, pkt, &tid) < 0) return reply_err(fd, "E01");
     if (tid <= 0) tid = ctx->fsm ? fsm_get_active_thread(ctx->fsm) : 1;
     if (tid <= 0) tid = 1;
     if (ctx->g_thread_p) *ctx->g_thread_p = tid;
@@ -898,7 +1292,7 @@ static int dh_set_thread_c(int fd, const char *pkt, void *vctx)
 {
     RspContext *ctx = (RspContext *)vctx;
     int tid;
-    if (parse_h_tid(pkt, &tid) < 0) return reply_err(fd, "E01");
+    if (parse_h_tid(ctx, pkt, &tid) < 0) return reply_err(fd, "E01");
     if (tid <= 0) tid = ctx->fsm ? fsm_get_active_thread(ctx->fsm) : 1;
     if (tid <= 0) tid = 1;
     if (ctx->c_thread_p) *ctx->c_thread_p = tid;
@@ -946,6 +1340,8 @@ static int dh_detach(int fd, const char *pkt, void *vctx)
     hw_bp_clear_all(ctx);
     (void)updi_run(ctx->updi_fd);
     (void)reply_ok(fd);
+    /* HLR-065 / LLR-RSP-43: signal disconnect reason to event_loop. */
+    ctx->disconnect_reason = "D";
     if (ctx->gdb_fd_p) {
         if (*ctx->gdb_fd_p >= 0) rsp_close(*ctx->gdb_fd_p);
         *ctx->gdb_fd_p = -1;
@@ -982,12 +1378,19 @@ static int dh_query_offsets(int fd, const char *pkt, void *vctx)
  * decoded thread id is present in FsmContext.threads[], else E01. When
  * the FSM context has not yet been built the active thread id (1) is
  * the only live tid; this mirrors the default empty thread list. */
+/* HLR-060 / LLR-RSP-41: T<tid> — is-thread-alive.  Accepts both legacy
+ * bare-hex and multiprocess `p<PID>.<TID>` thread-id forms via
+ * parse_mp_thread_id(); any-thread forms (p0.0 / p-1.-1 / -1) reply OK
+ * without a membership check.                                         */
 static int dh_thread_alive(int fd, const char *pkt, void *vctx)
 {
     RspContext *ctx = (RspContext *)vctx;
     const char *p = pkt + 1;            /* skip 'T' */
-    uint32_t tid = 0;
-    if (parse_hex_u32(&p, &tid) < 0) return reply_err(fd, "E01");
+    uint32_t pid, tid;
+    bool any;
+    if (parse_mp_thread_id(&p, &pid, &tid, &any) < 0) return reply_err(fd, "E01");
+    (void)pid;
+    if (any) return reply_ok(fd);
     if (ctx->fsm != NULL && ctx->fsm->valid) {
         for (int i = 0; i < ctx->fsm->thread_count; ++i) {
             if ((uint32_t)ctx->fsm->threads[i].gdb_id == tid) {
@@ -1167,6 +1570,7 @@ static int dh_vrun(int fd, const char *pkt, void *vctx)
     (void)pkt;
     RspContext *ctx = (RspContext *)vctx;
 
+    ctx->last_stop_cause = SC_NONE;
     if (updi_enter_debug(ctx->updi_fd) < 0) return reply_err(fd, "E01");
     fsm_invalidate(ctx->fsm);
     (void)fsm_build_thread_list(ctx->fsm, ctx->idx, ctx->updi_fd);
@@ -1184,21 +1588,40 @@ static int dh_vattach(int fd, const char *pkt, void *vctx)
     (void)pkt;
     RspContext *ctx = (RspContext *)vctx;
 
+    ctx->last_stop_cause = SC_NONE;
     if (updi_enter_debug(ctx->updi_fd) < 0) return reply_err(fd, "E01");
     fsm_invalidate(ctx->fsm);
     (void)fsm_build_thread_list(ctx->fsm, ctx->idx, ctx->updi_fd);
     return dh_halt_reason(fd, "?", vctx);
 }
 
-/* HLR-058 (LLR-RSP-25): vKill[;<pid>] — extended-remote kill.  Reply
- * "OK" and set the quit flag so the main loop terminates after the
- * current packet, mirroring the legacy `k` packet path.                */
+/* HLR-058 / HLR-064 (LLR-RSP-25): vKill[;<pid>] — per-session
+ * disconnect.  Halt the target, drop silicon-side and host-shadow
+ * breakpoints, reply OK, then close the GDB socket; the server stays
+ * up and continues to accept new GDB clients.                         */
 static int dh_vkill(int fd, const char *pkt, void *vctx)
 {
     (void)pkt;
     RspContext *ctx = (RspContext *)vctx;
-    if (ctx->quit_p) *ctx->quit_p = 1;
-    return reply_ok(fd);
+    /* HLR-064: vKill ends the *session*, not the *server*.  Halt the
+     * target, release silicon-side breakpoints (HW comparators) and
+     * the per-session SW-BP shadow, reply OK, classify the disconnect
+     * for the lifecycle logger, and close the GDB socket so the next
+     * accept() in event_loop() can take a fresh client.
+     *
+     * Crucially we do NOT set *ctx->quit_p; that path is reserved for
+     * the legacy `k` packet handled by dh_detach.                     */
+    (void)updi_halt(ctx->updi_fd);
+    rsp_hw_bp_clear_all(ctx);
+    rsp_sw_bp_clear_all(ctx);
+    (void)reply_ok(fd);
+    /* HLR-065 / LLR-RSP-43: classify the disconnect for event_loop(). */
+    ctx->disconnect_reason = "vKill";
+    if (ctx->gdb_fd_p) {
+        if (*ctx->gdb_fd_p >= 0) rsp_close(*ctx->gdb_fd_p);
+        *ctx->gdb_fd_p = -1;
+    }
+    return 0;
 }
 
 void rsp_default_handlers(RspHandlers *h, RspContext *ctx)
@@ -1209,6 +1632,8 @@ void rsp_default_handlers(RspHandlers *h, RspContext *ctx)
     ctx->hw_bp_addr[1] = HW_BP_SLOT_EMPTY;
     /* HLR-054: drop any SW-BP shadow that survived memset(). */
     rsp_sw_bp_clear_all(ctx);
+    /* HLR-065 / LLR-RSP-43: no disconnect classification recorded yet. */
+    ctx->disconnect_reason = NULL;
 
     h->on_halt_reason  = dh_halt_reason;
     h->on_read_regs    = dh_read_regs;
@@ -1260,17 +1685,23 @@ int rsp_dispatch_n(int fd, const char *packet, size_t plen, RspHandlers *h)
     if (strncmp(packet, "qSupported", 10) == 0) {
         return rsp_send_packet(fd,
             "PacketSize=800;QStartNoAckMode+;multiprocess+;vContSupported+"
-            ";vRun+;vAttach+;vKill+;vFlashErase+;vFlashWrite+;vFlashDone+");
+            ";vRun+;vAttach+;vKill+;vFlashErase+;vFlashWrite+;vFlashDone+"
+            ";swbreak+;hwbreak+;qXfer:memory-map:read+");
     }
     if (strncmp(packet, "qAttached", 9) == 0) {
         return rsp_send_packet(fd, "1");
+    }
+    /* HLR-063: qXfer:memory-map:read inlined here so it doesn't need a
+     * dedicated slot in RspHandlers.                                   */
+    if (strncmp(packet, "qXfer:memory-map:read::", 23) == 0) {
+        return dh_qxfer_memory_map(fd, packet, h->ctx);
     }
     if (strncmp(packet, "QStartNoAckMode", 15) == 0) {
         rsp_set_noack(true);
         return reply_ok(fd);
     }
     if (strncmp(packet, "vCont?", 6) == 0) {
-        return rsp_send_packet(fd, "vCont;c;s");
+        return rsp_send_packet(fd, "vCont;c;s;r");
     }
     /* HLR-053: vFlash* — route before vCont/vRun checks. */
     if (strncmp(packet, "vFlashErase:", 12) == 0) {
@@ -1287,6 +1718,11 @@ int rsp_dispatch_n(int fd, const char *packet, size_t plen, RspHandlers *h)
     }
     if (strncmp(packet, "vCont;s", 7) == 0) {
         return call_handler(h->on_step, fd, packet, h->ctx);
+    }
+    if (strncmp(packet, "vCont;r", 7) == 0) {
+        /* HLR-066 / LLR-RSP-46: range-step has no per-test override
+         * use case, so it is not in the RspHandlers vtable.          */
+        return dh_range_step(fd, packet, h->ctx);
     }
     if (strncmp(packet, "vRun", 4) == 0 &&
         (packet[4] == '\0' || packet[4] == ';')) {

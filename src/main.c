@@ -25,6 +25,10 @@
 #include "fsm_mapper.h"
 #include "gdb_rsp.h"
 
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+
 /* ── AppConfig (SDD data_dictionary) ──────────────────────────────────── */
 typedef struct {
     const char *serial_device;
@@ -54,6 +58,12 @@ typedef struct {
 /* Externally visible shutdown flag (LLR-MAIN-06). Set by SIGINT/SIGTERM
  * handler and by the RSP "k" packet handler. */
 volatile sig_atomic_t g_quit = 0;
+
+/* HLR-065 / LLR-MAIN-22: signal-number recorded by sig_handler so the
+ * shutdown lifecycle line can name SIGINT vs SIGTERM.  Value 0 means
+ * the quit flag was set by some non-signal path (e.g. the RSP `k` /
+ * `vKill` packet, or a fatal error in event_loop()).                  */
+static volatile sig_atomic_t g_shutdown_signal = 0;
 
 /* In UNIT_TEST builds expose internals to test_main.c and rename main()
  * out of the way so tests can supply their own. */
@@ -268,7 +278,10 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
 
 MAYBE_STATIC void sig_handler(int signo)
 {
-    (void)signo;
+    /* HLR-065 / LLR-MAIN-22: record the signo so app_main() can name it
+     * in the shutdown lifecycle line.  Only the first delivered signal
+     * is captured — subsequent ones are ignored to keep the log honest. */
+    if (g_shutdown_signal == 0) g_shutdown_signal = (sig_atomic_t)signo;
     g_quit = 1;
 }
 
@@ -312,6 +325,19 @@ MAYBE_STATIC void event_loop(AppConfig *cfg, RspHandlers *h)
             if (fd >= 0) {
                 cfg->gdb_fd = fd;
                 if (cfg->updi_fd >= 0) (void)updi_halt(cfg->updi_fd);
+                /* HLR-065 / LLR-MAIN-22: log peer address. */
+                struct sockaddr_in peer;
+                socklen_t plen = sizeof peer;
+                if (getpeername(fd, (struct sockaddr *)&peer, &plen) == 0 &&
+                    peer.sin_family == AF_INET) {
+                    char ip[INET_ADDRSTRLEN] = {0};
+                    inet_ntop(AF_INET, &peer.sin_addr, ip, sizeof ip);
+                    fprintf(stderr, "avrOSdb: client connected from %s:%u\n",
+                            ip, (unsigned)ntohs(peer.sin_port));
+                } else {
+                    fprintf(stderr, "avrOSdb: client connected from <unknown>\n");
+                }
+                fflush(stderr);
             }
         }
 
@@ -330,10 +356,36 @@ MAYBE_STATIC void event_loop(AppConfig *cfg, RspHandlers *h)
         if (cfg->gdb_fd >= 0 && FD_ISSET(cfg->gdb_fd, &rfds)) {
             int rc = rsp_recv_packet(cfg->gdb_fd, pkt, sizeof pkt);
             if (rc <= 0) {
+                /* HLR-065 / LLR-MAIN-22: classify peer-side disconnect. */
+                if (rc == 0) {
+                    fprintf(stderr, "avrOSdb: client disconnected (EOF)\n");
+                } else {
+                    fprintf(stderr, "avrOSdb: client disconnected (read error: %s)\n",
+                            strerror(errno));
+                }
+                fflush(stderr);
                 rsp_close(cfg->gdb_fd);
                 cfg->gdb_fd = -1;
             } else {
                 (void)rsp_dispatch_n(cfg->gdb_fd, pkt, (size_t)rc, h);
+                /* HLR-065 / LLR-RSP-43 / LLR-MAIN-22: drain any
+                 * disconnect classification that the protocol layer
+                 * recorded during dispatch (D, vKill, ...).            */
+                RspContext *rctx = (RspContext *)h->ctx;
+                if (rctx != NULL && rctx->disconnect_reason != NULL) {
+                    fprintf(stderr, "avrOSdb: client disconnected (%s)\n",
+                            rctx->disconnect_reason);
+                    fflush(stderr);
+                    rctx->disconnect_reason = NULL;
+                    /* If the handler did not close the socket itself
+                     * (e.g. vKill replied OK and set quit_p but left
+                     * gdb_fd open), close it now so we don't double-log
+                     * on the next event-loop iteration.                */
+                    if (cfg->gdb_fd >= 0) {
+                        rsp_close(cfg->gdb_fd);
+                        cfg->gdb_fd = -1;
+                    }
+                }
             }
         }
     }
@@ -1150,6 +1202,9 @@ int MAIN_NAME(int argc, char *argv[])
         exit_code = 1;
         goto teardown;
     }
+    /* HLR-065 / LLR-MAIN-22: announce server-ready state. */
+    fprintf(stderr, "avrOSdb: listening on :%u\n", (unsigned)cfg.gdb_port);
+    fflush(stderr);
 
     /* Best-effort session init; failures are tolerated. */
     (void)elf_find_avros_tables(&elf_ctx, &idx);
@@ -1166,11 +1221,31 @@ int MAIN_NAME(int argc, char *argv[])
         .quit_p     = &g_quit,
         .allow_erase = cfg.allow_erase ? 1 : 0,
         .bp_mode    = RSP_BP_MODE_SW,
+        /* HLR-063: feed the ELF-derived memory layout to the
+         * qXfer:memory-map:read handler.  Zero values disable the
+         * map advertisement entirely.                                */
+        .flash_size = elf_ctx.flash_size,
+        .sram_base  = elf_ctx.sram_base,
+        .sram_size  = elf_ctx.sram_size,
     };
     RspHandlers handlers;
     rsp_default_handlers(&handlers, &rctx);
 
     event_loop(&cfg, &handlers);
+
+    /* HLR-065 / LLR-MAIN-22: announce shutdown reason just before
+     * teardown frees the listener and silicon resources.              */
+    {
+        const char *reason;
+        switch (g_shutdown_signal) {
+            case SIGINT:  reason = "SIGINT";  break;
+            case SIGTERM: reason = "SIGTERM"; break;
+            case 0:       reason = "fatal: event loop exited"; break;
+            default:      reason = "fatal: unknown"; break;
+        }
+        fprintf(stderr, "avrOSdb: shutting down (%s)\n", reason);
+        fflush(stderr);
+    }
 
 teardown:
     /* LLR-MAIN-07: gdb_fd → listen_fd → elf_close → updi_close. */

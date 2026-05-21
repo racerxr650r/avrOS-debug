@@ -22,6 +22,7 @@
 
 #include "unity.h"
 #include "fsm_mapper.h"
+#include "updi.h"   /* flash_to_updi, sram_to_updi */
 
 /* ── Mock UPDI backing-store ─────────────────────────────────────────── */
 #define MAX_REGIONS 96
@@ -125,12 +126,18 @@ static void install_2entry_fixture(AvrOsSymbolIndex *idx)
     idx->fsm_table_count  = 2;
     idx->current_fsm_addr = CURRENT_FSM_ADDR;
 
-    mock_add_region(FSM_TABLE_ADDR,   fsm_table_2entries, sizeof(fsm_table_2entries));
+    /* FLASH-side data (FSM_TABLE, name strings) is fetched via UPDI's
+     * flash mirror (flash_to_updi).  SRAM-side data (sm_ptr targets,
+     * currStateMachine) uses sram_to_updi to strip the GDB-AVR data
+     * flag. */
+    mock_add_region(flash_to_updi(FSM_TABLE_ADDR),
+                    fsm_table_2entries, sizeof(fsm_table_2entries));
     mock_add_region(0x4000,           sm1_sram,           sizeof(sm1_sram));
     mock_add_region(0x4100,           sm2_sram,           sizeof(sm2_sram));
-    mock_add_region(0x6000,           name1,              sizeof(name1));
-    mock_add_region(0x6010,           name2,              sizeof(name2));
-    mock_add_region(CURRENT_FSM_ADDR, current_active2,    sizeof(current_active2));
+    mock_add_region(flash_to_updi(0x6000), name1,         sizeof(name1));
+    mock_add_region(flash_to_updi(0x6010), name2,         sizeof(name2));
+    mock_add_region(sram_to_updi(CURRENT_FSM_ADDR),
+                    current_active2, sizeof(current_active2));
 }
 
 /* ──────────────────────────────────────────────────────────────────────
@@ -148,11 +155,13 @@ void test_fsm_build_thread_list_reads_fsm_table_from_flash_via_updi(void)
     TEST_ASSERT_EQUAL_INT(2, n);
     TEST_ASSERT_TRUE(ctx.valid);
 
-    /* At least one UPDI read hit the FSM_TABLE address. */
+    /* At least one UPDI read hit the FSM_TABLE address (in UPDI flash
+     * mirror form). */
+    uint32_t fsm_updi = flash_to_updi(FSM_TABLE_ADDR);
     int saw_fsm_read = 0;
     for (int i = 0; i < g_call_count; i++)
-        if (g_calls[i].addr >= FSM_TABLE_ADDR
-            && g_calls[i].addr < FSM_TABLE_ADDR + 2 * 9)
+        if (g_calls[i].addr >= fsm_updi
+            && g_calls[i].addr < fsm_updi + 2 * 9)
             saw_fsm_read = 1;
     TEST_ASSERT_TRUE_MESSAGE(saw_fsm_read,
         "expected at least one updi_mem_read covering FSM_TABLE");
@@ -312,7 +321,8 @@ void test_fsm_build_thread_list_caps_at_32_entries_and_logs_warning(void)
         big_table[i * 9 + 3] = (uint8_t)(sm >>  8);
         mock_add_region(sm, sm_pages[i], sizeof(sm_pages[i]));
     }
-    mock_add_region(FSM_TABLE_ADDR, big_table, sizeof(big_table));
+    mock_add_region(flash_to_updi(FSM_TABLE_ADDR),
+                    big_table, sizeof(big_table));
 
     FsmContext ctx;
     int n = fsm_build_thread_list(&ctx, &idx, 7);

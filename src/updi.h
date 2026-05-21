@@ -355,4 +355,32 @@ int  updi_select_device(int fd, const char *force_family);
  * back to SIGROW autodetect.                                          */
 const char *updi_family_from_partname(const char *partname);
 
+/* ── GDB-AVR ELF ↔ UPDI address-space helpers ─────────────────────────
+ * GDB-AVR / avr-gcc convention (used in ELF symbol values and GDB 'm'
+ * packets):
+ *   bit 23 SET  (0x800000) → data space (SRAM/IO/mapped-flash window)
+ *   bit 23 CLEAR             → code space (FLASH byte address)
+ * AVR-Dx UPDI uses the opposite convention:
+ *   bit 23 SET  (UPDI_FLASH_BASE) → FLASH mirror (honours runtime FLMAP)
+ *   bit 23 CLEAR                  → data space (SRAM/IO at 16-bit addr)
+ *
+ * `sram_to_updi` strips the GDB-AVR data flag so a 16-bit SRAM address
+ * is passed through unchanged to updi_mem_read.
+ * `flash_to_updi` ORs in UPDI_FLASH_BASE so the read is routed through
+ * the UPDI flash mirror (works for both physical flash byte LMAs and
+ * data-space mapped-flash pointers 0x8000..0xFFFF — the chip's hardware
+ * resolves FLMAP transparently). */
+#define GDB_AVR_DATA_FLAG   0x800000u
+#define GDB_AVR_ADDR_MASK   0x7FFFFFu
+
+static inline uint32_t sram_to_updi(uint32_t gdb_avr_addr)
+{
+    return gdb_avr_addr & GDB_AVR_ADDR_MASK;
+}
+
+static inline uint32_t flash_to_updi(uint32_t flash_byte_addr)
+{
+    return UPDI_FLASH_BASE | (flash_byte_addr & GDB_AVR_ADDR_MASK);
+}
+
 #endif /* AOD_UPDI_H */

@@ -74,6 +74,31 @@ typedef struct {
      * drained on z0.  Cleared wholesale on `vFlashDone`,
      * `monitor reset`, and `monitor chip-erase`.                      */
     RspSwBp                   sw_bp[RSP_MAX_SW_BREAKPOINTS];
+    /* HLR-065 / LLR-RSP-43: classify why the GDB client transitioned
+     * from open to closed.  Set by dh_detach() / dh_vkill() to a
+     * static string (`"D"`, `"vKill"`); read and cleared by
+     * src/main.c:event_loop() after each rsp_dispatch_n().  Static
+     * lifetime — no ownership transfer.  This is the sole upward
+     * channel from the protocol layer to the entry/event-loop layer
+     * (preserves SDD §2.2 layered architecture).                    */
+    const char               *disconnect_reason;
+    /* HLR-062 / LLR-RSP-44: stop-cause classification carried out of
+     * dh_continue/dh_step/dh_halt_reason into format_stop_reply() so
+     * the emitted T-reply can carry `swbreak:;` or `hwbreak:;`.  Set
+     * to one of the RspStopCause values defined in gdb_rsp.c (kept
+     * as a plain int here to avoid leaking the private enum).  Reset
+     * to 0 (SC_NONE) at the start of every fresh resume.            */
+    int                       last_stop_cause;
+    /* HLR-063: memory-map advertisement.  Sizes copied verbatim out
+     * of the loaded ELF's program headers (`elf_ctx.flash_size` /
+     * `.sram_base` / `.sram_size`) at server startup and used by the
+     * `qXfer:memory-map:read` handler to render the GDB-side device
+     * memory map.  All three zero ⇒ no ELF available ⇒ handler
+     * replies the empty `l` (end-of-transfer with no content) and
+     * GDB falls back to its built-in defaults.                       */
+    uint32_t                  flash_size;
+    uint32_t                  sram_base;
+    uint32_t                  sram_size;
 } RspContext;
 
 /* Each handler returns 0 on success or -1 on error. The handler is
