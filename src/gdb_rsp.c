@@ -835,6 +835,71 @@ static int dh_step(int fd, const char *pkt, void *vctx)
     return dh_halt_reason(fd, "?", vctx);
 }
 
+/* HLR-066 / LLR-RSP-46: vCont;r<start>,<end>[:<thread>] — keep
+ * single-stepping while the live PC remains inside the half-open
+ * range [start, end).  Mirrors GDB's range-step optimisation so the
+ * front-end does not have to round-trip a `vCont;s` per instruction
+ * during source-stepping over a multi-statement line.  The handler
+ * does not install breakpoints; it is a host-driven step loop.       */
+#define RSP_RANGE_STEP_MAX 100000
+
+static int dh_range_step(int fd, const char *pkt, void *vctx)
+{
+    RspContext *ctx = (RspContext *)vctx;
+    /* Skip the literal "vCont;r" prefix. */
+    const char *p = pkt + 7;
+    uint32_t start = 0, end = 0;
+    if (parse_hex_u32(&p, &start) < 0) return reply_err(fd, "E22");
+    if (*p != ',') return reply_err(fd, "E22");
+    ++p;
+    if (parse_hex_u32(&p, &end) < 0) return reply_err(fd, "E22");
+    /* Optional `:<thread>` suffix is accepted but ignored — single-
+     * core target, the active thread is implicit.                    */
+
+    ctx->last_stop_cause = SC_NONE;
+    bool got_ctrl_c = false;
+    int  iter = 0;
+    for (;;) {
+        uint32_t pc = 0;
+        if (updi_ocd_read_pc(ctx->updi_fd, &pc) < 0) break;
+        if (pc < start || pc >= end) break;
+        if (++iter > RSP_RANGE_STEP_MAX) break;
+
+        if (updi_step(ctx->updi_fd) < 0) {
+            (void)updi_halt(ctx->updi_fd);
+            return reply_err(fd, "E01");
+        }
+
+        /* Non-blocking peek for Ctrl-C from the GDB client. */
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        struct timeval tv = { 0, 0 };
+        int sel = select(fd + 1, &rfds, NULL, NULL, &tv);
+        if (sel > 0 && FD_ISSET(fd, &rfds)) {
+            char c;
+            ssize_t n;
+            do { n = read(fd, &c, 1); } while (n < 0 && errno == EINTR);
+            if (n <= 0) {
+                (void)updi_halt(ctx->updi_fd);
+                return -1;
+            }
+            if (c == '\x03') { got_ctrl_c = true; break; }
+            /* Liberal: discard any other stray byte mid-range-step. */
+        }
+    }
+
+    fsm_invalidate(ctx->fsm);
+    if (ctx->fsm) {
+        (void)fsm_build_thread_list(ctx->fsm, ctx->idx, ctx->updi_fd);
+    }
+    ctx->last_stop_cause =
+        classify_stop_cause(ctx, got_ctrl_c ? SC_INTR : SC_STEP);
+    return format_stop_reply(fd, ctx,
+                             got_ctrl_c ? "T02" : "T05",
+                             ctx->last_stop_cause);
+}
+
 /* AVR-Dx OCD provides exactly two hardware breakpoint comparators
  * (BP0, BP1).  The per-session shadow lives in RspContext so detach
  * and reattach cycles leave silicon in a known state.                */
@@ -1478,7 +1543,7 @@ int rsp_dispatch_n(int fd, const char *packet, size_t plen, RspHandlers *h)
         return reply_ok(fd);
     }
     if (strncmp(packet, "vCont?", 6) == 0) {
-        return rsp_send_packet(fd, "vCont;c;s");
+        return rsp_send_packet(fd, "vCont;c;s;r");
     }
     /* HLR-053: vFlash* — route before vCont/vRun checks. */
     if (strncmp(packet, "vFlashErase:", 12) == 0) {
@@ -1495,6 +1560,11 @@ int rsp_dispatch_n(int fd, const char *packet, size_t plen, RspHandlers *h)
     }
     if (strncmp(packet, "vCont;s", 7) == 0) {
         return call_handler(h->on_step, fd, packet, h->ctx);
+    }
+    if (strncmp(packet, "vCont;r", 7) == 0) {
+        /* HLR-066 / LLR-RSP-46: range-step has no per-test override
+         * use case, so it is not in the RspHandlers vtable.          */
+        return dh_range_step(fd, packet, h->ctx);
     }
     if (strncmp(packet, "vRun", 4) == 0 &&
         (packet[4] == '\0' || packet[4] == ';')) {

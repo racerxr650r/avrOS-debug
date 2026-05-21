@@ -113,7 +113,7 @@ Role: **unit**. **47 test(s).**
 
 ### 3.3. [tests/test_rsp.c](../tests/test_rsp.c)
 
-Role: **unit**. **75 test(s).**
+Role: **unit**. **80 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -192,6 +192,11 @@ Role: **unit**. **75 test(s).**
 | 73 | <a id="continue_emits_swbreak_when_pc_matches_sw_bp_shadow"></a>`continue_emits_swbreak_when_pc_matches_sw_bp_shadow` | `LLR-RSP-44`, `LLR-RSP-45` | Install a software breakpoint at `0x100` via `Z0,100,2` (default `bp_mode == sw`), arrange `mock_ocd_pc = 0x100` and the OCD poll script to deliver an immediate halt, dispatch `vCont;c`, drain the reply, and assert the last RSP packet's payload begins with `T05swbreak:;thread:` so GDB sees the SW-BP cause. Per LLR-RSP-44 / LLR-RSP-45. |
 | 74 | <a id="continue_emits_hwbreak_when_pc_matches_hw_bp_shadow"></a>`continue_emits_hwbreak_when_pc_matches_hw_bp_shadow` | `LLR-RSP-44`, `LLR-RSP-45` | Switch to `bp_mode == hw-only`, install a hardware breakpoint at `0x200` via `Z0,200,2`, arrange `mock_ocd_pc = 0x200` and the OCD poll script to deliver an immediate halt, dispatch `vCont;c`, drain the reply, and assert the last RSP packet's payload begins with `T05hwbreak:;thread:` so GDB sees the HW-BP cause. Per LLR-RSP-44 / LLR-RSP-45. |
 | 75 | <a id="continue_emits_bare_T05_when_pc_matches_no_breakpoint"></a>`continue_emits_bare_T05_when_pc_matches_no_breakpoint` | `LLR-RSP-44`, `LLR-RSP-45` | With no breakpoints installed, arrange `mock_ocd_pc = 0xCAFE` and the OCD poll script to deliver an immediate halt, dispatch `vCont;c`, drain the reply, and assert the last RSP packet's payload begins with `T05thread:` (no `swbreak:` or `hwbreak:` tag). Confirms the classifier returns the caller's `SC_NONE` hint when neither shadow matches and the formatter therefore emits no extra tag. Per LLR-RSP-44 / LLR-RSP-45. |
+| 76 | <a id="vCont_probe_advertises_range_step"></a>`vCont_probe_advertises_range_step` | `LLR-RSP-46` | Dispatch `vCont?` and assert the reply payload is exactly `vCont;c;s;r` so a range-step-capable GDB activates its range-step optimisation. Per LLR-RSP-46. |
+| 77 | <a id="vCont_range_step_steps_until_pc_leaves_range"></a>`vCont_range_step_steps_until_pc_leaves_range` | `LLR-RSP-46` | Build the context, set `mock_ocd_pc = 0x100`, arrange `__wrap_updi_step` to advance `mock_ocd_pc` by 2 each call (script: 0x100, 0x102, 0x104, 0x200), dispatch `vCont;r100,200`, drain, assert the payload begins with `T05` (no `swbreak:`/`hwbreak:` tag because PC 0x200 matches no shadow) and that `mock_step_calls >= 1` (the loop must call `updi_step` at least once before exiting). Per LLR-RSP-46. |
+| 78 | <a id="vCont_range_step_returns_immediately_when_pc_already_outside"></a>`vCont_range_step_returns_immediately_when_pc_already_outside` | `LLR-RSP-46` | Set `mock_ocd_pc = 0x500` and dispatch `vCont;r100,200`. Assert `mock_step_calls == 0` (loop must check PC before stepping) and the payload begins with `T05thread:`. Per LLR-RSP-46. |
+| 79 | <a id="vCont_range_step_emits_T02_on_ctrl_c"></a>`vCont_range_step_emits_T02_on_ctrl_c` | `LLR-RSP-46` | Set `mock_ocd_pc = 0x100` (inside `[100,200)`) and arrange `__wrap_updi_step` to keep PC inside the range; write a single `\x03` byte to the GDB-side socket before dispatching `vCont;r100,200`. Assert the payload begins with `T02thread:` (Ctrl-C → SIGINT). Per LLR-RSP-46. |
+| 80 | <a id="vCont_range_step_rejects_malformed_packet_with_E22"></a>`vCont_range_step_rejects_malformed_packet_with_E22` | `LLR-RSP-46` | Dispatch `vCont;rZZ,200` (non-hex `start`) and assert the last reply payload is `E22`. Per LLR-RSP-46. |
 
 ### 3.4. [tests/test_elf.c](../tests/test_elf.c)
 
@@ -437,6 +442,7 @@ verified by code review — see
 | `LLR-RSP-43` | `rsp` | `HLR-065` | `on_detach_D_sets_disconnect_reason_to_D`, `vKill_sets_disconnect_reason_to_vKill` |
 | `LLR-RSP-44` | `rsp` | `HLR-062` | `continue_emits_swbreak_when_pc_matches_sw_bp_shadow`, `continue_emits_hwbreak_when_pc_matches_hw_bp_shadow`, `continue_emits_bare_T05_when_pc_matches_no_breakpoint` |
 | `LLR-RSP-45` | `rsp` | `HLR-062` | `qSupported_advertises_swbreak_and_hwbreak`, `continue_emits_swbreak_when_pc_matches_sw_bp_shadow`, `continue_emits_hwbreak_when_pc_matches_hw_bp_shadow`, `continue_emits_bare_T05_when_pc_matches_no_breakpoint` |
+| `LLR-RSP-46` | `rsp` | `HLR-066` | `vCont_probe_advertises_range_step`, `vCont_range_step_steps_until_pc_leaves_range`, `vCont_range_step_returns_immediately_when_pc_already_outside`, `vCont_range_step_emits_T02_on_ctrl_c`, `vCont_range_step_rejects_malformed_packet_with_E22` |
 | `LLR-ELF-01` | `elf` | `HLR-021` | `elf_open_accepts_valid_avr_elf32_binary`, `elf_open_returns_minus1_on_invalid_elf_magic`, `elf_open_returns_minus1_on_wrong_machine_type` |
 | `LLR-ELF-02` | `elf` | `HLR-021`, `HLR-040` | `elf_open_loads_symtab_and_strtab_into_heap_buffers`, `elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure` |
 | `LLR-ELF-03` | `elf` | `HLR-021` | `elf_find_avros_tables_performs_single_linear_scan`, `elf_find_avros_tables_populates_all_7_avros_sentinel_fields` |

@@ -183,7 +183,10 @@ int __wrap_updi_nvm_flash_patch(int fd, uint32_t addr,
 
 int __wrap_updi_halt(int fd)        { (void)fd; ++mock_halt_calls; log_event(EV_HALT); return 0; }
 int __wrap_updi_run (int fd)        { (void)fd; ++mock_run_calls;  log_event(EV_RUN);  return 0; }
-int __wrap_updi_step(int fd)        { (void)fd; ++mock_step_calls; log_event(EV_STEP); return 0; }
+/* HLR-066: per-step PC advance for vCont;r tests.  Default 0 leaves
+ * mock_ocd_pc untouched (preserves pre-existing test expectations). */
+static uint32_t mock_step_pc_delta;
+int __wrap_updi_step(int fd)        { (void)fd; ++mock_step_calls; mock_ocd_pc += mock_step_pc_delta; log_event(EV_STEP); return 0; }
 int __wrap_updi_console_poll(int u, int r) { (void)u; (void)r; return 0; }
 int __wrap_updi_enter_debug(int fd) { (void)fd; return 0; }
 int __wrap_updi_chip_erase(int fd) { (void)fd; return 0; }
@@ -382,6 +385,7 @@ static void reset_mocks(void)
 {
     mock_run_calls = mock_step_calls = mock_invalidate_calls = 0;
     mock_halt_calls = mock_build_calls = 0;
+    mock_step_pc_delta = 0;
     mock_write_count = mock_flash_write_count = mock_read_count = 0;
     mock_flash_patch_count = 0;
     memset(mock_writes, 0, sizeof mock_writes);
@@ -1198,6 +1202,72 @@ static void continue_emits_bare_T05_when_pc_matches_no_breakpoint(void)
     TEST_ASSERT_NULL(strstr(payload, "hwbreak"));
 }
 
+/* ── HLR-066 (LLR-RSP-46): vCont;r range-step ─────────────────────── */
+
+static void vCont_probe_advertises_range_step(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    rsp_dispatch(sock_pair[1], "vCont?", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("vCont;c;s;r", payload);
+}
+
+static void vCont_range_step_steps_until_pc_leaves_range(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    /* Start PC at 0x100, advance by 2 per step.  After ~80 steps PC
+     * crosses 0x200 and the loop exits.                             */
+    mock_ocd_pc = 0x100u;
+    mock_step_pc_delta = 2;
+    rsp_dispatch(sock_pair[1], "vCont;r100,200", &h);
+    TEST_ASSERT_GREATER_OR_EQUAL(1, mock_step_calls);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL(0, strncmp(payload, "T05", 3));
+}
+
+static void vCont_range_step_returns_immediately_when_pc_already_outside(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    mock_ocd_pc = 0x500u;   /* outside [0x100, 0x200) */
+    rsp_dispatch(sock_pair[1], "vCont;r100,200", &h);
+    TEST_ASSERT_EQUAL(0, mock_step_calls);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL(0, strncmp(payload, "T05thread:", 10));
+}
+
+static void vCont_range_step_emits_T02_on_ctrl_c(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    /* PC starts inside range and __wrap_updi_step does not move it
+     * (mock_step_pc_delta == 0) — would loop until RSP_RANGE_STEP_MAX
+     * but for the queued Ctrl-C byte on the GDB-side socket.        */
+    mock_ocd_pc = 0x100u;
+    char ctrlc = '\x03';
+    ssize_t n = write(sock_pair[0], &ctrlc, 1);
+    TEST_ASSERT_EQUAL(1, n);
+    rsp_dispatch(sock_pair[1], "vCont;r100,200", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL(0, strncmp(payload, "T02thread:", 10));
+}
+
+static void vCont_range_step_rejects_malformed_packet_with_E22(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    rsp_dispatch(sock_pair[1], "vCont;rZZ,200", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("E22", payload);
+}
+
 /* ── HLR-056: Z2/Z3/Z4 data watchpoints — silicon does not expose
  *           the hardware over UPDI (see src/updi.h and
  *           doc/reference/guesswork.md).  Server replies the empty
@@ -1721,6 +1791,11 @@ int main(void)
     RUN_TEST(continue_emits_swbreak_when_pc_matches_sw_bp_shadow);
     RUN_TEST(continue_emits_hwbreak_when_pc_matches_hw_bp_shadow);
     RUN_TEST(continue_emits_bare_T05_when_pc_matches_no_breakpoint);
+    RUN_TEST(vCont_probe_advertises_range_step);
+    RUN_TEST(vCont_range_step_steps_until_pc_leaves_range);
+    RUN_TEST(vCont_range_step_returns_immediately_when_pc_already_outside);
+    RUN_TEST(vCont_range_step_emits_T02_on_ctrl_c);
+    RUN_TEST(vCont_range_step_rejects_malformed_packet_with_E22);
     RUN_TEST(Z2_replies_empty_packet_so_gdb_falls_back_to_sw_watch);
     RUN_TEST(z3_remove_also_replies_empty_packet);
     /* HLR-053: vFlashErase / vFlashWrite / vFlashDone (`gdb load`). */
