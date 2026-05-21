@@ -971,6 +971,19 @@ int updi_halt(int fd)
 
 int updi_run(int fd)
 {
+    /* Defensive: clear OCD_CTRL0.STEP before resuming.  updi_step()
+     * arms the STEP bit to single-instruction the CPU; the silicon
+     * leaves it set after the step completes, so a subsequent plain
+     * RUN would behave as another single step.  Clearing here makes
+     * `c` (continue) reliably free-run regardless of how we got
+     * halted.                                                       */
+    uint8_t c0 = 0;
+    if (updi_lds8(fd, OCD_CTRL0, &c0) < 0) return -1;
+    if (c0 & OCD_CTRL0_STEP) {
+        if (updi_sts8(fd, OCD_CTRL0,
+                      (uint8_t)(c0 & (uint8_t)~OCD_CTRL0_STEP)) < 0)
+            return -1;
+    }
     /* Writing RUN starts the CPU.  STOPPED clears immediately. */
     return updi_stcs(fd, ASI_OCD_CTRLA, ASI_OCD_CTRLA_RUN);
 }
