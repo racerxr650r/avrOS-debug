@@ -1310,19 +1310,33 @@ static int dh_vattach(int fd, const char *pkt, void *vctx)
     return dh_halt_reason(fd, "?", vctx);
 }
 
-/* HLR-058 (LLR-RSP-25): vKill[;<pid>] — extended-remote kill.  Reply
- * "OK" and set the quit flag so the main loop terminates after the
- * current packet, mirroring the legacy `k` packet path.                */
+/* HLR-058 / HLR-064 (LLR-RSP-25): vKill[;<pid>] — per-session
+ * disconnect.  Halt the target, drop silicon-side and host-shadow
+ * breakpoints, reply OK, then close the GDB socket; the server stays
+ * up and continues to accept new GDB clients.                         */
 static int dh_vkill(int fd, const char *pkt, void *vctx)
 {
     (void)pkt;
     RspContext *ctx = (RspContext *)vctx;
-    /* HLR-065 / LLR-RSP-43: classify the disconnect for the lifecycle
-     * logger.  Phase 11 still sets quit_p (LLR-RSP-25) until HLR-064
-     * lifts that to per-session disconnect.                          */
+    /* HLR-064: vKill ends the *session*, not the *server*.  Halt the
+     * target, release silicon-side breakpoints (HW comparators) and
+     * the per-session SW-BP shadow, reply OK, classify the disconnect
+     * for the lifecycle logger, and close the GDB socket so the next
+     * accept() in event_loop() can take a fresh client.
+     *
+     * Crucially we do NOT set *ctx->quit_p; that path is reserved for
+     * the legacy `k` packet handled by dh_detach.                     */
+    (void)updi_halt(ctx->updi_fd);
+    rsp_hw_bp_clear_all(ctx);
+    rsp_sw_bp_clear_all(ctx);
+    (void)reply_ok(fd);
+    /* HLR-065 / LLR-RSP-43: classify the disconnect for event_loop(). */
     ctx->disconnect_reason = "vKill";
-    if (ctx->quit_p) *ctx->quit_p = 1;
-    return reply_ok(fd);
+    if (ctx->gdb_fd_p) {
+        if (*ctx->gdb_fd_p >= 0) rsp_close(*ctx->gdb_fd_p);
+        *ctx->gdb_fd_p = -1;
+    }
+    return 0;
 }
 
 void rsp_default_handlers(RspHandlers *h, RspContext *ctx)

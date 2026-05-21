@@ -1668,6 +1668,13 @@ Errors are propagated upward through the module stack without retrying:
         </traces>
       </hlr>
 
+      <hlr id="HLR-064" name="vKill Listener Survival">
+        <text><![CDATA[The `vKill[;<pid>]` packet shall close the GDB client connection but shall not terminate the avrOSdb server process. After replying `OK` and closing the client `fd`, `event_loop()` shall return to its `select()` loop and continue listening on the configured TCP port for a new GDB session. This makes avrOSdb honest about the GDB extended-remote contract: `vKill` ends the *debug session*, not the *debugger*, so a subsequent F5 / `target extended-remote :1234` from the same operator shall succeed without restarting the server. Concretely, `dh_vkill()` shall: (a) call `updi_halt()` on the target so the next session attaches to a stopped CPU; (b) release both AVR-Dx OCD hardware-breakpoint comparators via `rsp_hw_bp_clear_all()`; (c) drop the per-session software-breakpoint shadow via `rsp_sw_bp_clear_all()` (FLASH BREAK rewrite is not required — the shadow is purely host-side bookkeeping per LLR-RSP-30 et seq.); (d) reply `OK`; (e) record `ctx->disconnect_reason = "vKill"` for the lifecycle logger (HLR-065); (f) close the GDB socket via `*ctx->gdb_fd_p` and set the pointed-at fd to `-1`. The handler shall **not** set `*ctx->quit_p = 1`. The `--prog` mode (HLR-019/Phase 8) is unaffected: it never opens the GDB listener and never reaches `dh_vkill()`. The pre-Phase-11 legacy `k` packet path (`dh_detach` with `pkt[0] == 'k'`) is preserved and still sets `quit_p = 1` so existing operators relying on `kill` to shut the server down retain that behaviour.]]></text>
+        <traces>
+          <trace target="SDD" ref="5.3.1"/>
+        </traces>
+      </hlr>
+
       <hlr id="HLR-065" name="Lifecycle Logging">
         <text><![CDATA[The avrOSdb server shall emit one human-readable line per significant lifecycle transition to `stderr`, so that a developer running the server in a terminal can see at a glance when the GDB listener becomes ready, when a client attaches or detaches, and why the server is shutting down. The line set is:
 
@@ -1675,7 +1682,7 @@ Errors are propagated upward through the module stack without retrying:
 * `avrOSdb: client connected from <ip>:<port>` — emitted after every successful `rsp_accept()`. The peer address is taken from `getpeername()` on the accepted socket; on `getpeername()` failure the line shall instead read `client connected from <unknown>`.
 * `avrOSdb: client disconnected (<reason>)` — emitted whenever the client `fd` transitions from open to closed. `<reason>` shall be one of:
   - `D` — the GDB `D` (detach) packet was processed and the protocol layer closed the socket;
-  - `vKill` — the GDB `vKill` packet was processed (current Phase 11 behaviour: server then exits; HLR-064 will later make this a per-session disconnect);
+  - `vKill` — the GDB `vKill` packet was processed; per HLR-064 this closes the client socket and returns to the `accept()` loop without exiting the server;
   - `EOF` — `rsp_recv_packet()` returned 0 (peer half-closed);
   - `read error: <errno-text>` — `rsp_recv_packet()` returned −1; `<errno-text>` is `strerror(errno)`.
 * `avrOSdb: shutting down (<reason>)` — emitted exactly once, immediately after `event_loop()` returns and before teardown begins. `<reason>` shall be one of `SIGINT`, `SIGTERM`, or `fatal: <text>` for any other path that sets `g_quit`.
@@ -2262,9 +2269,10 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-RSP-25">
-        <text><![CDATA[The `dh_vkill()` default handler (`vKill[;<pid>]`) shall implement extended-remote kill by ignoring `<pid>`, setting `*ctx->quit_p = 1` so the main loop terminates after the current packet, and replying `OK`. This mirrors the behaviour of the legacy `k` packet path so a GDB session that uses either form releases the debugger identically.]]></text>
+        <text><![CDATA[The `dh_vkill()` default handler (`vKill[;<pid>]`) shall close the current GDB session without terminating the avrOSdb process. It shall ignore `<pid>` and, in order: (1) call `updi_halt()` on the target so the next attached session sees a stopped CPU; (2) release both AVR-Dx OCD HW-breakpoint comparators via `rsp_hw_bp_clear_all(ctx)`; (3) clear the per-session SW-breakpoint shadow via `rsp_sw_bp_clear_all(ctx)`; (4) reply `OK` to the client; (5) set `ctx->disconnect_reason = "vKill"` so `event_loop()` emits the lifecycle log line per LLR-MAIN-22; (6) close `*ctx->gdb_fd_p` (when ≥ 0) and set the pointed-at fd to `-1`. The handler shall **not** set `*ctx->quit_p`. This makes vKill a per-session disconnect (HLR-064) rather than a server-shutdown command; the legacy `k` packet path in `dh_detach` retains the old quit behaviour for operators relying on it.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-058" name="Extended-remote — multiprocess+, vRun, vAttach, vKill"/>
+          <trace target="HLR" ref="HLR-064" name="vKill Listener Survival"/>
         </traces>
       </llr>
 
@@ -2360,7 +2368,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-RSP-43">
-        <text><![CDATA[`RspContext` shall expose a new field `const char *disconnect_reason` (default `NULL`). The `dh_detach()` handler shall set this field to the static string `"D"` immediately before closing the GDB socket on the `D`-packet path. The `dh_vkill()` handler shall set it to the static string `"vKill"` immediately before returning `OK` (the handler still sets `*ctx->quit_p = 1` per LLR-RSP-25 until HLR-064 lifts that). The protocol layer shall never call into the entry/event-loop layer to log; the field is the sole upward signal channel and is consumed (read and reset to `NULL`) by `event_loop()` in `src/main.c` per LLR-MAIN-22. This preserves the layered-architecture constraint (SDD §2.2) — no new include from `gdb_rsp.c` to `main.c`.]]></text>
+        <text><![CDATA[`RspContext` shall expose a new field `const char *disconnect_reason` (default `NULL`). The `dh_detach()` handler shall set this field to the static string `"D"` immediately before closing the GDB socket on the `D`-packet path. The `dh_vkill()` handler shall set it to the static string `"vKill"` immediately before closing the GDB socket per LLR-RSP-25 (HLR-064 listener-survival semantics). The protocol layer shall never call into the entry/event-loop layer to log; the field is the sole upward signal channel and is consumed (read and reset to `NULL`) by `event_loop()` in `src/main.c` per LLR-MAIN-22. This preserves the layered-architecture constraint (SDD §2.2) — no new include from `gdb_rsp.c` to `main.c`.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-065" name="Lifecycle Logging"/>
         </traces>
@@ -3381,8 +3389,8 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces><trace target="LLR" ref="LLR-RSP-24"/></traces>
       </test>
 
-      <test name="vKill_sets_quit_and_replies_ok">
-        <purpose><![CDATA[Dispatch `vKill;1` and verify that the context's `*quit_p` flag is raised and the reply is the literal `OK`.]]></purpose>
+      <test name="vKill_replies_ok_closes_socket_does_not_set_quit">
+        <purpose><![CDATA[Dispatch `vKill;1` and assert the HLR-064 per-session-disconnect contract: the reply is the literal `OK`, `*quit_p` remains `0` (server does NOT shut down), `updi_halt()` was invoked at least once, both HW-BP comparators were released via `rsp_hw_bp_clear_all()`, and the GDB socket pointed-at by `ctx->gdb_fd_p` was closed and reset to `-1`. Per LLR-RSP-25.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-25"/></traces>
       </test>
 

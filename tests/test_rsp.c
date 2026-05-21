@@ -1081,19 +1081,35 @@ static void vAttach_halts_target_and_emits_stop_reply(void)
     TEST_ASSERT_NOT_NULL(strstr(payload, "thread:"));
 }
 
-/* ── LLR-RSP-25: vKill;<pid> ────────────────────────────────────────── */
+/* ── LLR-RSP-25 / HLR-064: vKill;<pid> ─────────────────────────────── */
 
-static void vKill_sets_quit_and_replies_ok(void)
+static void vKill_replies_ok_closes_socket_does_not_set_quit(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    /* Install one HW breakpoint so we can verify rsp_hw_bp_clear_all
+     * is called on the vKill path.                                   */
+    ctx.bp_mode = RSP_BP_MODE_HW_ONLY;
+    rsp_dispatch(sock_pair[1], "Z0,200,2", &h);
+    char drain_buf[256]; drain(sock_pair[0], drain_buf, sizeof drain_buf);
+    int clears_before = mock_hw_bp_clear_calls;
+    int halts_before  = mock_halt_calls;
+
     TEST_ASSERT_EQUAL(0, g_quit_var);
     rsp_dispatch(sock_pair[1], "vKill;1", &h);
 
-    TEST_ASSERT_EQUAL(1, (int)g_quit_var);
+    /* HLR-064: vKill is a per-session disconnect, not a server shutdown. */
+    TEST_ASSERT_EQUAL(0, (int)g_quit_var);
+    /* Target halted, HW comparator released. */
+    TEST_ASSERT_GREATER_THAN(halts_before, mock_halt_calls);
+    TEST_ASSERT_GREATER_THAN(clears_before, mock_hw_bp_clear_calls);
+    /* GDB socket fd reset to -1 (handler closed it). */
+    TEST_ASSERT_EQUAL(-1, g_gdb_fd_var);
+    /* Reply was OK (last packet on the wire). */
     char stream[64]; drain(sock_pair[0], stream, sizeof stream);
     char payload[64];
     TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
     TEST_ASSERT_EQUAL_STRING("OK", payload);
+    sock_pair[1] = -1; /* handler closed it */
 }
 
 /* HLR-065 / LLR-RSP-43: vKill records the disconnect reason. */
@@ -1104,6 +1120,7 @@ static void vKill_sets_disconnect_reason_to_vKill(void)
     rsp_dispatch(sock_pair[1], "vKill;1", &h);
     TEST_ASSERT_NOT_NULL(ctx.disconnect_reason);
     TEST_ASSERT_EQUAL_STRING("vKill", ctx.disconnect_reason);
+    sock_pair[1] = -1; /* handler closed it */
 }
 
 static void qSupported_advertises_multiprocess_vRun_vAttach_vKill(void)
@@ -1636,7 +1653,7 @@ int main(void)
     RUN_TEST(R_packet_invalidates_fsm_runs_and_emits_stop);
     RUN_TEST(vRun_invalidates_fsm_runs_and_emits_stop);
     RUN_TEST(vAttach_halts_target_and_emits_stop_reply);
-    RUN_TEST(vKill_sets_quit_and_replies_ok);
+    RUN_TEST(vKill_replies_ok_closes_socket_does_not_set_quit);
     RUN_TEST(vKill_sets_disconnect_reason_to_vKill);
     RUN_TEST(qSupported_advertises_multiprocess_vRun_vAttach_vKill);
     RUN_TEST(Z2_replies_empty_packet_so_gdb_falls_back_to_sw_watch);

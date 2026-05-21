@@ -630,16 +630,19 @@ system, independent of which thread is selected:
 
 ```
 (gdb) run                           # vRun — re-applies ELF, resets, halts at entry
-(gdb) kill                          # vKill — stop the program, keep the session
+(gdb) kill                          # vKill — halt target, drop GDB connection, keep server alive
 (gdb) detach                        # release HW comparators, let CPU run free, drop socket
 (gdb) quit                          # exit avr-gdb (also detaches)
 ```
 
-After `detach` (or `quit`) the `avrOSdb` server keeps running and is
-ready to accept the next `target remote :1234`. To stop the server
-itself, press Ctrl-C in its terminal or use `(gdb) monitor exit` is
-**not** supported — send `kill` followed by closing the GDB session,
-then SIGINT the server.
+After `kill`, `detach`, or `quit` the `avrOSdb` server keeps running
+and is ready to accept the next `target remote :1234` (HLR-064 — the
+GDB extended-remote contract: `vKill` ends the *session*, not the
+*debugger*). To stop the server itself, press Ctrl-C in its terminal
+(or send `SIGTERM` from another shell). The server logs each
+lifecycle transition on `stderr` (HLR-065): `listening on :<port>`,
+`client connected from <ip>:<port>`, `client disconnected (<reason>)`,
+and `shutting down (<reason>)`.
 
 #### 12. Getting help inside GDB
 
