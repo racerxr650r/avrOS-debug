@@ -1053,14 +1053,27 @@ static int dh_thread_info(int fd, const char *pkt, void *vctx)
 }
 
 /* HLR-063 / LLR-RSP-47: qXfer:memory-map:read::<offset>,<length> —
- * advertise the AVR-Dx Flash and SRAM regions to GDB so the client
- * routes M-packet writes correctly and stops short-reading past
- * device boundaries.  Sizes are sourced verbatim from the loaded
- * ELF (RspContext.flash_size / sram_*).  All-zero context ⇒ no ELF
- * was supplied at startup ⇒ reply `l` (end-of-transfer, no data) so
- * GDB falls back to its built-in defaults rather than rendering a
- * wrong map.  The XML payload is rebuilt per request into a stack
- * buffer; offset/length slicing is then applied with `m`/`l` framing.
+ * advertise the AVR-Dx memory map to GDB so the client routes
+ * M-packet writes correctly and stops short-reading past device
+ * boundaries.  The map covers seven regions:
+ *
+ *   Region   | GDB address    | Length              | type / blocksize
+ *   FLASH    | 0x000000       | RspContext.flash_size | flash / 512
+ *   RAM      | ctx->sram_base | ctx->sram_size      | ram (no blocksize)
+ *   EEPROM   | ELF_VMA_EEPROM | UPDI_EEPROM_SIZE    | flash / 1
+ *   FUSES    | ELF_VMA_FUSES  | UPDI_FUSES_SIZE     | flash / 1
+ *   LOCK     | ELF_VMA_LOCK   | UPDI_LOCK_SIZE      | flash / 1
+ *   SIGROW   | ELF_VMA_SIGROW | UPDI_SIGROW_SIZE    | rom
+ *   USERROW  | ELF_VMA_USERROW| UPDI_USERROW_SIZE   | flash / 32
+ *
+ * FLASH and RAM sizes are sourced verbatim from the loaded ELF; the
+ * five non-FLASH NVM regions are device-class constants (AVR-Dx) and
+ * therefore appear in the map whenever a FLASH or RAM region is
+ * present.  All-zero FLASH+RAM context ⇒ no ELF was supplied at
+ * startup ⇒ reply `l` (end-of-transfer, no data) so GDB falls back
+ * to its built-in defaults rather than rendering a wrong map.  The
+ * XML payload is rebuilt per request into a stack buffer;
+ * offset/length slicing is then applied with `m`/`l` framing.
  * Malformed offset/length ⇒ E00 per qXfer error convention.          */
 static int dh_qxfer_memory_map(int fd, const char *pkt, void *vctx)
 {
@@ -1081,33 +1094,63 @@ static int dh_qxfer_memory_map(int fd, const char *pkt, void *vctx)
         return rsp_send_packet(fd, "l");
     }
 
-    char xml[640];
-    int  n;
-    if (ctx->sram_size != 0u) {
-        n = snprintf(xml, sizeof xml,
-            "<memory-map>"
-            "<memory type=\"flash\" start=\"0x0\" length=\"0x%lx\">"
-            "<property name=\"blocksize\">0x%lx</property>"
-            "</memory>"
-            "<memory type=\"ram\" start=\"0x%lx\" length=\"0x%lx\"/>"
-            "</memory-map>",
-            (unsigned long)ctx->flash_size,
-            (unsigned long)UPDI_FLASH_PAGE_SIZE,
-            (unsigned long)ctx->sram_base,
-            (unsigned long)ctx->sram_size);
-    } else {
-        n = snprintf(xml, sizeof xml,
-            "<memory-map>"
-            "<memory type=\"flash\" start=\"0x0\" length=\"0x%lx\">"
-            "<property name=\"blocksize\">0x%lx</property>"
-            "</memory>"
-            "</memory-map>",
-            (unsigned long)ctx->flash_size,
-            (unsigned long)UPDI_FLASH_PAGE_SIZE);
-    }
-    if (n < 0 || (size_t)n >= sizeof xml) return reply_err(fd, "E01");
+    /* Build the XML document into a stack buffer.  1 KiB comfortably
+     * holds all seven regions (~700 B); on overflow reply E01.       */
+    char   xml[1024];
+    size_t off = 0;
+    #define MM_APPEND(...)                                                 \
+        do {                                                               \
+            int _w = snprintf(xml + off, sizeof xml - off, __VA_ARGS__);   \
+            if (_w < 0 || (size_t)_w >= sizeof xml - off)                  \
+                return reply_err(fd, "E01");                               \
+            off += (size_t)_w;                                             \
+        } while (0)
 
-    size_t total = (size_t)n;
+    MM_APPEND("<memory-map>");
+    if (ctx->flash_size != 0u) {
+        MM_APPEND("<memory type=\"flash\" start=\"0x0\" length=\"0x%lx\">"
+                  "<property name=\"blocksize\">0x%lx</property>"
+                  "</memory>",
+                  (unsigned long)ctx->flash_size,
+                  (unsigned long)UPDI_FLASH_PAGE_SIZE);
+    }
+    if (ctx->sram_size != 0u) {
+        MM_APPEND("<memory type=\"ram\" start=\"0x%lx\" length=\"0x%lx\"/>",
+                  (unsigned long)ctx->sram_base,
+                  (unsigned long)ctx->sram_size);
+    }
+    /* Non-FLASH NVM regions — AVR-Dx device-class constants.  Address
+     * each at its GDB-visible ELF VMA band (avr-libc convention) so
+     * `M`-writes initiated by GDB land in the correct band and the
+     * `load_segments()` path translates them to silicon UPDI.        */
+    MM_APPEND("<memory type=\"flash\" start=\"0x%lx\" length=\"0x%lx\">"
+              "<property name=\"blocksize\">0x1</property>"
+              "</memory>",
+              (unsigned long)ELF_VMA_EEPROM,
+              (unsigned long)UPDI_EEPROM_SIZE);
+    MM_APPEND("<memory type=\"flash\" start=\"0x%lx\" length=\"0x%lx\">"
+              "<property name=\"blocksize\">0x1</property>"
+              "</memory>",
+              (unsigned long)ELF_VMA_FUSES,
+              (unsigned long)UPDI_FUSES_SIZE);
+    MM_APPEND("<memory type=\"flash\" start=\"0x%lx\" length=\"0x%lx\">"
+              "<property name=\"blocksize\">0x1</property>"
+              "</memory>",
+              (unsigned long)ELF_VMA_LOCK,
+              (unsigned long)UPDI_LOCK_SIZE);
+    MM_APPEND("<memory type=\"rom\" start=\"0x%lx\" length=\"0x%lx\"/>",
+              (unsigned long)ELF_VMA_SIGROW,
+              (unsigned long)UPDI_SIGROW_SIZE);
+    MM_APPEND("<memory type=\"flash\" start=\"0x%lx\" length=\"0x%lx\">"
+              "<property name=\"blocksize\">0x%lx</property>"
+              "</memory>",
+              (unsigned long)ELF_VMA_USERROW,
+              (unsigned long)UPDI_USERROW_SIZE,
+              (unsigned long)UPDI_USERROW_SIZE);
+    MM_APPEND("</memory-map>");
+    #undef MM_APPEND
+
+    size_t total = off;
     if (offset >= total) {
         return rsp_send_packet(fd, "l");
     }

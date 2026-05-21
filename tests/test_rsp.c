@@ -1286,9 +1286,9 @@ static void qXfer_memory_map_read_returns_xml_with_flash_and_ram_regions(void)
     ctx.flash_size = 0x20000u;
     ctx.sram_base  = 0x803000u;
     ctx.sram_size  = 0x4000u;
-    rsp_dispatch(sock_pair[1], "qXfer:memory-map:read::0,200", &h);
-    char stream[1024]; drain(sock_pair[0], stream, sizeof stream);
-    char payload[1024];
+    rsp_dispatch(sock_pair[1], "qXfer:memory-map:read::0,800", &h);
+    char stream[2048]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[2048];
     TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
     TEST_ASSERT_EQUAL('l', payload[0]);
     TEST_ASSERT_NOT_NULL(strstr(payload, "<memory-map>"));
@@ -1300,10 +1300,42 @@ static void qXfer_memory_map_read_returns_xml_with_flash_and_ram_regions(void)
         "<memory type=\"ram\" start=\"0x803000\" length=\"0x4000\"/>"));
 }
 
+/* HLR-063: the memory-map must also describe the five non-FLASH NVM
+ * regions (EEPROM, FUSES, LOCK, SIGROW, USERROW) at their GDB-visible
+ * ELF VMA bands so `info mem` reports them and M-packet writes route
+ * via load_segments() to the correct silicon UPDI address.            */
+static void qXfer_memory_map_read_includes_eeprom_fuses_lock_sigrow_userrow(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    ctx.flash_size = 0x20000u;
+    ctx.sram_base  = 0x803000u;
+    ctx.sram_size  = 0x4000u;
+    rsp_dispatch(sock_pair[1], "qXfer:memory-map:read::0,800", &h);
+    char stream[2048]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[2048];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL('l', payload[0]);
+    /* EEPROM at ELF_VMA_EEPROM=0x810000, size UPDI_EEPROM_SIZE=0x200. */
+    TEST_ASSERT_NOT_NULL(strstr(payload,
+        "<memory type=\"flash\" start=\"0x810000\" length=\"0x200\">"));
+    /* FUSES at 0x820000, size 0x10. */
+    TEST_ASSERT_NOT_NULL(strstr(payload,
+        "<memory type=\"flash\" start=\"0x820000\" length=\"0x10\">"));
+    /* LOCK at 0x830000, size 0x4. */
+    TEST_ASSERT_NOT_NULL(strstr(payload,
+        "<memory type=\"flash\" start=\"0x830000\" length=\"0x4\">"));
+    /* SIGROW at 0x840000, size 0x40, read-only ⇒ type=rom. */
+    TEST_ASSERT_NOT_NULL(strstr(payload,
+        "<memory type=\"rom\" start=\"0x840000\" length=\"0x40\"/>"));
+    /* USERROW at 0x850000, size 0x20, blocksize=0x20 (whole-row write). */
+    TEST_ASSERT_NOT_NULL(strstr(payload,
+        "<memory type=\"flash\" start=\"0x850000\" length=\"0x20\">"));
+}
+
 static void qXfer_memory_map_read_supports_chunked_offset_length(void)
 {
     /* First window: 0,10 — should be a non-last `m` chunk of 0x10
-     * bytes.  Second window: 10,400 — should be a final `l` chunk
+     * bytes.  Second window: 10,800 — should be a final `l` chunk
      * containing the remainder.  Concatenation must reproduce the
      * full document.                                                 */
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
@@ -1312,23 +1344,20 @@ static void qXfer_memory_map_read_supports_chunked_offset_length(void)
     ctx.sram_size  = 0x4000u;
 
     rsp_dispatch(sock_pair[1], "qXfer:memory-map:read::0,10", &h);
-    char stream1[1024]; drain(sock_pair[0], stream1, sizeof stream1);
-    char p1[1024];
+    char stream1[2048]; drain(sock_pair[0], stream1, sizeof stream1);
+    char p1[2048];
     TEST_ASSERT_EQUAL(0, last_packet_payload(stream1, p1, sizeof p1));
     TEST_ASSERT_EQUAL('m', p1[0]);
     TEST_ASSERT_EQUAL(0x10u, strlen(p1) - 1u);
 
-    /* Re-establish the socket pair so the second dispatch sees a
-     * clean stream (drain consumes the bytes; the socket itself is
-     * still healthy, so we just clear the test's ack buffer).        */
-    rsp_dispatch(sock_pair[1], "qXfer:memory-map:read::10,400", &h);
-    char stream2[1024]; drain(sock_pair[0], stream2, sizeof stream2);
-    char p2[1024];
+    rsp_dispatch(sock_pair[1], "qXfer:memory-map:read::10,800", &h);
+    char stream2[2048]; drain(sock_pair[0], stream2, sizeof stream2);
+    char p2[2048];
     TEST_ASSERT_EQUAL(0, last_packet_payload(stream2, p2, sizeof p2));
     TEST_ASSERT_EQUAL('l', p2[0]);
 
     /* Concatenate p1[1:] + p2[1:] and confirm the document is intact. */
-    char combined[2048];
+    char combined[4096];
     int  c1 = snprintf(combined, sizeof combined, "%s%s", p1 + 1, p2 + 1);
     TEST_ASSERT_GREATER_THAN(0, c1);
     TEST_ASSERT_NOT_NULL(strstr(combined, "<memory-map>"));
@@ -1879,6 +1908,7 @@ int main(void)
     /* HLR-063: qXfer:memory-map:read+ */
     RUN_TEST(qSupported_advertises_qXfer_memory_map_read);
     RUN_TEST(qXfer_memory_map_read_returns_xml_with_flash_and_ram_regions);
+    RUN_TEST(qXfer_memory_map_read_includes_eeprom_fuses_lock_sigrow_userrow);
     RUN_TEST(qXfer_memory_map_read_supports_chunked_offset_length);
     RUN_TEST(qXfer_memory_map_read_replies_l_when_no_elf_loaded);
     RUN_TEST(Z2_replies_empty_packet_so_gdb_falls_back_to_sw_watch);
