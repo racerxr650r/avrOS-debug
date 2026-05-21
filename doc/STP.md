@@ -113,7 +113,7 @@ Role: **unit**. **47 test(s).**
 
 ### 3.3. [tests/test_rsp.c](../tests/test_rsp.c)
 
-Role: **unit**. **80 test(s).**
+Role: **unit**. **84 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -197,6 +197,10 @@ Role: **unit**. **80 test(s).**
 | 78 | <a id="vCont_range_step_returns_immediately_when_pc_already_outside"></a>`vCont_range_step_returns_immediately_when_pc_already_outside` | `LLR-RSP-46` | Set `mock_ocd_pc = 0x500` and dispatch `vCont;r100,200`. Assert `mock_step_calls == 0` (loop must check PC before stepping) and the payload begins with `T05thread:`. Per LLR-RSP-46. |
 | 79 | <a id="vCont_range_step_emits_T02_on_ctrl_c"></a>`vCont_range_step_emits_T02_on_ctrl_c` | `LLR-RSP-46` | Set `mock_ocd_pc = 0x100` (inside `[100,200)`) and arrange `__wrap_updi_step` to keep PC inside the range; write a single `\x03` byte to the GDB-side socket before dispatching `vCont;r100,200`. Assert the payload begins with `T02thread:` (Ctrl-C → SIGINT). Per LLR-RSP-46. |
 | 80 | <a id="vCont_range_step_rejects_malformed_packet_with_E22"></a>`vCont_range_step_rejects_malformed_packet_with_E22` | `LLR-RSP-46` | Dispatch `vCont;rZZ,200` (non-hex `start`) and assert the last reply payload is `E22`. Per LLR-RSP-46. |
+| 81 | <a id="qSupported_advertises_qXfer_memory_map_read"></a>`qSupported_advertises_qXfer_memory_map_read` | `LLR-RSP-47` | Dispatch `qSupported:multiprocess+;swbreak+;hwbreak+`, drain, and assert the reply payload contains the substring `qXfer:memory-map:read+`. Confirms the new capability is advertised so a memory-map-aware GDB requests the document. Per LLR-RSP-47. |
+| 82 | <a id="qXfer_memory_map_read_returns_xml_with_flash_and_ram_regions"></a>`qXfer_memory_map_read_returns_xml_with_flash_and_ram_regions` | `LLR-RSP-47` | Set `ctx.flash_size = 0x20000`, `ctx.sram_base = 0x803000`, `ctx.sram_size = 0x4000`. Dispatch `qXfer:memory-map:read::0,200`, drain, and assert the reply payload begins with `l<memory-map>` and contains the substrings `<memory type="flash" start="0x0" length="0x20000">`, `<property name="blocksize">0x200</property>`, and `<memory type="ram" start="0x803000" length="0x4000"/>`. Per LLR-RSP-47. |
+| 83 | <a id="qXfer_memory_map_read_supports_chunked_offset_length"></a>`qXfer_memory_map_read_supports_chunked_offset_length` | `LLR-RSP-47` | Set the same Flash/SRAM sizes as above, dispatch `qXfer:memory-map:read::0,10` first, assert the payload begins with `m` (more available) and is exactly 0x10 bytes after the framing prefix. Then dispatch `qXfer:memory-map:read::10,400` and assert the payload begins with `l` (last chunk) and equals the remainder of the document so concatenating both windows reproduces the full XML. Per LLR-RSP-47. |
+| 84 | <a id="qXfer_memory_map_read_replies_l_when_no_elf_loaded"></a>`qXfer_memory_map_read_replies_l_when_no_elf_loaded` | `LLR-RSP-47` | Build the context with all three sizing fields zero (no ELF supplied), dispatch `qXfer:memory-map:read::0,200`, and assert the reply payload is exactly `l` (end-of-transfer with no document). Confirms the server declines to fabricate a memory map when it cannot derive one from the ELF. Per LLR-RSP-47. |
 
 ### 3.4. [tests/test_elf.c](../tests/test_elf.c)
 
@@ -443,6 +447,7 @@ verified by code review — see
 | `LLR-RSP-44` | `rsp` | `HLR-062` | `continue_emits_swbreak_when_pc_matches_sw_bp_shadow`, `continue_emits_hwbreak_when_pc_matches_hw_bp_shadow`, `continue_emits_bare_T05_when_pc_matches_no_breakpoint` |
 | `LLR-RSP-45` | `rsp` | `HLR-062` | `qSupported_advertises_swbreak_and_hwbreak`, `continue_emits_swbreak_when_pc_matches_sw_bp_shadow`, `continue_emits_hwbreak_when_pc_matches_hw_bp_shadow`, `continue_emits_bare_T05_when_pc_matches_no_breakpoint` |
 | `LLR-RSP-46` | `rsp` | `HLR-066` | `vCont_probe_advertises_range_step`, `vCont_range_step_steps_until_pc_leaves_range`, `vCont_range_step_returns_immediately_when_pc_already_outside`, `vCont_range_step_emits_T02_on_ctrl_c`, `vCont_range_step_rejects_malformed_packet_with_E22` |
+| `LLR-RSP-47` | `rsp` | `HLR-063` | `qSupported_advertises_qXfer_memory_map_read`, `qXfer_memory_map_read_returns_xml_with_flash_and_ram_regions`, `qXfer_memory_map_read_supports_chunked_offset_length`, `qXfer_memory_map_read_replies_l_when_no_elf_loaded` |
 | `LLR-ELF-01` | `elf` | `HLR-021` | `elf_open_accepts_valid_avr_elf32_binary`, `elf_open_returns_minus1_on_invalid_elf_magic`, `elf_open_returns_minus1_on_wrong_machine_type` |
 | `LLR-ELF-02` | `elf` | `HLR-021`, `HLR-040` | `elf_open_loads_symtab_and_strtab_into_heap_buffers`, `elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure` |
 | `LLR-ELF-03` | `elf` | `HLR-021` | `elf_find_avros_tables_performs_single_linear_scan`, `elf_find_avros_tables_populates_all_7_avros_sentinel_fields` |

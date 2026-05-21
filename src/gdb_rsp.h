@@ -89,6 +89,16 @@ typedef struct {
      * as a plain int here to avoid leaking the private enum).  Reset
      * to 0 (SC_NONE) at the start of every fresh resume.            */
     int                       last_stop_cause;
+    /* HLR-063: memory-map advertisement.  Sizes copied verbatim out
+     * of the loaded ELF's program headers (`elf_ctx.flash_size` /
+     * `.sram_base` / `.sram_size`) at server startup and used by the
+     * `qXfer:memory-map:read` handler to render the GDB-side device
+     * memory map.  All three zero ⇒ no ELF available ⇒ handler
+     * replies the empty `l` (end-of-transfer with no content) and
+     * GDB falls back to its built-in defaults.                       */
+    uint32_t                  flash_size;
+    uint32_t                  sram_base;
+    uint32_t                  sram_size;
 } RspContext;
 
 /* Each handler returns 0 on success or -1 on error. The handler is

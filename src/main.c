@@ -1221,6 +1221,12 @@ int MAIN_NAME(int argc, char *argv[])
         .quit_p     = &g_quit,
         .allow_erase = cfg.allow_erase ? 1 : 0,
         .bp_mode    = RSP_BP_MODE_SW,
+        /* HLR-063: feed the ELF-derived memory layout to the
+         * qXfer:memory-map:read handler.  Zero values disable the
+         * map advertisement entirely.                                */
+        .flash_size = elf_ctx.flash_size,
+        .sram_base  = elf_ctx.sram_base,
+        .sram_size  = elf_ctx.sram_size,
     };
     RspHandlers handlers;
     rsp_default_handlers(&handlers, &rctx);

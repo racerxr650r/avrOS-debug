@@ -1706,6 +1706,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
           <trace target="SDD" ref="5.3.1"/>
         </traces>
       </hlr>
+
+      <hlr id="HLR-063" name="qXfer:memory-map:read+ Advertisement">
+        <text><![CDATA[The RSP server shall advertise `qXfer:memory-map:read+` in its `qSupported` reply and shall service `qXfer:memory-map:read::<offset>,<length>` requests by returning a GDB memory-map XML document describing the AVR-Dx Flash and SRAM regions of the connected device. The Flash region shall be expressed with `start="0x0"`, `length=<flash_size>`, and a `<property name="blocksize">` child set to the AVR-Dx Flash page size (`UPDI_FLASH_PAGE_SIZE` = 512 bytes). The SRAM region shall be expressed with `type="ram"`, `start=<sram_base>`, and `length=<sram_size>`, where `sram_base` is the GDB-side data-space address (already carrying the AVR `0x00800000` data-space flag, sourced verbatim from the second `PT_LOAD` segment of the supplied ELF). Sizes shall be sourced from `RspContext.flash_size` / `.sram_base` / `.sram_size`, which `main.c` populates from the parsed ELF at session init. When the server is started without an ELF (or the ELF lacks a SRAM `PT_LOAD`), the `sram_size == 0` branch shall emit a Flash-only map; when both sizes are zero, the handler shall reply `l` (end-of-transfer with no payload) and GDB shall fall back to its built-in defaults rather than receive a fabricated map. The reply shall honour the standard `qXfer` framing: a leading `m` for "more data follows" or `l` for "last chunk", followed by the raw XML bytes from `[offset, offset+length)` of the rendered document. Malformed `<offset>,<length>` syntax (missing comma, non-hex digits) shall produce `E00`. The XML shall be re-rendered per request into a stack buffer (no heap, no caching) so the handler is reentrant and stateless.]]></text>
+        <traces>
+          <trace target="SDD" ref="5.3.1"/>
+        </traces>
+      </hlr>
     </section>
 
   </hlrs>
@@ -2406,6 +2413,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <text><![CDATA[`rsp_dispatch()` shall recognise packets that begin with the literal prefix `vCont;r` (after the seven-byte `vCont;r` and before any `:<thread>` suffix) and route them to a new private handler `static int dh_range_step(int fd, const char *pkt, void *vctx)`. The handler shall: (1) parse two comma-separated 32-bit hex fields `start,end` immediately after the `r`; on parse failure reply `E22`; (2) reset `ctx->last_stop_cause = SC_NONE`; (3) loop up to `RSP_RANGE_STEP_MAX = 100000` iterations: read live PC via `updi_ocd_read_pc()`, exit the loop when `pc < start || pc >= end` (range-exit) or on UPDI failure, otherwise call `updi_step()` and check the GDB socket via `select()` for a Ctrl-C (`\x03`) byte using the same 0 ms-timeout pattern as `dh_continue` so the user can interrupt; on Ctrl-C set a local `got_ctrl_c = true` and exit the loop; (4) call `fsm_invalidate(ctx->fsm)` and `fsm_build_thread_list()` after the loop; (5) classify and emit via the LLR-RSP-45 formatter: `ctx->last_stop_cause = classify_stop_cause(ctx, got_ctrl_c ? SC_INTR : SC_STEP); return format_stop_reply(fd, ctx, got_ctrl_c ? 2 : 5, ctx->last_stop_cause);`. The `vCont?` reply shall be extended from `"vCont;c;s"` to `"vCont;c;s;r"`. The new handler shall be wired into the dispatcher in `rsp_dispatch()` as `if (strncmp(packet, "vCont;r", 7) == 0) return dh_range_step(fd, packet, h->ctx);` placed immediately after the existing `vCont;s` route (so `vCont;c` and `vCont;s` continue to match first by virtue of having distinct seventh bytes). The handler shall live alongside `dh_continue` / `dh_step` in `src/gdb_rsp.c` and shall not be added to the `RspHandlers` vtable (the dispatcher invokes it directly because it has no per-test override use case).]]></text>
         <traces>
           <trace target="HLR" ref="HLR-066" name="vCont;r Range Step"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-47">
+        <text><![CDATA[`rsp_dispatch()` shall recognise packets that begin with the literal prefix `qXfer:memory-map:read::` (23 bytes) and route them to a new private handler `static int dh_qxfer_memory_map(int fd, const char *pkt, void *vctx)`. The qSupported reply (currently `"PacketSize=800;QStartNoAckMode+;multiprocess+;vContSupported+;vRun+;vAttach+;vKill+;vFlashErase+;vFlashWrite+;vFlashDone+;swbreak+;hwbreak+"`) shall be extended with the suffix `";qXfer:memory-map:read+"`. The handler shall: (1) `strtoul()` two hex fields `<offset>,<length>` immediately after the prefix and reply `E00` on a missing comma or non-hex digits; (2) when both `ctx->flash_size == 0` and `ctx->sram_size == 0`, reply `l` (end-of-transfer with no data) so GDB falls back to its built-in defaults; (3) otherwise render an XML document into a stack `char xml[640]` via `snprintf()` containing one `<memory type="flash" start="0x0" length="0x%lx"><property name="blocksize">0x%lx</property></memory>` element (with `blocksize = UPDI_FLASH_PAGE_SIZE = 512`) and, when `ctx->sram_size != 0`, one `<memory type="ram" start="0x%lx" length="0x%lx"/>` element, both wrapped in `<memory-map>...</memory-map>`; on `snprintf` overflow reply `E01`; (4) slice `xml[offset, offset+length)` into the reply, prefix with `'l'` when the slice reaches end-of-document or `'m'` otherwise, and emit via `rsp_send_packet()`; offsets at or past the document length shall reply `l` with no payload. `RspContext` shall gain three sibling fields `uint32_t flash_size; uint32_t sram_base; uint32_t sram_size;` (declared adjacent to `last_stop_cause` in `src/gdb_rsp.h`); `src/main.c` shall populate them from `elf_ctx.flash_size` / `.sram_base` / `.sram_size` at the same designated-initialiser site that already sets `.idx`. The handler shall be inlined into `rsp_dispatch()` (sibling of the `qSupported` / `qAttached` inline routes, before the `case 'q':` switch arm) and shall not consume a `RspHandlers` vtable slot.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-063" name="qXfer:memory-map:read+ Advertisement"/>
         </traces>
       </llr>
     </function>
@@ -3206,7 +3220,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/gdb_rsp.c unit tests                                     -->
     <!-- ============================================================ -->
-    <file path="tests/test_rsp.c" role="unit" count="80">
+    <file path="tests/test_rsp.c" role="unit" count="84">
       <header><![CDATA[Unit tests for `src/gdb_rsp.c`: socket configuration, RSP packet framing, register and memory handlers, hardware-breakpoint comparator management, OCD-based execution control, async Ctrl-C interrupt, detach cleanup, session lifecycle packets, and monitor relay. Uses a `socketpair()` as a drop-in socket substitute and replaces every `updi_*`, `fsm_*`, and `monitor_dispatch` call site with `ld --wrap` mocks so all tests run without real silicon.]]></header>
 
       <test name="rsp_listen_sets_so_reuseaddr_before_bind">
@@ -3607,6 +3621,26 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="vCont_range_step_rejects_malformed_packet_with_E22">
         <purpose><![CDATA[Dispatch `vCont;rZZ,200` (non-hex `start`) and assert the last reply payload is `E22`. Per LLR-RSP-46.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-46"/></traces>
+      </test>
+
+      <test name="qSupported_advertises_qXfer_memory_map_read">
+        <purpose><![CDATA[Dispatch `qSupported:multiprocess+;swbreak+;hwbreak+`, drain, and assert the reply payload contains the substring `qXfer:memory-map:read+`. Confirms the new capability is advertised so a memory-map-aware GDB requests the document. Per LLR-RSP-47.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-47"/></traces>
+      </test>
+
+      <test name="qXfer_memory_map_read_returns_xml_with_flash_and_ram_regions">
+        <purpose><![CDATA[Set `ctx.flash_size = 0x20000`, `ctx.sram_base = 0x803000`, `ctx.sram_size = 0x4000`. Dispatch `qXfer:memory-map:read::0,200`, drain, and assert the reply payload begins with `l<memory-map>` and contains the substrings `<memory type="flash" start="0x0" length="0x20000">`, `<property name="blocksize">0x200</property>`, and `<memory type="ram" start="0x803000" length="0x4000"/>`. Per LLR-RSP-47.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-47"/></traces>
+      </test>
+
+      <test name="qXfer_memory_map_read_supports_chunked_offset_length">
+        <purpose><![CDATA[Set the same Flash/SRAM sizes as above, dispatch `qXfer:memory-map:read::0,10` first, assert the payload begins with `m` (more available) and is exactly 0x10 bytes after the framing prefix. Then dispatch `qXfer:memory-map:read::10,400` and assert the payload begins with `l` (last chunk) and equals the remainder of the document so concatenating both windows reproduces the full XML. Per LLR-RSP-47.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-47"/></traces>
+      </test>
+
+      <test name="qXfer_memory_map_read_replies_l_when_no_elf_loaded">
+        <purpose><![CDATA[Build the context with all three sizing fields zero (no ELF supplied), dispatch `qXfer:memory-map:read::0,200`, and assert the reply payload is exactly `l` (end-of-transfer with no document). Confirms the server declines to fabricate a memory map when it cannot derive one from the ELF. Per LLR-RSP-47.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-47"/></traces>
       </test>
     </file>
 

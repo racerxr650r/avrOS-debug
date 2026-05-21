@@ -1268,6 +1268,86 @@ static void vCont_range_step_rejects_malformed_packet_with_E22(void)
     TEST_ASSERT_EQUAL_STRING("E22", payload);
 }
 
+/* ── HLR-063 (LLR-RSP-47): qXfer:memory-map:read+ ─────────────────── */
+
+static void qSupported_advertises_qXfer_memory_map_read(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    rsp_dispatch(sock_pair[1], "qSupported:multiprocess+;swbreak+;hwbreak+", &h);
+    char stream[1024]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[1024];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_NOT_NULL(strstr(payload, "qXfer:memory-map:read+"));
+}
+
+static void qXfer_memory_map_read_returns_xml_with_flash_and_ram_regions(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    ctx.flash_size = 0x20000u;
+    ctx.sram_base  = 0x803000u;
+    ctx.sram_size  = 0x4000u;
+    rsp_dispatch(sock_pair[1], "qXfer:memory-map:read::0,200", &h);
+    char stream[1024]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[1024];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL('l', payload[0]);
+    TEST_ASSERT_NOT_NULL(strstr(payload, "<memory-map>"));
+    TEST_ASSERT_NOT_NULL(strstr(payload,
+        "<memory type=\"flash\" start=\"0x0\" length=\"0x20000\">"));
+    TEST_ASSERT_NOT_NULL(strstr(payload,
+        "<property name=\"blocksize\">0x200</property>"));
+    TEST_ASSERT_NOT_NULL(strstr(payload,
+        "<memory type=\"ram\" start=\"0x803000\" length=\"0x4000\"/>"));
+}
+
+static void qXfer_memory_map_read_supports_chunked_offset_length(void)
+{
+    /* First window: 0,10 — should be a non-last `m` chunk of 0x10
+     * bytes.  Second window: 10,400 — should be a final `l` chunk
+     * containing the remainder.  Concatenation must reproduce the
+     * full document.                                                 */
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    ctx.flash_size = 0x20000u;
+    ctx.sram_base  = 0x803000u;
+    ctx.sram_size  = 0x4000u;
+
+    rsp_dispatch(sock_pair[1], "qXfer:memory-map:read::0,10", &h);
+    char stream1[1024]; drain(sock_pair[0], stream1, sizeof stream1);
+    char p1[1024];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream1, p1, sizeof p1));
+    TEST_ASSERT_EQUAL('m', p1[0]);
+    TEST_ASSERT_EQUAL(0x10u, strlen(p1) - 1u);
+
+    /* Re-establish the socket pair so the second dispatch sees a
+     * clean stream (drain consumes the bytes; the socket itself is
+     * still healthy, so we just clear the test's ack buffer).        */
+    rsp_dispatch(sock_pair[1], "qXfer:memory-map:read::10,400", &h);
+    char stream2[1024]; drain(sock_pair[0], stream2, sizeof stream2);
+    char p2[1024];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream2, p2, sizeof p2));
+    TEST_ASSERT_EQUAL('l', p2[0]);
+
+    /* Concatenate p1[1:] + p2[1:] and confirm the document is intact. */
+    char combined[2048];
+    int  c1 = snprintf(combined, sizeof combined, "%s%s", p1 + 1, p2 + 1);
+    TEST_ASSERT_GREATER_THAN(0, c1);
+    TEST_ASSERT_NOT_NULL(strstr(combined, "<memory-map>"));
+    TEST_ASSERT_NOT_NULL(strstr(combined, "</memory-map>"));
+    TEST_ASSERT_NOT_NULL(strstr(combined,
+        "<memory type=\"ram\" start=\"0x803000\" length=\"0x4000\"/>"));
+}
+
+static void qXfer_memory_map_read_replies_l_when_no_elf_loaded(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    /* All three sizing fields zeroed by build_ctx() — no ELF. */
+    rsp_dispatch(sock_pair[1], "qXfer:memory-map:read::0,200", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("l", payload);
+}
+
 /* ── HLR-056: Z2/Z3/Z4 data watchpoints — silicon does not expose
  *           the hardware over UPDI (see src/updi.h and
  *           doc/reference/guesswork.md).  Server replies the empty
@@ -1796,6 +1876,11 @@ int main(void)
     RUN_TEST(vCont_range_step_returns_immediately_when_pc_already_outside);
     RUN_TEST(vCont_range_step_emits_T02_on_ctrl_c);
     RUN_TEST(vCont_range_step_rejects_malformed_packet_with_E22);
+    /* HLR-063: qXfer:memory-map:read+ */
+    RUN_TEST(qSupported_advertises_qXfer_memory_map_read);
+    RUN_TEST(qXfer_memory_map_read_returns_xml_with_flash_and_ram_regions);
+    RUN_TEST(qXfer_memory_map_read_supports_chunked_offset_length);
+    RUN_TEST(qXfer_memory_map_read_replies_l_when_no_elf_loaded);
     RUN_TEST(Z2_replies_empty_packet_so_gdb_falls_back_to_sw_watch);
     RUN_TEST(z3_remove_also_replies_empty_packet);
     /* HLR-053: vFlashErase / vFlashWrite / vFlashDone (`gdb load`). */

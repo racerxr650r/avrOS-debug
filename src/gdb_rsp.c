@@ -1052,6 +1052,76 @@ static int dh_thread_info(int fd, const char *pkt, void *vctx)
     return rsp_send_packet(fd, reply);
 }
 
+/* HLR-063 / LLR-RSP-47: qXfer:memory-map:read::<offset>,<length> —
+ * advertise the AVR-Dx Flash and SRAM regions to GDB so the client
+ * routes M-packet writes correctly and stops short-reading past
+ * device boundaries.  Sizes are sourced verbatim from the loaded
+ * ELF (RspContext.flash_size / sram_*).  All-zero context ⇒ no ELF
+ * was supplied at startup ⇒ reply `l` (end-of-transfer, no data) so
+ * GDB falls back to its built-in defaults rather than rendering a
+ * wrong map.  The XML payload is rebuilt per request into a stack
+ * buffer; offset/length slicing is then applied with `m`/`l` framing.
+ * Malformed offset/length ⇒ E00 per qXfer error convention.          */
+static int dh_qxfer_memory_map(int fd, const char *pkt, void *vctx)
+{
+    RspContext *ctx = (RspContext *)vctx;
+
+    /* Skip the prefix "qXfer:memory-map:read::" (23 chars). */
+    const char *p = pkt + 23;
+    char       *end = NULL;
+    unsigned long offset = strtoul(p, &end, 16);
+    if (end == NULL || *end != ',') return reply_err(fd, "E00");
+    p = end + 1;
+    unsigned long length = strtoul(p, &end, 16);
+    if (end == NULL) return reply_err(fd, "E00");
+
+    /* All-zero sizes ⇒ no ELF available ⇒ end-of-transfer with no
+     * data.  GDB then uses its built-in defaults.                    */
+    if (ctx->flash_size == 0u && ctx->sram_size == 0u) {
+        return rsp_send_packet(fd, "l");
+    }
+
+    char xml[640];
+    int  n;
+    if (ctx->sram_size != 0u) {
+        n = snprintf(xml, sizeof xml,
+            "<memory-map>"
+            "<memory type=\"flash\" start=\"0x0\" length=\"0x%lx\">"
+            "<property name=\"blocksize\">0x%lx</property>"
+            "</memory>"
+            "<memory type=\"ram\" start=\"0x%lx\" length=\"0x%lx\"/>"
+            "</memory-map>",
+            (unsigned long)ctx->flash_size,
+            (unsigned long)UPDI_FLASH_PAGE_SIZE,
+            (unsigned long)ctx->sram_base,
+            (unsigned long)ctx->sram_size);
+    } else {
+        n = snprintf(xml, sizeof xml,
+            "<memory-map>"
+            "<memory type=\"flash\" start=\"0x0\" length=\"0x%lx\">"
+            "<property name=\"blocksize\">0x%lx</property>"
+            "</memory>"
+            "</memory-map>",
+            (unsigned long)ctx->flash_size,
+            (unsigned long)UPDI_FLASH_PAGE_SIZE);
+    }
+    if (n < 0 || (size_t)n >= sizeof xml) return reply_err(fd, "E01");
+
+    size_t total = (size_t)n;
+    if (offset >= total) {
+        return rsp_send_packet(fd, "l");
+    }
+    size_t avail = total - offset;
+    size_t take  = (length < avail) ? length : avail;
+    bool   last  = (offset + take >= total);
+
+    char reply[1 + sizeof xml];
+    reply[0] = last ? 'l' : 'm';
+    memcpy(&reply[1], xml + offset, take);
+    reply[1 + take] = '\0';
+    return rsp_send_packet(fd, reply);
+}
+
 /* HLR-061 / LLR-RSP-42: qThreadExtraInfo,<tid> — return a
  * human-readable label for the FSM identified by <tid>:
  *   "FSM <name> [active|quiescent] state=0x<state_fn>"
@@ -1533,10 +1603,15 @@ int rsp_dispatch_n(int fd, const char *packet, size_t plen, RspHandlers *h)
         return rsp_send_packet(fd,
             "PacketSize=800;QStartNoAckMode+;multiprocess+;vContSupported+"
             ";vRun+;vAttach+;vKill+;vFlashErase+;vFlashWrite+;vFlashDone+"
-            ";swbreak+;hwbreak+");
+            ";swbreak+;hwbreak+;qXfer:memory-map:read+");
     }
     if (strncmp(packet, "qAttached", 9) == 0) {
         return rsp_send_packet(fd, "1");
+    }
+    /* HLR-063: qXfer:memory-map:read inlined here so it doesn't need a
+     * dedicated slot in RspHandlers.                                   */
+    if (strncmp(packet, "qXfer:memory-map:read::", 23) == 0) {
+        return dh_qxfer_memory_map(fd, packet, h->ctx);
     }
     if (strncmp(packet, "QStartNoAckMode", 15) == 0) {
         rsp_set_noack(true);
