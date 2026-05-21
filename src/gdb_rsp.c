@@ -34,12 +34,8 @@ static bool g_noack = false;
 void rsp_set_noack(bool e) { g_noack = e; }
 bool rsp_get_noack(void)   { return g_noack; }
 
-/* GDB AVR address-space split: addresses < 0x800000 are program memory
- * (FLASH); addresses >= 0x800000 are data space (SRAM/IO).  AVR-Dx UPDI
- * uses the opposite convention — FLASH lives at UPDI 0x800000+ and SRAM
- * at UPDI 0x000000+.  Translate by flipping bit 23.                    */
-#define GDB_AVR_DATA_FLAG   0x800000u
-#define GDB_AVR_ADDR_MASK   0x7FFFFFu
+/* GDB AVR ↔ UPDI address-space translation helpers live in updi.h
+ * (GDB_AVR_DATA_FLAG, GDB_AVR_ADDR_MASK, sram_to_updi, flash_to_updi). */
 
 /* Sentinel: no breakpoint installed in this HW comparator slot. */
 #define HW_BP_SLOT_EMPTY    0xFFFFFFFFu

@@ -64,12 +64,20 @@ int __wrap_updi_mem_read(int fd, uint32_t addr, uint8_t *buf, size_t len)
     (void)fd;
     g_read_calls++;
     g_read_total_bytes += len;
-    for (size_t i = 0; i < g_region_count; ++i) {
-        const Region *r = &g_regions[i];
-        if (addr >= r->addr && (addr + len) <= (r->addr + r->len)) {
-            memcpy(buf, r->data + (addr - r->addr), len);
-            return 0;
+    /* fsm_mapper/monitor route flash reads through UPDI's flash mirror
+     * (addr | 0x800000).  Tests register backing regions at the raw
+     * GDB-AVR / data-space address, so try the literal address first,
+     * then retry with the flash-mirror flag stripped. */
+    for (int pass = 0; pass < 2; ++pass) {
+        uint32_t a = (pass == 0) ? addr : (addr & 0x7FFFFFu);
+        for (size_t i = 0; i < g_region_count; ++i) {
+            const Region *r = &g_regions[i];
+            if (a >= r->addr && (a + len) <= (r->addr + r->len)) {
+                memcpy(buf, r->data + (a - r->addr), len);
+                return 0;
+            }
         }
+        if (!(addr & 0x800000u)) break;
     }
     return -1;
 }

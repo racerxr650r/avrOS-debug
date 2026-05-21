@@ -102,6 +102,7 @@ int elf_open(const char *path, ElfContext *ctx)
     ctx->flash_size  = 0;
     ctx->sram_base   = 0;
     ctx->sram_size   = 0;
+    ctx->load_count  = 0;
     ctx->device_name[0] = '\0';
 
     int fd = open(path, O_RDONLY);
@@ -163,6 +164,12 @@ int elf_open(const char *path, ElfContext *ctx)
             } else if (load_idx == 1) {
                 ctx->sram_base = phdr.p_vaddr;
                 ctx->sram_size = phdr.p_filesz;
+            }
+            if (ctx->load_count < ELF_MAX_PT_LOAD) {
+                ctx->loads[ctx->load_count].vaddr = phdr.p_vaddr;
+                ctx->loads[ctx->load_count].paddr = phdr.p_paddr;
+                ctx->loads[ctx->load_count].memsz = phdr.p_memsz;
+                ctx->load_count++;
             }
             load_idx++;
         }
@@ -336,17 +343,17 @@ int elf_find_avros_tables(ElfContext *ctx, AvrOsSymbolIndex *idx)
      *   evntDescriptor_t        = 4 bytes
      */
     if (found & B_FSM_S)
-        idx->fsm_table_addr  = elf_flash_addr(ctx, fsm_start);
+        idx->fsm_table_addr  = fsm_start;
     if ((found & (B_FSM_S | B_FSM_E)) == (B_FSM_S | B_FSM_E))
         idx->fsm_table_count = (uint8_t)((fsm_end - fsm_start) / 9U);
 
     if (found & B_Q_S)
-        idx->queue_table_addr = elf_flash_addr(ctx, queue_start);
+        idx->queue_table_addr = queue_start;
     if ((found & (B_Q_S | B_Q_E)) == (B_Q_S | B_Q_E))
         idx->queue_count = (uint8_t)((queue_end - queue_start) / 10U);
 
     if (found & B_EVT_S)
-        idx->event_table_addr = elf_flash_addr(ctx, event_start);
+        idx->event_table_addr = event_start;
     if ((found & (B_EVT_S | B_EVT_E)) == (B_EVT_S | B_EVT_E))
         idx->event_count = (uint8_t)((event_end - event_start) / 4U);
 
@@ -369,4 +376,21 @@ uint32_t elf_flash_addr(const ElfContext *ctx, uint32_t vma)
 {
     return (vma - ctx->flash_base) / 2U;
 }
-
+/* ── elf_phys_flash_byte_addr ───────────────────────────────
+ * Walk the captured PT_LOAD table and return the absolute FLASH byte
+ * address (LMA) corresponding to `vma`.  This is required for AVR-Dx
+ * parts where const data lives in the mapped-flash window (data-space
+ * 0x8000–0xFFFF) but UPDI must address the actual physical flash
+ * page (e.g. 0x18000+) via ST_PTR_LONG, bypassing NVMCTRL.CTRLB.FLMAP.
+ * Falls back to returning `vma` unchanged when no segment matches
+ * (synthesized fixtures or addresses outside all PT_LOADs).         */
+uint32_t elf_phys_flash_byte_addr(const ElfContext *ctx, uint32_t vma)
+{
+    for (unsigned i = 0; i < ctx->load_count; i++) {
+        const ElfLoadSegment *s = &ctx->loads[i];
+        if (vma >= s->vaddr && vma < s->vaddr + s->memsz) {
+            return vma + (s->paddr - s->vaddr);
+        }
+    }
+    return vma;
+}

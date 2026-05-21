@@ -20,21 +20,26 @@
  *   currStateMachine        (file-static SRAM pointer, 2 bytes)
  *     The currently-running fsmStateMachine_t (set on each dispatch).
  *
- * Address spaces:
- *   • idx->fsm_table_addr  is a *word* address in FLASH program memory
- *     (output of elf_flash_addr).  updi_mem_read on Phase-2 maps that
- *     to the byte address used by the UPDI LD/ST commands.
- *   • idx->current_fsm_addr is a *byte* address in SRAM (raw VMA).
- *   • Per-entry stateMachine pointers and currStateMachine are
- *     16-bit AVR data-space pointers (byte addresses in SRAM).
+ * Address spaces (all addresses below are GDB-AVR ELF form — bit 23
+ * SET = data space, bit 23 CLEAR = flash):
+ *   • idx->fsm_table_addr is a 16-bit data-space VMA inside the
+ *     AVR-Dx mapped-flash window (0x8000..0xFFFF).  We route reads
+ *     through UPDI's flash mirror via flash_to_updi() so the chip's
+ *     FLMAP hardware resolves the physical page transparently.
+ *   • idx->current_fsm_addr is a GDB-AVR data-space address; we strip
+ *     the data flag with sram_to_updi() before passing it to UPDI.
+ *   • Per-entry stateMachine pointers and currStateMachine are bare
+ *     16-bit AVR data-space byte addresses (already in UPDI form,
+ *     no flag bit set).  Per-entry name pointers are 16-bit C
+ *     pointers; on AVR-Dx they land in the mapped-flash window
+ *     (>= 0x8000) and we read them via flash_to_updi() likewise.
  */
 #include <stdio.h>
 #include <string.h>
 
 #include "fsm_mapper.h"
+#include "updi.h"   /* UPDI_FLASH_BASE, sram_to_updi, flash_to_updi */
 
-/* updi.h is included transitively by fsm_mapper consumers; we need
- * only the prototype for updi_mem_read here. */
 extern int updi_mem_read(int fd, uint32_t addr, uint8_t *buf, size_t len);
 
 #define FSM_DESCR_SIZE        9U   /* sizeof(fsmStateMachineDescr_t)        */
@@ -47,22 +52,23 @@ static uint16_t read_le16(const uint8_t *p)
     return (uint16_t)(p[0] | ((uint16_t)p[1] << 8));
 }
 
-/* Read up to `max-1` bytes from FLASH starting at byte address `byte_addr`,
- * stop on first NUL or after `max-1` bytes, NUL-terminate `dst`.
- * Returns 0 on success, -1 on UPDI failure. */
+/* Read up to `max-1` bytes from FLASH starting at GDB-AVR byte address
+ * `byte_addr`, stop on first NUL or after `max-1` bytes, NUL-terminate
+ * `dst`.  Routes through UPDI's flash mirror (flash_to_updi); the chip
+ * resolves any mapped-flash window pointer (0x8000..0xFFFF) via FLMAP
+ * in hardware.  Returns 0 on success, -1 on UPDI failure. */
 static int read_flash_string(int updi_fd, uint32_t byte_addr,
                              char *dst, size_t max)
 {
     if (max == 0)
         return 0;
 
-    /* Convert byte-addr in FLASH to the word address space used by
-     * updi_mem_read for program-memory reads.  Phase-2 updi_mem_read
-     * accepts byte addresses for FLASH; we pass through unchanged. */
+    uint32_t base_addr = flash_to_updi(byte_addr);
+
     size_t off = 0;
     while (off + 1 < max) {
         uint8_t b;
-        if (updi_mem_read(updi_fd, byte_addr + (uint32_t)off, &b, 1) < 0)
+        if (updi_mem_read(updi_fd, base_addr + (uint32_t)off, &b, 1) < 0)
             return -1;
         if (b == 0)
             break;
@@ -99,7 +105,7 @@ int fsm_build_thread_list(FsmContext *ctx, const AvrOsSymbolIndex *idx, int updi
     uint16_t current_sm = 0;
     if (idx->current_fsm_addr != 0U) {
         uint8_t buf[2];
-        if (updi_mem_read(updi_fd, idx->current_fsm_addr, buf, sizeof(buf)) < 0) {
+        if (updi_mem_read(updi_fd, sram_to_updi(idx->current_fsm_addr), buf, sizeof(buf)) < 0) {
             fprintf(stderr,
                     "fsm: failed to read currStateMachine at 0x%08x\n",
                     (unsigned)idx->current_fsm_addr);
@@ -117,7 +123,8 @@ int fsm_build_thread_list(FsmContext *ctx, const AvrOsSymbolIndex *idx, int updi
         uint8_t descr[FSM_DESCR_SIZE];
         uint32_t descr_addr = idx->fsm_table_addr
                             + (uint32_t)i * FSM_DESCR_SIZE;
-        if (updi_mem_read(updi_fd, descr_addr, descr, sizeof(descr)) < 0) {
+        if (updi_mem_read(updi_fd, flash_to_updi(descr_addr),
+                          descr, sizeof(descr)) < 0) {
             fprintf(stderr,
                     "fsm: failed to read FSM_TABLE[%u] at 0x%08x\n",
                     (unsigned)i, (unsigned)descr_addr);
@@ -140,7 +147,9 @@ int fsm_build_thread_list(FsmContext *ctx, const AvrOsSymbolIndex *idx, int updi
         t->gdb_id   = produced + 1; /* GDB threads are 1-based         */
         t->is_active = (sm_ptr == current_sm);
 
-        /* Read currState (function pointer) from SRAM at sm_ptr + 9. */
+        /* Read currState (function pointer) from SRAM at sm_ptr + 9.
+         * sm_ptr is a raw 16-bit AVR data-space byte address (already
+         * in UPDI form — no flag bit set). */
         uint8_t cs[2];
         if (updi_mem_read(updi_fd,
                           (uint32_t)sm_ptr + FSM_CURRSTATE_OFFSET,
@@ -152,7 +161,10 @@ int fsm_build_thread_list(FsmContext *ctx, const AvrOsSymbolIndex *idx, int updi
         }
         t->state_fn = (uint32_t)read_le16(cs);
 
-        /* Read the descriptor name (NUL-terminated, in FLASH). */
+        /* Read the descriptor name (NUL-terminated, in FLASH).
+         * name_ptr is a 16-bit AVR C pointer; on AVR-Dx parts string
+         * literals live in the mapped-flash window (>= 0x8000) and
+         * the chip resolves FLMAP via UPDI's flash mirror. */
         if (name_ptr != 0) {
             if (read_flash_string(updi_fd, (uint32_t)name_ptr,
                                   t->name, sizeof(t->name)) < 0) {
