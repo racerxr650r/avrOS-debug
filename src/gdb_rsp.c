@@ -331,6 +331,57 @@ static const char *signal_for_halt_status(int updi_fd)
     return "T05";
 }
 
+/* HLR-062 / LLR-RSP-44: stop-cause classification.  Returned from
+ * classify_stop_cause() and stored in RspContext.last_stop_cause for
+ * the formatter (LLR-RSP-45).                                        */
+enum RspStopCause {
+    SC_NONE    = 0,
+    SC_SWBREAK = 1,
+    SC_HWBREAK = 2,
+    SC_STEP    = 3,
+    SC_INTR    = 4
+};
+
+/* Read the live PC and decide whether the halt is a SW-BP hit, a
+ * HW-BP hit, or something else (in which case the caller's `hint` is
+ * returned unchanged).  No PC adjustment — GDB rewinds itself when it
+ * sees `swbreak:;`.                                                  */
+static int classify_stop_cause(RspContext *ctx, int hint)
+{
+    uint32_t pc = 0;
+    if (ctx == NULL) return hint;
+    if (updi_ocd_read_pc(ctx->updi_fd, &pc) < 0) return hint;
+    for (int i = 0; i < RSP_MAX_SW_BREAKPOINTS; i++) {
+        if (ctx->sw_bp[i].in_use && ctx->sw_bp[i].addr == pc) {
+            return SC_SWBREAK;
+        }
+    }
+    for (int i = 0; i < 2; i++) {
+        if (ctx->hw_bp_addr[i] != HW_BP_SLOT_EMPTY &&
+            ctx->hw_bp_addr[i] == pc) {
+            return SC_HWBREAK;
+        }
+    }
+    return hint;
+}
+
+/* HLR-062 / LLR-RSP-45: render `<sig><tag>thread:<hex_tid>;` into a
+ * single packet.  `sig` is "T05" or "T02"; `tag` is "swbreak:;"
+ * for SC_SWBREAK, "hwbreak:;" for SC_HWBREAK, empty otherwise.       */
+static int format_stop_reply(int fd, RspContext *ctx,
+                             const char *sig, int cause)
+{
+    const char *tag = "";
+    if (cause == SC_SWBREAK) tag = "swbreak:;";
+    else if (cause == SC_HWBREAK) tag = "hwbreak:;";
+    int aid = (ctx && ctx->fsm) ? fsm_get_active_thread(ctx->fsm) : 0;
+    if (aid <= 0) aid = 1;
+    char reply[64];
+    snprintf(reply, sizeof reply, "%s%sthread:%x;",
+             sig, tag, (unsigned)aid);
+    return rsp_send_packet(fd, reply);
+}
+
 /* Clear all OCD HW breakpoints in silicon and reset the local shadow.
  * Idempotent and tolerant of UPDI errors (used on detach).            */
 void rsp_hw_bp_clear_all(RspContext *ctx)
@@ -439,12 +490,14 @@ static int dh_halt_reason(int fd, const char *pkt, void *vctx)
 {
     (void)pkt;
     RspContext *ctx = (RspContext *)vctx;
-    int aid = ctx->fsm ? fsm_get_active_thread(ctx->fsm) : 0;
-    if (aid <= 0) aid = 1;
-    char reply[64];
-    snprintf(reply, sizeof reply, "%sthread:%x;",
-             signal_for_halt_status(ctx->updi_fd), (unsigned)aid);
-    return rsp_send_packet(fd, reply);
+    /* HLR-062: classify (PC vs SW/HW BP shadow) when the previous
+     * resume path has not already set a more specific cause.        */
+    if (ctx->last_stop_cause == SC_NONE) {
+        ctx->last_stop_cause = classify_stop_cause(ctx, SC_NONE);
+    }
+    return format_stop_reply(fd, ctx,
+                             signal_for_halt_status(ctx->updi_fd),
+                             ctx->last_stop_cause);
 }
 
 /* Hex-encode one byte into *p (advances p by 2 chars). */
@@ -685,6 +738,9 @@ static int dh_continue(int fd, const char *pkt, void *vctx)
     (void)pkt;
     RspContext *ctx = (RspContext *)vctx;
 
+    /* HLR-062: clear the previous-halt cause hint so a stale tag
+     * never bleeds across resumes.                                  */
+    ctx->last_stop_cause = SC_NONE;
     if (updi_run(ctx->updi_fd) < 0) return reply_err(fd, "E01");
     fsm_invalidate(ctx->fsm);
 
@@ -747,14 +803,17 @@ static int dh_continue(int fd, const char *pkt, void *vctx)
     if (ctx->fsm) {
         (void)fsm_build_thread_list(ctx->fsm, ctx->idx, ctx->updi_fd);
     }
-    /* Signal: SIGINT (T02) for user-Ctrl-C, SIGTRAP (T05) otherwise. */
+    /* HLR-062 / LLR-RSP-44/45: classify (PC vs SW/HW BP shadow) and
+     * route through the single stop-reply formatter so the client
+     * sees `T05swbreak:;...` / `T05hwbreak:;...` / bare `T05` as
+     * appropriate.  Ctrl-C wins over BP-shadow match: a user
+     * interrupt is reported as SIGINT regardless of where the PC
+     * happened to land.                                              */
     {
-        int aid = ctx->fsm ? fsm_get_active_thread(ctx->fsm) : 0;
-        if (aid <= 0) aid = 1;
         const char *sig = got_ctrl_c ? "T02" : "T05";
-        char reply[64];
-        snprintf(reply, sizeof reply, "%sthread:%x;", sig, (unsigned)aid);
-        return rsp_send_packet(fd, reply);
+        int hint = got_ctrl_c ? SC_INTR : SC_NONE;
+        ctx->last_stop_cause = classify_stop_cause(ctx, hint);
+        return format_stop_reply(fd, ctx, sig, ctx->last_stop_cause);
     }
 }
 
@@ -762,11 +821,17 @@ static int dh_step(int fd, const char *pkt, void *vctx)
 {
     (void)pkt;
     RspContext *ctx = (RspContext *)vctx;
+    /* HLR-062: a step that lands on a SW/HW BP shadow is still
+     * a breakpoint hit; otherwise the cause is `step`.  Seed the
+     * hint with SC_STEP so classify_stop_cause() returns it when
+     * neither shadow matches.                                       */
+    ctx->last_stop_cause = SC_NONE;
     if (updi_step(ctx->updi_fd) < 0) return reply_err(fd, "E01");
     fsm_invalidate(ctx->fsm);
     if (ctx->fsm) {
         (void)fsm_build_thread_list(ctx->fsm, ctx->idx, ctx->updi_fd);
     }
+    ctx->last_stop_cause = classify_stop_cause(ctx, SC_STEP);
     return dh_halt_reason(fd, "?", vctx);
 }
 
@@ -1287,6 +1352,7 @@ static int dh_vrun(int fd, const char *pkt, void *vctx)
     (void)pkt;
     RspContext *ctx = (RspContext *)vctx;
 
+    ctx->last_stop_cause = SC_NONE;
     if (updi_enter_debug(ctx->updi_fd) < 0) return reply_err(fd, "E01");
     fsm_invalidate(ctx->fsm);
     (void)fsm_build_thread_list(ctx->fsm, ctx->idx, ctx->updi_fd);
@@ -1304,6 +1370,7 @@ static int dh_vattach(int fd, const char *pkt, void *vctx)
     (void)pkt;
     RspContext *ctx = (RspContext *)vctx;
 
+    ctx->last_stop_cause = SC_NONE;
     if (updi_enter_debug(ctx->updi_fd) < 0) return reply_err(fd, "E01");
     fsm_invalidate(ctx->fsm);
     (void)fsm_build_thread_list(ctx->fsm, ctx->idx, ctx->updi_fd);
@@ -1400,7 +1467,8 @@ int rsp_dispatch_n(int fd, const char *packet, size_t plen, RspHandlers *h)
     if (strncmp(packet, "qSupported", 10) == 0) {
         return rsp_send_packet(fd,
             "PacketSize=800;QStartNoAckMode+;multiprocess+;vContSupported+"
-            ";vRun+;vAttach+;vKill+;vFlashErase+;vFlashWrite+;vFlashDone+");
+            ";vRun+;vAttach+;vKill+;vFlashErase+;vFlashWrite+;vFlashDone+"
+            ";swbreak+;hwbreak+");
     }
     if (strncmp(packet, "qAttached", 9) == 0) {
         return rsp_send_packet(fd, "1");

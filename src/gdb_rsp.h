@@ -82,6 +82,13 @@ typedef struct {
      * channel from the protocol layer to the entry/event-loop layer
      * (preserves SDD §2.2 layered architecture).                    */
     const char               *disconnect_reason;
+    /* HLR-062 / LLR-RSP-44: stop-cause classification carried out of
+     * dh_continue/dh_step/dh_halt_reason into format_stop_reply() so
+     * the emitted T-reply can carry `swbreak:;` or `hwbreak:;`.  Set
+     * to one of the RspStopCause values defined in gdb_rsp.c (kept
+     * as a plain int here to avoid leaking the private enum).  Reset
+     * to 0 (SC_NONE) at the start of every fresh resume.            */
+    int                       last_stop_cause;
 } RspContext;
 
 /* Each handler returns 0 on success or -1 on error. The handler is

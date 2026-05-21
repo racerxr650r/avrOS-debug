@@ -113,7 +113,7 @@ Role: **unit**. **47 test(s).**
 
 ### 3.3. [tests/test_rsp.c](../tests/test_rsp.c)
 
-Role: **unit**. **71 test(s).**
+Role: **unit**. **75 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -188,6 +188,10 @@ Role: **unit**. **71 test(s).**
 | 69 | <a id="qThreadExtraInfo_unknown_tid_replies_empty_packet"></a>`qThreadExtraInfo_unknown_tid_replies_empty_packet` | `LLR-RSP-42` | Dispatch `qThreadExtraInfo,pa410.99` against a 2-thread FsmContext and assert the reply is the empty RSP packet (zero-length payload), not `E01`. Then dispatch `qThreadExtraInfo,p0.0` and assert empty packet (no aggregate label exists for the any-thread form). Confirms LLR-RSP-41 / LLR-RSP-42 unknown-TID and any-thread semantics. |
 | 70 | <a id="on_detach_D_sets_disconnect_reason_to_D"></a>`on_detach_D_sets_disconnect_reason_to_D` | `LLR-RSP-43` | Build a default `RspContext`, assert `ctx.disconnect_reason == NULL`, dispatch the RSP packet `D`, and assert `ctx.disconnect_reason` is now the string `"D"`. Confirms `dh_detach` records the disconnect classification before closing the GDB socket so the entry-layer lifecycle logger can name the cause without a reverse include. Per LLR-RSP-43. |
 | 71 | <a id="vKill_sets_disconnect_reason_to_vKill"></a>`vKill_sets_disconnect_reason_to_vKill` | `LLR-RSP-43` | Build a default `RspContext`, assert `ctx.disconnect_reason == NULL`, dispatch `vKill;1`, and assert `ctx.disconnect_reason == "vKill"`. Confirms the vKill handler records its classification on the upward-only field so the disconnect lifecycle line can name the cause as `vKill` rather than the generic `EOF`. Per LLR-RSP-43. |
+| 72 | <a id="qSupported_advertises_swbreak_and_hwbreak"></a>`qSupported_advertises_swbreak_and_hwbreak` | `LLR-RSP-45` | Dispatch `qSupported:multiprocess+;swbreak+;hwbreak+` and assert the reply payload contains the substrings `swbreak+` and `hwbreak+` so a multiprocess-capable GDB sees the new stop-cause tags advertised. Per LLR-RSP-45. |
+| 73 | <a id="continue_emits_swbreak_when_pc_matches_sw_bp_shadow"></a>`continue_emits_swbreak_when_pc_matches_sw_bp_shadow` | `LLR-RSP-44`, `LLR-RSP-45` | Install a software breakpoint at `0x100` via `Z0,100,2` (default `bp_mode == sw`), arrange `mock_ocd_pc = 0x100` and the OCD poll script to deliver an immediate halt, dispatch `vCont;c`, drain the reply, and assert the last RSP packet's payload begins with `T05swbreak:;thread:` so GDB sees the SW-BP cause. Per LLR-RSP-44 / LLR-RSP-45. |
+| 74 | <a id="continue_emits_hwbreak_when_pc_matches_hw_bp_shadow"></a>`continue_emits_hwbreak_when_pc_matches_hw_bp_shadow` | `LLR-RSP-44`, `LLR-RSP-45` | Switch to `bp_mode == hw-only`, install a hardware breakpoint at `0x200` via `Z0,200,2`, arrange `mock_ocd_pc = 0x200` and the OCD poll script to deliver an immediate halt, dispatch `vCont;c`, drain the reply, and assert the last RSP packet's payload begins with `T05hwbreak:;thread:` so GDB sees the HW-BP cause. Per LLR-RSP-44 / LLR-RSP-45. |
+| 75 | <a id="continue_emits_bare_T05_when_pc_matches_no_breakpoint"></a>`continue_emits_bare_T05_when_pc_matches_no_breakpoint` | `LLR-RSP-44`, `LLR-RSP-45` | With no breakpoints installed, arrange `mock_ocd_pc = 0xCAFE` and the OCD poll script to deliver an immediate halt, dispatch `vCont;c`, drain the reply, and assert the last RSP packet's payload begins with `T05thread:` (no `swbreak:` or `hwbreak:` tag). Confirms the classifier returns the caller's `SC_NONE` hint when neither shadow matches and the formatter therefore emits no extra tag. Per LLR-RSP-44 / LLR-RSP-45. |
 
 ### 3.4. [tests/test_elf.c](../tests/test_elf.c)
 
@@ -431,6 +435,8 @@ verified by code review — see
 | `LLR-RSP-41` | `rsp` | `HLR-060` | `Hg_accepts_multiprocess_thread_id_form`, `Hc_accepts_multiprocess_thread_id_form`, `T_thread_alive_accepts_multiprocess_form` |
 | `LLR-RSP-42` | `rsp` | `HLR-061` | `qThreadExtraInfo_returns_FSM_label_with_state_and_active_flag`, `qThreadExtraInfo_unknown_tid_replies_empty_packet` |
 | `LLR-RSP-43` | `rsp` | `HLR-065` | `on_detach_D_sets_disconnect_reason_to_D`, `vKill_sets_disconnect_reason_to_vKill` |
+| `LLR-RSP-44` | `rsp` | `HLR-062` | `continue_emits_swbreak_when_pc_matches_sw_bp_shadow`, `continue_emits_hwbreak_when_pc_matches_hw_bp_shadow`, `continue_emits_bare_T05_when_pc_matches_no_breakpoint` |
+| `LLR-RSP-45` | `rsp` | `HLR-062` | `qSupported_advertises_swbreak_and_hwbreak`, `continue_emits_swbreak_when_pc_matches_sw_bp_shadow`, `continue_emits_hwbreak_when_pc_matches_hw_bp_shadow`, `continue_emits_bare_T05_when_pc_matches_no_breakpoint` |
 | `LLR-ELF-01` | `elf` | `HLR-021` | `elf_open_accepts_valid_avr_elf32_binary`, `elf_open_returns_minus1_on_invalid_elf_magic`, `elf_open_returns_minus1_on_wrong_machine_type` |
 | `LLR-ELF-02` | `elf` | `HLR-021`, `HLR-040` | `elf_open_loads_symtab_and_strtab_into_heap_buffers`, `elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure` |
 | `LLR-ELF-03` | `elf` | `HLR-021` | `elf_find_avros_tables_performs_single_linear_scan`, `elf_find_avros_tables_populates_all_7_avros_sentinel_fields` |

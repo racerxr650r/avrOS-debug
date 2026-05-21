@@ -1137,6 +1137,67 @@ static void qSupported_advertises_multiprocess_vRun_vAttach_vKill(void)
     TEST_ASSERT_NULL(strstr(payload, "multiprocess-"));
 }
 
+/* ── HLR-062 (LLR-RSP-44/45): swbreak/hwbreak stop-cause tags ─────── */
+
+static void qSupported_advertises_swbreak_and_hwbreak(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    rsp_dispatch(sock_pair[1], "qSupported:multiprocess+;swbreak+;hwbreak+", &h);
+    char stream[256]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[256];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_NOT_NULL(strstr(payload, "swbreak+"));
+    TEST_ASSERT_NOT_NULL(strstr(payload, "hwbreak+"));
+}
+
+static void continue_emits_swbreak_when_pc_matches_sw_bp_shadow(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    /* Default bp_mode is RSP_BP_MODE_SW; Z0,100,2 patches the BREAK
+     * shadow at GDB addr 0x100.                                     */
+    rsp_dispatch(sock_pair[1], "Z0,100,2", &h);
+    char tmp[64]; drain(sock_pair[0], tmp, sizeof tmp);
+    /* Park PC on the BREAK shadow and let dh_continue see an
+     * immediate halt on first poll.                                 */
+    mock_ocd_pc = 0x100u;
+    mock_ocd_poll_default = 0;
+    rsp_dispatch(sock_pair[1], "vCont;c", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL(0, strncmp(payload, "T05swbreak:;thread:", 19));
+}
+
+static void continue_emits_hwbreak_when_pc_matches_hw_bp_shadow(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    ctx.bp_mode = RSP_BP_MODE_HW_ONLY;
+    rsp_dispatch(sock_pair[1], "Z0,200,2", &h);
+    char tmp[64]; drain(sock_pair[0], tmp, sizeof tmp);
+    mock_ocd_pc = 0x200u;
+    mock_ocd_poll_default = 0;
+    rsp_dispatch(sock_pair[1], "vCont;c", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL(0, strncmp(payload, "T05hwbreak:;thread:", 19));
+}
+
+static void continue_emits_bare_T05_when_pc_matches_no_breakpoint(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    /* No breakpoints installed — shadow scan returns SC_NONE. */
+    mock_ocd_pc = 0xCAFEu;
+    mock_ocd_poll_default = 0;
+    rsp_dispatch(sock_pair[1], "vCont;c", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL(0, strncmp(payload, "T05thread:", 10));
+    TEST_ASSERT_NULL(strstr(payload, "swbreak"));
+    TEST_ASSERT_NULL(strstr(payload, "hwbreak"));
+}
+
 /* ── HLR-056: Z2/Z3/Z4 data watchpoints — silicon does not expose
  *           the hardware over UPDI (see src/updi.h and
  *           doc/reference/guesswork.md).  Server replies the empty
@@ -1656,6 +1717,10 @@ int main(void)
     RUN_TEST(vKill_replies_ok_closes_socket_does_not_set_quit);
     RUN_TEST(vKill_sets_disconnect_reason_to_vKill);
     RUN_TEST(qSupported_advertises_multiprocess_vRun_vAttach_vKill);
+    RUN_TEST(qSupported_advertises_swbreak_and_hwbreak);
+    RUN_TEST(continue_emits_swbreak_when_pc_matches_sw_bp_shadow);
+    RUN_TEST(continue_emits_hwbreak_when_pc_matches_hw_bp_shadow);
+    RUN_TEST(continue_emits_bare_T05_when_pc_matches_no_breakpoint);
     RUN_TEST(Z2_replies_empty_packet_so_gdb_falls_back_to_sw_watch);
     RUN_TEST(z3_remove_also_replies_empty_packet);
     /* HLR-053: vFlashErase / vFlashWrite / vFlashDone (`gdb load`). */

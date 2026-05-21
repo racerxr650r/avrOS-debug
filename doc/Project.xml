@@ -1675,6 +1675,13 @@ Errors are propagated upward through the module stack without retrying:
         </traces>
       </hlr>
 
+      <hlr id="HLR-062" name="swbreak/hwbreak Stop-Cause Tags">
+        <text><![CDATA[The application shall classify every halt and tag the resulting `T05` stop reply with the GDB Remote Serial Protocol stop-cause field that names the cause, so that `avr-gdb` (and front-ends layered on it, in particular VS Code `cppdbg`) can distinguish a software breakpoint hit from a hardware comparator hit from a single-step completion from a host-issued interrupt without a target-side guess. Concretely: (a) the `qSupported` reply shall advertise `swbreak+;hwbreak+` in addition to the existing capability set; (b) a new `enum RspStopCause` shall enumerate `SC_NONE`, `SC_SWBREAK`, `SC_HWBREAK`, `SC_STEP`, `SC_INTR`; (c) every default handler that emits a `T<sig>thread:<tid>;` stop reply (`dh_halt_reason`, the post-`vCont;c`/`c` halt path inside `dh_continue`, `dh_step`, and the indirect emitters `dh_vrun` and `dh_vattach` which delegate to `dh_halt_reason`) shall route through a single formatter that, after the `T<sig>` and before the `thread:` field, inserts `swbreak:;` when the cause is `SC_SWBREAK` and `hwbreak:;` when the cause is `SC_HWBREAK`; `SC_STEP`, `SC_INTR`, and `SC_NONE` shall produce no extra tag (the existing bare `T05`/`T02` semantics). Classification rules: read the live PC via `updi_ocd_read_pc()` after the halt has settled; if the PC matches any in-use `RspContext.sw_bp[i].addr` slot the cause is `SC_SWBREAK`; otherwise if the PC matches either `RspContext.hw_bp_addr[i]` slot the cause is `SC_HWBREAK`; otherwise the cause is `SC_INTR` when the local `got_ctrl_c` flag is set inside `dh_continue` (or when `OCD_STATUS1_EXTBRK` is set as observed by `signal_for_halt_status()`), `SC_STEP` when the halt arrived via `dh_step()`, and `SC_NONE` for the bare `?` probe. The classifier shall not adjust PC — GDB performs the BREAK-instruction PC rewind itself when it sees `swbreak:;`. The classifier shall preserve the layered architecture (SDD §2.2): it lives entirely in `src/gdb_rsp.c` and reads silicon only via the existing `updi_ocd_*` helpers. Backward compatibility: the tag is informational; older `avr-gdb` releases that do not advertise `swbreak+`/`hwbreak+` in their own `qSupported` ignore the extra field per the GDB RSP spec, so emission can remain unconditional.]]></text>
+        <traces>
+          <trace target="SDD" ref="5.3.1"/>
+        </traces>
+      </hlr>
+
       <hlr id="HLR-065" name="Lifecycle Logging">
         <text><![CDATA[The avrOSdb server shall emit one human-readable line per significant lifecycle transition to `stderr`, so that a developer running the server in a terminal can see at a glance when the GDB listener becomes ready, when a client attaches or detaches, and why the server is shutting down. The line set is:
 
@@ -2371,6 +2378,20 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <text><![CDATA[`RspContext` shall expose a new field `const char *disconnect_reason` (default `NULL`). The `dh_detach()` handler shall set this field to the static string `"D"` immediately before closing the GDB socket on the `D`-packet path. The `dh_vkill()` handler shall set it to the static string `"vKill"` immediately before closing the GDB socket per LLR-RSP-25 (HLR-064 listener-survival semantics). The protocol layer shall never call into the entry/event-loop layer to log; the field is the sole upward signal channel and is consumed (read and reset to `NULL`) by `event_loop()` in `src/main.c` per LLR-MAIN-22. This preserves the layered-architecture constraint (SDD §2.2) — no new include from `gdb_rsp.c` to `main.c`.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-065" name="Lifecycle Logging"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-44">
+        <text><![CDATA[`gdb_rsp.c` shall define a private `enum RspStopCause { SC_NONE = 0, SC_SWBREAK, SC_HWBREAK, SC_STEP, SC_INTR }` and a private function `static int classify_stop_cause(RspContext *ctx, int hint)` that returns one of those values. The classifier shall: (1) read the live PC via `updi_ocd_read_pc(ctx->updi_fd, &pc)`; on UPDI failure return `hint` (the caller-supplied fallback); (2) if any `ctx->sw_bp[i].in_use` slot has `ctx->sw_bp[i].addr == pc` return `SC_SWBREAK`; (3) else if either `ctx->hw_bp_addr[i] != HW_BP_SLOT_EMPTY` slot equals `pc` return `SC_HWBREAK`; (4) else return `hint`. Callers pass `SC_INTR` from the `dh_continue` path when `got_ctrl_c` is set, `SC_STEP` from the `dh_step` path, and `SC_NONE` from the bare `?` (`dh_halt_reason`) and `vRun` / `vAttach` delegated paths. The classifier shall not call `updi_ocd_read_halt_status()` (the EXTBRK-as-SIGINT decision is owned by `signal_for_halt_status()` and remains there) and shall not adjust the PC.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-062" name="swbreak/hwbreak Stop-Cause Tags"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-45">
+        <text><![CDATA[The `qSupported` reply emitted by `rsp_dispatch()` shall append the literal substring `;swbreak+;hwbreak+` to the existing capability list, immediately after `vFlashDone+`. A new private helper `static int format_stop_reply(int fd, RspContext *ctx, int sig_t05_or_t02, int cause)` shall build a single packet of the form `<sig><tag>thread:<hex_tid>;` where `<sig>` is `"T05"` or `"T02"` (chosen by the caller via `sig_t05_or_t02 == 5` ⇒ `T05`, otherwise `T02`), `<tag>` is `"swbreak:;"` for `SC_SWBREAK`, `"hwbreak:;"` for `SC_HWBREAK`, and the empty string for every other cause, and `<hex_tid>` is the active FSM thread id (`fsm_get_active_thread()`, defaulting to `1`). `dh_halt_reason()`, the final stop emission inside `dh_continue()`, and `dh_step()` (via `dh_halt_reason()` after setting `ctx->last_stop_cause = SC_STEP`) shall route through this single formatter. `dh_continue()` shall set `ctx->last_stop_cause = classify_stop_cause(ctx, got_ctrl_c ? SC_INTR : SC_NONE)` immediately before formatting; `dh_step()` shall set it to `classify_stop_cause(ctx, SC_STEP)`; `dh_halt_reason()` shall set it to `classify_stop_cause(ctx, SC_NONE)` if it has not already been set by the previous-packet path. The previous-packet hint shall be cleared (`ctx->last_stop_cause = SC_NONE`) at the start of every fresh resume (`dh_continue`, `dh_step`, `dh_vrun`, `dh_vattach`) so a stale tag never bleeds across halts.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-062" name="swbreak/hwbreak Stop-Cause Tags"/>
         </traces>
       </llr>
     </function>
@@ -3171,7 +3192,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/gdb_rsp.c unit tests                                     -->
     <!-- ============================================================ -->
-    <file path="tests/test_rsp.c" role="unit" count="71">
+    <file path="tests/test_rsp.c" role="unit" count="75">
       <header><![CDATA[Unit tests for `src/gdb_rsp.c`: socket configuration, RSP packet framing, register and memory handlers, hardware-breakpoint comparator management, OCD-based execution control, async Ctrl-C interrupt, detach cleanup, session lifecycle packets, and monitor relay. Uses a `socketpair()` as a drop-in socket substitute and replaces every `updi_*`, `fsm_*`, and `monitor_dispatch` call site with `ld --wrap` mocks so all tests run without real silicon.]]></header>
 
       <test name="rsp_listen_sets_so_reuseaddr_before_bind">
@@ -3527,6 +3548,26 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="vKill_sets_disconnect_reason_to_vKill">
         <purpose><![CDATA[Build a default `RspContext`, assert `ctx.disconnect_reason == NULL`, dispatch `vKill;1`, and assert `ctx.disconnect_reason == "vKill"`. Confirms the vKill handler records its classification on the upward-only field so the disconnect lifecycle line can name the cause as `vKill` rather than the generic `EOF`. Per LLR-RSP-43.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-43"/></traces>
+      </test>
+
+      <test name="qSupported_advertises_swbreak_and_hwbreak">
+        <purpose><![CDATA[Dispatch `qSupported:multiprocess+;swbreak+;hwbreak+` and assert the reply payload contains the substrings `swbreak+` and `hwbreak+` so a multiprocess-capable GDB sees the new stop-cause tags advertised. Per LLR-RSP-45.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-45"/></traces>
+      </test>
+
+      <test name="continue_emits_swbreak_when_pc_matches_sw_bp_shadow">
+        <purpose><![CDATA[Install a software breakpoint at `0x100` via `Z0,100,2` (default `bp_mode == sw`), arrange `mock_ocd_pc = 0x100` and the OCD poll script to deliver an immediate halt, dispatch `vCont;c`, drain the reply, and assert the last RSP packet's payload begins with `T05swbreak:;thread:` so GDB sees the SW-BP cause. Per LLR-RSP-44 / LLR-RSP-45.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-44"/><trace target="LLR" ref="LLR-RSP-45"/></traces>
+      </test>
+
+      <test name="continue_emits_hwbreak_when_pc_matches_hw_bp_shadow">
+        <purpose><![CDATA[Switch to `bp_mode == hw-only`, install a hardware breakpoint at `0x200` via `Z0,200,2`, arrange `mock_ocd_pc = 0x200` and the OCD poll script to deliver an immediate halt, dispatch `vCont;c`, drain the reply, and assert the last RSP packet's payload begins with `T05hwbreak:;thread:` so GDB sees the HW-BP cause. Per LLR-RSP-44 / LLR-RSP-45.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-44"/><trace target="LLR" ref="LLR-RSP-45"/></traces>
+      </test>
+
+      <test name="continue_emits_bare_T05_when_pc_matches_no_breakpoint">
+        <purpose><![CDATA[With no breakpoints installed, arrange `mock_ocd_pc = 0xCAFE` and the OCD poll script to deliver an immediate halt, dispatch `vCont;c`, drain the reply, and assert the last RSP packet's payload begins with `T05thread:` (no `swbreak:` or `hwbreak:` tag). Confirms the classifier returns the caller's `SC_NONE` hint when neither shadow matches and the formatter therefore emits no extra tag. Per LLR-RSP-44 / LLR-RSP-45.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-44"/><trace target="LLR" ref="LLR-RSP-45"/></traces>
       </test>
     </file>
 
