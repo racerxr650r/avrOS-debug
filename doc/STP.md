@@ -15,7 +15,7 @@ Snapshot: **115 test(s)** across
 
 ### 3.1. [tests/test_main.c](../tests/test_main.c)
 
-Role: **unit**. **34 test(s).**
+Role: **unit**. **36 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -53,6 +53,8 @@ Role: **unit**. **34 test(s).**
 | 32 | <a id="parse_args_no_autobaud_sets_flag"></a>`parse_args_no_autobaud_sets_flag` | `LLR-MAIN-17` | Call `parse_args()` with argv `{ "prog", "--device", "--no-autobaud", "/dev/x" }` and assert `cfg.no_autobaud == true` — confirming the autobaud-suppression flag is recognised and stored on `AppConfig` so `run_device_mode()` can gate its probe call accordingly. |
 | 33 | <a id="parse_args_allow_erase_sets_flag"></a>`parse_args_allow_erase_sets_flag` | `LLR-MAIN-21` | Call `parse_args()` with argv `{ "prog", "--allow-erase", "/dev/x", "a.elf" }` and assert `cfg.allow_erase == true` — confirming the destructive-erase gate is recognised by the option parser. |
 | 34 | <a id="parse_args_allow_erase_defaults_false"></a>`parse_args_allow_erase_defaults_false` | `LLR-MAIN-21` | Call `parse_args()` with argv that omits `--allow-erase` and assert `cfg.allow_erase == false` — confirming the safety default refuses destructive erase verbs unless the operator explicitly opts in. |
+| 35 | <a id="test_sig_handler_records_signo_in_g_shutdown_signal"></a>`test_sig_handler_records_signo_in_g_shutdown_signal` | `LLR-MAIN-22` | Reset `g_shutdown_signal` to 0, invoke `sig_handler(SIGTERM)`, and assert `g_quit == 1` and `g_shutdown_signal == SIGTERM`. Then invoke `sig_handler(SIGINT)` and assert `g_shutdown_signal` remains `SIGTERM` — confirming the first delivered signal is captured for the shutdown lifecycle log line and is not overwritten by a follow-up signal. Per LLR-MAIN-22. |
+| 36 | <a id="test_event_loop_clears_disconnect_reason_after_drain"></a>`test_event_loop_clears_disconnect_reason_after_drain` | `LLR-MAIN-22` | Stage `RspContext.disconnect_reason = "D"` and execute the event_loop drain contract: read the field, then NULL it. Assert the field is NULL afterwards. This locks in the no-duplicate-emission guarantee from LLR-MAIN-22 — a single disconnect line per fd-close. |
 
 ### 3.2. [tests/test_updi.c](../tests/test_updi.c)
 
@@ -111,7 +113,7 @@ Role: **unit**. **47 test(s).**
 
 ### 3.3. [tests/test_rsp.c](../tests/test_rsp.c)
 
-Role: **unit**. **69 test(s).**
+Role: **unit**. **71 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -184,6 +186,8 @@ Role: **unit**. **69 test(s).**
 | 67 | <a id="T_thread_alive_accepts_multiprocess_form"></a>`T_thread_alive_accepts_multiprocess_form` | `LLR-RSP-41` | Build a 2-thread FsmContext (TIDs 1, 2). Dispatch `Tpa410.1` → `OK`. Dispatch `Tpa410.99` → `E01`. Dispatch `Tp0.0` → `OK` (any-thread). Dispatch malformed `Tpa410.` → `E01`. Per LLR-RSP-41. |
 | 68 | <a id="qThreadExtraInfo_returns_FSM_label_with_state_and_active_flag"></a>`qThreadExtraInfo_returns_FSM_label_with_state_and_active_flag` | `LLR-RSP-42` | Build an FsmContext with thread 1 = `{name:"sched", state_fn:0x0140, is_active:true}`, thread 2 = `{name:"blinker", state_fn:0x01A4, is_active:false}`. Dispatch `qThreadExtraInfo,pa410.1` and assert the reply hex-decodes to exactly `"FSM sched [active] state=0x0140"`. Dispatch `qThreadExtraInfo,pa410.2` and assert hex-decodes to `"FSM blinker [quiescent] state=0x01a4"`. Per LLR-RSP-42. |
 | 69 | <a id="qThreadExtraInfo_unknown_tid_replies_empty_packet"></a>`qThreadExtraInfo_unknown_tid_replies_empty_packet` | `LLR-RSP-42` | Dispatch `qThreadExtraInfo,pa410.99` against a 2-thread FsmContext and assert the reply is the empty RSP packet (zero-length payload), not `E01`. Then dispatch `qThreadExtraInfo,p0.0` and assert empty packet (no aggregate label exists for the any-thread form). Confirms LLR-RSP-41 / LLR-RSP-42 unknown-TID and any-thread semantics. |
+| 70 | <a id="on_detach_D_sets_disconnect_reason_to_D"></a>`on_detach_D_sets_disconnect_reason_to_D` | `LLR-RSP-43` | Build a default `RspContext`, assert `ctx.disconnect_reason == NULL`, dispatch the RSP packet `D`, and assert `ctx.disconnect_reason` is now the string `"D"`. Confirms `dh_detach` records the disconnect classification before closing the GDB socket so the entry-layer lifecycle logger can name the cause without a reverse include. Per LLR-RSP-43. |
+| 71 | <a id="vKill_sets_disconnect_reason_to_vKill"></a>`vKill_sets_disconnect_reason_to_vKill` | `LLR-RSP-43` | Build a default `RspContext`, assert `ctx.disconnect_reason == NULL`, dispatch `vKill;1`, and assert `ctx.disconnect_reason == "vKill"`. Confirms the vKill handler records its classification on the upward-only field so the disconnect lifecycle line can name the cause as `vKill` rather than the generic `EOF`. Per LLR-RSP-43. |
 
 ### 3.4. [tests/test_elf.c](../tests/test_elf.c)
 
@@ -355,6 +359,7 @@ verified by code review — see
 | `LLR-MAIN-16` | `main` | `HLR-050`, `HLR-049` | `F3_prog_mode_end_to_end_with_verify` |
 | `LLR-MAIN-17` | `main` | `HLR-050`, `HLR-051`, `HLR-052` | `parse_args_no_autobaud_sets_flag` |
 | `LLR-MAIN-21` | `main` | `HLR-055` | `parse_args_allow_erase_sets_flag`, `parse_args_allow_erase_defaults_false` |
+| `LLR-MAIN-22` | `main` | `HLR-065` | `test_sig_handler_records_signo_in_g_shutdown_signal`, `test_event_loop_clears_disconnect_reason_after_drain` |
 | `LLR-UPDI-01` | `updi` | `HLR-006` | `updi_open_sets_8e2_raw_half_duplex_via_termios`, `updi_open_returns_minus1_on_device_open_failure` |
 | `LLR-UPDI-02` | `updi` | `HLR-006`, `HLR-036` | `updi_open_asserts_wake_byte_then_stcs_ctrlb`, `updi_open_restores_session_baud_after_break` |
 | `LLR-UPDI-03` | `updi` | `HLR-036` | `updi_open_issues_stcs_ctrla_and_ldcs_statusa`, `updi_open_retries_cold_start_3_times_on_no_ack`, `updi_open_returns_minus1_after_3_consecutive_link_failures` |
@@ -425,6 +430,7 @@ verified by code review — see
 | `LLR-RSP-40` | `rsp` | `HLR-060` | `parse_mp_thread_id_accepts_legacy_and_multiprocess_forms` |
 | `LLR-RSP-41` | `rsp` | `HLR-060` | `Hg_accepts_multiprocess_thread_id_form`, `Hc_accepts_multiprocess_thread_id_form`, `T_thread_alive_accepts_multiprocess_form` |
 | `LLR-RSP-42` | `rsp` | `HLR-061` | `qThreadExtraInfo_returns_FSM_label_with_state_and_active_flag`, `qThreadExtraInfo_unknown_tid_replies_empty_packet` |
+| `LLR-RSP-43` | `rsp` | `HLR-065` | `on_detach_D_sets_disconnect_reason_to_D`, `vKill_sets_disconnect_reason_to_vKill` |
 | `LLR-ELF-01` | `elf` | `HLR-021` | `elf_open_accepts_valid_avr_elf32_binary`, `elf_open_returns_minus1_on_invalid_elf_magic`, `elf_open_returns_minus1_on_wrong_machine_type` |
 | `LLR-ELF-02` | `elf` | `HLR-021`, `HLR-040` | `elf_open_loads_symtab_and_strtab_into_heap_buffers`, `elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure` |
 | `LLR-ELF-03` | `elf` | `HLR-021` | `elf_find_avros_tables_performs_single_linear_scan`, `elf_find_avros_tables_populates_all_7_avros_sentinel_fields` |

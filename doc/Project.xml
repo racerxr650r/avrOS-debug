@@ -1667,6 +1667,24 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="SDD" ref="5.3.1"/>
         </traces>
       </hlr>
+
+      <hlr id="HLR-065" name="Lifecycle Logging">
+        <text><![CDATA[The avrOSdb server shall emit one human-readable line per significant lifecycle transition to `stderr`, so that a developer running the server in a terminal can see at a glance when the GDB listener becomes ready, when a client attaches or detaches, and why the server is shutting down. The line set is:
+
+* `avrOSdb: listening on :<port>` — emitted exactly once, after `rsp_listen()` succeeds and immediately before the first `select()` call in `event_loop()`.
+* `avrOSdb: client connected from <ip>:<port>` — emitted after every successful `rsp_accept()`. The peer address is taken from `getpeername()` on the accepted socket; on `getpeername()` failure the line shall instead read `client connected from <unknown>`.
+* `avrOSdb: client disconnected (<reason>)` — emitted whenever the client `fd` transitions from open to closed. `<reason>` shall be one of:
+  - `D` — the GDB `D` (detach) packet was processed and the protocol layer closed the socket;
+  - `vKill` — the GDB `vKill` packet was processed (current Phase 11 behaviour: server then exits; HLR-064 will later make this a per-session disconnect);
+  - `EOF` — `rsp_recv_packet()` returned 0 (peer half-closed);
+  - `read error: <errno-text>` — `rsp_recv_packet()` returned −1; `<errno-text>` is `strerror(errno)`.
+* `avrOSdb: shutting down (<reason>)` — emitted exactly once, immediately after `event_loop()` returns and before teardown begins. `<reason>` shall be one of `SIGINT`, `SIGTERM`, or `fatal: <text>` for any other path that sets `g_quit`.
+
+No new CLI flag shall gate these emissions; they are always-on and route to `stderr` only (never `stdout`, which is reserved for `--device` reports, the `--prog` progress bar, and UPDI console traffic). The lines shall be terminated by a single `\n` and shall not contain ANSI colour codes. Each transition shall produce exactly one line; duplicates from the same transition (e.g. an `EOF` followed by a fatal-error path on the same socket) are forbidden. The `D`/`vKill` reason classifier shall be carried out of `gdb_rsp.c` via a new `RspContext.disconnect_reason` field set by the corresponding handlers; `event_loop()` reads and clears that field after dispatching each packet so the protocol layer never invokes upper-layer code (preserving the layered-architecture constraint, SDD §2.2).]]></text>
+        <traces>
+          <trace target="SDD" ref="4.1"/>
+        </traces>
+      </hlr>
     </section>
 
   </hlrs>
@@ -1816,6 +1834,13 @@ Errors are propagated upward through the module stack without retrying:
         <text><![CDATA[`parse_args()` shall recognise `--allow-erase` as a boolean flag (no argument) and set `cfg->allow_erase = true` when present. The default initialiser shall set the flag to `false`. The `usage()` help text shall include a one-paragraph description naming the verbs it unlocks (`monitor erase`, `monitor chip-erase`) so operators see the gating relationship without consulting the man page. The flag value shall be propagated to the constructed `RspContext` at server start by assigning `ctx.allow_erase = cfg->allow_erase ? 1 : 0;`, and the default breakpoint mode shall be set to `RSP_BP_MODE_SW` in the same initialiser block.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-055" name="avarice-Compatible Monitor Commands"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MAIN-22">
+        <text><![CDATA[`main()` and `event_loop()` shall emit lifecycle log lines to `stderr` per HLR-065. Specifically: (a) immediately after `rsp_listen()` returns a non-negative fd in `app_main()`, print `"avrOSdb: listening on :%u\n"` with `cfg.gdb_port`; (b) inside `event_loop()`, after every successful `rsp_accept()` that yields a non-negative fd, call `getpeername()` on the new fd and print `"avrOSdb: client connected from %s:%u\n"` with the dotted-quad IPv4 address and port from the returned `sockaddr_in`; on `getpeername()` failure print `"avrOSdb: client connected from <unknown>\n"`; (c) when `rsp_recv_packet()` returns 0 print `"avrOSdb: client disconnected (EOF)\n"` before closing the fd, when it returns negative print `"avrOSdb: client disconnected (read error: %s)\n"` with `strerror(errno)`; (d) after `rsp_dispatch_n()` returns, if `gdb_fd < 0` (the handler closed the socket) and `rctx.disconnect_reason != NULL`, print `"avrOSdb: client disconnected (%s)\n"` with that reason and clear the field by setting it to `NULL`; if instead `gdb_fd >= 0` but `disconnect_reason != NULL` (vKill while listener-survival is still TODO), print the same line, then close `gdb_fd` and clear it locally; (e) immediately after `event_loop()` returns in `app_main()`, before the `teardown:` label runs, print `"avrOSdb: shutting down (%s)\n"` where the reason is selected from a `volatile sig_atomic_t g_shutdown_signal` set by `sig_handler()` (`SIGINT`/`SIGTERM`) when applicable, defaulting to `"fatal: <best-effort context>"` for any other quit path. The signal handler shall record `signo` into `g_shutdown_signal` in addition to setting `g_quit = 1`. All log lines shall use `fprintf(stderr, ...)` followed by `fflush(stderr)`; no new flag gates them and they shall not be emitted on `stdout`. Duplicate emissions for the same transition are forbidden — only one disconnect line per fd-close.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-065" name="Lifecycle Logging"/>
         </traces>
       </llr>
     </function>
@@ -2333,6 +2358,13 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="HLR" ref="HLR-061" name="qThreadExtraInfo with FSM Name and State"/>
         </traces>
       </llr>
+
+      <llr id="LLR-RSP-43">
+        <text><![CDATA[`RspContext` shall expose a new field `const char *disconnect_reason` (default `NULL`). The `dh_detach()` handler shall set this field to the static string `"D"` immediately before closing the GDB socket on the `D`-packet path. The `dh_vkill()` handler shall set it to the static string `"vKill"` immediately before returning `OK` (the handler still sets `*ctx->quit_p = 1` per LLR-RSP-25 until HLR-064 lifts that). The protocol layer shall never call into the entry/event-loop layer to log; the field is the sole upward signal channel and is consumed (read and reset to `NULL`) by `event_loop()` in `src/main.c` per LLR-MAIN-22. This preserves the layered-architecture constraint (SDD §2.2) — no new include from `gdb_rsp.c` to `main.c`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-065" name="Lifecycle Logging"/>
+        </traces>
+      </llr>
     </function>
 
     <function number="5" title="src/elf_parser.c — ELF Binary Parser" name="elf" source="src/elf_parser.c">
@@ -2697,7 +2729,7 @@ Errors are propagated upward through the module stack without retrying:
     <!-- ============================================================ -->
     <!-- src/main.c unit tests                                        -->
     <!-- ============================================================ -->
-    <file path="tests/test_main.c" role="unit" count="34">
+    <file path="tests/test_main.c" role="unit" count="36">
       <header><![CDATA[Unit tests for `src/main.c`: argument parsing, event loop, signal handling, and resource teardown. Uses `fork()`/`waitpid()` to test `exit()` paths and a mock UPDI/RSP layer to exercise the event loop without real hardware.]]></header>
 
       <test name="parse_args_valid_positional_args_populate_config">
@@ -2868,6 +2900,16 @@ Errors are propagated upward through the module stack without retrying:
       <test name="parse_args_allow_erase_defaults_false">
         <purpose><![CDATA[Call `parse_args()` with argv that omits `--allow-erase` and assert `cfg.allow_erase == false` — confirming the safety default refuses destructive erase verbs unless the operator explicitly opts in.]]></purpose>
         <traces><trace target="LLR" ref="LLR-MAIN-21"/></traces>
+      </test>
+
+      <test name="test_sig_handler_records_signo_in_g_shutdown_signal">
+        <purpose><![CDATA[Reset `g_shutdown_signal` to 0, invoke `sig_handler(SIGTERM)`, and assert `g_quit == 1` and `g_shutdown_signal == SIGTERM`. Then invoke `sig_handler(SIGINT)` and assert `g_shutdown_signal` remains `SIGTERM` — confirming the first delivered signal is captured for the shutdown lifecycle log line and is not overwritten by a follow-up signal. Per LLR-MAIN-22.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-22"/></traces>
+      </test>
+
+      <test name="test_event_loop_clears_disconnect_reason_after_drain">
+        <purpose><![CDATA[Stage `RspContext.disconnect_reason = "D"` and execute the event_loop drain contract: read the field, then NULL it. Assert the field is NULL afterwards. This locks in the no-duplicate-emission guarantee from LLR-MAIN-22 — a single disconnect line per fd-close.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-22"/></traces>
       </test>
     </file>
 
@@ -3121,7 +3163,7 @@ Errors are propagated upward through the module stack without retrying:
     <!-- ============================================================ -->
     <!-- src/gdb_rsp.c unit tests                                     -->
     <!-- ============================================================ -->
-    <file path="tests/test_rsp.c" role="unit" count="69">
+    <file path="tests/test_rsp.c" role="unit" count="71">
       <header><![CDATA[Unit tests for `src/gdb_rsp.c`: socket configuration, RSP packet framing, register and memory handlers, hardware-breakpoint comparator management, OCD-based execution control, async Ctrl-C interrupt, detach cleanup, session lifecycle packets, and monitor relay. Uses a `socketpair()` as a drop-in socket substitute and replaces every `updi_*`, `fsm_*`, and `monitor_dispatch` call site with `ld --wrap` mocks so all tests run without real silicon.]]></header>
 
       <test name="rsp_listen_sets_so_reuseaddr_before_bind">
@@ -3467,6 +3509,16 @@ Errors are propagated upward through the module stack without retrying:
       <test name="qThreadExtraInfo_unknown_tid_replies_empty_packet">
         <purpose><![CDATA[Dispatch `qThreadExtraInfo,pa410.99` against a 2-thread FsmContext and assert the reply is the empty RSP packet (zero-length payload), not `E01`. Then dispatch `qThreadExtraInfo,p0.0` and assert empty packet (no aggregate label exists for the any-thread form). Confirms LLR-RSP-41 / LLR-RSP-42 unknown-TID and any-thread semantics.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-42"/></traces>
+      </test>
+
+      <test name="on_detach_D_sets_disconnect_reason_to_D">
+        <purpose><![CDATA[Build a default `RspContext`, assert `ctx.disconnect_reason == NULL`, dispatch the RSP packet `D`, and assert `ctx.disconnect_reason` is now the string `"D"`. Confirms `dh_detach` records the disconnect classification before closing the GDB socket so the entry-layer lifecycle logger can name the cause without a reverse include. Per LLR-RSP-43.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-43"/></traces>
+      </test>
+
+      <test name="vKill_sets_disconnect_reason_to_vKill">
+        <purpose><![CDATA[Build a default `RspContext`, assert `ctx.disconnect_reason == NULL`, dispatch `vKill;1`, and assert `ctx.disconnect_reason == "vKill"`. Confirms the vKill handler records its classification on the upward-only field so the disconnect lifecycle line can name the cause as `vKill` rather than the generic `EOF`. Per LLR-RSP-43.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-43"/></traces>
       </test>
     </file>
 

@@ -850,6 +850,18 @@ static void on_detach_D_resumes_target_closes_socket_resets_gdb_fd(void)
     sock_pair[1] = -1;
 }
 
+/* ── HLR-065 / LLR-RSP-43 ───────────────────────────────────────────── */
+
+static void on_detach_D_sets_disconnect_reason_to_D(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    TEST_ASSERT_NULL(ctx.disconnect_reason);
+    rsp_dispatch(sock_pair[1], "D", &h);
+    TEST_ASSERT_NOT_NULL(ctx.disconnect_reason);
+    TEST_ASSERT_EQUAL_STRING("D", ctx.disconnect_reason);
+    sock_pair[1] = -1;
+}
+
 static void on_detach_clears_hw_bps_before_run(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
@@ -1082,6 +1094,16 @@ static void vKill_sets_quit_and_replies_ok(void)
     char payload[64];
     TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
     TEST_ASSERT_EQUAL_STRING("OK", payload);
+}
+
+/* HLR-065 / LLR-RSP-43: vKill records the disconnect reason. */
+static void vKill_sets_disconnect_reason_to_vKill(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    TEST_ASSERT_NULL(ctx.disconnect_reason);
+    rsp_dispatch(sock_pair[1], "vKill;1", &h);
+    TEST_ASSERT_NOT_NULL(ctx.disconnect_reason);
+    TEST_ASSERT_EQUAL_STRING("vKill", ctx.disconnect_reason);
 }
 
 static void qSupported_advertises_multiprocess_vRun_vAttach_vKill(void)
@@ -1599,8 +1621,8 @@ int main(void)
     RUN_TEST(rsp_dispatch_qsupported_returns_feature_string_no_target_access);
     RUN_TEST(rsp_dispatch_qattached_returns_1_no_target_access);
     RUN_TEST(on_detach_D_resumes_target_closes_socket_resets_gdb_fd);
-    RUN_TEST(on_detach_clears_hw_bps_before_run);
-    RUN_TEST(on_kill_k_sets_g_quit_to_1);
+    RUN_TEST(on_detach_D_sets_disconnect_reason_to_D);
+    RUN_TEST(on_detach_clears_hw_bps_before_run);    RUN_TEST(on_kill_k_sets_g_quit_to_1);
     RUN_TEST(on_monitor_qRcmd_passes_hex_body_to_monitor_dispatch);
     RUN_TEST(on_monitor_returns_ok_when_monitor_dispatch_succeeds);
     RUN_TEST(on_monitor_sends_o_packet_error_on_updi_failure);
@@ -1615,6 +1637,7 @@ int main(void)
     RUN_TEST(vRun_invalidates_fsm_runs_and_emits_stop);
     RUN_TEST(vAttach_halts_target_and_emits_stop_reply);
     RUN_TEST(vKill_sets_quit_and_replies_ok);
+    RUN_TEST(vKill_sets_disconnect_reason_to_vKill);
     RUN_TEST(qSupported_advertises_multiprocess_vRun_vAttach_vKill);
     RUN_TEST(Z2_replies_empty_packet_so_gdb_falls_back_to_sw_watch);
     RUN_TEST(z3_remove_also_replies_empty_packet);

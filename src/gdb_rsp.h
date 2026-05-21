@@ -74,6 +74,14 @@ typedef struct {
      * drained on z0.  Cleared wholesale on `vFlashDone`,
      * `monitor reset`, and `monitor chip-erase`.                      */
     RspSwBp                   sw_bp[RSP_MAX_SW_BREAKPOINTS];
+    /* HLR-065 / LLR-RSP-43: classify why the GDB client transitioned
+     * from open to closed.  Set by dh_detach() / dh_vkill() to a
+     * static string (`"D"`, `"vKill"`); read and cleared by
+     * src/main.c:event_loop() after each rsp_dispatch_n().  Static
+     * lifetime — no ownership transfer.  This is the sole upward
+     * channel from the protocol layer to the entry/event-loop layer
+     * (preserves SDD §2.2 layered architecture).                    */
+    const char               *disconnect_reason;
 } RspContext;
 
 /* Each handler returns 0 on success or -1 on error. The handler is

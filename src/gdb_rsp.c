@@ -1057,6 +1057,8 @@ static int dh_detach(int fd, const char *pkt, void *vctx)
     hw_bp_clear_all(ctx);
     (void)updi_run(ctx->updi_fd);
     (void)reply_ok(fd);
+    /* HLR-065 / LLR-RSP-43: signal disconnect reason to event_loop. */
+    ctx->disconnect_reason = "D";
     if (ctx->gdb_fd_p) {
         if (*ctx->gdb_fd_p >= 0) rsp_close(*ctx->gdb_fd_p);
         *ctx->gdb_fd_p = -1;
@@ -1315,6 +1317,10 @@ static int dh_vkill(int fd, const char *pkt, void *vctx)
 {
     (void)pkt;
     RspContext *ctx = (RspContext *)vctx;
+    /* HLR-065 / LLR-RSP-43: classify the disconnect for the lifecycle
+     * logger.  Phase 11 still sets quit_p (LLR-RSP-25) until HLR-064
+     * lifts that to per-session disconnect.                          */
+    ctx->disconnect_reason = "vKill";
     if (ctx->quit_p) *ctx->quit_p = 1;
     return reply_ok(fd);
 }
@@ -1327,6 +1333,8 @@ void rsp_default_handlers(RspHandlers *h, RspContext *ctx)
     ctx->hw_bp_addr[1] = HW_BP_SLOT_EMPTY;
     /* HLR-054: drop any SW-BP shadow that survived memset(). */
     rsp_sw_bp_clear_all(ctx);
+    /* HLR-065 / LLR-RSP-43: no disconnect classification recorded yet. */
+    ctx->disconnect_reason = NULL;
 
     h->on_halt_reason  = dh_halt_reason;
     h->on_read_regs    = dh_read_regs;
