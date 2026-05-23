@@ -41,6 +41,7 @@ In VS Code (using the `Cortex-Debug` extension), set up your `launch.json`:
   "configurations": [
     {
       // Cortex-debug used as a *generic* GDB frontend
+      "name": "Debug avrOS (external GDB)",
       "type": "cortex-debug",
       "request": "attach",
       "servertype": "external",
@@ -54,13 +55,13 @@ In VS Code (using the `Cortex-Debug` extension), set up your `launch.json`:
         "tbreak main",
         "continue"
       ],
-      "overrideRestartCommands": [
+      "overrideResetCommands": [
         "monitor reset",
         "tbreak main",
         "continue"
       ],
       "showDevDebugOutput": "none",
-      "preLaunchCommands": [
+      "preAttachCommands": [
         "set breakpoint auto-hw off",
         "set pagination off",
         "set print pretty on",
@@ -69,7 +70,8 @@ In VS Code (using the `Cortex-Debug` extension), set up your `launch.json`:
       ]
     }
   ]
-}```
+}
+```
 
 ## Documentation
 
