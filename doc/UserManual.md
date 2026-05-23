@@ -673,21 +673,40 @@ Add the following to `.vscode/launch.json` in your firmware project (note that w
 
 ```json
 {
-    "version": "0.2.0",
-    "configurations": [
-        {
-            "name": "Debug AVR via avrOSdb",
-            "type": "cortex-debug",
-            "request": "attach",
-            "executable": "${workspaceFolder}/build/firmware.elf",
-            "servertype": "custom",
-            "gdbPath": "/usr/bin/avr-gdb",
-            "gdbTarget": "localhost:1234",
-            "cwd": "${workspaceFolder}"
-        }
-    ]
-}
-```
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // Cortex-debug used as a *generic* GDB frontend
+      "name": "Debug avrOS (external GDB)",
+      "type": "cortex-debug",
+      "request": "attach",
+      "servertype": "external",
+      "gdbTarget": "localhost:1234",
+      "gdbPath": "/usr/bin/avr-gdb",
+      "executable": "${workspaceFolder}/app/avrOS_example/build/main.elf",
+      "cwd": "${workspaceFolder}/app/avrOS_example",
+      "overrideAttachCommands": [
+        "target extended-remote localhost:1234",
+        "monitor reset",
+        "tbreak main",
+        "continue"
+      ],
+      "overrideResetCommands": [
+        "monitor reset",
+        "tbreak main",
+        "continue"
+      ],
+      "showDevDebugOutput": "none",
+      "preAttachCommands": [
+        "set breakpoint auto-hw off",
+        "set pagination off",
+        "set print pretty on",
+        "set remotetimeout 30",
+        "set mem inaccessible-by-default off"
+      ]
+    }
+  ]
+}```
 
 Recommended workflow:
 
