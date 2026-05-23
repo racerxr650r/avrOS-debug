@@ -41,6 +41,8 @@
 #include "fsm_mapper.h"
 #include "gdb_rsp.h"
 
+void rsp_set_logging(bool enabled) { (void)enabled; }
+
 /* main.c is brought in so parse_args(), run_device_mode(), app_main(),
  * and the static device_family[] table are visible.                     */
 #include "main.c"

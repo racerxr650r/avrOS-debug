@@ -15,7 +15,7 @@ Snapshot: **115 test(s)** across
 
 ### 3.1. [tests/test_main.c](../tests/test_main.c)
 
-Role: **unit**. **36 test(s).**
+Role: **unit**. **37 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -51,10 +51,11 @@ Role: **unit**. **36 test(s).**
 | 30 | <a id="parse_args_prog_mode_sets_flag"></a>`parse_args_prog_mode_sets_flag` | `LLR-MAIN-14` | Call `parse_args()` with argv `{ "prog", "--prog", "/dev/x", "a.elf" }` and assert `cfg.prog_mode == true`, `cfg.device_info == false`, and `cfg.load_flash == false` — confirming `--prog` is recognised, sets only `prog_mode`, and does not implicitly set the other operating-mode flags. |
 | 31 | <a id="parse_args_no_verify_sets_flag"></a>`parse_args_no_verify_sets_flag` | `LLR-MAIN-14` | Call `parse_args()` with argv `{ "prog", "--load", "--no-verify", "/dev/x", "a.elf" }` and assert `cfg.no_verify == true` — confirming the verify-suppression flag is recognised and stored on `AppConfig`. |
 | 32 | <a id="parse_args_no_autobaud_sets_flag"></a>`parse_args_no_autobaud_sets_flag` | `LLR-MAIN-17` | Call `parse_args()` with argv `{ "prog", "--device", "--no-autobaud", "/dev/x" }` and assert `cfg.no_autobaud == true` — confirming the autobaud-suppression flag is recognised and stored on `AppConfig` so `run_device_mode()` can gate its probe call accordingly. |
-| 33 | <a id="parse_args_allow_erase_sets_flag"></a>`parse_args_allow_erase_sets_flag` | `LLR-MAIN-21` | Call `parse_args()` with argv `{ "prog", "--allow-erase", "/dev/x", "a.elf" }` and assert `cfg.allow_erase == true` — confirming the destructive-erase gate is recognised by the option parser. |
-| 34 | <a id="parse_args_allow_erase_defaults_false"></a>`parse_args_allow_erase_defaults_false` | `LLR-MAIN-21` | Call `parse_args()` with argv that omits `--allow-erase` and assert `cfg.allow_erase == false` — confirming the safety default refuses destructive erase verbs unless the operator explicitly opts in. |
-| 35 | <a id="test_sig_handler_records_signo_in_g_shutdown_signal"></a>`test_sig_handler_records_signo_in_g_shutdown_signal` | `LLR-MAIN-22` | Reset `g_shutdown_signal` to 0, invoke `sig_handler(SIGTERM)`, and assert `g_quit == 1` and `g_shutdown_signal == SIGTERM`. Then invoke `sig_handler(SIGINT)` and assert `g_shutdown_signal` remains `SIGTERM` — confirming the first delivered signal is captured for the shutdown lifecycle log line and is not overwritten by a follow-up signal. Per LLR-MAIN-22. |
-| 36 | <a id="test_event_loop_clears_disconnect_reason_after_drain"></a>`test_event_loop_clears_disconnect_reason_after_drain` | `LLR-MAIN-22` | Stage `RspContext.disconnect_reason = "D"` and execute the event_loop drain contract: read the field, then NULL it. Assert the field is NULL afterwards. This locks in the no-duplicate-emission guarantee from LLR-MAIN-22 — a single disconnect line per fd-close. |
+| 33 | <a id="test_parse_args_log_rsp_sets_flag"></a>`test_parse_args_log_rsp_sets_flag` | `LLR-MAIN-23` | Call `parse_args()` with argv `{ "prog", "--log-rsp", "/dev/x", "a.elf" }` and assert `cfg.log_rsp == true` — confirming the logging flag is recognised by the option parser. |
+| 34 | <a id="parse_args_allow_erase_sets_flag"></a>`parse_args_allow_erase_sets_flag` | `LLR-MAIN-21` | Call `parse_args()` with argv `{ "prog", "--allow-erase", "/dev/x", "a.elf" }` and assert `cfg.allow_erase == true` — confirming the destructive-erase gate is recognised by the option parser. |
+| 35 | <a id="parse_args_allow_erase_defaults_false"></a>`parse_args_allow_erase_defaults_false` | `LLR-MAIN-21` | Call `parse_args()` with argv that omits `--allow-erase` and assert `cfg.allow_erase == false` — confirming the safety default refuses destructive erase verbs unless the operator explicitly opts in. |
+| 36 | <a id="test_sig_handler_records_signo_in_g_shutdown_signal"></a>`test_sig_handler_records_signo_in_g_shutdown_signal` | `LLR-MAIN-22` | Reset `g_shutdown_signal` to 0, invoke `sig_handler(SIGTERM)`, and assert `g_quit == 1` and `g_shutdown_signal == SIGTERM`. Then invoke `sig_handler(SIGINT)` and assert `g_shutdown_signal` remains `SIGTERM` — confirming the first delivered signal is captured for the shutdown lifecycle log line and is not overwritten by a follow-up signal. Per LLR-MAIN-22. |
+| 37 | <a id="test_event_loop_clears_disconnect_reason_after_drain"></a>`test_event_loop_clears_disconnect_reason_after_drain` | `LLR-MAIN-22` | Stage `RspContext.disconnect_reason = "D"` and execute the event_loop drain contract: read the field, then NULL it. Assert the field is NULL afterwards. This locks in the no-duplicate-emission guarantee from LLR-MAIN-22 — a single disconnect line per fd-close. |
 
 ### 3.2. [tests/test_updi.c](../tests/test_updi.c)
 
@@ -376,6 +377,7 @@ verified by code review — see
 | `LLR-MAIN-16` | `main` | `HLR-050`, `HLR-049` | `F3_prog_mode_end_to_end_with_verify` |
 | `LLR-MAIN-17` | `main` | `HLR-050`, `HLR-051`, `HLR-052` | `parse_args_no_autobaud_sets_flag` |
 | `LLR-MAIN-21` | `main` | `HLR-055` | `parse_args_allow_erase_sets_flag`, `parse_args_allow_erase_defaults_false` |
+| `LLR-MAIN-23` | `main` | `HLR-068` | `test_parse_args_log_rsp_sets_flag` |
 | `LLR-MAIN-22` | `main` | `HLR-065` | `test_sig_handler_records_signo_in_g_shutdown_signal`, `test_event_loop_clears_disconnect_reason_after_drain` |
 | `LLR-UPDI-01` | `updi` | `HLR-006` | `updi_open_sets_8e2_raw_half_duplex_via_termios`, `updi_open_returns_minus1_on_device_open_failure` |
 | `LLR-UPDI-02` | `updi` | `HLR-006`, `HLR-036` | `updi_open_asserts_wake_byte_then_stcs_ctrlb`, `updi_open_restores_session_baud_after_break` |
@@ -452,6 +454,7 @@ verified by code review — see
 | `LLR-RSP-45` | `rsp` | `HLR-062` | `qSupported_advertises_swbreak_and_hwbreak`, `continue_emits_swbreak_when_pc_matches_sw_bp_shadow`, `continue_emits_hwbreak_when_pc_matches_hw_bp_shadow`, `continue_emits_bare_T05_when_pc_matches_no_breakpoint` |
 | `LLR-RSP-46` | `rsp` | `HLR-066` | `vCont_probe_advertises_range_step`, `vCont_range_step_steps_until_pc_leaves_range`, `vCont_range_step_returns_immediately_when_pc_already_outside`, `vCont_range_step_emits_T02_on_ctrl_c`, `vCont_range_step_rejects_malformed_packet_with_E22` |
 | `LLR-RSP-47` | `rsp` | `HLR-063` | `qSupported_advertises_qXfer_memory_map_read`, `qXfer_memory_map_read_returns_xml_with_flash_and_ram_regions`, `qXfer_memory_map_read_includes_eeprom_fuses_lock_sigrow_userrow`, `qXfer_memory_map_read_supports_chunked_offset_length`, `qXfer_memory_map_read_replies_l_when_no_elf_loaded` |
+| `LLR-RSP-49` | `rsp` | `HLR-068` | **(no direct test)** |
 | `LLR-RSP-48` | `rsp` | `HLR-067` | `on_read_mem_returns_E14_for_address_outside_advertised_map`, `on_read_mem_allows_address_inside_eeprom_band`, `on_read_mem_permissive_when_no_memory_map_advertised` |
 | `LLR-ELF-01` | `elf` | `HLR-021` | `elf_open_accepts_valid_avr_elf32_binary`, `elf_open_returns_minus1_on_invalid_elf_magic`, `elf_open_returns_minus1_on_wrong_machine_type` |
 | `LLR-ELF-02` | `elf` | `HLR-021`, `HLR-040` | `elf_open_loads_symtab_and_strtab_into_heap_buffers`, `elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure` |

@@ -1172,6 +1172,14 @@ Errors are propagated upward through the module stack without retrying:
     <section number="1" title="System Startup and Command-Line Interface">
       <intro><![CDATA[Requirements in this section govern how `avrOSdb` is invoked, how it initialises its resources, and how quickly it becomes ready for a GDB connection.]]></intro>
 
+      <hlr id="HLR-068" name="Detailed RSP Traffic Logging">
+        <text><![CDATA[The application shall accept a `--log-rsp` command line flag that enables detailed logging of all GDB Remote Serial Protocol requests and responses to `stderr`. It shall be parsed via `--log-rsp` and set an internal logging flag. When this flag is enabled, every RSP packet received from or sent to the GDB client shall be printed to `stderr` prefixed with `RSP &lt; ` or `RSP &gt; ` respectively.]]></text>
+        <traces>
+          <trace target="SDD" ref="1.1"/>
+          <trace target="SDD" ref="3.2.2"/>
+        </traces>
+      </hlr>
+
       <hlr id="HLR-001" name="CLI Argument Parsing">
         <text><![CDATA[The application shall accept the following command-line arguments: a required positional `<serial-device>` path, a required positional `<elf-file>` path, an optional `--port <port>` TCP port (default `1234`), an optional `--baud <baud>` UART baud rate (default `115200`), and an optional `--load` flag. Any unrecognised argument shall cause the application to print a usage message to `stderr` and exit with a non-zero status.]]></text>
         <traces>
@@ -1872,6 +1880,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         </traces>
       </llr>
 
+      <llr id="LLR-MAIN-23">
+        <text><![CDATA[`parse_args()` shall recognise `--log-rsp` as a boolean flag (no argument) and set `cfg->log_rsp = true` when present. The default initialiser shall set the flag to `false`. The main orchestrator shall pass this flag to `rsp_set_logging()` before entering the event loop.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-068" name="Detailed RSP Traffic Logging"/>
+        </traces>
+      </llr>
+
       <llr id="LLR-MAIN-22">
         <text><![CDATA[`main()` and `event_loop()` shall emit lifecycle log lines to `stderr` per HLR-065. Specifically: (a) immediately after `rsp_listen()` returns a non-negative fd in `app_main()`, print `"avrOSdb: listening on :%u\n"` with `cfg.gdb_port`; (b) inside `event_loop()`, after every successful `rsp_accept()` that yields a non-negative fd, call `getpeername()` on the new fd and print `"avrOSdb: client connected from %s:%u\n"` with the dotted-quad IPv4 address and port from the returned `sockaddr_in`; on `getpeername()` failure print `"avrOSdb: client connected from <unknown>\n"`; (c) when `rsp_recv_packet()` returns 0 print `"avrOSdb: client disconnected (EOF)\n"` before closing the fd, when it returns negative print `"avrOSdb: client disconnected (read error: %s)\n"` with `strerror(errno)`; (d) after `rsp_dispatch_n()` returns, if `gdb_fd < 0` (the handler closed the socket) and `rctx.disconnect_reason != NULL`, print `"avrOSdb: client disconnected (%s)\n"` with that reason and clear the field by setting it to `NULL`; if instead `gdb_fd >= 0` but `disconnect_reason != NULL` (vKill while listener-survival is still TODO), print the same line, then close `gdb_fd` and clear it locally; (e) immediately after `event_loop()` returns in `app_main()`, before the `teardown:` label runs, print `"avrOSdb: shutting down (%s)\n"` where the reason is selected from a `volatile sig_atomic_t g_shutdown_signal` set by `sig_handler()` (`SIGINT`/`SIGTERM`) when applicable, defaulting to `"fatal: <best-effort context>"` for any other quit path. The signal handler shall record `signo` into `g_shutdown_signal` in addition to setting `g_quit = 1`. All log lines shall use `fprintf(stderr, ...)` followed by `fflush(stderr)`; no new flag gates them and they shall not be emitted on `stdout`. Duplicate emissions for the same transition are forbidden — only one disconnect line per fd-close.]]></text>
         <traces>
@@ -2430,6 +2445,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         </traces>
       </llr>
 
+      <llr id="LLR-RSP-49">
+        <text><![CDATA[`rsp_recv_packet()` and `rsp_send_packet()` shall check a file-scoped boolean flag `g_log_rsp`. If true, `rsp_recv_packet()` shall output `RSP < <packet>` to `stderr` after receipt, and `rsp_send_packet()` shall output `RSP > <packet>` to `stderr` before sending. The flag shall be mutated via a new `rsp_set_logging(bool)` setter exposed in `gdb_rsp.h`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-068" name="Detailed RSP Traffic Logging"/>
+        </traces>
+      </llr>
+
       <llr id="LLR-RSP-48">
         <text><![CDATA[`dh_read_mem()` shall, immediately after parsing and length-validating the `m<addr>,<len>` packet (and before the GDB↔UPDI bit-23 address translation), call a new file-private helper `static bool mm_range_in_advertised_region(const RspContext *ctx, uint32_t addr, uint32_t len)` and, when the helper returns `false`, return `reply_err(fd, "E14")` instead of invoking `updi_mem_read()`. The helper shall return `false` for `len == 0` or when the 32-bit sum `addr + len` wraps; it shall return `true` when both `ctx->flash_size == 0` and `ctx->sram_size == 0` (no memory map advertised — permissive fallback for HLR-063's no-ELF case); otherwise it shall return `true` iff the half-open range `[addr, addr+len)` lies entirely within one of these seven regions (using the same constants HLR-063's advertisement emits): `[0, ctx->flash_size)` when `flash_size != 0`; `[ctx->sram_base, ctx->sram_base + ctx->sram_size)` when `sram_size != 0`; `[ELF_VMA_EEPROM, ELF_VMA_EEPROM + UPDI_EEPROM_SIZE)`; `[ELF_VMA_FUSES, ELF_VMA_FUSES + UPDI_FUSES_SIZE)`; `[ELF_VMA_LOCK, ELF_VMA_LOCK + UPDI_LOCK_SIZE)`; `[ELF_VMA_SIGROW, ELF_VMA_SIGROW + UPDI_SIGROW_SIZE)`; `[ELF_VMA_USERROW, ELF_VMA_USERROW + UPDI_USERROW_SIZE)`. The helper shall be defined immediately above `dh_read_mem()` in `src/gdb_rsp.c` and shall be `static` (file scope) so it is exclusively callable from the `m`-read path. The check shall NOT be wired into `dh_write_mem()` for this requirement — symmetric write enforcement is deferred. UPDI shall not be touched on a bounds rejection (`mock_read_count` MUST remain 0 in the negative unit test).]]></text>
         <traces>
@@ -2800,7 +2822,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/main.c unit tests                                        -->
     <!-- ============================================================ -->
-    <file path="tests/test_main.c" role="unit" count="36">
+    <file path="tests/test_main.c" role="unit" count="37">
       <header><![CDATA[Unit tests for `src/main.c`: argument parsing, event loop, signal handling, and resource teardown. Uses `fork()`/`waitpid()` to test `exit()` paths and a mock UPDI/RSP layer to exercise the event loop without real hardware.]]></header>
 
       <test name="parse_args_valid_positional_args_populate_config">
@@ -2961,6 +2983,11 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="parse_args_no_autobaud_sets_flag">
         <purpose><![CDATA[Call `parse_args()` with argv `{ "prog", "--device", "--no-autobaud", "/dev/x" }` and assert `cfg.no_autobaud == true` — confirming the autobaud-suppression flag is recognised and stored on `AppConfig` so `run_device_mode()` can gate its probe call accordingly.]]></purpose>
         <traces><trace target="LLR" ref="LLR-MAIN-17"/></traces>
+      </test>
+
+      <test name="test_parse_args_log_rsp_sets_flag">
+        <purpose><![CDATA[Call `parse_args()` with argv `{ "prog", "--log-rsp", "/dev/x", "a.elf" }` and assert `cfg.log_rsp == true` — confirming the logging flag is recognised by the option parser.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-23"/></traces>
       </test>
 
       <test name="parse_args_allow_erase_sets_flag">

@@ -298,7 +298,7 @@ static int verb_erase(int rsp_fd, RspContext *ctx)
         (void)o_line(rsp_fd,
             "monitor erase: refused — launch the server with "
             "--allow-erase to enable.\n");
-        return -1;
+        return 0;
     }
     if (updi_chip_erase(ctx->updi_fd) < 0) return -1;
     /* The chip is now blank and in NVMPROG-exit state.  Re-enter OCD

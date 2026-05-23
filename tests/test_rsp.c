@@ -664,15 +664,15 @@ static void on_insert_bp_calls_updi_ocd_set_hw_bp_with_byte_addr(void)
     TEST_ASSERT_EQUAL(0, mock_flash_write_count); /* no SW patching */
 }
 
-static void on_insert_bp_second_slot_succeeds(void)
+static void on_insert_bp_second_slot_fails(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
     ctx.bp_mode = RSP_BP_MODE_HW_ONLY;
     rsp_dispatch(sock_pair[1], "Z0,200,2", &h);
     rsp_dispatch(sock_pair[1], "Z0,400,2", &h);
-    TEST_ASSERT_EQUAL(2, mock_hw_bp_set_calls);
+    TEST_ASSERT_EQUAL(1, mock_hw_bp_set_calls);
     TEST_ASSERT_EQUAL(0x200u, mock_hw_bp_silicon[0]);
-    TEST_ASSERT_EQUAL(0x400u, mock_hw_bp_silicon[1]);
+    // slot 1 is reserved for 32-bit stepping workaround
 }
 
 static void on_insert_bp_duplicate_returns_ok_without_reprogramming(void)
@@ -709,19 +709,18 @@ static void on_remove_bp_unknown_address_returns_ok_for_resync(void)
 
 /* ── LLR-RSP-09: third bp returns E08 ──────────────────────────────── */
 
-static void on_insert_bp_returns_E08_when_both_slots_occupied(void)
+static void on_insert_bp_returns_E08_when_slot_occupied(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
     ctx.bp_mode = RSP_BP_MODE_HW_ONLY;
     rsp_dispatch(sock_pair[1], "Z0,200,2", &h);
-    rsp_dispatch(sock_pair[1], "Z0,400,2", &h);
     char drain_buf[256]; drain(sock_pair[0], drain_buf, sizeof drain_buf);
     rsp_dispatch(sock_pair[1], "Z0,600,2", &h);
     char stream[64]; drain(sock_pair[0], stream, sizeof stream);
     char payload[64];
     TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
     TEST_ASSERT_EQUAL_STRING("E08", payload);
-    TEST_ASSERT_EQUAL(2, mock_hw_bp_set_calls); /* no third call */
+    TEST_ASSERT_EQUAL(1, mock_hw_bp_set_calls); /* no second call */
 }
 
 /* ── LLR-RSP-10: step ───────────────────────────────────────────────── */
@@ -871,13 +870,11 @@ static void on_detach_clears_hw_bps_before_run(void)
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
     ctx.bp_mode = RSP_BP_MODE_HW_ONLY;
     rsp_dispatch(sock_pair[1], "Z0,200,2", &h);
-    rsp_dispatch(sock_pair[1], "Z0,400,2", &h);
     char drain_buf[256]; drain(sock_pair[0], drain_buf, sizeof drain_buf);
     int events_before = mock_event_count;
     rsp_dispatch(sock_pair[1], "D", &h);
-    TEST_ASSERT_EQUAL(2, mock_hw_bp_clear_calls);
+    TEST_ASSERT_EQUAL(1, mock_hw_bp_clear_calls);
     TEST_ASSERT_EQUAL(0xFFFFFFFFu, mock_hw_bp_silicon[0]);
-    TEST_ASSERT_EQUAL(0xFFFFFFFFu, mock_hw_bp_silicon[1]);
     /* Both EV_OCD_CLEAR_BP events must precede the EV_RUN event. */
     int run_idx = -1, last_clear_idx = -1;
     for (int i = events_before; i < mock_event_count; ++i) {
@@ -1283,9 +1280,19 @@ static void qSupported_advertises_qXfer_memory_map_read(void)
 static void qXfer_memory_map_read_returns_xml_with_flash_and_ram_regions(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
-    ctx.flash_size = 0x20000u;
-    ctx.sram_base  = 0x803000u;
-    ctx.sram_size  = 0x4000u;
+    ctx.map.flash_size = 0x20000u;
+    ctx.map.sram_base  = 0x803000u;
+    ctx.map.sram_size  = 0x4000u;
+    ctx.map.eeprom_base  = 0x810000;
+    ctx.map.eeprom_size  = 0x200;
+    ctx.map.fuses_base   = 0x820000;
+    ctx.map.fuses_size   = 0x10;
+    ctx.map.lock_base    = 0x830000;
+    ctx.map.lock_size    = 0x4;
+    ctx.map.sigrow_base  = 0x840000;
+    ctx.map.sigrow_size  = 0x40;
+    ctx.map.userrow_base = 0x850000;
+    ctx.map.userrow_size = 0x20;
     rsp_dispatch(sock_pair[1], "qXfer:memory-map:read::0,800", &h);
     char stream[2048]; drain(sock_pair[0], stream, sizeof stream);
     char payload[2048];
@@ -1307,9 +1314,19 @@ static void qXfer_memory_map_read_returns_xml_with_flash_and_ram_regions(void)
 static void qXfer_memory_map_read_includes_eeprom_fuses_lock_sigrow_userrow(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
-    ctx.flash_size = 0x20000u;
-    ctx.sram_base  = 0x803000u;
-    ctx.sram_size  = 0x4000u;
+    ctx.map.flash_size = 0x20000u;
+    ctx.map.sram_base  = 0x803000u;
+    ctx.map.sram_size  = 0x4000u;
+    ctx.map.eeprom_base  = 0x810000;
+    ctx.map.eeprom_size  = 0x200;
+    ctx.map.fuses_base   = 0x820000;
+    ctx.map.fuses_size   = 0x10;
+    ctx.map.lock_base    = 0x830000;
+    ctx.map.lock_size    = 0x4;
+    ctx.map.sigrow_base  = 0x840000;
+    ctx.map.sigrow_size  = 0x40;
+    ctx.map.userrow_base = 0x850000;
+    ctx.map.userrow_size = 0x20;
     rsp_dispatch(sock_pair[1], "qXfer:memory-map:read::0,800", &h);
     char stream[2048]; drain(sock_pair[0], stream, sizeof stream);
     char payload[2048];
@@ -1339,9 +1356,19 @@ static void qXfer_memory_map_read_supports_chunked_offset_length(void)
      * containing the remainder.  Concatenation must reproduce the
      * full document.                                                 */
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
-    ctx.flash_size = 0x20000u;
-    ctx.sram_base  = 0x803000u;
-    ctx.sram_size  = 0x4000u;
+    ctx.map.flash_size = 0x20000u;
+    ctx.map.sram_base  = 0x803000u;
+    ctx.map.sram_size  = 0x4000u;
+    ctx.map.eeprom_base  = 0x810000;
+    ctx.map.eeprom_size  = 0x200;
+    ctx.map.fuses_base   = 0x820000;
+    ctx.map.fuses_size   = 0x10;
+    ctx.map.lock_base    = 0x830000;
+    ctx.map.lock_size    = 0x4;
+    ctx.map.sigrow_base  = 0x840000;
+    ctx.map.sigrow_size  = 0x40;
+    ctx.map.userrow_base = 0x850000;
+    ctx.map.userrow_size = 0x20;
 
     rsp_dispatch(sock_pair[1], "qXfer:memory-map:read::0,10", &h);
     char stream1[2048]; drain(sock_pair[0], stream1, sizeof stream1);
@@ -1388,9 +1415,9 @@ static void qXfer_memory_map_read_replies_l_when_no_elf_loaded(void)
 static void on_read_mem_returns_E14_for_address_outside_advertised_map(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
-    ctx.flash_size = 0x4740u;        /* mirrors the captured ELF       */
-    ctx.sram_base  = 0x804000u;
-    ctx.sram_size  = 0x10eu;
+    ctx.map.flash_size = 0x4740u;        /* mirrors the captured ELF       */
+    ctx.map.sram_base  = 0x804000u;
+    ctx.map.sram_size  = 0x10eu;
     /* 0x807ff8 is 0x3eea bytes past the advertised SRAM end. */
     rsp_dispatch(sock_pair[1], "m807ff8,2", &h);
     char stream[64]; drain(sock_pair[0], stream, sizeof stream);
@@ -1408,9 +1435,9 @@ static void on_read_mem_returns_E14_for_address_outside_advertised_map(void)
 static void on_read_mem_allows_address_inside_eeprom_band(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
-    ctx.flash_size = 0x4740u;
-    ctx.sram_base  = 0x804000u;
-    ctx.sram_size  = 0x10eu;
+    ctx.map.flash_size = 0x4740u;
+    ctx.map.sram_base  = 0x804000u;
+    ctx.map.sram_size  = 0x10eu;
     mock_read_canned_len = 2;
     mock_read_canned[0] = 0xCA; mock_read_canned[1] = 0xFE;
     /* EEPROM at GDB 0x810000; bit-23 flip yields UPDI 0x010000. */
@@ -1930,11 +1957,11 @@ int main(void)
     RUN_TEST(on_write_mem_M_calls_updi_mem_write_for_sram_address);
     RUN_TEST(on_write_mem_X_calls_nvm_write_flash_for_flash_address);
     RUN_TEST(on_insert_bp_calls_updi_ocd_set_hw_bp_with_byte_addr);
-    RUN_TEST(on_insert_bp_second_slot_succeeds);
+    RUN_TEST(on_insert_bp_second_slot_fails);
     RUN_TEST(on_insert_bp_duplicate_returns_ok_without_reprogramming);
     RUN_TEST(on_remove_bp_calls_updi_ocd_clear_hw_bp);
     RUN_TEST(on_remove_bp_unknown_address_returns_ok_for_resync);
-    RUN_TEST(on_insert_bp_returns_E08_when_both_slots_occupied);
+    RUN_TEST(on_insert_bp_returns_E08_when_slot_occupied);
     RUN_TEST(on_step_s_calls_updi_step_and_sends_T05_stop_reason);
     RUN_TEST(on_continue_calls_updi_run_then_fsm_invalidate);
     RUN_TEST(on_continue_rebuilds_thread_list_after_halt_and_sends_stop);

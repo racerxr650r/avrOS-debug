@@ -106,10 +106,10 @@ def wait_for_tcp(port: int, timeout_s: float) -> bool:
     return False
 
 def spawn_server(avros_bin: str, port: int, rsp_port: int, elf: str,
-                 log_path: str) -> subprocess.Popen:
+                 log_path: str, extra_args: Optional[List[str]] = None) -> subprocess.Popen:
     log = open(log_path, "w", encoding="utf-8")
     proc = subprocess.Popen(
-        [avros_bin, "--port", str(rsp_port), port, elf],
+        [avros_bin, "--port", str(rsp_port)] + (extra_args or []) + [port, elf],
         stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
         close_fds=True,
     )
@@ -161,6 +161,18 @@ PER_TEST_CMDS: dict[int, str] = {
     7: ("detach\n"
         "target extended-remote :{rsp_port}\n"
         "info registers pc\n"),
+    8: ("mem 0x0 0x20000 rw\n"
+        "monitor reset\n"
+        "hbreak blink\n"
+        "break blink2\n"
+        "hbreak blink3\n"
+        "continue\n"
+        "continue\n"
+        "continue\n"
+        "continue\n"
+        "continue\n"
+        "delete breakpoints\n"),
+    9: "info threads\n",
 }
 
 # Per-test wall-clock cap (s) when running `avr-gdb -batch`. G2 has to
@@ -172,6 +184,7 @@ PER_TEST_TIMEOUT: dict[int, float] = {
     4: 15.0,
     6: 15.0,
     7: 15.0,
+    8: 15.0,
 }
 
 def build_test_script(n: int, rsp_port: int) -> str:
@@ -267,6 +280,27 @@ def verdict_G7(sect: str) -> Tuple[str, str]:
         return "FAIL", "no PC after re-attach"
     return "PASS", ""
 
+def verdict_G9(sect: str) -> Tuple[str, str]:
+    if "FSM" in sect or "state=" in sect:
+        return "FAIL", "Found FSM thread labels despite --no-fsm-threads"
+    if "Id   Target Id" in sect and re.search(r"1\s+Thread \d+\.1", sect):
+        return "PASS", ""
+    return "FAIL", "No threads found"
+
+def verdict_G8(sect: str) -> Tuple[str, str]:
+    # Continue must produce breakpoint hit lines for blink, blink2, blink3
+    hits_blink = len(re.findall(r"Breakpoint \d+,.*\bblink\b", sect))
+    hits_blink2 = len(re.findall(r"Breakpoint \d+,.*\bblink2\b", sect))
+    hits_blink3 = len(re.findall(r"Breakpoint \d+,.*\bblink3\b", sect))
+    
+    if hits_blink < 1:
+        return "FAIL", f"expected at least 1 hit at blink, got {hits_blink}"
+    if hits_blink2 < 1:
+        return "FAIL", f"expected at least 1 hit at blink2, got {hits_blink2}"
+    if hits_blink3 < 1:
+        return "FAIL", f"expected at least 1 hit at blink3, got {hits_blink3}"
+    return "PASS", ""
+
 VERDICTS = {
     1: ("attach + monitor version", verdict_G1),
     2: ("`(gdb) load` reflashes target",  verdict_G2),
@@ -274,6 +308,8 @@ VERDICTS = {
     4: ("break main + continue hit",      verdict_G4),
     6: ("monitor reset/halt/version verbs",  verdict_G6),
     7: ("detach + re-attach lifecycle",   verdict_G7),
+    8: ("multiple breakpoints correctly hit during execution", verdict_G8),
+    9: ("--no-fsm-threads switch yields single thread", verdict_G9),
 }
 
 # ──────────────────────────────────────────────────────────────────────
@@ -319,7 +355,7 @@ def main() -> int:
     # 1) Spawn avrOSdb.
     server_log = "/tmp/avrosdb_gdb_g.log"
     server = spawn_server(args.avros_bin, args.port, args.rsp_port,
-                          args.elf, server_log)
+                          args.elf, server_log, extra_args=["--log-rsp"])
     try:
         if not wait_for_tcp(args.rsp_port, timeout_s=8.0):
             print(f"hw-test: server did not bind 127.0.0.1:{args.rsp_port}",
@@ -330,6 +366,15 @@ def main() -> int:
         any_fail = False
         all_transcripts: List[str] = []
         for n in sorted(VERDICTS):
+            if n == 9:
+                kill_server(server)
+                server_log = "/tmp/avrosdb_gdb_g9.log"
+                server = spawn_server(args.avros_bin, args.port, args.rsp_port,
+                                      args.elf, server_log, extra_args=["--no-fsm-threads"])
+                if not wait_for_tcp(args.rsp_port, timeout_s=8.0):
+                    print(f"hw-test: G9 server did not bind", file=sys.stderr)
+                    return 1
+
             title, fn = VERDICTS[n]
             script = build_test_script(n, args.rsp_port)
             with tempfile.NamedTemporaryFile("w", suffix=f"_G{n}.gdb",

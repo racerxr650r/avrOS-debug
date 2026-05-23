@@ -30,6 +30,9 @@
 static char   rsp_buf[RSP_PACKET_MAX + 8];
 
 static bool g_noack = false;
+bool g_log_rsp = false;
+
+void rsp_set_logging(bool enabled) { g_log_rsp = enabled; }
 
 void rsp_set_noack(bool e) { g_noack = e; }
 bool rsp_get_noack(void)   { return g_noack; }
@@ -290,12 +293,15 @@ int rsp_recv_packet(int fd, char *buf, size_t cap)
     if (hi < 0 || lo < 0) return -1;
     uint8_t got = (uint8_t)((hi << 4) | lo);
 
-    if (g_noack) {
-        return (got == csum) ? (int)plen : -1;
+    bool ok = (got == csum);
+    if (!g_noack) {
+        char ack = ok ? '+' : '-';
+        if (write_all(fd, &ack, 1) < 0) return -1;
     }
-    char ack = (got == csum) ? '+' : '-';
-    if (write_all(fd, &ack, 1) < 0) return -1;
-    return (got == csum) ? (int)plen : -1;
+    if (ok && g_log_rsp) {
+        fprintf(stderr, "RSP < %s\n", buf);
+    }
+    return ok ? (int)plen : -1;
 }
 
 int rsp_send_packet(int fd, const char *payload)
@@ -308,6 +314,9 @@ int rsp_send_packet(int fd, const char *payload)
     memcpy(rsp_buf + 1, payload, plen);
     rsp_buf[1 + plen] = '#';
     byte_to_hex(csum, &rsp_buf[2 + plen]);
+    if (g_log_rsp) {
+        fprintf(stderr, "RSP > %s\n", payload);
+    }
     return (write_all(fd, rsp_buf, plen + 4u) < 0) ? -1 : 0;
 }
 
@@ -446,12 +455,13 @@ static int sw_bp_restore_cpu(int updi_fd, const uint8_t gpr[32],
  * NVMPROG entry that `updi_nvm_flash_patch()` performs internally
  * and restored after `updi_enter_debug()` brings the chip back into
  * OCD.  Returns 0 on success, -1 on any UPDI failure.               */
-static int sw_bp_patch_flash(int updi_fd, uint32_t byte_addr,
+static int sw_bp_patch_flash(RspContext *ctx, uint32_t byte_addr,
                              const uint8_t bytes[2], uint8_t orig_out[2])
 {
     uint8_t  gpr[32], sreg;
     uint16_t sp;
     uint32_t pc;
+    int updi_fd = ctx->updi_fd;
 
     if (sw_bp_snapshot_cpu(updi_fd, gpr, &sreg, &sp, &pc) < 0) return -1;
 
@@ -466,6 +476,14 @@ static int sw_bp_patch_flash(int updi_fd, uint32_t byte_addr,
         return -1;
 
     if (updi_enter_debug(updi_fd) < 0) return -1;
+
+    for (int i = 0; i < 2; i++) {
+        if (ctx->hw_bp_addr[i] != HW_BP_SLOT_EMPTY) {
+            uint32_t flash_byte = ctx->hw_bp_addr[i] & GDB_AVR_ADDR_MASK;
+            if (updi_ocd_set_hw_bp(updi_fd, i, flash_byte) < 0)
+                return -1;
+        }
+    }
 
     return sw_bp_restore_cpu(updi_fd, gpr, sreg, sp, pc);
 }
@@ -666,12 +684,12 @@ static bool mm_range_in_advertised_region(const RspContext *ctx,
 {
     if (len == 0u) return false;
     if (addr + len < addr) return false;  /* arithmetic wrap */
-    if (ctx->flash_size == 0u && ctx->sram_size == 0u) return true;
+    if (ctx->map.flash_size == 0u && ctx->map.sram_size == 0u) return true;
 
     const uint32_t end = addr + len;
     struct { uint32_t base; uint32_t size; } regions[] = {
-        { 0u,                ctx->flash_size      },  /* FLASH   */
-        { ctx->sram_base,    ctx->sram_size       },  /* SRAM    */
+        { 0u,                ctx->map.flash_size      },  /* FLASH   */
+        { ctx->map.sram_base,    ctx->map.sram_size       },  /* SRAM    */
         { ELF_VMA_EEPROM,    UPDI_EEPROM_SIZE     },  /* EEPROM  */
         { ELF_VMA_FUSES,     UPDI_FUSES_SIZE      },  /* FUSES   */
         { ELF_VMA_LOCK,      UPDI_LOCK_SIZE       },  /* LOCK    */
@@ -866,7 +884,54 @@ static int dh_step(int fd, const char *pkt, void *vctx)
      * hint with SC_STEP so classify_stop_cause() returns it when
      * neither shadow matches.                                       */
     ctx->last_stop_cause = SC_NONE;
-    if (updi_step(ctx->updi_fd) < 0) return reply_err(fd, "E01");
+
+    /* Detect if current instruction is 32-bit (AVR UPDI hardware stepper errata workaround) */
+    uint32_t pc_byte = 0;
+    if (updi_ocd_read_pc(ctx->updi_fd, &pc_byte) < 0) return reply_err(fd, "E01");
+
+    uint8_t opcode[4] = {0};
+    if (updi_mem_read(ctx->updi_fd, pc_byte | UPDI_FLASH_BASE, opcode, 4) < 0) return reply_err(fd, "E01");
+
+    uint16_t w0 = (uint16_t)opcode[0] | ((uint16_t)opcode[1] << 8);
+    uint16_t w1 = (uint16_t)opcode[2] | ((uint16_t)opcode[3] << 8);
+
+    bool is_32bit = false;
+    uint32_t target_pc = pc_byte + 4;
+
+    if ((w0 & 0xFE0F) == 0x9000 || (w0 & 0xFE0F) == 0x9200) {
+        /* LDS or STS */
+        is_32bit = true;
+    } else if ((w0 & 0xFE0E) == 0x940E || (w0 & 0xFE0E) == 0x940C) {
+        /* CALL or JMP */
+        uint32_t k = (uint32_t)w1 | (((uint32_t)w0 & 0x0001) << 16) | ((((uint32_t)w0 & 0x01F0) >> 4) << 17);
+        target_pc = k * 2;
+        is_32bit = true;
+    }
+
+    if (is_32bit) {
+        if (updi_ocd_set_hw_bp(ctx->updi_fd, 1, target_pc) < 0) return reply_err(fd, "E01");
+        if (updi_run(ctx->updi_fd) < 0) return reply_err(fd, "E01");
+
+        bool halted = false;
+        long total_wait_ms = 0;
+        int max_wait_ms = 200; /* generous timeout for one instruction */
+        
+        while (total_wait_ms < max_wait_ms) {
+            int s = updi_ocd_poll_halted(ctx->updi_fd, 10);
+            if (s == 0) { halted = true; break; }
+            if (s < 0) break;
+            total_wait_ms += 10;
+        }
+
+        (void)updi_ocd_clear_hw_bp(ctx->updi_fd, 1);
+        if (!halted) {
+             (void)updi_halt(ctx->updi_fd);
+             return reply_err(fd, "E01");
+        }
+    } else {
+        if (updi_step(ctx->updi_fd) < 0) return reply_err(fd, "E01");
+    }
+
     fsm_invalidate(ctx->fsm);
     if (ctx->fsm) {
         (void)fsm_build_thread_list(ctx->fsm, ctx->idx, ctx->updi_fd);
@@ -996,7 +1061,7 @@ static int dh_insert_bp(int fd, const char *pkt, void *vctx)
         if (slot_i < 0) return reply_err(fd, "E08");
         uint32_t byte_addr = addr & GDB_AVR_ADDR_MASK;
         uint8_t  orig[2];
-        if (sw_bp_patch_flash(ctx->updi_fd, byte_addr,
+        if (sw_bp_patch_flash(ctx, byte_addr,
                               SW_BP_BREAK_BYTES, orig) < 0)
             return reply_err(fd, "E01");
         ctx->sw_bp[slot_i].in_use  = true;
@@ -1007,14 +1072,14 @@ static int dh_insert_bp(int fd, const char *pkt, void *vctx)
     }
 
     /* Already set?  Idempotent OK. */
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 1; i++) {
         if (ctx->hw_bp_addr[i] == addr) return reply_ok(fd);
     }
     int slot_i = -1;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 1; i++) {
         if (ctx->hw_bp_addr[i] == HW_BP_SLOT_EMPTY) { slot_i = i; break; }
     }
-    if (slot_i < 0) return reply_err(fd, "E08");          /* both slots used */
+    if (slot_i < 0) return reply_err(fd, "E08");          /* slot used */
     uint32_t flash_byte = addr & GDB_AVR_ADDR_MASK;       /* gdb→byte */
     if (updi_ocd_set_hw_bp(ctx->updi_fd, slot_i, flash_byte) < 0)
         return reply_err(fd, "E01");
@@ -1046,7 +1111,7 @@ static int dh_remove_bp(int fd, const char *pkt, void *vctx)
         for (int i = 0; i < RSP_MAX_SW_BREAKPOINTS; i++) {
             if (ctx->sw_bp[i].in_use && ctx->sw_bp[i].addr == addr) {
                 uint32_t byte_addr = addr & GDB_AVR_ADDR_MASK;
-                if (sw_bp_patch_flash(ctx->updi_fd, byte_addr,
+                if (sw_bp_patch_flash(ctx, byte_addr,
                                       ctx->sw_bp[i].orig, NULL) < 0)
                     return reply_err(fd, "E01");
                 ctx->sw_bp[i].in_use  = false;
@@ -1059,7 +1124,7 @@ static int dh_remove_bp(int fd, const char *pkt, void *vctx)
         /* Not in SW shadow — fall through to HW shadow scan below.   */
     }
 
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 1; i++) {
         if (ctx->hw_bp_addr[i] == addr) {
             if (updi_ocd_clear_hw_bp(ctx->updi_fd, i) < 0)
                 return reply_err(fd, "E01");
@@ -1099,7 +1164,7 @@ static int dh_thread_info(int fd, const char *pkt, void *vctx)
  *
  *   Region   | GDB address    | Length              | type / blocksize
  *   FLASH    | 0x000000       | RspContext.flash_size | flash / 512
- *   RAM      | ctx->sram_base | ctx->sram_size      | ram (no blocksize)
+ *   RAM      | ctx->map.sram_base | ctx->map.sram_size      | ram (no blocksize)
  *   EEPROM   | ELF_VMA_EEPROM | UPDI_EEPROM_SIZE    | flash / 1
  *   FUSES    | ELF_VMA_FUSES  | UPDI_FUSES_SIZE     | flash / 1
  *   LOCK     | ELF_VMA_LOCK   | UPDI_LOCK_SIZE      | flash / 1
@@ -1130,7 +1195,7 @@ static int dh_qxfer_memory_map(int fd, const char *pkt, void *vctx)
 
     /* All-zero sizes ⇒ no ELF available ⇒ end-of-transfer with no
      * data.  GDB then uses its built-in defaults.                    */
-    if (ctx->flash_size == 0u && ctx->sram_size == 0u) {
+    if (ctx->map.flash_size == 0u && ctx->map.sram_size == 0u) {
         return rsp_send_packet(fd, "l");
     }
 
@@ -1147,46 +1212,53 @@ static int dh_qxfer_memory_map(int fd, const char *pkt, void *vctx)
         } while (0)
 
     MM_APPEND("<memory-map>");
-    if (ctx->flash_size != 0u) {
-        MM_APPEND("<memory type=\"flash\" start=\"0x0\" length=\"0x%lx\">"
+    if (ctx->map.flash_size != 0u) {
+        MM_APPEND("<memory type=\"flash\" start=\"0x%lx\" length=\"0x%lx\">"
                   "<property name=\"blocksize\">0x%lx</property>"
                   "</memory>",
-                  (unsigned long)ctx->flash_size,
+                  (unsigned long)ctx->map.flash_base,
+                  (unsigned long)ctx->map.flash_size,
                   (unsigned long)UPDI_FLASH_PAGE_SIZE);
     }
-    if (ctx->sram_size != 0u) {
+    if (ctx->map.sram_size != 0u) {
         MM_APPEND("<memory type=\"ram\" start=\"0x%lx\" length=\"0x%lx\"/>",
-                  (unsigned long)ctx->sram_base,
-                  (unsigned long)ctx->sram_size);
+                  (unsigned long)ctx->map.sram_base,
+                  (unsigned long)ctx->map.sram_size);
     }
-    /* Non-FLASH NVM regions — AVR-Dx device-class constants.  Address
-     * each at its GDB-visible ELF VMA band (avr-libc convention) so
-     * `M`-writes initiated by GDB land in the correct band and the
-     * `load_segments()` path translates them to silicon UPDI.        */
-    MM_APPEND("<memory type=\"flash\" start=\"0x%lx\" length=\"0x%lx\">"
-              "<property name=\"blocksize\">0x1</property>"
-              "</memory>",
-              (unsigned long)ELF_VMA_EEPROM,
-              (unsigned long)UPDI_EEPROM_SIZE);
-    MM_APPEND("<memory type=\"flash\" start=\"0x%lx\" length=\"0x%lx\">"
-              "<property name=\"blocksize\">0x1</property>"
-              "</memory>",
-              (unsigned long)ELF_VMA_FUSES,
-              (unsigned long)UPDI_FUSES_SIZE);
-    MM_APPEND("<memory type=\"flash\" start=\"0x%lx\" length=\"0x%lx\">"
-              "<property name=\"blocksize\">0x1</property>"
-              "</memory>",
-              (unsigned long)ELF_VMA_LOCK,
-              (unsigned long)UPDI_LOCK_SIZE);
-    MM_APPEND("<memory type=\"rom\" start=\"0x%lx\" length=\"0x%lx\"/>",
-              (unsigned long)ELF_VMA_SIGROW,
-              (unsigned long)UPDI_SIGROW_SIZE);
-    MM_APPEND("<memory type=\"flash\" start=\"0x%lx\" length=\"0x%lx\">"
-              "<property name=\"blocksize\">0x%lx</property>"
-              "</memory>",
-              (unsigned long)ELF_VMA_USERROW,
-              (unsigned long)UPDI_USERROW_SIZE,
-              (unsigned long)UPDI_USERROW_SIZE);
+    if (ctx->map.eeprom_size != 0u) {
+        MM_APPEND("<memory type=\"flash\" start=\"0x%lx\" length=\"0x%lx\">"
+                  "<property name=\"blocksize\">0x1</property>"
+                  "</memory>",
+                  (unsigned long)ctx->map.eeprom_base,
+                  (unsigned long)ctx->map.eeprom_size);
+    }
+    if (ctx->map.fuses_size != 0u) {
+        MM_APPEND("<memory type=\"flash\" start=\"0x%lx\" length=\"0x%lx\">"
+                  "<property name=\"blocksize\">0x1</property>"
+                  "</memory>",
+                  (unsigned long)ctx->map.fuses_base,
+                  (unsigned long)ctx->map.fuses_size);
+    }
+    if (ctx->map.lock_size != 0u) {
+        MM_APPEND("<memory type=\"flash\" start=\"0x%lx\" length=\"0x%lx\">"
+                  "<property name=\"blocksize\">0x1</property>"
+                  "</memory>",
+                  (unsigned long)ctx->map.lock_base,
+                  (unsigned long)ctx->map.lock_size);
+    }
+    if (ctx->map.sigrow_size != 0u) {
+        MM_APPEND("<memory type=\"rom\" start=\"0x%lx\" length=\"0x%lx\"/>",
+                  (unsigned long)ctx->map.sigrow_base,
+                  (unsigned long)ctx->map.sigrow_size);
+    }
+    if (ctx->map.userrow_size != 0u) {
+        MM_APPEND("<memory type=\"flash\" start=\"0x%lx\" length=\"0x%lx\">"
+                  "<property name=\"blocksize\">0x%lx</property>"
+                  "</memory>",
+                  (unsigned long)ctx->map.userrow_base,
+                  (unsigned long)ctx->map.userrow_size,
+                  (unsigned long)UPDI_USERROW_SIZE);
+    }
     MM_APPEND("</memory-map>");
     #undef MM_APPEND
 

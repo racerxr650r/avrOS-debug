@@ -25,9 +25,21 @@ __attribute__((noinline)) void blink(void)
     g_counter++;
 }
 
+__attribute__((noinline)) void blink2(void)
+{
+    g_counter += 2;
+}
+
+__attribute__((noinline)) void blink3(void)
+{
+    g_counter += 3;
+}
+
 int main(void)
 {
     while (1) {
         blink();
+        blink2();
+        blink3();
     }
 }

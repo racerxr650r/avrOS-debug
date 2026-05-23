@@ -8,6 +8,10 @@
 
 Requirements in this section govern how `avrOSdb` is invoked, how it initialises its resources, and how quickly it becomes ready for a GDB connection.
 
+*   <a id="HLR-068"></a>**HLR-068: Detailed RSP Traffic Logging.**
+    The application shall accept a `--log-rsp` command line flag that enables detailed logging of all GDB Remote Serial Protocol requests and responses to `stderr`. It shall be parsed via `--log-rsp` and set an internal logging flag. When this flag is enabled, every RSP packet received from or sent to the GDB client shall be printed to `stderr` prefixed with `RSP &lt; ` or `RSP &gt; ` respectively.
+    *Trace:* [SDD Section 1.1](SDD.md), [SDD Section 3.2.2](SDD.md).
+
 *   <a id="HLR-001"></a>**HLR-001: CLI Argument Parsing.**
     The application shall accept the following command-line arguments: a required positional `<serial-device>` path, a required positional `<elf-file>` path, an optional `--port <port>` TCP port (default `1234`), an optional `--baud <baud>` UART baud rate (default `115200`), and an optional `--load` flag. Any unrecognised argument shall cause the application to print a usage message to `stderr` and exit with a non-zero status.
     *Trace:* [SDD Section 3.2.2](SDD.md).
