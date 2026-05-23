@@ -1320,7 +1320,7 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-016" name="Breakpoints">
-        <text><![CDATA[The application shall implement code breakpoints by programming the two AVR-Dx OCD hardware comparators (`BP0`, `BP1`). Both `Z0` (software breakpoint) and `Z1` (hardware breakpoint) requests from GDB shall be routed to the same two hardware comparators, since installing the AVR `BREAK` opcode at runtime would require exiting OCD mode, entering NVMPROG (which resets the CPU and destroys live register/SREG/SP state), patching the FLASH page, and re-entering OCD — a sequence whose state-preservation cost outweighs the benefit on parts with only 32 KiB of FLASH per session. The shadow of the two comparator slots shall live in the RSP session context so that detach/reattach cycles leave silicon in a known state. Attempting to install a third breakpoint shall return GDB error reply `E08`; a duplicate insert at an already-installed address shall return `OK` without re-programming the comparator.]]></text>
+        <text><![CDATA[The application shall implement code breakpoints by programming the two AVR-Dx OCD hardware comparators (`BP0`, `BP1`). Both `Z0` (software breakpoint) and `Z1` (hardware breakpoint) requests from GDB shall be routed to hardware comparator `BP0`. Comparator `BP1` is reserved internally as a workaround for the AVR-Dx hardware 32-bit stepping errata. Installing the AVR `BREAK` opcode at runtime would require exiting OCD mode, entering NVMPROG (which resets the CPU and destroys live register/SREG/SP state), patching the FLASH page, and re-entering OCD — a sequence whose state-preservation cost outweighs the benefit on parts with only 32 KiB of FLASH per session. The shadow of the comparator slots shall live in the RSP session context so that detach/reattach cycles leave silicon in a known state. Attempting to install a second breakpoint shall return GDB error reply `E08`; a duplicate insert at an already-installed address shall return `OK` without re-programming the comparator.]]></text>
         <traces>
           <trace target="SDD" ref="4.3.1"/>
           <trace target="SDD" ref="5.3.1"/>
@@ -1328,7 +1328,7 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-017" name="Single-Step Execution">
-        <text><![CDATA[The application shall respond to the GDB single-step (`s`/`S`) packet by executing exactly one AVR instruction on the target CPU via the UPDI step primitive and reporting the resulting stop reason.]]></text>
+        <text><![CDATA[The application shall respond to the GDB single-step (`s`/`S`) packet by executing exactly one AVR instruction on the target CPU and reporting the resulting stop reason. Due to the AVR-Dx hardware 32-bit stepping errata, if the instruction at the current PC is determined to be a 32-bit instruction (e.g. `CALL`, `JMP`, `LDS`, `STS`), the application shall bypass the native UPDI hardware stepper, calculate the target PC of the subsequent instruction, plant a temporary hardware breakpoint there, `RUN` the CPU, and await the halt. For 16-bit instructions, it shall use the native UPDI step primitive.]]></text>
         <traces>
           <trace target="SDD" ref="4.3.1"/>
           <trace target="SDD" ref="5.3.1"/>
@@ -2195,14 +2195,14 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-RSP-09">
-        <text><![CDATA[When `on_insert_bp` is called with both `RspContext.hw_bp_addr[]` slots occupied and the requested address does not match either slot, the handler shall not call `updi_ocd_set_hw_bp()` and shall reply with the GDB error packet `E08`. This surfaces the AVR-Dx two-comparator hardware limit to the user.]]></text>
+        <text><![CDATA[When `on_insert_bp` is called and the single user `RspContext.hw_bp_addr[]` slot (slot 0) is occupied, and the requested address does not match that slot, the handler shall not call `updi_ocd_set_hw_bp()` and shall reply with the GDB error packet `E08`. This surfaces the fact that although AVR-Dx has two comparators, one is permanently reserved for the 32-bit stepping errata workaround, leaving exactly one hardware breakpoint slot available for the user.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-016" name="Breakpoints"/>
         </traces>
       </llr>
 
       <llr id="LLR-RSP-10">
-        <text><![CDATA[The `on_step` handler for `s`/`vCont;s` shall call `updi_step()`, invalidate the FSM thread cache, rebuild the thread list, and then reply with the stop-reason packet `T<sig>thread:<active_id>;` produced by the `on_halt_reason` handler. The signal returned by `signal_for_halt_status()` shall be `T02` (SIGINT) if `OCD_STATUS1.EXTBRK` is observed (e.g. the step landed back inside a software-halt window) and `T05` (SIGTRAP) otherwise.]]></text>
+        <text><![CDATA[The `on_step` handler for `s`/`vCont;s` shall read the current PC and the corresponding opcode. If the instruction is a 32-bit `CALL`, `JMP`, `LDS` or `STS`, it shall calculate the target PC of the next instruction, install a temporary hardware breakpoint at that target PC using `BP1` (slot 1), call `updi_run()` and await a halt, then immediately clear the `BP1` comparator. Otherwise, it shall call `updi_step()`. In either case, it subsequently invalidates the FSM thread cache, rebuilds the thread list, and then replies with the stop-reason packet `T<sig>thread:<active_id>;` produced by the `on_halt_reason` handler. The signal returned by `signal_for_halt_status()` shall be `T02` (SIGINT) if `OCD_STATUS1.EXTBRK` is observed (e.g. the step landed back inside a software-halt window) and `T05` (SIGTRAP) otherwise.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-017" name="Single-Step Execution"/>
         </traces>
@@ -2262,7 +2262,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-RSP-18">
-        <text><![CDATA[The `hw_bp_clear_all(ctx)` helper shall iterate `ctx->hw_bp_addr[0..1]` and, for every slot not equal to the empty sentinel (`0xFFFFFFFF`), call `updi_ocd_clear_hw_bp()` and reset the slot. It shall be called by `on_detach` for the `D` packet to guarantee the silicon comparators are released before the target is resumed.]]></text>
+        <text><![CDATA[The `hw_bp_clear_all(ctx)` helper shall check `ctx->hw_bp_addr[0]` and, if it is not equal to the empty sentinel (`0xFFFFFFFF`), call `updi_ocd_clear_hw_bp()` and reset the slot. It shall be called by `on_detach` for the `D` packet to guarantee the user's silicon comparator is released before the target is resumed. (Slot 1 is temporarily utilized by `dh_step` and cleared immediately within that function.)]]></text>
         <traces>
           <trace target="HLR" ref="HLR-016" name="Breakpoints"/>
           <trace target="HLR" ref="HLR-019" name="RSP Capability Negotiation and Lifecycle"/>
@@ -3334,8 +3334,8 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces><trace target="LLR" ref="LLR-RSP-07"/></traces>
       </test>
 
-      <test name="on_insert_bp_second_slot_succeeds">
-        <purpose><![CDATA[Dispatch two `Z0` inserts at distinct addresses and verify that `updi_ocd_set_hw_bp()` is called once for slot 0 and once for slot 1, that both slots in `RspContext.hw_bp_addr[]` are populated, and that both replies are `OK`.]]></purpose>
+      <test name="on_insert_bp_second_slot_fails">
+        <purpose><![CDATA[Dispatch two `Z0` inserts at distinct addresses and verify that `updi_ocd_set_hw_bp()` is called once for slot 0, then fails for slot 1 because it is reserved for the 32-bit stepping errata workaround, returning `E08`.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-07"/></traces>
       </test>
 
@@ -3354,13 +3354,18 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces><trace target="LLR" ref="LLR-RSP-08"/></traces>
       </test>
 
-      <test name="on_insert_bp_returns_E08_when_both_slots_occupied">
-        <purpose><![CDATA[Fill both `RspContext.hw_bp_addr[]` slots with distinct addresses, then dispatch a third `Z0` insert at a different address and verify the reply is `E08` and that no further `updi_ocd_set_hw_bp()` call is made.]]></purpose>
+      <test name="on_insert_bp_returns_E08_when_slot_occupied">
+        <purpose><![CDATA[Fill the single available `RspContext.hw_bp_addr[]` slot with an address, then dispatch a second `Z0`/`Z1` insert at a different address and verify the reply is `E08` and that no further `updi_ocd_set_hw_bp()` call is made.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-09"/></traces>
       </test>
 
-      <test name="on_step_s_calls_updi_step_and_sends_T05_stop_reason">
-        <purpose><![CDATA[Dispatch an `s` packet with the mock `updi_ocd_read_halt_status()` returning `OCD_STATUS1 = 0x00` and verify that the handler calls `updi_step()` once, rebuilds the FSM thread list, and sends a stop-reason reply of the form `T05thread:<id>;`.]]></purpose>
+      <test name="on_step_s_calls_updi_step_and_sends_T05_stop_reason_16bit">
+        <purpose><![CDATA[Dispatch an `s` packet for a 16-bit instruction, with the mock `updi_ocd_read_halt_status()` returning `OCD_STATUS1 = 0x00`, and verify that the handler calls `updi_step()` once, rebuilds the FSM thread list, and sends a stop-reason reply of the form `T05thread:<id>;`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-10"/></traces>
+      </test>
+
+      <test name="on_step_s_calls_updi_run_and_sends_T05_stop_reason_32bit">
+        <purpose><![CDATA[Dispatch an `s` packet for a 32-bit instruction (e.g., `CALL`, `JMP`, `LDS` or `STS`), and verify that the handler sniffs the instruction, correctly calculates the target PC, temporarily installs a hardware breakpoint at slot 1, calls `updi_run()`, clears slot 1, rebuilds the FSM thread list, and sends a stop-reason reply of the form `T05thread:<id>;`.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-10"/></traces>
       </test>
 
@@ -3405,7 +3410,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </test>
 
       <test name="on_detach_clears_hw_bps_before_run">
-        <purpose><![CDATA[Insert two `Z0` breakpoints, dispatch a `D` packet, and verify the call sequence: `updi_ocd_clear_hw_bp()` is called for both occupied slots BEFORE `updi_run()`, and afterwards both `RspContext.hw_bp_addr[]` slots are `0xFFFFFFFF`. This guarantees the next GDB session inherits clean silicon comparators.]]></purpose>
+        <purpose><![CDATA[Insert a `Z0` breakpoint, dispatch a `D` packet, and verify the call sequence: `updi_ocd_clear_hw_bp()` is called for the occupied slot 0 BEFORE `updi_run()`, and afterwards the `RspContext.hw_bp_addr[0]` slot is `0xFFFFFFFF`. This guarantees the next GDB session inherits a clean user silicon comparator.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-18"/></traces>
       </test>
 

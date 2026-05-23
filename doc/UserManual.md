@@ -662,15 +662,14 @@ was started with `--allow-erase`.
 
 ## 6. VS Code Integration
 
-`avrOSdb` speaks standard GDB RSP, so VS Code's built-in
-`cppdbg` debug adapter connects to it as a remote target. Two pieces
-are required:
+`avrOSdb` speaks standard GDB RSP. While many debug adapters support RSP, the **cortex-debug** extension is the only officially tested extension for `avrOSdb` integration in VS Code.
 
-1. The Microsoft **C/C++** extension (`ms-vscode.cpptools`), which
-   provides the `cppdbg` adapter.
+Two pieces are required:
+
+1. The **Cortex-Debug** extension (`marus25.cortex-debug`).
 2. An `avr-gdb` binary on `PATH` (the adapter spawns it locally).
 
-Add the following to `.vscode/launch.json` in your firmware project:
+Add the following to `.vscode/launch.json` in your firmware project (note that we use `gdbTarget` and a `custom` server type):
 
 ```json
 {
@@ -678,18 +677,13 @@ Add the following to `.vscode/launch.json` in your firmware project:
     "configurations": [
         {
             "name": "Debug AVR via avrOSdb",
-            "type": "cppdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/build/firmware.elf",
-            "miDebuggerPath": "/usr/bin/avr-gdb",
-            "miDebuggerServerAddress": "localhost:1234",
-            "cwd": "${workspaceFolder}",
-            "MIMode": "gdb",
-            "externalConsole": false,
-            "setupCommands": [
-                { "text": "set architecture avr" },
-                { "text": "set print pretty on" }
-            ]
+            "type": "cortex-debug",
+            "request": "attach",
+            "executable": "${workspaceFolder}/build/firmware.elf",
+            "servertype": "custom",
+            "gdbPath": "/usr/bin/avr-gdb",
+            "gdbTarget": "localhost:1234",
+            "cwd": "${workspaceFolder}"
         }
     ]
 }
@@ -738,3 +732,138 @@ launch script already manages the stub.
 - `doc/avrOSdb.1` — Unix man page (installed by `make install`).
 - [doc/PVD.md](PVD.md), [doc/SDD.md](SDD.md) — product vision and
   software design document.
+
+---
+
+## 9. Appendix A: Raspberry PI 4 model B Development Platform for avrOSdb
+
+The following instructions describe how to assemble and configure an avrOSdb
+debugging environment using a Raspberry Pi 4 Model B and a solderless
+breadboard.
+
+Running GUI apps natively on the Pi can be slow and frustrating. So, a headless Pi configuration alongside VS Code running on a desktop Linux PC provides the optimal debugging experience. 
+
+> [!NOTE]
+> With the TPM requirement for Windows 11, you can find
+refurbished business class PC's very cheap. They run resource hungry applications like VS Code much better than a Pi 4.
+
+With this setup, you can take advantage of the Pi's WiFi connection to debug remotely over the network. You can connect to the Pi using VS Code's remote-SSH feature or configure `avrOSdb` to listen on your network so that your local `avr-gdb` attaches to the remote `avrOSdb` server.
+
+### A.1 Bill of Materials
+
+1. Raspberry Pi 4 Model B - The PI 4 is required for the additional UART ports.
+   Prior models do not have enough ports to support simultaneous console,
+   logging, and UPDI programming/debugging ports.
+2. Solderless Breadboard
+3. Solderless jumper wires or solid core 24 AWG wire
+4. AVR128DA28 Microcontroller - AVR microcontroller in a 28 pin dip package.
+5. Leaded (through hole) 100 nF ceramic capacitor
+6. Leaded (through hole) 10 nF ceramic capacitor
+7. Leaded (through hole) 1 uF ceramic capacitor
+8. Leaded (through hole) 1K ohm 1/4 watt resistor (Crucial for the UPDI connection)
+9. 3 Digit LED Voltmeter (Optional)
+10. Raspberry Pi 4 passive heatsink (Optional)
+11. Ultra-Small RPi GPIO Status LED & Terminal Block Breakout Board Module (Optional)
+12. M2 Standoffs (Optional)
+
+### A.2 Assemble the hardware
+
+1. Using standoffs, drill out the metal base of the solderless breadboard and mount the Raspberry Pi and 3 digit LED voltmeter.
+
+![base board](./images/20231020_184806.jpg)
+
+2. Connect pin 1 from the Pi IO header to the positive power rail of the breadboard. Connect pin 9 from the Pi IO header to the negative power rail of the breadboard.
+
+![Pi Pinout](./images/pinout-corrected-1024x605.jpg)
+
+3. Add jumpers to connect the other power rails on the board.
+
+4. Connect both ground pins (15 and 21) on the AVR128DA28 to the ground rail.
+
+5. Connect Vdd (pin 20) to the power rail (3.3V).
+
+6. Insert the 3 decoupling caps (100nF, 10nF, and 1uF) between Vdd and ground (pins 20 and 21).
+
+![AVR128DA28 Powered](./images/20231020_200450.jpg)
+
+7. Connect Pi UART 2 to the UPDI pin. Connect the Rx (Pi pin 28) to the UPDI port pin on the AVR (AVR pin 19). Then connect the Tx (Pi pin 27) to a 1K ohm resistor, and connect the resistor to the UPDI port pin on the AVR (AVR pin 19).
+
+![UPDI Connected](./images/20231021_162617.jpg)
+
+8. Connect Pi UART 3 to the AVR serial console. Connect the Tx pin (Pi pin 7) to the AVR UART 2 Rx pin (AVR pin 17). Then connect the Rx (Pi pin 29) to the AVR UART 2 Tx pin (AVR pin 16).
+
+9. Connect Pi UART 4 to the AVR logging serial port. Connect the Tx pin (Pi pin 24) to the AVR UART 1 Rx pin (AVR pin 3). Then connect the Rx pin (Pi pin 21) to the AVR UART 1 Tx pin (AVR pin 2).
+
+This is what it should look like when you are done:
+
+![All Connected](./images/20231021_165040.jpg)
+
+This setup provides headers for all AVR-DA I/O pins, 5V power, and 3.3V power so it can be used for prototyping while being debugged with `avrOSdb`.
+
+![Compact Build](./images/20231227_141036.jpg)
+
+### A.3 Configure PI OS (Bookworm)
+
+1. Use the 64 bit Pi OS Lite. Enable SSH during setup. Power up the Pi and login remotely.
+
+2. Edit the configuration file to enable UART2, UART3, and UART4 on the Pi.
+
+   ```console
+   sudo nano /boot/firmware/config.txt
+   ```
+   
+   Add the following lines to the end of the file:
+
+   ```console
+   [all]
+   enable_uart=1
+   dtoverlay=uart2
+   dtoverlay=uart3
+   dtoverlay=uart4
+   ```
+
+   Save the file and reboot the Pi.
+
+3. Confirm the serial ports are enabled:
+
+   ```console
+   ls -l /dev/ttyAMA*
+   ```
+
+   You should see `/dev/ttyAMA2`, `/dev/ttyAMA3`, and `/dev/ttyAMA4`.
+
+4. Build and start `avrOSdb` using the UPDI UART (`/dev/ttyAMA2`):
+
+   ```console
+   make
+   build/avrOSdb /dev/ttyAMA2 firmware.elf
+   ```
+   
+   `avrOSdb` will now be listening on `:1234` for GDB connections over UPDI.
+
+5. (Optional) Install `tio` to monitor the avrOS command line and logging serial ports (`/dev/ttyAMA3` and `/dev/ttyAMA4`):
+
+   ```console
+   sudo apt update
+   sudo apt install tio
+   ```
+
+   Add the following to `~/.tioconfig`:
+
+   ```console
+   # Defaults
+   baudrate = 115200
+   databits = 8
+   parity = none
+   stopbits = 1
+
+   [cli]
+   color = 2
+   device = /dev/ttyAMA3
+
+   [log]
+   color = 3
+   device = /dev/ttyAMA4
+   ```
+
+   Connect with `tio cli` or `tio log`.
