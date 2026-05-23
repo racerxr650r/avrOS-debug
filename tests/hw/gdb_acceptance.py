@@ -156,6 +156,9 @@ PER_TEST_CMDS: dict[int, str] = {
     3: ("\n".join(f"break *0x{a:04X}" for a in BP_ADDRS_HEX)
         + "\ninfo breakpoints\ndelete breakpoints\n"),
     4: "break main\ncontinue\ninfo registers pc\ndelete breakpoints\n",
+    5: ("break do_32bit_inst\ncontinue\n"
+        "stepi\nstepi\nstepi\n"
+        "info registers pc\ndelete breakpoints\n"),
     6: ("monitor reset\nflushregs\ninfo registers pc\n"
         "monitor halt\nmonitor version\n"),
     7: ("detach\n"
@@ -165,7 +168,7 @@ PER_TEST_CMDS: dict[int, str] = {
         "monitor reset\n"
         "hbreak blink\n"
         "break blink2\n"
-        "hbreak blink3\n"
+        "break blink3\n"
         "continue\n"
         "continue\n"
         "continue\n"
@@ -182,6 +185,7 @@ PER_TEST_TIMEOUT: dict[int, float] = {
     2: 30.0,
     3: 20.0,
     4: 15.0,
+    5: 15.0,
     6: 15.0,
     7: 15.0,
     8: 15.0,
@@ -249,9 +253,12 @@ def verdict_G4(sect: str) -> Tuple[str, str]:
     return "PASS", ""
 
 def verdict_G5(sect: str) -> Tuple[str, str]:
-    # G5 removed: UPDI silicon has no data-watchpoint hardware (HLR-056).
-    # Kept as a stub so any stale RUN_TEST() registration still imports.
-    return "SKIP", "data watchpoints handled by GDB software fallback"
+    if not re.search(r"Breakpoint \d+,.*\bdo_32bit_inst\b", sect):
+        return "FAIL", "no breakpoint hit at do_32bit_inst"
+    pc = pc_value(sect)
+    if pc is None or pc == 0:
+        return "FAIL", f"PC unexpected after hit: {pc}"
+    return "PASS", ""
 
 def verdict_G6(sect: str) -> Tuple[str, str]:
     # monitor reset → PC=0; monitor halt → "target halted"; monitor
@@ -306,6 +313,7 @@ VERDICTS = {
     2: ("`(gdb) load` reflashes target",  verdict_G2),
     3: ("five simultaneous breakpoints",  verdict_G3),
     4: ("break main + continue hit",      verdict_G4),
+    5: ("stepi over 32-bit instructions", verdict_G5),
     6: ("monitor reset/halt/version verbs",  verdict_G6),
     7: ("detach + re-attach lifecycle",   verdict_G7),
     8: ("multiple breakpoints correctly hit during execution", verdict_G8),

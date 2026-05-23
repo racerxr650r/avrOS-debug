@@ -35,11 +35,22 @@ __attribute__((noinline)) void blink3(void)
     g_counter += 3;
 }
 
+__attribute__((noinline)) void do_32bit_inst(void)
+{
+    __asm__ __volatile__ (
+        "sts 0x4000, r24 \n\t"
+        "lds r24, 0x4000 \n\t"
+        "call blink \n\t"
+        ::: "r24", "memory"
+    );
+}
+
 int main(void)
 {
     while (1) {
         blink();
         blink2();
+        do_32bit_inst();
         blink3();
     }
 }
