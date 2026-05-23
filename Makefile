@@ -106,7 +106,7 @@ endif
 ifeq ($(V),1)
   Q :=
 else
-  Q := @
+  Q :=
 endif
 
 # ── Common flags ─────────────────────────────────────────────────────────────
@@ -674,8 +674,8 @@ prereqs:
 # ── clean target ──────────────────────────────────────────────────────────────
 .PHONY: clean
 clean:
-	$(Q)rm -rf $(BUILDDIR) $(DISTDIR)
-	@echo "  CLEAN  $(BUILDDIR)/ $(DISTDIR)/"
+	$(Q)rm -rf $(BUILDDIR) $(DISTDIR) AI-tmp
+	@echo "  CLEAN  $(BUILDDIR)/ $(DISTDIR)/ AI-tmp/"
 # ── help target ───────────────────────────────────────────────────────────
 # Prints the top-of-file comment block from `# Targets:` up to (but not
 # including) the first `# ──` section separator or the first non-comment line.

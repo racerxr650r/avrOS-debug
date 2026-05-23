@@ -10,6 +10,17 @@
 #include "elf_parser.h"
 #include "fsm_mapper.h"
 
+typedef struct {
+    uint32_t flash_base;  uint32_t flash_size;
+    uint32_t sram_base;   uint32_t sram_size;
+    uint32_t eeprom_base; uint32_t eeprom_size;
+    uint32_t userrow_base;uint32_t userrow_size;
+    uint32_t fuses_base;  uint32_t fuses_size;
+    uint32_t lock_base;   uint32_t lock_size;
+    uint32_t sigrow_base; uint32_t sigrow_size;
+} DeviceMemoryLayout;
+
+
 #define RSP_PACKET_MAX      2048
 /* AVR-Dx OCD provides exactly two hardware breakpoint comparators
  * (BP0, BP1).  Both Z0 (software) and Z1 (hardware) GDB requests are
@@ -96,9 +107,7 @@ typedef struct {
      * memory map.  All three zero ⇒ no ELF available ⇒ handler
      * replies the empty `l` (end-of-transfer with no content) and
      * GDB falls back to its built-in defaults.                       */
-    uint32_t                  flash_size;
-    uint32_t                  sram_base;
-    uint32_t                  sram_size;
+    DeviceMemoryLayout        map;
 } RspContext;
 
 /* Each handler returns 0 on success or -1 on error. The handler is
@@ -145,6 +154,7 @@ int  rsp_send_packet(int fd, const char *payload);
 
 /* ── No-ack mode (toggled by QStartNoAckMode) ────────────────────────── */
 void rsp_set_noack(bool enabled);
+void rsp_set_logging(bool enabled);
 bool rsp_get_noack(void);
 
 /* ── Dispatch ────────────────────────────────────────────────────────── */

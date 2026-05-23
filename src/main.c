@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <signal.h>
@@ -45,10 +46,12 @@ typedef struct {
     bool        no_verify;     /* --no-verify: skip read-back verify
                                 *  after --load / --prog (LLR-MAIN-14)  */
     bool        no_autobaud;   /* --no-autobaud: skip --device autobaud */
+    bool        log_rsp;       /* --log-rsp: detailed logging to stderr */
     bool        allow_erase;   /* --allow-erase: HLR-055 gate for the
                                 *  monitor erase / chip-erase verbs   */
     const char *force_device;    /* --force-device=<family>: skip SIGROW
                                   *  autodetect and use the named family  */
+    bool        no_fsm_threads;  /* --no-fsm-threads: disable FSM/RTOS threading */
     /* fds owned by main; -1 = closed/unset */
     int         listen_fd;
     int         gdb_fd;
@@ -79,10 +82,10 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
         "usage: %s [--port <port>] [--baud <baud>] [--erase] [--load] "
-        "[--no-verify] [--allow-lock-updi] [--force-device=<family>] "
+        "[--no-verify] [--allow-lock-updi] [--force-device=<family>] [--log-rsp] "
         "<serial-device> <elf-file>\n"
         "       %s --prog [--baud <baud>] [--erase] [--no-verify] "
-        "[--allow-lock-updi] [--force-device=<family>] "
+        "[--allow-lock-updi] [--force-device=<family>] [--log-rsp] "
         "<serial-device> <elf-file>\n"
         "       %s --device [--baud <baud>] [--no-autobaud] "
         "[--force-device=<family>] <serial-device> [elf-file]\n"
@@ -108,7 +111,12 @@ static void usage(const char *prog)
         "                     (AVR-DA|AVR-DB|AVR-DD|AVR-DU|AVR-SD).\n"
         "                     Only AVR-DA is hardware-validated; the other\n"
         "                     four families are declared from datasheet\n"
-        "                     evidence only.\n",
+        "                     evidence only.\n"
+        "  --device           Print target device SIGROW info and exit.\n"
+        "  --log-rsp          Log all incoming and outgoing GDB RSP packets\n"
+        "                     to standard error.\n"
+        "  --no-fsm-threads   Disable RTOS multi-thread reporting. Exposes\n"
+        "                     only the single hardware CPU thread.\n",
         prog, prog, prog);
 }
 
@@ -132,49 +140,246 @@ MAYBE_STATIC void progress_finish(void);
 typedef struct {
     uint8_t     id[3];
     const char *name;
+    DeviceMemoryLayout map;
 } DeviceFamilyEntry;
 
 static const DeviceFamilyEntry device_family[] = {
     /* AVR128DA */
-    { { 0x1E, 0x97, 0x0A }, "AVR128DA28" },
-    { { 0x1E, 0x97, 0x09 }, "AVR128DA32" },
-    { { 0x1E, 0x97, 0x08 }, "AVR128DA48" },
-    { { 0x1E, 0x97, 0x07 }, "AVR128DA64" },
+    { { 0x1E, 0x97, 0x0A }, "AVR128DA28", {
+      .flash_base = 0x000000, .flash_size = 131072,
+      .sram_base = 0x804000, .sram_size = 16384,
+      .eeprom_base = 0x810000, .eeprom_size = 512,
+      .userrow_base = 0x850000, .userrow_size = 32,
+      .fuses_base = 0x820000, .fuses_size = 16,
+      .lock_base = 0x830000, .lock_size = 4,
+      .sigrow_base = 0x840000, .sigrow_size = 64
+    } },
+    { { 0x1E, 0x97, 0x09 }, "AVR128DA32", {
+      .flash_base = 0x000000, .flash_size = 131072,
+      .sram_base = 0x804000, .sram_size = 16384,
+      .eeprom_base = 0x810000, .eeprom_size = 512,
+      .userrow_base = 0x850000, .userrow_size = 32,
+      .fuses_base = 0x820000, .fuses_size = 16,
+      .lock_base = 0x830000, .lock_size = 4,
+      .sigrow_base = 0x840000, .sigrow_size = 64
+    } },
+    { { 0x1E, 0x97, 0x08 }, "AVR128DA48", {
+      .flash_base = 0x000000, .flash_size = 131072,
+      .sram_base = 0x804000, .sram_size = 16384,
+      .eeprom_base = 0x810000, .eeprom_size = 512,
+      .userrow_base = 0x850000, .userrow_size = 32,
+      .fuses_base = 0x820000, .fuses_size = 16,
+      .lock_base = 0x830000, .lock_size = 4,
+      .sigrow_base = 0x840000, .sigrow_size = 64
+    } },
+    { { 0x1E, 0x97, 0x07 }, "AVR128DA64", {
+      .flash_base = 0x000000, .flash_size = 131072,
+      .sram_base = 0x804000, .sram_size = 16384,
+      .eeprom_base = 0x810000, .eeprom_size = 512,
+      .userrow_base = 0x850000, .userrow_size = 32,
+      .fuses_base = 0x820000, .fuses_size = 16,
+      .lock_base = 0x830000, .lock_size = 4,
+      .sigrow_base = 0x840000, .sigrow_size = 64
+    } },
     /* AVR64DA */
-    { { 0x1E, 0x96, 0x15 }, "AVR64DA28"  },
-    { { 0x1E, 0x96, 0x14 }, "AVR64DA32"  },
-    { { 0x1E, 0x96, 0x13 }, "AVR64DA48"  },
-    { { 0x1E, 0x96, 0x12 }, "AVR64DA64"  },
+    { { 0x1E, 0x96, 0x15 }, "AVR64DA28", {
+      .flash_base = 0x000000, .flash_size = 65536,
+      .sram_base = 0x804000, .sram_size = 8192,
+      .eeprom_base = 0x810000, .eeprom_size = 512,
+      .userrow_base = 0x850000, .userrow_size = 32,
+      .fuses_base = 0x820000, .fuses_size = 16,
+      .lock_base = 0x830000, .lock_size = 4,
+      .sigrow_base = 0x840000, .sigrow_size = 64
+    } },
+    { { 0x1E, 0x96, 0x14 }, "AVR64DA32", {
+      .flash_base = 0x000000, .flash_size = 65536,
+      .sram_base = 0x804000, .sram_size = 8192,
+      .eeprom_base = 0x810000, .eeprom_size = 512,
+      .userrow_base = 0x850000, .userrow_size = 32,
+      .fuses_base = 0x820000, .fuses_size = 16,
+      .lock_base = 0x830000, .lock_size = 4,
+      .sigrow_base = 0x840000, .sigrow_size = 64
+    } },
+    { { 0x1E, 0x96, 0x13 }, "AVR64DA48", {
+      .flash_base = 0x000000, .flash_size = 65536,
+      .sram_base = 0x804000, .sram_size = 8192,
+      .eeprom_base = 0x810000, .eeprom_size = 512,
+      .userrow_base = 0x850000, .userrow_size = 32,
+      .fuses_base = 0x820000, .fuses_size = 16,
+      .lock_base = 0x830000, .lock_size = 4,
+      .sigrow_base = 0x840000, .sigrow_size = 64
+    } },
+    { { 0x1E, 0x96, 0x12 }, "AVR64DA64", {
+      .flash_base = 0x000000, .flash_size = 65536,
+      .sram_base = 0x804000, .sram_size = 8192,
+      .eeprom_base = 0x810000, .eeprom_size = 512,
+      .userrow_base = 0x850000, .userrow_size = 32,
+      .fuses_base = 0x820000, .fuses_size = 16,
+      .lock_base = 0x830000, .lock_size = 4,
+      .sigrow_base = 0x840000, .sigrow_size = 64
+    } },
     /* AVR32DA */
-    { { 0x1E, 0x95, 0x36 }, "AVR32DA28"  },
-    { { 0x1E, 0x95, 0x35 }, "AVR32DA32"  },
-    { { 0x1E, 0x95, 0x34 }, "AVR32DA48"  },
+    { { 0x1E, 0x95, 0x36 }, "AVR32DA28", {
+      .flash_base = 0x000000, .flash_size = 32768,
+      .sram_base = 0x804000, .sram_size = 4096,
+      .eeprom_base = 0x810000, .eeprom_size = 512,
+      .userrow_base = 0x850000, .userrow_size = 32,
+      .fuses_base = 0x820000, .fuses_size = 16,
+      .lock_base = 0x830000, .lock_size = 4,
+      .sigrow_base = 0x840000, .sigrow_size = 64
+    } },
+    { { 0x1E, 0x95, 0x35 }, "AVR32DA32", {
+      .flash_base = 0x000000, .flash_size = 32768,
+      .sram_base = 0x804000, .sram_size = 4096,
+      .eeprom_base = 0x810000, .eeprom_size = 512,
+      .userrow_base = 0x850000, .userrow_size = 32,
+      .fuses_base = 0x820000, .fuses_size = 16,
+      .lock_base = 0x830000, .lock_size = 4,
+      .sigrow_base = 0x840000, .sigrow_size = 64
+    } },
+    { { 0x1E, 0x95, 0x34 }, "AVR32DA48", {
+      .flash_base = 0x000000, .flash_size = 32768,
+      .sram_base = 0x804000, .sram_size = 4096,
+      .eeprom_base = 0x810000, .eeprom_size = 512,
+      .userrow_base = 0x850000, .userrow_size = 32,
+      .fuses_base = 0x820000, .fuses_size = 16,
+      .lock_base = 0x830000, .lock_size = 4,
+      .sigrow_base = 0x840000, .sigrow_size = 64
+    } },
     /* AVR128DB */
-    { { 0x1E, 0x97, 0x0E }, "AVR128DB28" },
-    { { 0x1E, 0x97, 0x0D }, "AVR128DB32" },
-    { { 0x1E, 0x97, 0x0C }, "AVR128DB48" },
-    { { 0x1E, 0x97, 0x0B }, "AVR128DB64" },
+    { { 0x1E, 0x97, 0x0E }, "AVR128DB28", {
+      .flash_base = 0x000000, .flash_size = 131072,
+      .sram_base = 0x804000, .sram_size = 16384,
+      .eeprom_base = 0x810000, .eeprom_size = 512,
+      .userrow_base = 0x850000, .userrow_size = 32,
+      .fuses_base = 0x820000, .fuses_size = 16,
+      .lock_base = 0x830000, .lock_size = 4,
+      .sigrow_base = 0x840000, .sigrow_size = 64
+    } },
+    { { 0x1E, 0x97, 0x0D }, "AVR128DB32", {
+      .flash_base = 0x000000, .flash_size = 131072,
+      .sram_base = 0x804000, .sram_size = 16384,
+      .eeprom_base = 0x810000, .eeprom_size = 512,
+      .userrow_base = 0x850000, .userrow_size = 32,
+      .fuses_base = 0x820000, .fuses_size = 16,
+      .lock_base = 0x830000, .lock_size = 4,
+      .sigrow_base = 0x840000, .sigrow_size = 64
+    } },
+    { { 0x1E, 0x97, 0x0C }, "AVR128DB48", {
+      .flash_base = 0x000000, .flash_size = 131072,
+      .sram_base = 0x804000, .sram_size = 16384,
+      .eeprom_base = 0x810000, .eeprom_size = 512,
+      .userrow_base = 0x850000, .userrow_size = 32,
+      .fuses_base = 0x820000, .fuses_size = 16,
+      .lock_base = 0x830000, .lock_size = 4,
+      .sigrow_base = 0x840000, .sigrow_size = 64
+    } },
+    { { 0x1E, 0x97, 0x0B }, "AVR128DB64", {
+      .flash_base = 0x000000, .flash_size = 131072,
+      .sram_base = 0x804000, .sram_size = 16384,
+      .eeprom_base = 0x810000, .eeprom_size = 512,
+      .userrow_base = 0x850000, .userrow_size = 32,
+      .fuses_base = 0x820000, .fuses_size = 16,
+      .lock_base = 0x830000, .lock_size = 4,
+      .sigrow_base = 0x840000, .sigrow_size = 64
+    } },
     /* AVR64DB */
-    { { 0x1E, 0x96, 0x19 }, "AVR64DB28"  },
-    { { 0x1E, 0x96, 0x18 }, "AVR64DB32"  },
-    { { 0x1E, 0x96, 0x17 }, "AVR64DB48"  },
-    { { 0x1E, 0x96, 0x16 }, "AVR64DB64"  },
+    { { 0x1E, 0x96, 0x19 }, "AVR64DB28", {
+      .flash_base = 0x000000, .flash_size = 65536,
+      .sram_base = 0x804000, .sram_size = 8192,
+      .eeprom_base = 0x810000, .eeprom_size = 512,
+      .userrow_base = 0x850000, .userrow_size = 32,
+      .fuses_base = 0x820000, .fuses_size = 16,
+      .lock_base = 0x830000, .lock_size = 4,
+      .sigrow_base = 0x840000, .sigrow_size = 64
+    } },
+    { { 0x1E, 0x96, 0x18 }, "AVR64DB32", {
+      .flash_base = 0x000000, .flash_size = 65536,
+      .sram_base = 0x804000, .sram_size = 8192,
+      .eeprom_base = 0x810000, .eeprom_size = 512,
+      .userrow_base = 0x850000, .userrow_size = 32,
+      .fuses_base = 0x820000, .fuses_size = 16,
+      .lock_base = 0x830000, .lock_size = 4,
+      .sigrow_base = 0x840000, .sigrow_size = 64
+    } },
+    { { 0x1E, 0x96, 0x17 }, "AVR64DB48", {
+      .flash_base = 0x000000, .flash_size = 65536,
+      .sram_base = 0x804000, .sram_size = 8192,
+      .eeprom_base = 0x810000, .eeprom_size = 512,
+      .userrow_base = 0x850000, .userrow_size = 32,
+      .fuses_base = 0x820000, .fuses_size = 16,
+      .lock_base = 0x830000, .lock_size = 4,
+      .sigrow_base = 0x840000, .sigrow_size = 64
+    } },
+    { { 0x1E, 0x96, 0x16 }, "AVR64DB64", {
+      .flash_base = 0x000000, .flash_size = 65536,
+      .sram_base = 0x804000, .sram_size = 8192,
+      .eeprom_base = 0x810000, .eeprom_size = 512,
+      .userrow_base = 0x850000, .userrow_size = 32,
+      .fuses_base = 0x820000, .fuses_size = 16,
+      .lock_base = 0x830000, .lock_size = 4,
+      .sigrow_base = 0x840000, .sigrow_size = 64
+    } },
     /* AVR32DB */
-    { { 0x1E, 0x95, 0x3A }, "AVR32DB28"  },
-    { { 0x1E, 0x95, 0x39 }, "AVR32DB32"  },
-    { { 0x1E, 0x95, 0x38 }, "AVR32DB48"  },
+    { { 0x1E, 0x95, 0x3A }, "AVR32DB28", {
+      .flash_base = 0x000000, .flash_size = 32768,
+      .sram_base = 0x804000, .sram_size = 4096,
+      .eeprom_base = 0x810000, .eeprom_size = 512,
+      .userrow_base = 0x850000, .userrow_size = 32,
+      .fuses_base = 0x820000, .fuses_size = 16,
+      .lock_base = 0x830000, .lock_size = 4,
+      .sigrow_base = 0x840000, .sigrow_size = 64
+    } },
+    { { 0x1E, 0x95, 0x39 }, "AVR32DB32", {
+      .flash_base = 0x000000, .flash_size = 32768,
+      .sram_base = 0x804000, .sram_size = 4096,
+      .eeprom_base = 0x810000, .eeprom_size = 512,
+      .userrow_base = 0x850000, .userrow_size = 32,
+      .fuses_base = 0x820000, .fuses_size = 16,
+      .lock_base = 0x830000, .lock_size = 4,
+      .sigrow_base = 0x840000, .sigrow_size = 64
+    } },
+    { { 0x1E, 0x95, 0x38 }, "AVR32DB48", {
+      .flash_base = 0x000000, .flash_size = 32768,
+      .sram_base = 0x804000, .sram_size = 4096,
+      .eeprom_base = 0x810000, .eeprom_size = 512,
+      .userrow_base = 0x850000, .userrow_size = 32,
+      .fuses_base = 0x820000, .fuses_size = 16,
+      .lock_base = 0x830000, .lock_size = 4,
+      .sigrow_base = 0x840000, .sigrow_size = 64
+    } },
 };
 
-static const char *lookup_device_family(const uint8_t id[3])
+static const DeviceFamilyEntry *lookup_device_by_id(const uint8_t id[3])
 {
     for (size_t i = 0; i < sizeof(device_family)/sizeof(device_family[0]); i++) {
         if (device_family[i].id[0] == id[0] &&
             device_family[i].id[1] == id[1] &&
             device_family[i].id[2] == id[2])
-            return device_family[i].name;
+            return &device_family[i];
     }
-    return "unknown device";
+    return NULL;
 }
+
+static const DeviceFamilyEntry *lookup_device_by_name(const char *name)
+{
+    for (size_t i = 0; i < sizeof(device_family)/sizeof(device_family[0]); i++) {
+        if (strcasecmp(device_family[i].name, name) == 0)
+            return &device_family[i];
+    }
+    return NULL;
+}
+MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg);
+MAYBE_STATIC void event_loop(AppConfig *cfg, RspHandlers *h);
+MAYBE_STATIC int  load_segments(AppConfig *cfg, ElfContext *ctx);
+MAYBE_STATIC int  verify_segments(AppConfig *cfg, ElfContext *ctx);
+MAYBE_STATIC int  run_device_mode(AppConfig *cfg);
+MAYBE_STATIC int  run_prog_mode(AppConfig *cfg);
+MAYBE_STATIC void run_autobaud_probe(AppConfig *cfg);
+MAYBE_STATIC void sig_handler(int signo);
+MAYBE_STATIC void progress_render(const char *phase, const char *window,
+                                  unsigned page, unsigned total);
+MAYBE_STATIC void progress_finish(void);
 
 MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
 {
@@ -191,6 +396,8 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
     cfg->no_autobaud   = false;
     cfg->force_device  = NULL;
     cfg->allow_erase   = false;
+    cfg->log_rsp       = false;
+    cfg->no_fsm_threads = false;
     cfg->listen_fd     = -1;
     cfg->gdb_fd        = -1;
     cfg->updi_fd       = -1;
@@ -229,6 +436,10 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
             cfg->no_autobaud = true;
         } else if (strcmp(a, "--allow-erase") == 0) {
             cfg->allow_erase = true;
+        } else if (strcmp(a, "--log-rsp") == 0) {
+            cfg->log_rsp = true;
+        } else if (strcmp(a, "--no-fsm-threads") == 0) {
+            cfg->no_fsm_threads = true;
         } else if (a[0] == '-' && a[1] != '\0') {
             fprintf(stderr, "%s: unrecognised option '%s'\n", argv[0], a);
             usage(argv[0]);
@@ -366,6 +577,11 @@ MAYBE_STATIC void event_loop(AppConfig *cfg, RspHandlers *h)
                 fflush(stderr);
                 rsp_close(cfg->gdb_fd);
                 cfg->gdb_fd = -1;
+                /* Force fresh state for the next connection so a new client
+                 * doesn't inherit a stale halt reason (like a ghost breakpoint). */
+                if (h->ctx != NULL) {
+                    ((RspContext *)h->ctx)->last_stop_cause = 0;
+                }
             } else {
                 (void)rsp_dispatch_n(cfg->gdb_fd, pkt, (size_t)rc, h);
                 /* HLR-065 / LLR-RSP-43 / LLR-MAIN-22: drain any
@@ -377,6 +593,7 @@ MAYBE_STATIC void event_loop(AppConfig *cfg, RspHandlers *h)
                             rctx->disconnect_reason);
                     fflush(stderr);
                     rctx->disconnect_reason = NULL;
+                    rctx->last_stop_cause = 0;
                     /* If the handler did not close the socket itself
                      * (e.g. vKill replied OK and set quit_p but left
                      * gdb_fd open), close it now so we don't double-log
@@ -519,7 +736,8 @@ MAYBE_STATIC int run_device_mode(AppConfig *cfg)
     printf("Baud rate:       %d\n", cfg->baud_rate);
     printf("Signature:       %02X %02X %02X\n",
            info.device_id[0], info.device_id[1], info.device_id[2]);
-    printf("Family:          %s\n", lookup_device_family(info.device_id));
+    const DeviceFamilyEntry *e = lookup_device_by_id(info.device_id);
+    printf("Family:          %s\n", e ? e->name : "unknown device");
     {
         /* Datasheet §8.3.2.1: REVID MAJOR encoding 0x01=A, 0x02=B, ...   *
          * MINOR encoding 0x00=0, 0x01=1, ...                              */
@@ -1210,27 +1428,53 @@ int MAIN_NAME(int argc, char *argv[])
     (void)elf_find_avros_tables(&elf_ctx, &idx);
     (void)fsm_build_thread_list(&fsm_ctx, &idx, cfg.updi_fd);
 
+    UpdiDeviceInfo target_info;
+    bool target_info_valid = false;
+    if (updi_read_device_info(cfg.updi_fd, &target_info) == 0) {
+        target_info_valid = true;
+    }
+
+    const DeviceFamilyEntry *dev_match = NULL;
+    if (cfg.force_device != NULL) {
+        dev_match = lookup_device_by_name(cfg.force_device);
+    } else if (elf_ctx.device_name[0] != '\0') {
+        dev_match = lookup_device_by_name(elf_ctx.device_name);
+    }
+    if (dev_match == NULL && target_info_valid) {
+        dev_match = lookup_device_by_id(target_info.device_id);
+    }
+
+    DeviceMemoryLayout final_map;
+    if (dev_match) {
+        final_map = dev_match->map;
+    } else {
+        memset(&final_map, 0, sizeof final_map);
+        final_map.flash_base = 0;
+        final_map.flash_size = elf_ctx.flash_size;
+        final_map.sram_base  = elf_ctx.sram_base;
+        final_map.sram_size  = elf_ctx.sram_size;
+    }
+
     int g_thread = -1, c_thread = -1;
     RspContext rctx = {
         .updi_fd    = cfg.updi_fd,
         .gdb_fd_p   = &cfg.gdb_fd,
-        .fsm        = &fsm_ctx,
+        .fsm        = cfg.no_fsm_threads ? NULL : &fsm_ctx,
         .idx        = &idx,
         .g_thread_p = &g_thread,
         .c_thread_p = &c_thread,
         .quit_p     = &g_quit,
         .allow_erase = cfg.allow_erase ? 1 : 0,
         .bp_mode    = RSP_BP_MODE_SW,
-        /* HLR-063: feed the ELF-derived memory layout to the
+                /* HLR-063: feed the target-detected memory layout to the
          * qXfer:memory-map:read handler.  Zero values disable the
          * map advertisement entirely.                                */
-        .flash_size = elf_ctx.flash_size,
-        .sram_base  = elf_ctx.sram_base,
-        .sram_size  = elf_ctx.sram_size,
+        .map        = final_map,
     };
     RspHandlers handlers;
     rsp_default_handlers(&handlers, &rctx);
 
+    rsp_set_logging(cfg.log_rsp);
     event_loop(&cfg, &handlers);
 
     /* HLR-065 / LLR-MAIN-22: announce shutdown reason just before

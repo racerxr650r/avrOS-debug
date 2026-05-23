@@ -8,6 +8,10 @@
 
 Requirements in this section govern how `avrOSdb` is invoked, how it initialises its resources, and how quickly it becomes ready for a GDB connection.
 
+*   <a id="HLR-068"></a>**HLR-068: Detailed RSP Traffic Logging.**
+    The application shall accept a `--log-rsp` command line flag that enables detailed logging of all GDB Remote Serial Protocol requests and responses to `stderr`. It shall be parsed via `--log-rsp` and set an internal logging flag. When this flag is enabled, every RSP packet received from or sent to the GDB client shall be printed to `stderr` prefixed with `RSP &lt; ` or `RSP &gt; ` respectively.
+    *Trace:* [SDD Section 1.1](SDD.md), [SDD Section 3.2.2](SDD.md).
+
 *   <a id="HLR-001"></a>**HLR-001: CLI Argument Parsing.**
     The application shall accept the following command-line arguments: a required positional `<serial-device>` path, a required positional `<elf-file>` path, an optional `--port <port>` TCP port (default `1234`), an optional `--baud <baud>` UART baud rate (default `115200`), and an optional `--load` flag. Any unrecognised argument shall cause the application to print a usage message to `stderr` and exit with a non-zero status.
     *Trace:* [SDD Section 3.2.2](SDD.md).
@@ -89,11 +93,11 @@ Requirements in this section govern the GDB RSP server behaviour, covering packe
     *Trace:* [SDD Section 5.3.1](SDD.md).
 
 *   <a id="HLR-016"></a>**HLR-016: Breakpoints.**
-    The application shall implement code breakpoints by programming the two AVR-Dx OCD hardware comparators (`BP0`, `BP1`). Both `Z0` (software breakpoint) and `Z1` (hardware breakpoint) requests from GDB shall be routed to the same two hardware comparators, since installing the AVR `BREAK` opcode at runtime would require exiting OCD mode, entering NVMPROG (which resets the CPU and destroys live register/SREG/SP state), patching the FLASH page, and re-entering OCD — a sequence whose state-preservation cost outweighs the benefit on parts with only 32 KiB of FLASH per session. The shadow of the two comparator slots shall live in the RSP session context so that detach/reattach cycles leave silicon in a known state. Attempting to install a third breakpoint shall return GDB error reply `E08`; a duplicate insert at an already-installed address shall return `OK` without re-programming the comparator.
+    The application shall implement code breakpoints by programming the two AVR-Dx OCD hardware comparators (`BP0`, `BP1`). Both `Z0` (software breakpoint) and `Z1` (hardware breakpoint) requests from GDB shall be routed to hardware comparator `BP0`. Comparator `BP1` is reserved internally as a workaround for the AVR-Dx hardware 32-bit stepping errata. Installing the AVR `BREAK` opcode at runtime would require exiting OCD mode, entering NVMPROG (which resets the CPU and destroys live register/SREG/SP state), patching the FLASH page, and re-entering OCD — a sequence whose state-preservation cost outweighs the benefit on parts with only 32 KiB of FLASH per session. The shadow of the comparator slots shall live in the RSP session context so that detach/reattach cycles leave silicon in a known state. Attempting to install a second breakpoint shall return GDB error reply `E08`; a duplicate insert at an already-installed address shall return `OK` without re-programming the comparator.
     *Trace:* [SDD Section 4.3.1](SDD.md), [SDD Section 5.3.1](SDD.md).
 
 *   <a id="HLR-017"></a>**HLR-017: Single-Step Execution.**
-    The application shall respond to the GDB single-step (`s`/`S`) packet by executing exactly one AVR instruction on the target CPU via the UPDI step primitive and reporting the resulting stop reason.
+    The application shall respond to the GDB single-step (`s`/`S`) packet by executing exactly one AVR instruction on the target CPU and reporting the resulting stop reason. Due to the AVR-Dx hardware 32-bit stepping errata, if the instruction at the current PC is determined to be a 32-bit instruction (e.g. `CALL`, `JMP`, `LDS`, `STS`), the application shall bypass the native UPDI hardware stepper, calculate the target PC of the subsequent instruction, plant a temporary hardware breakpoint there, `RUN` the CPU, and await the halt. For 16-bit instructions, it shall use the native UPDI step primitive.
     *Trace:* [SDD Section 4.3.1](SDD.md), [SDD Section 5.3.1](SDD.md).
 
 *   <a id="HLR-018"></a>**HLR-018: Continue Execution.**

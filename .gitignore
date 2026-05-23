@@ -69,3 +69,6 @@ dist/
 tests/fixtures/*.elf
 core
 .vscode/
+
+# Temporary AI output directory
+AI-tmp/

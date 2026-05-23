@@ -390,6 +390,8 @@ int __wrap_rsp_accept(int listen_fd)
     return mk_rsp_accept_ret;
 }
 
+void rsp_set_logging(bool enabled) { (void)enabled; }
+
 void __wrap_rsp_close(int fd);
 void __wrap_rsp_close(int fd)
 {
@@ -942,6 +944,16 @@ static void test_parse_args_allow_erase_sets_flag(void)
 }
 
 /* HLR-055 / LLR-MAIN-21: --allow-erase defaults to false when absent. */
+
+static void test_parse_args_log_rsp_sets_flag(void)
+{
+    char *argv[] = { (char*)"prog", (char*)"--log-rsp", (char*)"/dev/x",
+                     (char*)"a.elf" };
+    AppConfig cfg;
+    parse_args(4, argv, &cfg);
+    TEST_ASSERT_TRUE(cfg.log_rsp);
+}
+
 static void test_parse_args_allow_erase_defaults_false(void)
 {
     char *argv[] = { (char*)"prog", (char*)"/dev/x", (char*)"a.elf" };
@@ -1154,6 +1166,7 @@ int main(void)
     RUN_TEST(test_parse_args_no_verify_sets_flag);
     RUN_TEST(test_parse_args_no_autobaud_sets_flag);
     RUN_TEST(test_parse_args_allow_erase_sets_flag);
+    RUN_TEST(test_parse_args_log_rsp_sets_flag);
     RUN_TEST(test_parse_args_allow_erase_defaults_false);
     RUN_TEST(test_load_segments_dispatches_eeprom_segment_to_eeprom_writer);
     RUN_TEST(test_load_segments_dispatches_fuses_segment_to_fuses_writer);

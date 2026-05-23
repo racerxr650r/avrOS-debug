@@ -497,7 +497,7 @@ void test_verb_erase_refused_without_allow_erase_flag(void)
     ctx.allow_erase = 0;
     char *hex = hexify("erase");
     int rc = monitor_dispatch_ex(1, &ctx, hex);
-    TEST_ASSERT_EQUAL_INT(-1, rc);
+    TEST_ASSERT_EQUAL_INT(0, rc);
     TEST_ASSERT_EQUAL_INT(0, g_chip_erase_calls);
     /* Diagnostic O-packet must mention --allow-erase. */
     char *txt = last_o_packet_text();

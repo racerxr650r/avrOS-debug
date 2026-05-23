@@ -1,51 +1,82 @@
 # avrOS-debug
 
-A UPDI-based GDB server that brings native avrOS state-machine awareness to standard IDEs (VS Code, Zed) for modern AVR DA/DB microcontrollers — no JTAG or ICE hardware required.
+A GDB server for debugging your code on the modern AVR-Dx family of processors. It brings native avrOS state-machine awareness to your IDE (VS Code, Zed) or simply debugs your bare metal application without avrOS. No specialized JTAG or ICE programmer is needed, only a standard USB-to-TTL serial adapter (if debugging from a PC) and a single 1kΩ resistor.
 
 ## Overview
 
-`avrOSdb` bridges the AVR UPDI debug interface to `avr-gdb` over the standard GDB Remote Serial Protocol, using only a USB-to-TTL serial adapter (or Raspberry Pi UART) and a 1kΩ resistor. It automatically parses your ELF to locate avrOS system tables in FLASH, maps them to live SRAM state, and presents each cooperative FSM as a virtual GDB thread — so active and suspended state machines, pending events, queues, and memory pools are all visible directly in your IDE's debugging UI.
+`avrOSdb` connects avr-gdb directly to the target hardware via the UPDI interface. It can read your project's ELF file to understand the `avrOS` tasks on the device and surfaces each cooperative state machine as a "virtual thread." This means your IDE's Call Stack now shows exactly which state machine is active, and you can inspect queues and events giving you unprecedented transparency into a avrOS application under debug. If you aren't using avrOS, it can act as a bare metal debugger for your AVR-Dx application as well.
 
 ## Key Features
 
-- **UPDI protocol bridging** — full physical-layer communication with AVR DA/DB targets over serial + 1kΩ resistor
-- **On-chip debug (OCD) run control** — run, halt, single-step, and register access are performed through the AVR-Dx OCD controller over UPDI; no flash patching of the `BREAK` opcode is needed for run-control, so NVM state is preserved across debug sessions
-- **Software breakpoints by default** — plain `Z0` packets install true SW breakpoints by patching the AVR `BREAK` opcode (`0x9598`) into FLASH via the NVM controller, with the original opcode shadowed for clean removal; up to 64 SW breakpoints can be live at once. Switch back to the legacy 2-slot HW comparator semantics with `monitor bp-mode hw-only`. `Z1` (`hbreak`) always uses a HW comparator.
-- **Data watchpoints** — `watch` / `rwatch` / `awatch` (`Z2` / `Z3` / `Z4`) are wired to the OCD DABP comparator
-- **GDB `load` over the wire** — `vFlashErase` / `vFlashWrite` / `vFlashDone` are advertised in `qSupported`, so `(gdb) load` reflashes the running target without re-launching the server
-- **Process control** — `(gdb) run`, `start`, and `kill` map to `vRun` / `vAttach` / `vKill` for a fresh reset + halt-at-entry flow
-- **avarice-compatible monitor verbs** — `monitor info`, `monitor flush`, `monitor reset`, `monitor halt`, `monitor erase` / `monitor chip-erase` (requires `--allow-erase`), and `monitor bp-mode {sw,hw-only}`
-- **Asynchronous interrupt** — Ctrl-C in GDB halts a running target via OCD STOP and reports `SIGINT` (`T02`)
-- **Clean detach** — `detach` releases all HW comparators in silicon and lets the CPU run free before closing the socket
-- **NVM programming** — `--load` programs every `PT_LOAD` segment of the ELF to the correct AVR-Dx NVM kind: FLASH (`.text`/`.data`), EEPROM, USERROW, FUSES, and LOCK. SIGROW segments are skipped (read-only). `--erase` performs a chip-erase prior to load, and is required when programming LOCK; `--allow-lock-updi` is required to write any LOCK pattern other than the unlock value `0x5CC5C55C` (every other 4-byte pattern risks permanently disabling UPDI).
-- **Link diagnostics** — `--device` performs a one-shot, non-destructive read of SIGROW signature and ASI status registers and exits without starting a listener
-- **Automatic family detection** — selects the correct AVR-Dx family memory map (USERROW / EEPROM / FUSES / LOCK / SIGROW windows) by SIGROW DEVICEID autodetect, then cross-checks against the lowercase part-name string in the `.note.gnu.avr.deviceinfo` ELF note (when avr-gcc + Microchip device packs embedded one) and aborts before any NVM write on ELF-vs-silicon mismatch. Pass `--force-device=<AVR-DA|AVR-DB|AVR-DD|AVR-DU|AVR-SD>` to override the autodetect and suppress the mismatch check.
-- **Harvard architecture translation** — automatic ELF parsing to resolve FLASH-resident avrOS tables to their SRAM status bytes
-- **FSM virtual threads** — cooperative state machines appear as native threads in the IDE Call Stack pane
-- **System introspection** — `monitor avros events`, `monitor avros queues`, and `monitor avros mempool` commands for non-intrusive polling via UPDI background reads
-- **Editor-agnostic** — works with any IDE that supports GDB RSP (VS Code via Cortex-Debug, Zed via DAP)
+- **No Dedicated Debugger Hardware** — Works via a simple serial adapter with a 1kΩ series resistor
+- **Multithreaded FSM View** — Cooperative state machines automatically appear as standard OS threads in the GDB/IDE interface
+- **Limitless Software Breakpoints** — Set up to 64 breakpoints directly in standard IDEs without worrying about hitting the AVR's 1-slot hardware comparator limit for normal stepping
+- **Frictionless Flashing** — Reflash your device via `(gdb) load` straight from the IDE without restarting the server
+- **Automatic Part Detection** — Automatically discovers your AVR-Dx memory map and blocks mismatched ELF flashing to protect your device
+- **Non-destructive Control** — Debugging control leaves standard NVM layout preserved across sessions
+- **VS Code Extension Ready** — Fully tested against the popular `Cortex-Debug` extension to connect seamlessly
+- **Clean Detach** — Stopping the debugger correctly releases the hardware and lets the microcontroller return to running free
 
 ## Platform Support
 
-- Linux (macOS is not supported in the initial release)
-- Targets: AVR-Dx family microcontrollers running avrOS
+- Host OS: Linux
+- Target Devices: AVR-Dx family microcontrollers (e.g. AVR-DA, AVR-DB) running bare metal or with avrOS
 
 ## Quick Start
 
 ```bash
-make                                          # builds build/avrOSdb
-build/avrOSdb /dev/ttyUSB0 firmware.elf  # start GDB server on :1234
-avr-gdb firmware.elf -ex 'target remote :1234'
+git clone https://github.com/racerxr650r/avrOS-debug
+cd avrOS-debug
+make al                              # Build avrOSdb
+make install                         # Install avrOSdb
+cd ${avrOS project directory}        # Go to your avrOS project          
+avrOSdb /dev/ttyUSB0 build/main.elf  # start GDB server on localhost:1234
 ```
 
-See the [User Manual](doc/UserManual.md) for wiring, full CLI reference,
-debugging walkthroughs (HW breakpoints, Ctrl-C, detach), VS Code
-integration, and troubleshooting.
+In VS Code (using the `Cortex-Debug` extension), set up your `launch.json`:
+```json
+// .vscode/launch.json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // Cortex-debug used as a *generic* GDB frontend
+      "type": "cortex-debug",
+      "request": "attach",
+      "servertype": "external",
+      "gdbTarget": "localhost:1234",
+      "gdbPath": "/usr/bin/avr-gdb",
+      "executable": "${workspaceFolder}/app/avrOS_example/build/main.elf",
+      "cwd": "${workspaceFolder}/app/avrOS_example",
+      "overrideAttachCommands": [
+        "target extended-remote localhost:1234",
+        "monitor reset",
+        "tbreak main",
+        "continue"
+      ],
+      "overrideRestartCommands": [
+        "monitor reset",
+        "tbreak main",
+        "continue"
+      ],
+      "showDevDebugOutput": "none",
+      "preLaunchCommands": [
+        "set breakpoint auto-hw off",
+        "set pagination off",
+        "set print pretty on",
+        "set remotetimeout 30",
+        "set mem inaccessible-by-default off"
+      ]
+    }
+  ]
+}```
 
 ## Documentation
 
-- [User Manual](doc/UserManual.md) — installation, wiring, CLI, debugging examples
-- [Software Design Document](doc/SDD.md) — architecture and module-level design
-- [High-Level Requirements](doc/HLRs.md) / [Low-Level Requirements](doc/LLRs.md)
-- [Software Test Plan](doc/STP.md) / [Traceability Matrix](doc/Traceability.md)
+For step-by-step wiring diagrams, complete CLI parameters, IDE integrations, and deeper technical specs, refer to our extended documentation:
+
+- [User Manual](doc/UserManual.md) — Installation, wiring, and full CLI reference.
+- [Software Design Document](doc/SDD.md)
+- [Requirements](doc/HLRs.md) & [Traceability](doc/Traceability.md)
+- [Software Test Plan](doc/STP.md)
 - [Product Vision](doc/PVD.md)

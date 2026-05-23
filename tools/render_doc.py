@@ -1651,7 +1651,7 @@ def main() -> int:
     output = output.rstrip("\n") + "\n"
 
     if args.out:
-        args.out.write_text(output)
+        args.out.write_text(output, encoding='utf-8')
     else:
         sys.stdout.write(output)
     return 0
