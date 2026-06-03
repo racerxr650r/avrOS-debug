@@ -242,6 +242,25 @@ PER_TEST_CMDS: dict[int, str] = {
          "bt\n"
          "info threads\n"
          "monitor avros tasks\n"),
+    # G15: HW-comparator arbiter (issue #45). A user hardware breakpoint
+    # occupies the single user comparator (slot 0); stepping over a 32-bit
+    # LDS uses the RESERVED comparator (slot 1), and the user hbreak must
+    # survive. 0x123c (just inside fsmDispatch) is `lds r24, 0x4670` (32-bit).
+    # fsmDispatch is hit by the hbreak, we step over its LDS, then continue
+    # must re-hit the hbreak on the next dispatch — so it fires >=2 times.
+    15: ("mem 0x0 0x20000 rw\nmem 0x804000 0x808000 rw\n"
+         "monitor reset\n"
+         "tbreak main\n"
+         "continue\n"
+         "hbreak fsmDispatch\n"          # user HW breakpoint -> slot 0
+         "continue\n"                    # hit fsmDispatch entry (#1)
+         "tbreak *0x123c\n"              # the 32-bit LDS inside fsmDispatch
+         "continue\n"                    # halt at the LDS (this invocation)
+         "x/i $pc\n"                     # confirm it is an lds
+         "stepi\n"                       # step OVER it (reserved slot 1)
+         "x/i $pc\n"
+         "continue\n"                    # next dispatch must re-hit the hbreak (#2)
+         "info registers pc\n"),
 }
 
 # Per-test wall-clock cap (s) when running `avr-gdb -batch`. G2 has to
@@ -260,6 +279,7 @@ PER_TEST_TIMEOUT: dict[int, float] = {
     12: 25.0,
     13: 20.0,
     14: 20.0,
+    15: 25.0,
 }
 
 def build_test_script(n: int, rsp_port: int) -> str:
@@ -446,6 +466,19 @@ def verdict_G13(sect: str) -> Tuple[str, str]:
         return "FAIL", f"PC unexpected after attach sequence: {pc}"
     return "PASS", ""
 
+def verdict_G15(sect: str) -> Tuple[str, str]:
+    # The single-step over the 32-bit LDS must use the reserved comparator
+    # and leave the user hbreak intact. The hbreak at fsmDispatch must fire
+    # both before the stepi (#1) and again on the next dispatch after it
+    # (#2): >= 2 hits proves it survived the LDS step. If the step had
+    # clobbered the user comparator, the final `continue` would not re-hit.
+    if "lds" not in sect.lower():
+        return "FAIL", "did not reach / disassemble the 32-bit LDS at 0x123c"
+    hits = len(re.findall(r"Breakpoint \d+,.*\bfsmDispatch\b", sect))
+    if hits < 2:
+        return "FAIL", f"hbreak at fsmDispatch fired {hits}x (<2): did not survive the LDS stepi"
+    return "PASS", ""
+
 def verdict_G14(sect: str) -> Tuple[str, str]:
     # Demote regression net (issue #42): bt must produce a clean backtrace
     # reaching main (avr-gdb must NOT crash on the FSM-aware session), info
@@ -489,6 +522,7 @@ VERDICTS = {
          verdict_G12),
     13: ("cortex-debug attach sequence reaches main", verdict_G13),
     14: ("demote: bt clean single-thread + avros tasks lists FSMs", verdict_G14),
+    15: ("HW-comparator arbiter: user hbreak survives a 32-bit LDS stepi", verdict_G15),
 }
 
 # ──────────────────────────────────────────────────────────────────────
@@ -558,12 +592,12 @@ def main() -> int:
         for n in sorted(VERDICTS):
             if n == 9:
                 desired_extra_args = ["--log-rsp", "--no-introspect"]
-            elif n in (10, 11, 12, 13, 14):
+            elif n in (10, 11, 12, 13, 14, 15):
                 desired_extra_args = ["--log-rsp", "--load"]
             else:
                 desired_extra_args = ["--log-rsp"]
-            desired_elf = args.g10_elf if n in (10, 11, 12, 13, 14) else args.elf
-            force_restart = (n in (11, 12, 13, 14))
+            desired_elf = args.g10_elf if n in (10, 11, 12, 13, 14, 15) else args.elf
+            force_restart = (n in (11, 12, 13, 14, 15))
             if (force_restart or desired_extra_args != current_extra_args or
                     desired_elf != current_elf):
                 kill_server(server)
