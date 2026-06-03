@@ -3186,7 +3186,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/gdb_rsp.c unit tests                                     -->
     <!-- ============================================================ -->
-    <file path="tests/test_rsp.c" role="unit" count="85">
+    <file path="tests/test_rsp.c" role="unit" count="86">
       <header><![CDATA[Unit tests for `src/gdb_rsp.c`: socket configuration, RSP packet framing, register and memory handlers, hardware-breakpoint comparator management, OCD-based execution control, async Ctrl-C interrupt, detach cleanup, session lifecycle packets, and monitor relay. Uses a `socketpair()` as a drop-in socket substitute and replaces every `updi_*`, `fsm_*`, and `monitor_dispatch` call site with `ld --wrap` mocks so all tests run without real silicon.]]></header>
 
       <test name="rsp_listen_sets_so_reuseaddr_before_bind">
@@ -3418,6 +3418,11 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
 
       <test name="qSupported_advertises_vRun_vAttach_vKill_no_multiprocess">
         <purpose><![CDATA[Dispatch `qSupported` and verify the reply does NOT contain `multiprocess+` (FSM threading is demoted to introspection; the live CPU is the sole GDB thread) and DOES contain `vRun+`, `vAttach+`, and `vKill+`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-26"/></traces>
+      </test>
+
+      <test name="captured_session_replay_holds_demote_invariants">
+        <purpose><![CDATA[Replay the demote-correctness invariants from a real captured GDB session (tests/fixtures/rsp/break_hit_bt.log, AVR128DA28 hardware: the monitor-reset/break/hit/bt/info-threads/monitor-avros-tasks sequence that previously crashed avr-gdb). Feed the captured GDB request packets through the server and assert: the qSupported reply omits multiprocess+ (keeps vRun+), qfThreadInfo replies l, qThreadExtraInfo,1 replies empty, and bare Hg0 is accepted. Proves FSM-as-GDB-threads cannot reappear, which is what makes bt safe. Per LLR-RSP-26.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-26"/></traces>
       </test>
 
