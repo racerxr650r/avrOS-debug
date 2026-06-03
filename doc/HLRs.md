@@ -85,7 +85,7 @@ Requirements in this section govern the GDB RSP server behaviour, covering packe
     *Trace:* [SDD Section 5.2.2](SDD.md).
 
 *   <a id="HLR-014"></a>**HLR-014: Register Read and Write.**
-    The application shall respond to GDB register read (`g`) and write (`G`, `P`) packets, returning or updating the current AVR CPU register state (32 general-purpose registers, PC, SP, and status register) obtained from or written to the target via the AVR-Dx OCD register file at UPDI base `0x0F80`. Reads against the active GDB thread (or against any thread when no FSM context is established) shall return live OCD values; reads against a non-active virtual FSM thread shall return the synthesized register frame from the FSM mapper.
+    The application shall respond to GDB register read (`g`) and write (`G`, `P`) packets, returning or updating the current AVR CPU register state (32 general-purpose registers, PC, SP, and status register) obtained from or written to the target via the AVR-Dx OCD register file at UPDI base `0x0F80`. All register reads shall return live OCD values: the live CPU is the sole GDB thread (avrOS FSM state is exposed via introspection, HLR-029 et seq., not as GDB threads).
     *Trace:* [SDD Section 5.3.1](SDD.md).
 
 *   <a id="HLR-015"></a>**HLR-015: Memory Read and Write.**
@@ -137,24 +137,12 @@ Requirements in this section govern how the server locates avrOS system tables i
 Requirements in this section govern how the server translates the avrOS cooperative scheduler state into GDB virtual threads visible in the IDE's call-stack and thread panes.
 
 *   <a id="HLR-024"></a>**HLR-024: FSM Thread Enumeration.**
-    Upon halting the target, the application shall read the avrOS FSM registration table from target SRAM via UPDI and present each registered FSM entry as a distinct GDB virtual thread, identified by a stable thread ID.
+    Upon halting the target, the application shall read the avrOS FSM registration table from target SRAM via UPDI into an internal snapshot (per-FSM name, active flag, and current-state function pointer). The snapshot is exposed to the developer through introspection commands (HLR-029 et seq.) and is NOT presented as GDB virtual threads — the live CPU is the sole GDB thread.
     *Trace:* [SDD Section 7.1](SDD.md), [SDD Section 7.3.1](SDD.md).
 
 *   <a id="HLR-025"></a>**HLR-025: Active Thread Identification.**
-    The application shall identify the currently executing avrOS FSM from the runtime state read via UPDI and report it to the GDB client as the active thread. All register reads and memory operations issued without an explicit thread context shall operate on the active thread's context.
+    The application shall identify the currently executing avrOS FSM from the runtime state read via UPDI and mark it as active in the introspection snapshot (HLR-024). All GDB register reads and memory operations target the single live-CPU thread; the active-FSM identification is surfaced via introspection, not as a GDB active-thread selection.
     *Trace:* [SDD Section 7.3.1](SDD.md).
-
-*   <a id="HLR-026"></a>**HLR-026: Virtual Thread Register Frame.**
-    Each virtual thread shall present a synthesized GDB register frame in which the program counter (PC) is set to the function pointer of the FSM's current state handler. For the active virtual thread, SP and SREG shall be read live from the target's hardware registers and inserted into the register frame. For all non-active virtual threads, SP and SREG shall be set to zero, as dormant FSMs do not maintain independent stacks in the avrOS cooperative scheduler model.
-    *Trace:* [SDD Section 7.1](SDD.md), [SDD Section 7.3.1](SDD.md).
-
-*   <a id="HLR-027"></a>**HLR-027: Complete FSM Thread Coverage.**
-    All FSMs registered in the avrOS FSM table shall appear as virtual threads in the GDB client thread pane upon halting at or after `main()`, up to a maximum of `FSM_MAX_THREADS` (32) entries. If more than `FSM_MAX_THREADS` FSMs are registered, the server shall silently cap the virtual thread list at 32 and log a diagnostic warning; no registered FSM within the cap shall be omitted.
-    *Trace:* [SDD Section 7.1](SDD.md), [SDD Section 7.3.1](SDD.md).
-
-*   <a id="HLR-028"></a>**HLR-028: Stack-Free Thread Model.**
-    The application shall not attempt to unwind stack frames for suspended FSMs. The execution context of a non-active virtual thread shall be defined solely by its state function pointer; the server shall never dereference a dormant stack pointer to infer thread state.
-    *Trace:* [SDD Section 2.2](SDD.md), [SDD Section 7.1](SDD.md).
 
 ## 6. System Introspection
 

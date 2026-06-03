@@ -182,8 +182,8 @@ Requirements for RSP packet framing, dispatch, GDB packet handlers, session life
 *   <a id="LLR-RSP-02"></a>**LLR-RSP-02** — `rsp_recv_packet()` shall scan incoming bytes discarding pre-packet ACK/NAK characters until a `$` delimiter is received. It shall accumulate the payload with a running XOR checksum until `#` is received, then compare the computed checksum against the two ASCII-hex checksum bytes that follow. On match it shall write `+` to the socket and return the payload length; on mismatch it shall write `-` and return -1.
     *Trace:* HLR-013 (RSP Server Accessibility).
 
-*   <a id="LLR-RSP-03"></a>**LLR-RSP-03** — The `on_read_regs` handler for the `g` packet shall produce a 78-character hex string in GDB's AVR register-block layout: R0-R31 at hex positions 0-63, SREG at 64-65, SPL at 66-67, SPH at 68-69, and PC as 4-byte little-endian byte-address at positions 70-77. Reads against the active virtual thread — or against any thread when the FSM mapper has not identified one (e.g. `--load` without `--device`) — shall use the live OCD register file via `updi_ocd_read_gpr()`, `updi_ocd_read_sreg()`, `updi_ocd_read_sp()`, and `updi_ocd_read_pc()`. Reads against a non-active virtual thread shall delegate to `fsm_get_registers()` for the synthesized FSM register frame.
-    *Trace:* HLR-014 (Register Read and Write), HLR-026 (Virtual Thread Register Frame).
+*   <a id="LLR-RSP-03"></a>**LLR-RSP-03** — The `on_read_regs` handler for the `g` packet shall produce a 78-character hex string in GDB's AVR register-block layout: R0-R31 at hex positions 0-63, SREG at 64-65, SPL at 66-67, SPH at 68-69, and PC as 4-byte little-endian byte-address at positions 70-77. All `g` reads shall use the live OCD register file via `updi_ocd_read_gpr()`, `updi_ocd_read_sreg()`, `updi_ocd_read_sp()`, and `updi_ocd_read_pc()` — the live CPU is the sole GDB thread.
+    *Trace:* HLR-014 (Register Read and Write).
 
 *   <a id="LLR-RSP-04"></a>**LLR-RSP-04** — The `on_write_regs` handler shall accept both the full-register `G<78 hex>` and single-register `P<n>=<hex>` packets and shall route each register slot to the matching OCD writer: `updi_ocd_write_gpr()` for registers 0..31, `updi_ocd_write_sreg()` for register 32, `updi_ocd_write_sp()` for register 33 (little-endian 16-bit), and `updi_ocd_write_pc()` for register 34 (little-endian 32-bit byte-address). On success the handler shall reply `OK`; on any OCD failure or hex parse error it shall reply `E01`.
     *Trace:* HLR-014 (Register Read and Write).
@@ -340,20 +340,8 @@ Requirements for `fsm_build_thread_list()`, `fsm_invalidate()`, `fsm_get_active_
 *   <a id="LLR-FSM-01"></a>**LLR-FSM-01** — `fsm_build_thread_list()` shall read `idx->fsm_table_count` consecutive 9-byte `fsmStateMachineDescr_t` records from the FLASH address `idx->fsm_table_addr` via `updi_mem_read()`. Each descriptor carries a 2-byte `name` pointer (FLASH), a 2-byte `stateMachine` pointer (SRAM, or NULL for an initializer slot that shall be skipped), a 2-byte `handler` function pointer, a 1-byte `priority`, and a 2-byte `instance`. For each non-NULL `stateMachine` pointer, the function shall read 2 bytes from `stateMachine + 9` (the `currState` field of `fsmStateMachine_t`) to obtain the current state function pointer and store it in `thread->state_fn`. A UPDI read failure at any point shall cause the function to return -1.
     *Trace:* HLR-024 (FSM Thread Enumeration).
 
-*   <a id="LLR-FSM-02"></a>**LLR-FSM-02** — `fsm_build_thread_list()` shall assign `thread->gdb_id = loop_index + 1` (1-based) to each FSM entry in the order the entries appear in the FLASH table. Thread IDs shall not be reassigned within a debug session, ensuring the same FSM always maps to the same GDB thread ID.
-    *Trace:* HLR-024 (FSM Thread Enumeration).
-
-*   <a id="LLR-FSM-03"></a>**LLR-FSM-03** — `fsm_build_thread_list()` shall read the 2-byte SRAM value at `idx->current_fsm_addr` (avrOS `currStateMachine`) and compare it against each retained FSM entry's `stateMachine` pointer. The matching entry shall have `thread->is_active = true` and its `gdb_id` stored in `ctx->active_id`. If no entry matches, `ctx->active_id` shall be set to 0.
+*   <a id="LLR-FSM-03"></a>**LLR-FSM-03** — `fsm_build_thread_list()` shall read the 2-byte SRAM value at `idx->current_fsm_addr` (avrOS `currStateMachine`) and compare it against each retained FSM entry's `stateMachine` pointer. The matching entry shall have `thread->is_active = true` and its identifier stored in `ctx->active_id`. If no entry matches, `ctx->active_id` shall be set to 0.
     *Trace:* HLR-025 (Active Thread Identification).
-
-*   <a id="LLR-FSM-04"></a>**LLR-FSM-04** — `fsm_get_registers()` shall set the PC field (GDB register index 35, 4-byte little-endian at hex positions 70–77 of the 78-character g-packet buffer) to `thread->state_fn`. For non-active threads, R0–R31 (indices 0–31) and SREG (index 32) shall be zero-filled, and SPL (index 33) and SPH (index 34) shall be set to zero. For the active thread, SREG (index 32, hex positions 64–65), SPL (index 33, hex positions 66–67), and SPH (index 34, hex positions 68–69) shall be read from the target SRAM via `updi_mem_read()`.
-    *Trace:* HLR-026 (Virtual Thread Register Frame).
-
-*   <a id="LLR-FSM-05"></a>**LLR-FSM-05** — `fsm_build_thread_list()` shall process at most `FSM_MAX_THREADS` (32) entries from the FSM registration table regardless of `idx->fsm_table_count`. If `idx->fsm_table_count` exceeds `FSM_MAX_THREADS`, the function shall log a diagnostic warning and return `FSM_MAX_THREADS` as the thread count without returning an error to the GDB client.
-    *Trace:* HLR-027 (Complete FSM Thread Coverage).
-
-*   <a id="LLR-FSM-06"></a>**LLR-FSM-06** — `fsm_get_registers()` shall not issue any UPDI memory read targeting a non-active thread's stack region. The suspended FSM register frame shall be constructed entirely from the cached `thread->state_fn` value; the SP field shall be zeroed for non-active threads.
-    *Trace:* HLR-028 (Stack-Free Thread Model).
 
 ## 7. src/monitor.c — avrOS System Introspection
 
