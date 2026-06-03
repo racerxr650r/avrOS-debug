@@ -39,6 +39,7 @@ typedef struct { uint32_t addr; size_t len; uint8_t data[64]; } MockMemOp;
 /* Generic call counters. */
 static int mock_run_calls;
 static int mock_step_calls;
+static int mock_step_32bit_calls;
 static int mock_invalidate_calls;
 static int mock_halt_calls;
 static int mock_build_calls;
@@ -117,6 +118,13 @@ static int mock_ocd_poll_script_len;
 static int mock_ocd_poll_script_idx;
 static int mock_ocd_poll_default = 0; /* default → halt on first poll */
 static int mock_ocd_poll_calls;
+static int      mock_pc_stabilize_calls;
+static int      mock_step_32bit_slot;
+static uint32_t mock_step_32bit_target_pc;
+static int      mock_step_32bit_halt_on_jump;
+static int      mock_emul_cof_calls;
+static uint32_t mock_emul_cof_return_pc;
+static uint32_t mock_emul_cof_target_pc;
 
 /* ── --wrap stubs ───────────────────────────────────────────────────── */
 
@@ -187,6 +195,35 @@ int __wrap_updi_run (int fd)        { (void)fd; ++mock_run_calls;  log_event(EV_
  * mock_ocd_pc untouched (preserves pre-existing test expectations). */
 static uint32_t mock_step_pc_delta;
 int __wrap_updi_step(int fd)        { (void)fd; ++mock_step_calls; mock_ocd_pc += mock_step_pc_delta; log_event(EV_STEP); return 0; }
+int __wrap_updi_step_32bit(int fd, int bp_slot,
+                           uint32_t target_pc, bool halt_on_jump)
+{
+    (void)fd;
+    ++mock_step_32bit_calls;
+    mock_step_32bit_slot = bp_slot;
+    mock_step_32bit_target_pc = target_pc;
+    mock_step_32bit_halt_on_jump = halt_on_jump ? 1 : 0;
+    mock_ocd_pc = target_pc;
+    log_event(EV_STEP);
+    return 0;
+}
+int __wrap_updi_ocd_stabilize_pc_after_write(int fd)
+{
+    (void)fd;
+    ++mock_pc_stabilize_calls;
+    return 0;
+}
+int __wrap_updi_ocd_emulate_cof_32bit(int fd, uint32_t return_pc,
+                                      uint32_t target_pc)
+{
+    (void)fd;
+    ++mock_emul_cof_calls;
+    mock_emul_cof_return_pc = return_pc;
+    mock_emul_cof_target_pc = target_pc;
+    mock_ocd_pc = target_pc;
+    log_event(EV_STEP);
+    return 0;
+}
 int __wrap_updi_console_poll(int u, int r) { (void)u; (void)r; return 0; }
 int __wrap_updi_enter_debug(int fd) { (void)fd; return 0; }
 int __wrap_updi_chip_erase(int fd) { (void)fd; return 0; }
@@ -361,6 +398,9 @@ static size_t drain(int fd, char *buf, size_t cap)
     return off;
 }
 
+static void dispatch_and_capture(RspHandlers *h, const char *pkt,
+                                 char *payload, size_t cap);
+
 static int last_packet_payload(const char *stream, char *payload, size_t cap)
 {
     const char *last_dollar = NULL;
@@ -383,9 +423,17 @@ static int event_index(MockEvent e)
 
 static void reset_mocks(void)
 {
-    mock_run_calls = mock_step_calls = mock_invalidate_calls = 0;
+    mock_run_calls = mock_step_calls = mock_step_32bit_calls = 0;
+    mock_invalidate_calls = 0;
     mock_halt_calls = mock_build_calls = 0;
     mock_step_pc_delta = 0;
+    mock_pc_stabilize_calls = 0;
+    mock_step_32bit_slot = -1;
+    mock_step_32bit_target_pc = 0;
+    mock_step_32bit_halt_on_jump = 0;
+    mock_emul_cof_calls = 0;
+    mock_emul_cof_return_pc = 0;
+    mock_emul_cof_target_pc = 0;
     mock_write_count = mock_flash_write_count = mock_read_count = 0;
     mock_flash_patch_count = 0;
     memset(mock_writes, 0, sizeof mock_writes);
@@ -397,7 +445,7 @@ static void reset_mocks(void)
     mock_monitor_rc = 0;
     mock_monitor_calls = 0;
     memset(mock_monitor_last_body, 0, sizeof mock_monitor_last_body);
-    mock_active_thread = 1;
+    mock_active_thread = FSM_SYSTEM_THREAD_ID;
     mock_get_regs_last_tid = 0;
     memset(mock_ocd_gpr, 0, sizeof mock_ocd_gpr);
     mock_ocd_sreg = 0; mock_ocd_sp = 0; mock_ocd_pc = 0;
@@ -413,7 +461,7 @@ static void reset_mocks(void)
     memset(&fake_fsm, 0, sizeof fake_fsm);
     fake_fsm.valid = true;
     fake_fsm.thread_count = 1;
-    fake_fsm.threads[0].gdb_id = 1;
+    fake_fsm.threads[0].gdb_id = FSM_FIRST_PSEUDO_THREAD_ID;
     strcpy(fake_fsm.threads[0].name, "FSM_A");
     fake_fsm.threads[0].is_active = true;
     rsp_set_noack(false);
@@ -559,6 +607,26 @@ static void on_read_regs_non_active_thread_uses_fsm_register_frame(void)
     rsp_dispatch(sock_pair[1], "g", &h);
     TEST_ASSERT_EQUAL(2, mock_get_regs_last_tid);
     TEST_ASSERT_EQUAL(0, mock_ocd_gpr_reads_active);
+}
+
+static void on_read_regs_selected_pseudothread_stays_synthetic_when_active_unknown(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    fake_fsm.thread_count = 2;
+    fake_fsm.threads[1].gdb_id = 2;
+    strcpy(fake_fsm.threads[1].name, "B");
+    mock_active_thread = 0;
+
+    rsp_dispatch(sock_pair[1], "Hgpa410.2", &h);
+    char drain1[64]; drain(sock_pair[0], drain1, sizeof drain1);
+
+    rsp_dispatch(sock_pair[1], "g", &h);
+    char stream[256]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[256];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL(2, mock_get_regs_last_tid);
+    TEST_ASSERT_EQUAL(0, mock_ocd_gpr_reads_active);
+    TEST_ASSERT_EQUAL_STRING_LEN("efbeadde", payload + 70, 8);
 }
 
 /* ── LLR-RSP-04: `G` / `P` ──────────────────────────────────────────── */
@@ -731,10 +799,55 @@ static void on_step_s_calls_updi_step_and_sends_T05_stop_reason(void)
     mock_ocd_status1 = 0x00; /* not EXTBRK */
     rsp_dispatch(sock_pair[1], "s", &h);
     TEST_ASSERT_EQUAL(1, mock_step_calls);
+    TEST_ASSERT_EQUAL(0, mock_step_32bit_calls);
     char stream[64]; drain(sock_pair[0], stream, sizeof stream);
     char payload[64];
     TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
     TEST_ASSERT_EQUAL(0, strncmp(payload, "T05thread:", 10));
+}
+
+static void on_step_s_uses_32bit_breakpoint_workaround_for_call(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    mock_ocd_status1 = 0x00;
+    mock_ocd_pc = 0x3f0u;
+    mock_read_canned_len = 4;
+    mock_read_canned[0] = 0x0e;
+    mock_read_canned[1] = 0x94;
+    mock_read_canned[2] = 0x1c;
+    mock_read_canned[3] = 0x09;
+
+    rsp_dispatch(sock_pair[1], "s", &h);
+
+    /* HLR-062 / issue #40: direct 32-bit CALL is emulated via OCD
+     * (push return addr + write OCD.PC), not stepped via HW-BP, to
+     * work around the AVR-Dx HW-BP-not-firing-on-first-CoF bug.    */
+    TEST_ASSERT_EQUAL(0, mock_step_calls);
+    TEST_ASSERT_EQUAL(0, mock_step_32bit_calls);
+    TEST_ASSERT_EQUAL(1, mock_emul_cof_calls);
+    TEST_ASSERT_EQUAL_HEX32(0x3f4u,   mock_emul_cof_return_pc); /* PC+4 */
+    TEST_ASSERT_EQUAL_HEX32(0x1238u,  mock_emul_cof_target_pc);
+
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL(0, strncmp(payload, "T05thread:", 10));
+}
+
+static void z0_in_sw_mode_stabilizes_pc_after_restore(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    int stabilize_before_remove;
+    mock_read_canned_len = 2;
+    mock_read_canned[0] = 0xCD;
+    mock_read_canned[1] = 0xAB;
+
+    rsp_dispatch(sock_pair[1], "Z0,200,2", &h);
+    char drain_buf[128]; drain(sock_pair[0], drain_buf, sizeof drain_buf);
+    stabilize_before_remove = mock_pc_stabilize_calls;
+
+    rsp_dispatch(sock_pair[1], "z0,200,2", &h);
+    TEST_ASSERT_EQUAL(stabilize_before_remove + 1, mock_pc_stabilize_calls);
 }
 
 /* ── LLR-RSP-11: continue ───────────────────────────────────────────── */
@@ -792,6 +905,51 @@ static void on_continue_returns_E01_after_UPDI_FAIL_MAX_consecutive_poll_failure
     TEST_ASSERT_EQUAL_STRING("E01", payload);
     TEST_ASSERT_EQUAL(8, mock_ocd_poll_calls);
     TEST_ASSERT_GREATER_OR_EQUAL(1, mock_halt_calls); /* defensive halt */
+}
+
+/* HLR-062 / issue #40: a `continue` issued while the PC sits on a direct
+ * 32-bit CALL must emulate that change-of-flow over OCD (push return addr
+ * + write OCD.PC) before the free-run, otherwise the AVR-Dx OCD "first
+ * CoF after RUN" quirk runs straight through the callee and skips every
+ * breakpoint inside it.                                                  */
+static void on_continue_emulates_leading_32bit_call_before_run(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    mock_ocd_poll_default = 0;       /* halt on first poll after RUN */
+    mock_ocd_pc = 0x3f0u;            /* PC parked on `call` */
+    mock_read_canned_len = 4;
+    mock_read_canned[0] = 0x0e;      /* CALL 0x1238 (32-bit) */
+    mock_read_canned[1] = 0x94;
+    mock_read_canned[2] = 0x1c;
+    mock_read_canned[3] = 0x09;
+
+    rsp_dispatch(sock_pair[1], "c", &h);
+
+    TEST_ASSERT_EQUAL(1, mock_emul_cof_calls);
+    TEST_ASSERT_EQUAL_HEX32(0x3f4u,  mock_emul_cof_return_pc);  /* PC+4 */
+    TEST_ASSERT_EQUAL_HEX32(0x1238u, mock_emul_cof_target_pc);
+    TEST_ASSERT_EQUAL(1, mock_run_calls);                       /* still free-runs */
+    /* Emulation must precede the free-run. */
+    TEST_ASSERT_TRUE(event_index(EV_STEP) < event_index(EV_RUN));
+}
+
+/* A plain `continue` parked on a non-change-of-flow instruction must NOT
+ * emulate anything and must free-run directly.                          */
+static void on_continue_does_not_emulate_when_pc_not_on_cof(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    mock_ocd_poll_default = 0;
+    mock_ocd_pc = 0x400u;
+    mock_read_canned_len = 4;
+    mock_read_canned[0] = 0x08;      /* SEC (0x9408) — not a CoF */
+    mock_read_canned[1] = 0x94;
+    mock_read_canned[2] = 0x00;
+    mock_read_canned[3] = 0x00;
+
+    rsp_dispatch(sock_pair[1], "c", &h);
+
+    TEST_ASSERT_EQUAL(0, mock_emul_cof_calls);
+    TEST_ASSERT_EQUAL(1, mock_run_calls);
 }
 
 /* ── LLR-RSP-17: ? / halt reason ────────────────────────────────────── */
@@ -942,14 +1100,14 @@ static void H_packet_stores_thread_id_for_register_operations(void)
     TEST_ASSERT_EQUAL(3, mock_get_regs_last_tid);
 }
 
-static void H_packet_minus1_and_0_both_map_to_active_fsm_thread(void)
+static void H_packet_minus1_and_0_both_map_to_system_thread(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
     mock_active_thread = 7;
     rsp_dispatch(sock_pair[1], "Hg-1", &h);
-    TEST_ASSERT_EQUAL(7, g_tid_var);
+    TEST_ASSERT_EQUAL(FSM_SYSTEM_THREAD_ID, g_tid_var);
     rsp_dispatch(sock_pair[1], "Hg0", &h);
-    TEST_ASSERT_EQUAL(7, g_tid_var);
+    TEST_ASSERT_EQUAL(FSM_SYSTEM_THREAD_ID, g_tid_var);
 }
 
 /* ── LLR-RSP-19: qC ─────────────────────────────────────────────────── */
@@ -999,7 +1157,7 @@ static void T_packet_returns_OK_for_live_thread(void)
     fake_fsm.thread_count = 2;
     fake_fsm.threads[0].gdb_id = 1;
     fake_fsm.threads[1].gdb_id = 3;
-    rsp_dispatch(sock_pair[1], "T3", &h);
+    rsp_dispatch(sock_pair[1], "T1", &h);
     char stream[64]; drain(sock_pair[0], stream, sizeof stream);
     char payload[64];
     TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
@@ -1236,6 +1394,28 @@ static void vCont_range_step_returns_immediately_when_pc_already_outside(void)
     char payload[64];
     TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
     TEST_ASSERT_EQUAL(0, strncmp(payload, "T05thread:", 10));
+}
+
+static void stop_reply_resets_selected_register_thread_to_system(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    fake_fsm.thread_count = 2;
+    fake_fsm.threads[0].gdb_id = 2; strcpy(fake_fsm.threads[0].name, "B");
+    fake_fsm.threads[1].gdb_id = 3; strcpy(fake_fsm.threads[1].name, "C");
+
+    char p[128];
+    dispatch_and_capture(&h, "Hgpa410.3", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+    TEST_ASSERT_EQUAL(3, g_tid_var);
+
+    mock_ocd_pc = 0x00c6u;
+    dispatch_and_capture(&h, "?", p, sizeof p);
+    TEST_ASSERT_EQUAL(1, g_tid_var);
+    TEST_ASSERT_EQUAL(1, c_tid_var);
+
+    dispatch_and_capture(&h, "g", p, sizeof p);
+    TEST_ASSERT_EQUAL(0, mock_get_regs_last_tid);
+    TEST_ASSERT_EQUAL_STRING_LEN("c6000000", p + 70, 8);
 }
 
 static void vCont_range_step_emits_T02_on_ctrl_c(void)
@@ -1809,18 +1989,18 @@ static void parse_mp_thread_id_accepts_legacy_and_multiprocess_forms(void)
     TEST_ASSERT_EQUAL_STRING("OK", p);
     TEST_ASSERT_EQUAL(5, g_tid_var);
 
-    /* Any-thread shorthand → resolves to active thread (mock = 1). */
+    /* Any-thread shorthand resolves to the System thread. */
     dispatch_and_capture(&h, "Hgp0.0", p, sizeof p);
     TEST_ASSERT_EQUAL_STRING("OK", p);
-    TEST_ASSERT_EQUAL(1, g_tid_var);
+    TEST_ASSERT_EQUAL(FSM_SYSTEM_THREAD_ID, g_tid_var);
 
     dispatch_and_capture(&h, "Hgp-1.-1", p, sizeof p);
     TEST_ASSERT_EQUAL_STRING("OK", p);
-    TEST_ASSERT_EQUAL(1, g_tid_var);
+    TEST_ASSERT_EQUAL(FSM_SYSTEM_THREAD_ID, g_tid_var);
 
     dispatch_and_capture(&h, "Hg-1", p, sizeof p);
     TEST_ASSERT_EQUAL_STRING("OK", p);
-    TEST_ASSERT_EQUAL(1, g_tid_var);
+    TEST_ASSERT_EQUAL(FSM_SYSTEM_THREAD_ID, g_tid_var);
 
     /* Malformed forms reply E01. */
     dispatch_and_capture(&h, "Hgp", p, sizeof p);
@@ -1868,11 +2048,11 @@ static void Hc_accepts_multiprocess_thread_id_form(void)
 
     dispatch_and_capture(&h, "Hcp-1.-1", p, sizeof p);
     TEST_ASSERT_EQUAL_STRING("OK", p);
-    TEST_ASSERT_EQUAL(mock_active_thread, c_tid_var);
+    TEST_ASSERT_EQUAL(FSM_SYSTEM_THREAD_ID, c_tid_var);
 
     dispatch_and_capture(&h, "Hc-1", p, sizeof p);
     TEST_ASSERT_EQUAL_STRING("OK", p);
-    TEST_ASSERT_EQUAL(mock_active_thread, c_tid_var);
+    TEST_ASSERT_EQUAL(FSM_SYSTEM_THREAD_ID, c_tid_var);
 }
 
 /* D14 — T<tid> accepts multiprocess form per LLR-RSP-41. */
@@ -1903,10 +2083,10 @@ static void qThreadExtraInfo_returns_FSM_label_with_state_and_active_flag(void)
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
     fake_fsm.thread_count = 2;
     strcpy(fake_fsm.threads[0].name, "sched");
-    fake_fsm.threads[0].gdb_id = 1;
+    fake_fsm.threads[0].gdb_id = 2;
     fake_fsm.threads[0].state_fn = 0x0140u;
     fake_fsm.threads[0].is_active = true;
-    fake_fsm.threads[1].gdb_id = 2;
+    fake_fsm.threads[1].gdb_id = 3;
     strcpy(fake_fsm.threads[1].name, "blinker");
     fake_fsm.threads[1].state_fn = 0x01A4u;
     fake_fsm.threads[1].is_active = false;
@@ -1915,9 +2095,13 @@ static void qThreadExtraInfo_returns_FSM_label_with_state_and_active_flag(void)
 
     dispatch_and_capture(&h, "qThreadExtraInfo,pa410.1", p, sizeof p);
     hex_decode(p, txt, sizeof txt);
-    TEST_ASSERT_EQUAL_STRING("FSM sched [active] state=0x0140", txt);
+    TEST_ASSERT_EQUAL_STRING("System [live CPU]", txt);
 
     dispatch_and_capture(&h, "qThreadExtraInfo,pa410.2", p, sizeof p);
+    hex_decode(p, txt, sizeof txt);
+    TEST_ASSERT_EQUAL_STRING("FSM sched [active] state=0x0140", txt);
+
+    dispatch_and_capture(&h, "qThreadExtraInfo,pa410.3", p, sizeof p);
     hex_decode(p, txt, sizeof txt);
     TEST_ASSERT_EQUAL_STRING("FSM blinker [quiescent] state=0x01a4", txt);
 }
@@ -1938,6 +2122,60 @@ static void qThreadExtraInfo_unknown_tid_replies_empty_packet(void)
     TEST_ASSERT_EQUAL_STRING("", p);
 }
 
+/* D17 — qfThreadInfo falls back to `l` when no FSM context exists. */
+static void qfThreadInfo_without_fsm_context_replies_l(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    ctx.fsm = NULL;
+    char p[32];
+
+    dispatch_and_capture(&h, "qfThreadInfo", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("l", p);
+}
+
+/* D18 — replay the Cortex-Debug post-reset sequence from test.log:
+ * the frontend keeps asking about pa410.2 after reset, so the server
+ * must rebuild the FSM cache before replying to qfThreadInfo and
+ * qThreadExtraInfo, and `g` must keep returning thread 2's synthetic
+ * FSM register frame rather than the live reset-vector CPU frame. */
+static void cortex_debug_post_reset_sequence_keeps_pa410_2_visible(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    fake_fsm.thread_count = 1;
+    fake_fsm.threads[0].gdb_id = 2;
+    strcpy(fake_fsm.threads[0].name, "blinker");
+    fake_fsm.threads[0].state_fn = 0x01A4u;
+    fake_fsm.threads[0].is_active = false;
+
+    char p[256], txt[128];
+
+    dispatch_and_capture(&h, "Hgpa410.2", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("OK", p);
+
+    dispatch_and_capture(&h, "g", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING_LEN("efbeadde", p + 70, 8);
+    TEST_ASSERT_EQUAL(2, mock_get_regs_last_tid);
+    TEST_ASSERT_EQUAL(0, mock_ocd_gpr_reads_active);
+
+    /* Post-reset state from the latest Cortex-Debug log: cache
+     * invalidated before the frontend re-queries pa410.2. */
+    fake_fsm.valid = false;
+    mock_active_thread = 0;
+
+    dispatch_and_capture(&h, "qfThreadInfo", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING("m1,2", p);
+
+    dispatch_and_capture(&h, "qThreadExtraInfo,pa410.2", p, sizeof p);
+    TEST_ASSERT_TRUE(strlen(p) > 0u);
+    hex_decode(p, txt, sizeof txt);
+    TEST_ASSERT_EQUAL_STRING("FSM blinker [quiescent] state=0x01a4", txt);
+
+    dispatch_and_capture(&h, "g", p, sizeof p);
+    TEST_ASSERT_EQUAL_STRING_LEN("efbeadde", p + 70, 8);
+    TEST_ASSERT_EQUAL(2, mock_get_regs_last_tid);
+    TEST_ASSERT_EQUAL(0, mock_ocd_gpr_reads_active);
+}
+
 /* ── Runner ─────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -1951,6 +2189,7 @@ int main(void)
     RUN_TEST(on_read_regs_g_returns_78_char_hex_string);
     RUN_TEST(on_read_regs_g_places_pc_little_endian_at_positions_70_77);
     RUN_TEST(on_read_regs_non_active_thread_uses_fsm_register_frame);
+    RUN_TEST(on_read_regs_selected_pseudothread_stays_synthetic_when_active_unknown);
     RUN_TEST(on_write_regs_G_writes_all_registers_via_ocd);
     RUN_TEST(on_write_regs_P_writes_single_register_via_ocd);
     RUN_TEST(on_read_mem_m_calls_updi_mem_read_and_returns_hex);
@@ -1963,10 +2202,13 @@ int main(void)
     RUN_TEST(on_remove_bp_unknown_address_returns_ok_for_resync);
     RUN_TEST(on_insert_bp_returns_E08_when_slot_occupied);
     RUN_TEST(on_step_s_calls_updi_step_and_sends_T05_stop_reason);
+    RUN_TEST(on_step_s_uses_32bit_breakpoint_workaround_for_call);
     RUN_TEST(on_continue_calls_updi_run_then_fsm_invalidate);
     RUN_TEST(on_continue_rebuilds_thread_list_after_halt_and_sends_stop);
     RUN_TEST(on_continue_ctrl_c_returns_T02);
     RUN_TEST(on_continue_returns_E01_after_UPDI_FAIL_MAX_consecutive_poll_failures);
+    RUN_TEST(on_continue_emulates_leading_32bit_call_before_run);
+    RUN_TEST(on_continue_does_not_emulate_when_pc_not_on_cof);
     RUN_TEST(on_halt_reason_returns_T02_when_extbrk_set);
     RUN_TEST(rsp_dispatch_qsupported_returns_feature_string_no_target_access);
     RUN_TEST(rsp_dispatch_qattached_returns_1_no_target_access);
@@ -1977,7 +2219,7 @@ int main(void)
     RUN_TEST(on_monitor_returns_ok_when_monitor_dispatch_succeeds);
     RUN_TEST(on_monitor_sends_o_packet_error_on_updi_failure);
     RUN_TEST(H_packet_stores_thread_id_for_register_operations);
-    RUN_TEST(H_packet_minus1_and_0_both_map_to_active_fsm_thread);
+    RUN_TEST(H_packet_minus1_and_0_both_map_to_system_thread);
     RUN_TEST(qC_returns_QC0_when_no_c_thread_selected);
     RUN_TEST(qC_returns_selected_c_thread_in_hex);
     RUN_TEST(qOffsets_returns_text_data_bss_all_zero);
@@ -1993,6 +2235,7 @@ int main(void)
     RUN_TEST(continue_emits_swbreak_when_pc_matches_sw_bp_shadow);
     RUN_TEST(continue_emits_hwbreak_when_pc_matches_hw_bp_shadow);
     RUN_TEST(continue_emits_bare_T05_when_pc_matches_no_breakpoint);
+    RUN_TEST(stop_reply_resets_selected_register_thread_to_system);
     RUN_TEST(vCont_probe_advertises_range_step);
     RUN_TEST(vCont_range_step_steps_until_pc_leaves_range);
     RUN_TEST(vCont_range_step_returns_immediately_when_pc_already_outside);
@@ -2021,6 +2264,7 @@ int main(void)
     RUN_TEST(Z0_in_sw_mode_patches_BREAK_opcode_via_flash_patch);
     RUN_TEST(Z0_in_sw_mode_records_original_opcode_from_flash);
     RUN_TEST(z0_in_sw_mode_restores_original_opcode);
+    RUN_TEST(z0_in_sw_mode_stabilizes_pc_after_restore);
     RUN_TEST(Z0_in_sw_mode_refuses_data_space_address_with_E22);
     RUN_TEST(Z0_in_sw_mode_snapshots_and_restores_cpu_state);
     RUN_TEST(Z0_in_hw_only_mode_falls_back_to_HW_BP_path);
@@ -2033,5 +2277,7 @@ int main(void)
     RUN_TEST(T_thread_alive_accepts_multiprocess_form);
     RUN_TEST(qThreadExtraInfo_returns_FSM_label_with_state_and_active_flag);
     RUN_TEST(qThreadExtraInfo_unknown_tid_replies_empty_packet);
+    RUN_TEST(qfThreadInfo_without_fsm_context_replies_l);
+    RUN_TEST(cortex_debug_post_reset_sequence_keeps_pa410_2_visible);
     return UNITY_END();
 }

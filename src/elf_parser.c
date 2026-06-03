@@ -371,6 +371,13 @@ int elf_find_avros_tables(ElfContext *ctx, AvrOsSymbolIndex *idx)
     return 0;
 }
 
+int elf_has_fsm_symbols(const AvrOsSymbolIndex *idx)
+{
+    return idx != NULL
+        && idx->fsm_table_addr != 0u
+        && idx->fsm_table_count != 0u;
+}
+
 /* ── elf_flash_addr ──────────────────────────────────────────────────────── */
 uint32_t elf_flash_addr(const ElfContext *ctx, uint32_t vma)
 {

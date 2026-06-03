@@ -191,6 +191,11 @@ int __wrap_elf_find_avros_tables(ElfContext *c, AvrOsSymbolIndex *i)
     return 0;
 }
 
+/* elf_has_fsm_symbols is not linked from src/elf_parser.c in this
+ * test binary; provide a minimal stub so main.c's reference resolves. */
+int elf_has_fsm_symbols(const AvrOsSymbolIndex *idx);
+int elf_has_fsm_symbols(const AvrOsSymbolIndex *idx) { (void)idx; return 1; }
+
 int __wrap_fsm_build_thread_list(FsmContext *c, const AvrOsSymbolIndex *i, int fd);
 int __wrap_fsm_build_thread_list(FsmContext *c, const AvrOsSymbolIndex *i, int fd)
 {

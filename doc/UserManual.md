@@ -623,7 +623,6 @@ system, independent of which thread is selected:
 ```
 (gdb) monitor avros events          # global event mask
 (gdb) monitor avros queues          # message-queue depths
-(gdb) monitor avros mempool         # memory-pool free-block counts
 ```
 
 #### 11. Restart, detach, and quit

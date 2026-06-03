@@ -52,6 +52,7 @@ typedef struct {
     const char *force_device;    /* --force-device=<family>: skip SIGROW
                                   *  autodetect and use the named family  */
     bool        no_fsm_threads;  /* --no-fsm-threads: disable FSM/RTOS threading */
+    bool        reset_cpu;       /* --reset: pulse UPDI system reset and exit    */
     /* fds owned by main; -1 = closed/unset */
     int         listen_fd;
     int         gdb_fd;
@@ -89,6 +90,7 @@ static void usage(const char *prog)
         "<serial-device> <elf-file>\n"
         "       %s --device [--baud <baud>] [--no-autobaud] "
         "[--force-device=<family>] <serial-device> [elf-file]\n"
+        "       %s --reset [--baud <baud>] <serial-device>\n"
         "\n"
         "  --erase            DESTRUCTIVE: chip-erase + unlock before --load.\n"
         "                     Required on a locked AVR-Dx target before NVMPROG.\n"
@@ -113,11 +115,14 @@ static void usage(const char *prog)
         "                     four families are declared from datasheet\n"
         "                     evidence only.\n"
         "  --device           Print target device SIGROW info and exit.\n"
+        "  --reset            Pulse the UPDI system reset and exit.\n"
+        "                     Requires only <serial-device>; no ELF needed.\n"
+        "                     Redundant when combined with --prog.\n"
         "  --log-rsp          Log all incoming and outgoing GDB RSP packets\n"
         "                     to standard error.\n"
         "  --no-fsm-threads   Disable RTOS multi-thread reporting. Exposes\n"
         "                     only the single hardware CPU thread.\n",
-        prog, prog, prog);
+        prog, prog, prog, prog);
 }
 
 MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg);
@@ -126,6 +131,7 @@ MAYBE_STATIC int  load_segments(AppConfig *cfg, ElfContext *ctx);
 MAYBE_STATIC int  verify_segments(AppConfig *cfg, ElfContext *ctx);
 MAYBE_STATIC int  run_device_mode(AppConfig *cfg);
 MAYBE_STATIC int  run_prog_mode(AppConfig *cfg);
+MAYBE_STATIC int  run_reset_mode(AppConfig *cfg);
 MAYBE_STATIC void run_autobaud_probe(AppConfig *cfg);
 MAYBE_STATIC void sig_handler(int signo);
 MAYBE_STATIC void progress_render(const char *phase, const char *window,
@@ -375,6 +381,7 @@ MAYBE_STATIC int  load_segments(AppConfig *cfg, ElfContext *ctx);
 MAYBE_STATIC int  verify_segments(AppConfig *cfg, ElfContext *ctx);
 MAYBE_STATIC int  run_device_mode(AppConfig *cfg);
 MAYBE_STATIC int  run_prog_mode(AppConfig *cfg);
+MAYBE_STATIC int  run_reset_mode(AppConfig *cfg);
 MAYBE_STATIC void run_autobaud_probe(AppConfig *cfg);
 MAYBE_STATIC void sig_handler(int signo);
 MAYBE_STATIC void progress_render(const char *phase, const char *window,
@@ -398,6 +405,7 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
     cfg->allow_erase   = false;
     cfg->log_rsp       = false;
     cfg->no_fsm_threads = false;
+    cfg->reset_cpu      = false;
     cfg->listen_fd     = -1;
     cfg->gdb_fd        = -1;
     cfg->updi_fd       = -1;
@@ -440,6 +448,8 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
             cfg->log_rsp = true;
         } else if (strcmp(a, "--no-fsm-threads") == 0) {
             cfg->no_fsm_threads = true;
+        } else if (strcmp(a, "--reset") == 0) {
+            cfg->reset_cpu = true;
         } else if (a[0] == '-' && a[1] != '\0') {
             fprintf(stderr, "%s: unrecognised option '%s'\n", argv[0], a);
             usage(argv[0]);
@@ -480,8 +490,9 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
         exit(1);
     }
     /* --device makes <elf-file> optional (LLR-MAIN-08).
+     * --reset makes <elf-file> optional.
      * --prog requires an ELF (LLR-MAIN-15).                            */
-    if (!cfg->device_info && cfg->elf_path == NULL) {
+    if (!cfg->device_info && !cfg->reset_cpu && cfg->elf_path == NULL) {
         usage(argv[0]);
         exit(1);
     }
@@ -794,6 +805,28 @@ MAYBE_STATIC int run_device_mode(AppConfig *cfg)
     return 0;
 }
 
+/* run_reset_mode: open the UPDI link and immediately close it.
+ * updi_close() pulses ASI_RESET_REQ (assert then release) before
+ * tearing down the serial link, which issues a clean system reset to
+ * the target CPU.  No ELF, no GDB listener, no event loop.          */
+MAYBE_STATIC int run_reset_mode(AppConfig *cfg)
+{
+    int fd = updi_open(cfg->serial_device, cfg->baud_rate);
+    if (fd < 0) {
+        fprintf(stderr,
+                "error: updi-open failed for '%s' — "
+                "check wiring, target power, UPDIDIS fuse\n",
+                cfg->serial_device);
+        return 1;
+    }
+    cfg->updi_fd = fd;
+    updi_close(fd);
+    cfg->updi_fd = -1;
+    fprintf(stdout, "reset: OK\n");
+    fflush(stdout);
+    return 0;
+}
+
 /* Iterate PT_LOAD segments and program each one to the NVM window that
  * its UPDI address falls within (Phase 8, LLR-MAIN-11).
  *
@@ -839,15 +872,15 @@ static int load_count_total_pages(ElfContext *ctx, unsigned *out_total)
         if (lseek(ctx->fd, off, SEEK_SET) < 0) return -1;
         if (read(ctx->fd, &ph, sizeof ph) != (ssize_t)sizeof ph) return -1;
         if (ph.p_type != PT_LOAD || ph.p_filesz == 0) continue;
-        if (ctx->sram_base != 0 && ph.p_vaddr >= ctx->sram_base) continue;
+        if (ctx->sram_base != 0 && ph.p_paddr >= ctx->sram_base) continue;
 
-        if (ph.p_vaddr < UPDI_FLASH_BASE) {
+        if (ph.p_paddr < UPDI_FLASH_BASE) {
             /* FLASH: pad to page boundary first. */
             uint32_t padded = (ph.p_filesz + UPDI_FLASH_PAGE_SIZE - 1u) &
                               ~(UPDI_FLASH_PAGE_SIZE - 1u);
             total += (padded + PROGRESS_CHUNK - 1u) / PROGRESS_CHUNK;
         } else {
-            uint32_t band = ph.p_vaddr & ELF_VMA_BAND_MASK;
+            uint32_t band = ph.p_paddr & ELF_VMA_BAND_MASK;
             if (band == ELF_VMA_SIGROW) continue;   /* skipped */
             total += ((unsigned)ph.p_filesz + PROGRESS_CHUNK - 1u)
                      / PROGRESS_CHUNK;
@@ -902,7 +935,7 @@ MAYBE_STATIC int load_segments(AppConfig *cfg, ElfContext *ctx)
         /* SRAM segments (when an SRAM image is present in the ELF) are
          * skipped silently. */
         if (ctx->sram_base != 0 &&
-            ph.p_vaddr >= ctx->sram_base) {
+            ph.p_paddr >= ctx->sram_base) {
             continue;
         }
 
@@ -913,12 +946,12 @@ MAYBE_STATIC int load_segments(AppConfig *cfg, ElfContext *ctx)
         bool in_flash = false, in_eeprom = false, in_userrow = false;
         bool in_fuses = false, in_lock = false, in_sigrow = false;
 
-        if (ph.p_vaddr < UPDI_FLASH_BASE) {
-            updi_addr = ph.p_vaddr | UPDI_FLASH_BASE;
+        if (ph.p_paddr < UPDI_FLASH_BASE) {
+            updi_addr = ph.p_paddr | UPDI_FLASH_BASE;
             in_flash = true;
         } else {
-            uint32_t band = ph.p_vaddr & ELF_VMA_BAND_MASK;
-            uint32_t lo   = ph.p_vaddr & ELF_VMA_OFFSET_MASK;
+            uint32_t band = ph.p_paddr & ELF_VMA_BAND_MASK;
+            uint32_t lo   = ph.p_paddr & ELF_VMA_OFFSET_MASK;
             switch (band) {
             case ELF_VMA_EEPROM:
                 updi_addr = dev->eeprom_base + lo;  in_eeprom  = true; break;
@@ -933,7 +966,7 @@ MAYBE_STATIC int load_segments(AppConfig *cfg, ElfContext *ctx)
             default:
                 fprintf(stderr,
                         "error: segment vaddr 0x%06x not in any programmable "
-                        "NVM window\n", (unsigned)ph.p_vaddr);
+                        "NVM window\n", (unsigned)ph.p_paddr);
                 return -1;
             }
         }
@@ -945,30 +978,23 @@ MAYBE_STATIC int load_segments(AppConfig *cfg, ElfContext *ctx)
             continue;
         }
 
-        /* FLASH window: pad to 512-byte page boundary with 0xFF (erased). */
+        /* FLASH window: handle arbitrary byte alignments via read-modify-write. */
         if (in_flash) {
             s_load_window = "FLASH";
-            if ((updi_addr % UPDI_FLASH_PAGE_SIZE) != 0u) {
-                fprintf(stderr,
-                        "error: FLASH segment vaddr 0x%06x not page-aligned\n",
-                        (unsigned)updi_addr);
-                updi_set_nvm_progress(NULL, NULL);
-                return -1;
-            }
-            uint32_t padded = (ph.p_filesz + UPDI_FLASH_PAGE_SIZE - 1u) &
-                              ~(UPDI_FLASH_PAGE_SIZE - 1u);
-            uint8_t *buf = malloc(padded);
-            if (!buf) { updi_set_nvm_progress(NULL, NULL); return -1; }
-            memset(buf, 0xFF, padded);
+            uint8_t *buf = malloc(ph.p_filesz);
+            if (!buf && ph.p_filesz > 0) { updi_set_nvm_progress(NULL, NULL); return -1; }
             if (lseek(ctx->fd, (off_t)ph.p_offset, SEEK_SET) < 0 ||
                 read(ctx->fd, buf, ph.p_filesz) != (ssize_t)ph.p_filesz) {
                 free(buf);
                 updi_set_nvm_progress(NULL, NULL);
                 return -1;
             }
-            int rc = updi_nvm_write_flash(cfg->updi_fd, updi_addr, buf, padded);
+            int rc = updi_nvm_flash_patch(cfg->updi_fd, updi_addr, buf, ph.p_filesz);
             free(buf);
             if (rc < 0) { updi_set_nvm_progress(NULL, NULL); return -1; }
+            /* Note: progress bar will not update smoothly for small patches */
+            uint32_t padded = (ph.p_filesz + UPDI_FLASH_PAGE_SIZE - 1u) & ~(UPDI_FLASH_PAGE_SIZE - 1u);
+            s_load_done_pages += padded / UPDI_FLASH_PAGE_SIZE;
             continue;
         }
 
@@ -1084,9 +1110,9 @@ MAYBE_STATIC int verify_segments(AppConfig *cfg, ElfContext *ctx)
         if (lseek(ctx->fd, off, SEEK_SET) < 0) return -1;
         if (read(ctx->fd, &ph, sizeof ph) != (ssize_t)sizeof ph) return -1;
         if (ph.p_type != PT_LOAD || ph.p_filesz == 0) continue;
-        if (ctx->sram_base != 0 && ph.p_vaddr >= ctx->sram_base) continue;
-        if (ph.p_vaddr >= UPDI_FLASH_BASE) {
-            uint32_t band = ph.p_vaddr & ELF_VMA_BAND_MASK;
+        if (ctx->sram_base != 0 && ph.p_paddr >= ctx->sram_base) continue;
+        if (ph.p_paddr >= UPDI_FLASH_BASE) {
+            uint32_t band = ph.p_paddr & ELF_VMA_BAND_MASK;
             if (band == ELF_VMA_LOCK || band == ELF_VMA_SIGROW) continue;
         }
         total_pages += ((unsigned)ph.p_filesz + (unsigned)CHUNK - 1u)
@@ -1103,18 +1129,18 @@ MAYBE_STATIC int verify_segments(AppConfig *cfg, ElfContext *ctx)
         if (read(ctx->fd, &ph, sizeof ph) != (ssize_t)sizeof ph) return -1;
         if (ph.p_type != PT_LOAD || ph.p_filesz == 0) continue;
 
-        if (ctx->sram_base != 0 && ph.p_vaddr >= ctx->sram_base) continue;
+        if (ctx->sram_base != 0 && ph.p_paddr >= ctx->sram_base) continue;
 
         uint32_t updi_addr;
         const char *kind = NULL;
         bool skip = false;
 
-        if (ph.p_vaddr < UPDI_FLASH_BASE) {
-            updi_addr = ph.p_vaddr | UPDI_FLASH_BASE;
+        if (ph.p_paddr < UPDI_FLASH_BASE) {
+            updi_addr = ph.p_paddr | UPDI_FLASH_BASE;
             kind = "FLASH";
         } else {
-            uint32_t band = ph.p_vaddr & ELF_VMA_BAND_MASK;
-            uint32_t lo   = ph.p_vaddr & ELF_VMA_OFFSET_MASK;
+            uint32_t band = ph.p_paddr & ELF_VMA_BAND_MASK;
+            uint32_t lo   = ph.p_paddr & ELF_VMA_OFFSET_MASK;
             switch (band) {
             case ELF_VMA_EEPROM:
                 updi_addr = dev->eeprom_base + lo;  kind = "EEPROM"; break;
@@ -1131,7 +1157,7 @@ MAYBE_STATIC int verify_segments(AppConfig *cfg, ElfContext *ctx)
             default:
                 fprintf(stderr,
                         "verify: segment vaddr 0x%06x not in any NVM window\n",
-                        (unsigned)ph.p_vaddr);
+                        (unsigned)ph.p_paddr);
                 return -1;
             }
         }
@@ -1301,6 +1327,11 @@ int MAIN_NAME(int argc, char *argv[])
         return run_prog_mode(&cfg);
     }
 
+    /* --reset: pulse UPDI system reset and exit. */
+    if (cfg.reset_cpu) {
+        return run_reset_mode(&cfg);
+    }
+
     /* Signal handlers (LLR-MAIN-06). */
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
@@ -1424,9 +1455,17 @@ int MAIN_NAME(int argc, char *argv[])
     fprintf(stderr, "avrOSdb: listening on :%u\n", (unsigned)cfg.gdb_port);
     fflush(stderr);
 
-    /* Best-effort session init; failures are tolerated. */
-    (void)elf_find_avros_tables(&elf_ctx, &idx);
-    (void)fsm_build_thread_list(&fsm_ctx, &idx, cfg.updi_fd);
+    /* Best-effort session init; synthetic threads are enabled only
+     * when the ELF exposes avrOS FSM table symbols and the user did
+     * not explicitly disable them. */
+    bool have_fsm_symbols = false;
+    if (elf_find_avros_tables(&elf_ctx, &idx) == 0) {
+        have_fsm_symbols = (elf_has_fsm_symbols(&idx) != 0);
+    }
+    bool enable_fsm_threads = !cfg.no_fsm_threads && have_fsm_symbols;
+    if (enable_fsm_threads) {
+        (void)fsm_build_thread_list(&fsm_ctx, &idx, cfg.updi_fd);
+    }
 
     UpdiDeviceInfo target_info;
     bool target_info_valid = false;
@@ -1459,7 +1498,7 @@ int MAIN_NAME(int argc, char *argv[])
     RspContext rctx = {
         .updi_fd    = cfg.updi_fd,
         .gdb_fd_p   = &cfg.gdb_fd,
-        .fsm        = cfg.no_fsm_threads ? NULL : &fsm_ctx,
+        .fsm        = enable_fsm_threads ? &fsm_ctx : NULL,
         .idx        = &idx,
         .g_thread_p = &g_thread,
         .c_thread_p = &c_thread,

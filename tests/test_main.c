@@ -94,6 +94,8 @@ static int  mk_elf_open_calls;
 static int  mk_elf_close_calls;
 static int  mk_elf_tmp_fd;
 static char mk_elf_planted_device_name[16];
+static int  mk_elf_find_tables_ret;
+static AvrOsSymbolIndex mk_elf_find_tables_idx;
 
 /* Captured arguments / family-selection state for the
  * `__wrap_updi_select_device()` / `__wrap_updi_get_device()` stubs. */
@@ -160,6 +162,15 @@ int updi_read_device_info(int fd, UpdiDeviceInfo *info)
 
 int __wrap_updi_nvm_write_flash(int fd, uint32_t a, const uint8_t *d, size_t n);
 int __wrap_updi_nvm_write_flash(int fd, uint32_t a, const uint8_t *d, size_t n)
+{
+    (void)fd; (void)a; (void)d; (void)n;
+    mk_updi_nvm_calls++;
+    LOG(CALL_UPDI_NVM);
+    return mk_updi_nvm_ret;
+}
+
+int __wrap_updi_nvm_flash_patch(int fd, uint32_t a, const uint8_t *d, size_t n);
+int __wrap_updi_nvm_flash_patch(int fd, uint32_t a, const uint8_t *d, size_t n)
 {
     (void)fd; (void)a; (void)d; (void)n;
     mk_updi_nvm_calls++;
@@ -468,9 +479,17 @@ void __wrap_elf_close(ElfContext *ctx)
 int __wrap_elf_find_avros_tables(ElfContext *c, AvrOsSymbolIndex *i);
 int __wrap_elf_find_avros_tables(ElfContext *c, AvrOsSymbolIndex *i)
 {
-    (void)c; (void)i;
+    (void)c;
     LOG(CALL_ELF_TABLES);
-    return 0;
+    if (i != NULL) *i = mk_elf_find_tables_idx;
+    return mk_elf_find_tables_ret;
+}
+
+int elf_has_fsm_symbols(const AvrOsSymbolIndex *idx)
+{
+    return idx != NULL
+        && idx->fsm_table_addr != 0u
+        && idx->fsm_table_count != 0u;
 }
 
 int __wrap_fsm_build_thread_list(FsmContext *c, const AvrOsSymbolIndex *i, int fd);
@@ -540,6 +559,8 @@ void setUp(void)
     mk_elf_open_ret = 0;        mk_elf_open_calls = 0;
     mk_elf_close_calls = 0;
     mk_elf_tmp_fd = -1;
+    mk_elf_find_tables_ret = 0;
+    memset(&mk_elf_find_tables_idx, 0, sizeof mk_elf_find_tables_idx);
     mk_elf_planted_sram = 0;
     mk_elf_have_ehdr = 0;
     memset(&mk_elf_planted_ehdr, 0, sizeof mk_elf_planted_ehdr);
@@ -1138,6 +1159,40 @@ static void test_main_passes_null_to_select_when_elf_lacks_deviceinfo(void)
     TEST_ASSERT_EQUAL_STRING("", mk_updi_select_force);
 }
 
+static void test_main_only_builds_fsm_threads_when_elf_has_fsm_symbols(void)
+{
+    uint32_t v[] = {0}, s[] = {0};
+    mk_elf_tmp_fd = build_min_elf(v, s, 1, &mk_elf_planted_ehdr);
+    mk_elf_have_ehdr = 1;
+    mk_elf_find_tables_idx.fsm_table_addr = 0x1000u;
+    mk_elf_find_tables_idx.fsm_table_count = 2u;
+
+    char *argv[] = { (char*)"prog", (char*)"/dev/x", (char*)"a.elf" };
+    TEST_ASSERT_EQUAL_INT(0, app_main(3, argv));
+
+    int saw_fsm_build = 0;
+    for (int i = 0; i < call_log_len; i++) {
+        if (call_log[i] == CALL_FSM_BUILD) saw_fsm_build = 1;
+    }
+    TEST_ASSERT_TRUE(saw_fsm_build);
+}
+
+static void test_main_skips_fsm_build_when_elf_lacks_fsm_symbols(void)
+{
+    uint32_t v[] = {0}, s[] = {0};
+    mk_elf_tmp_fd = build_min_elf(v, s, 1, &mk_elf_planted_ehdr);
+    mk_elf_have_ehdr = 1;
+
+    char *argv[] = { (char*)"prog", (char*)"/dev/x", (char*)"a.elf" };
+    TEST_ASSERT_EQUAL_INT(0, app_main(3, argv));
+
+    int saw_fsm_build = 0;
+    for (int i = 0; i < call_log_len; i++) {
+        if (call_log[i] == CALL_FSM_BUILD) saw_fsm_build = 1;
+    }
+    TEST_ASSERT_FALSE(saw_fsm_build);
+}
+
 /* ── Runner ──────────────────────────────────────────────────────────── */
 int main(void)
 {
@@ -1179,5 +1234,7 @@ int main(void)
     RUN_TEST(test_main_force_device_overrides_elf_deviceinfo);
     RUN_TEST(test_main_aborts_on_elf_vs_silicon_family_mismatch);
     RUN_TEST(test_main_passes_null_to_select_when_elf_lacks_deviceinfo);
+    RUN_TEST(test_main_only_builds_fsm_threads_when_elf_has_fsm_symbols);
+    RUN_TEST(test_main_skips_fsm_build_when_elf_lacks_fsm_symbols);
     return UNITY_END();
 }

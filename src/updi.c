@@ -785,8 +785,14 @@ void updi_close(int fd)
      * The reset pulse clears any latched NVMPROG/OCD mode so the next
      * --open does not see SYS_STATUS with stale bits set (notably the
      * 0x82 we observed after a debug session, which blocked NVMPROG
-     * entry).  Errors are intentionally ignored — close() must succeed
+     * entry).
+     *
+     * IMPORTANT: We must explicitly clear the NVMProg key latch before
+     * asserting reset. If the key is still latched, the reset pulse
+     * will simply command the CPU to re-enter NVMPROG mode and halt.
+     * Errors are intentionally ignored — close() must succeed
      * even if the target stopped responding.                          */
+    (void)updi_stcs(fd, ASI_KEY_STATUS, ASI_KEY_STATUS_NVMPROG);
     (void)updi_stcs(fd, ASI_RESET_REQ, ASI_RESET_REQ_RESET);
     (void)updi_stcs(fd, ASI_RESET_REQ, ASI_RESET_REQ_RUN);
     (void)updi_stcs(fd, ASI_CTRLB,
@@ -1010,6 +1016,104 @@ int updi_step(int fd)
     return -1;
 }
 
+int updi_step_32bit(int fd, int bp_slot,
+                    uint32_t target_pc, bool halt_on_jump)
+{
+    /* The `halt_on_jump` parameter is retained for API stability but
+     * intentionally NOT applied to OCD_CTRL1_JMP.  Hardware experiment
+     * (issue #40, Phase B) showed that arming OCD_CTRL1_JMP together
+     * with a HW BP slot misses the *first* change-of-flow after RUN —
+     * a step over `CALL fsmDispatch` would silently run through the
+     * callee and halt at the next outer-frame CoF instead.  Relying
+     * solely on the HW BP at `target_pc` (which RSP computes from the
+     * opcode for direct CALL/JMP, or PC+4 for LDS/STS) is reliable for
+     * every case the workaround actually needs.                       */
+    (void)halt_on_jump;
+
+    bool halted = false;
+    int total_wait_ms = 0;
+    const int max_wait_ms = 200;
+
+    if (bp_slot < 0 || bp_slot > 1) return -1;
+
+    if (updi_ocd_set_hw_bp(fd, bp_slot, target_pc) < 0) return -1;
+
+    if (updi_run(fd) < 0) goto fail;
+
+    while (total_wait_ms < max_wait_ms) {
+        int s = updi_ocd_poll_halted(fd, 10);
+        if (s == 0) {
+            halted = true;
+            break;
+        }
+        if (s < 0) break;
+        total_wait_ms += 10;
+    }
+
+    if (!halted) goto fail;
+
+    (void)updi_ocd_clear_hw_bp(fd, bp_slot);
+    return 0;
+
+fail:
+    (void)updi_halt(fd);
+    (void)updi_ocd_clear_hw_bp(fd, bp_slot);
+    return -1;
+}
+
+int updi_ocd_emulate_cof_32bit(int fd,
+                               uint32_t push_return_byte_addr,
+                               uint32_t target_byte_addr)
+{
+    /* If asked, push the AVR-Dx 2-byte return address onto the SRAM
+     * stack.  Although guesswork.md notes a "17-bit PC", the
+     * AVR128DA28/32/48/64 part has exactly 128 KB = 64 KW = 2**16 word
+     * addresses of flash, so PC is 16 bits wide and CALL/RET use a
+     * 2-byte stack frame.  Empirically validated on AVR128DA48
+     * (issue #40, finish-from-fsmDispatch experiment): RET pops
+     * exactly two bytes — SP advances by +2 — and the third byte we
+     * had been pushing remained as untouched stack garbage.  AVR ISA
+     * convention for CALL on 16-bit-PC parts:
+     *     mem[SP    ] = PCL
+     *     mem[SP - 1] = PCH
+     *     SP <- SP - 2
+     * `push_return_byte_addr` is the GDB-style BYTE address of the
+     * instruction immediately following the CALL we are emulating.   */
+    if (push_return_byte_addr != 0u) {
+        uint16_t sp = 0;
+        if (updi_ocd_read_sp(fd, &sp) < 0) return -1;
+        /* The CPU's real SP lives in I/O-space SPL/SPH (data 0x003D /
+         * 0x003E).  OCD_SP at OCD+0x18 is a debug-side mirror only:
+         * writing it shows the new value on subsequent `g`-packet
+         * reads but the CPU keeps using the unmodified real SP — its
+         * very next PUSH would clobber the bytes we just wrote.      */
+        uint32_t ret_word = push_return_byte_addr >> 1u;
+        uint8_t  pcl = (uint8_t)( ret_word        & 0xFFu);
+        uint8_t  pch = (uint8_t)((ret_word >>  8) & 0xFFu);
+        if (updi_mem_write(fd, (uint32_t)(sp - 1u), &pch, 1) < 0) return -1;
+        if (updi_mem_write(fd, sp,                  &pcl, 1) < 0) return -1;
+        uint16_t new_sp = (uint16_t)(sp - 2u);
+        uint8_t  spl = (uint8_t)( new_sp       & 0xFFu);
+        uint8_t  sph = (uint8_t)((new_sp >> 8) & 0xFFu);
+        if (updi_mem_write(fd, 0x003Du, &spl, 1) < 0) return -1;
+        if (updi_mem_write(fd, 0x003Eu, &sph, 1) < 0) return -1;
+        if (updi_ocd_write_sp(fd, new_sp) < 0) return -1;
+        if (updi_ocd_write_pc(fd, target_byte_addr) < 0) return -1;
+        if (updi_ocd_stabilize_pc_after_write(fd) < 0) return -1;
+        /* Re-write SPL/SPH and OCD_SP AFTER stabilize too — the
+         * pipeline-settle NOP step under PCHOLD has been observed to
+         * resync the CPU's real SP from the OCD shadow.  Belt and
+         * braces (issue #40, Phase C). */
+        if (updi_mem_write(fd, 0x003Du, &spl, 1) < 0) return -1;
+        if (updi_mem_write(fd, 0x003Eu, &sph, 1) < 0) return -1;
+        if (updi_ocd_write_sp(fd, new_sp) < 0) return -1;
+        return 0;
+    }
+
+    if (updi_ocd_write_pc(fd, target_byte_addr) < 0) return -1;
+    return updi_ocd_stabilize_pc_after_write(fd);
+}
+
 int updi_ocd_poll_halted(int fd, int timeout_ms)
 {
     struct timespec ts = { 0, 1000000L };   /* 1 ms */
@@ -1066,6 +1170,24 @@ int updi_ocd_write_pc(int fd, uint32_t byte_addr)
     if (updi_sts8(fd, OCD_PC,     (uint8_t)( pc_word        & 0xFFu)) < 0) return -1;
     if (updi_sts8(fd, OCD_PC + 1, (uint8_t)((pc_word >> 8u) & 0xFFu)) < 0) return -1;
     return 0;
+}
+
+int updi_ocd_stabilize_pc_after_write(int fd)
+{
+    uint8_t ctrl0 = 0;
+
+    if (updi_lds8(fd, OCD_CTRL0, &ctrl0) < 0) return -1;
+    if (updi_sts8(fd, OCD_CTRL0, (uint8_t)(ctrl0 | OCD_CTRL0_PCHOLD)) < 0)
+        return -1;
+    if (updi_sts8(fd, OCD_INSN0, 0x00u) < 0) goto fail;
+    if (updi_sts8(fd, OCD_INSN0 + 1u, 0x00u) < 0) goto fail;
+    if (updi_step(fd) < 0) goto fail;
+    if (updi_sts8(fd, OCD_CTRL0, ctrl0) < 0) return -1;
+    return 0;
+
+fail:
+    (void)updi_sts8(fd, OCD_CTRL0, ctrl0);
+    return -1;
 }
 
 int updi_ocd_read_sp(int fd, uint16_t *val)
@@ -1415,6 +1537,11 @@ int updi_nvm_flash_patch(int fd, uint32_t addr, const uint8_t *data,
             return -1;
         }
         if (nvm_wait_not_busy(fd, pa, "patch-post") < 0) return -1;
+        if (g_nvm_progress_cb != NULL) {
+            size_t done_bytes = (pa + UPDI_FLASH_PAGE_SIZE) - (addr & ~page_mask);
+            if (done_bytes > len) done_bytes = len;
+            g_nvm_progress_cb(pa, done_bytes, len, g_nvm_progress_user);
+        }
     }
     return 0;
 }

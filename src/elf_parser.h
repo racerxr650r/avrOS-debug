@@ -67,6 +67,7 @@ typedef struct {
 int      elf_open(const char *path, ElfContext *ctx);
 void     elf_close(ElfContext *ctx);
 int      elf_find_avros_tables(ElfContext *ctx, AvrOsSymbolIndex *idx);
+int      elf_has_fsm_symbols(const AvrOsSymbolIndex *idx);
 uint32_t elf_flash_addr(const ElfContext *ctx, uint32_t vma);
 /* Translate a data-space VMA to the absolute physical FLASH byte
  * address (LMA) by locating the PT_LOAD segment that contains it and

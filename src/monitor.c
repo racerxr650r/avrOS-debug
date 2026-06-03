@@ -267,7 +267,12 @@ static int verb_reset(int rsp_fd, RspContext *ctx)
     if (updi_enter_debug(ctx->updi_fd) < 0) return -1;
     rsp_hw_bp_clear_all(ctx);
     rsp_sw_bp_clear_all(ctx);   /* HLR-054 */
-    if (ctx->fsm != NULL) fsm_invalidate(ctx->fsm);
+    if (ctx->fsm != NULL) {
+        fsm_invalidate(ctx->fsm);
+        if (ctx->idx != NULL) {
+            (void)fsm_build_thread_list(ctx->fsm, ctx->idx, ctx->updi_fd);
+        }
+    }
     (void)o_line(rsp_fd, "target reset, halted at reset vector\n");
     return 0;
 }

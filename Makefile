@@ -207,7 +207,8 @@ TEST_SRCS_test_monitor := $(TESTDIR)/test_monitor.c \
 TEST_WRAP_test_monitor  := updi_mem_read rsp_send_packet \
                             updi_enter_debug updi_halt updi_run \
                             updi_chip_erase \
-                            fsm_invalidate fsm_get_active_thread \
+							fsm_invalidate fsm_get_active_thread \
+							fsm_build_thread_list \
                             rsp_hw_bp_clear_all \
                             rsp_sw_bp_clear_all
 TEST_EXTRA_LDFLAGS_test_monitor :=
@@ -218,6 +219,7 @@ TEST_SRCS_test_rsp := $(TESTDIR)/test_rsp.c \
                        $(SRCDIR)/fsm_mapper.c \
                        $(SRCDIR)/monitor.c
 TEST_WRAP_test_rsp  := updi_mem_read updi_mem_write updi_halt updi_run updi_step \
+					   updi_step_32bit \
                        updi_nvm_write_flash updi_nvm_flash_patch \
                        updi_console_poll \
                        updi_enter_debug updi_chip_erase \
@@ -225,7 +227,9 @@ TEST_WRAP_test_rsp  := updi_mem_read updi_mem_write updi_halt updi_run updi_step
                        updi_ocd_read_gpr updi_ocd_write_gpr \
                        updi_ocd_read_sreg updi_ocd_write_sreg \
                        updi_ocd_read_sp updi_ocd_write_sp \
-                       updi_ocd_read_pc updi_ocd_write_pc \
+					   updi_ocd_read_pc updi_ocd_write_pc \
+					   updi_ocd_stabilize_pc_after_write \
+                       updi_ocd_emulate_cof_32bit \
                        updi_ocd_set_hw_bp updi_ocd_clear_hw_bp \
                        fsm_build_thread_list fsm_get_registers \
                        fsm_get_active_thread fsm_invalidate \
@@ -237,7 +241,7 @@ TEST_EXTRA_LDFLAGS_test_rsp :=
 TEST_SRCS_test_main := $(TESTDIR)/test_main.c
 TEST_WRAP_test_main  := updi_open updi_close updi_console_poll \
                         updi_select_device updi_get_device \
-                        updi_nvm_write_flash \
+                        updi_nvm_write_flash updi_nvm_flash_patch \
                         updi_nvm_write_eeprom updi_nvm_write_userrow \
                         updi_nvm_write_fuses updi_nvm_write_lockbits \
                         updi_chip_erase updi_enter_debug updi_halt \
@@ -536,9 +540,12 @@ hw-test-rsp: $(HW_TEST_BIN) all
 
 # Full-stack GDB acceptance (Group G, Phase 10 — avarice feature parity).
 # Spawns build/avrOSdb, drives a real avr-gdb -batch session through the
-# acceptance script, validates load/break/watch/monitor/detach. DESTRUCTIVE:
-# `(gdb) load` reprograms FLASH from build/fixtures/gdb_target.elf.
+# acceptance script, validates load/break/watch/monitor/detach. G1-G9 run
+# against the existing gdb_target fixture; G10 runs against a local avrOS
+# example ELF with real FSM symbols so the reset/thread regression stays
+# reproducible. DESTRUCTIVE: `(gdb) load` reprograms FLASH from the active ELF.
 HW_GDB_ELF ?= $(FIXBINDIR)/gdb_target.elf
+HW_GDB_G10_ELF ?= tests/hw/fixtures/avrOS_example_main.elf
 hw-test-gdb: $(FIXBINDIR)/gdb_target.elf all
 	@if [ "$(HW_TEST_NVM_CONFIRM)" != "YES" ]; then \
 	    echo "hw-test-gdb: refused — set HW_TEST_NVM_CONFIRM=YES to confirm"; \
@@ -554,6 +561,7 @@ hw-test-gdb: $(FIXBINDIR)/gdb_target.elf all
 	        --port      '$(HW_PORT)' \
 	        --rsp-port  '$(if $(HW_RSP_PORT),$(HW_RSP_PORT),1234)' \
 	        --elf       '$(HW_GDB_ELF)' \
+	        --g10-elf   '$(HW_GDB_G10_ELF)' \
 	        --avros-bin '$(BUILDDIR)/$(TARGET)'
 
 # Run Groups A + B + C + D in one go. NVM still requires explicit confirm.

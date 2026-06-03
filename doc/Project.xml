@@ -1336,7 +1336,7 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-018" name="Continue Execution">
-        <text><![CDATA[The application shall respond to the GDB continue (`c`/`C`) packet by resuming target CPU execution via `updi_run()` and then polling for a stop condition. While polling, the server shall remain responsive to the GDB Ctrl-C (`0x03`) async-interrupt byte on the client socket and shall halt the target via `updi_halt()` when one is received. The stop-reason packet shall report SIGINT (`T02`) when the halt was caused by Ctrl-C and SIGTRAP (`T05`) for every other halt cause (hardware breakpoint, BREAK opcode, single-step, external break). To bound recovery time on a flaky UPDI link, the run-poll loop shall give up after a fixed number of consecutive `updi_ocd_poll_halted()` failures and return GDB error reply `E01` rather than spinning indefinitely.]]></text>
+        <text><![CDATA[The application shall respond to the GDB continue (`c`/`C`) packet by resuming target CPU execution via `updi_run()` and then polling for a stop condition. Before the free-run, if the instruction at the resume PC is a direct 32-bit `CALL` or `JMP`, the application shall emulate that change-of-flow over OCD (push the return address for `CALL`, set the OCD PC to the branch target) so the AVR-Dx OCD "first change-of-flow after RUN" errata (issue #40) does not run straight through the callee and silently skip every breakpoint reached inside it. While polling, the server shall remain responsive to the GDB Ctrl-C (`0x03`) async-interrupt byte on the client socket and shall halt the target via `updi_halt()` when one is received. The stop-reason packet shall report SIGINT (`T02`) when the halt was caused by Ctrl-C and SIGTRAP (`T05`) for every other halt cause (hardware breakpoint, BREAK opcode, single-step, external break). To bound recovery time on a flaky UPDI link, the run-poll loop shall give up after a fixed number of consecutive `updi_ocd_poll_halted()` failures and return GDB error reply `E01` rather than spinning indefinitely.]]></text>
         <traces>
           <trace target="SDD" ref="4.3.1"/>
           <trace target="SDD" ref="5.3.1"/>
@@ -2209,9 +2209,10 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-RSP-11">
-        <text><![CDATA[The `on_continue` handler for `c`/`vCont;c` shall call `updi_run()` and `fsm_invalidate()`, then enter a poll loop that waits for either (a) a spontaneous CPU halt detected by `updi_ocd_poll_halted()` or (b) an async-interrupt byte (`\x03`) on the GDB client socket. The loop shall multiplex the two events using `select()` with a 5 ms timeout on the client socket; on socket-readable it shall consume one byte and break on `0x03`; on select-timeout it shall poll OCD with a 1 ms deadline. After the loop breaks the handler shall call `updi_halt()` to guarantee the CPU is stopped, rebuild the FSM thread list, and reply with `T02thread:<id>;` if Ctrl-C was received or `T05thread:<id>;` otherwise. The handler shall give up after `UPDI_FAIL_MAX` (8) consecutive `updi_ocd_poll_halted()` failures and reply `E01` rather than spinning indefinitely on a degraded UPDI link.]]></text>
+        <text><![CDATA[The `on_continue` handler for `c`/`vCont;c` shall, before resuming, call the `continue_step_over_leading_cof(ctx)` helper to compensate for the AVR-Dx OCD "first change-of-flow after RUN" errata (issue #40, HLR-062): the helper reads the live PC via `updi_ocd_read_pc()` and the 4 opcode bytes at that PC via `updi_mem_read(fd, pc | UPDI_FLASH_BASE, buf, 4)`, and — if the instruction is a direct 32-bit `CALL` (`(w0 & 0xFE0E) == 0x940E`) or `JMP` (`(w0 & 0xFE0E) == 0x940C`), decoding the branch target `k = w1 | ((w0 & 0x0001) << 16) | (((w0 & 0x01F0) >> 4) << 17)` — emulates the change-of-flow over OCD via `updi_ocd_emulate_cof_32bit()` (return address `pc + 4` pushed for `CALL`, `0` i.e. no push for `JMP`; branch byte target `k * 2`) so the subsequent free-run resumes at a non-CoF instruction. 16-bit change-of-flow (`RJMP`/`RCALL`/branches/`RET`/`ICALL`) and the resume-from-SW-BREAK case read back as non-matching opcodes and fall through to a plain run unchanged. The helper returns 0 (with or without an emulation) or -1 on UPDI error, in which case the handler replies `E01`. The handler shall then call `updi_run()` and `fsm_invalidate()`, then enter a poll loop that waits for either (a) a spontaneous CPU halt detected by `updi_ocd_poll_halted()` or (b) an async-interrupt byte (`\x03`) on the GDB client socket. The loop shall multiplex the two events using `select()` with a 5 ms timeout on the client socket; on socket-readable it shall consume one byte and break on `0x03`; on select-timeout it shall poll OCD with a 1 ms deadline. After the loop breaks the handler shall call `updi_halt()` to guarantee the CPU is stopped, rebuild the FSM thread list, and reply with `T02thread:<id>;` if Ctrl-C was received or `T05thread:<id>;` otherwise. The handler shall give up after `UPDI_FAIL_MAX` (8) consecutive `updi_ocd_poll_halted()` failures and reply `E01` rather than spinning indefinitely on a degraded UPDI link.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-018" name="Continue Execution"/>
+          <trace target="HLR" ref="HLR-062" name="swbreak/hwbreak Stop-Cause Tags"/>
         </traces>
       </llr>
 
@@ -3386,6 +3387,16 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
 
       <test name="on_continue_returns_E01_after_UPDI_FAIL_MAX_consecutive_poll_failures">
         <purpose><![CDATA[Configure the mock `updi_ocd_poll_halted()` to return -1 unconditionally. Dispatch a `c` packet and verify that the handler gives up after `UPDI_FAIL_MAX` (8) consecutive failures and replies `E01` rather than spinning indefinitely.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-11"/></traces>
+      </test>
+
+      <test name="on_continue_emulates_leading_32bit_call_before_run">
+        <purpose><![CDATA[Park the live PC (mock `updi_ocd_read_pc()`) on a direct 32-bit `CALL 0x1238` opcode (mock `updi_mem_read()` canned bytes `0e 94 1c 09`), with the mock `updi_ocd_poll_halted()` halting on the first poll. Dispatch a `c` packet and verify the handler emulates the change-of-flow once via `updi_ocd_emulate_cof_32bit()` with return address `0x3f4` (PC+4) and branch target `0x1238` before calling `updi_run()`, working around the AVR-Dx OCD first-change-of-flow-after-RUN errata (issue #40) so breakpoints inside the callee are not skipped.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-11"/></traces>
+      </test>
+
+      <test name="on_continue_does_not_emulate_when_pc_not_on_cof">
+        <purpose><![CDATA[Park the live PC on a non-change-of-flow opcode (mock `updi_mem_read()` canned bytes for `SEC`, `08 94 00 00`). Dispatch a `c` packet and verify the handler performs no change-of-flow emulation (`updi_ocd_emulate_cof_32bit()` is not called) and free-runs directly via `updi_run()`.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-11"/></traces>
       </test>
 

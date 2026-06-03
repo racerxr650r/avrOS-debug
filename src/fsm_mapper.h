@@ -7,6 +7,8 @@
 #include "elf_parser.h"
 
 #define FSM_MAX_THREADS 32
+#define FSM_SYSTEM_THREAD_ID 1
+#define FSM_FIRST_PSEUDO_THREAD_ID 2
 
 typedef struct {
     int    gdb_id;

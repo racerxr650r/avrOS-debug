@@ -336,6 +336,17 @@ void test_elf_find_avros_tables_zero_initialises_absent_symbol_fields(void)
     elf_close(&ctx);
 }
 
+void test_elf_has_fsm_symbols_requires_non_zero_table_address_and_count(void)
+{
+    AvrOsSymbolIndex idx;
+    memset(&idx, 0, sizeof(idx));
+    TEST_ASSERT_EQUAL_INT(0, elf_has_fsm_symbols(&idx));
+
+    idx.fsm_table_addr = 0x1000u;
+    idx.fsm_table_count = 2u;
+    TEST_ASSERT_EQUAL_INT(1, elf_has_fsm_symbols(&idx));
+}
+
 /* ── Test 12: elf_close frees heap and closes fd ─────────────────────── */
 void test_elf_close_frees_symtab_strtab_and_closes_fd(void)
 {
@@ -477,6 +488,7 @@ int main(void)
     RUN_TEST(test_elf_flash_addr_all_avros_symbol_addresses_use_word_formula);
     RUN_TEST(test_elf_find_avros_tables_returns_0_on_partial_symbol_match);
     RUN_TEST(test_elf_find_avros_tables_zero_initialises_absent_symbol_fields);
+    RUN_TEST(test_elf_has_fsm_symbols_requires_non_zero_table_address_and_count);
     RUN_TEST(test_elf_close_frees_symtab_strtab_and_closes_fd);
     RUN_TEST(test_elf_close_safe_on_partially_initialised_context);
     RUN_TEST(test_elf_open_sets_flash_base_and_sram_base_from_pt_load_segments);
