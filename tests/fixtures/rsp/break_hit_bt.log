@@ -1,0 +1,67 @@
+RSP < qSupported:multiprocess+;swbreak+;hwbreak+;qRelocInsn+;fork-events+;vfork-events+;exec-events+;vContSupported+;QThreadEvents+;no-resumed+;memory-tagging+
+RSP > PacketSize=800;QStartNoAckMode+;vContSupported+;vRun+;vAttach+;vKill+;vFlashErase+;vFlashWrite+;vFlashDone+;swbreak+;hwbreak+;qXfer:memory-map:read+
+RSP < vCont?
+RSP > vCont;c;s;r
+RSP < vMustReplyEmpty
+RSP > 
+RSP < QStartNoAckMode
+RSP > OK
+RSP < !
+RSP > 
+RSP < Hg0
+RSP > OK
+RSP < qTStatus
+RSP > 
+RSP < ?
+RSP > T05thread:1;
+RSP < qfThreadInfo
+RSP > l
+RSP < Hc-1
+RSP > OK
+RSP < qAttached
+RSP > 1
+RSP < qOffsets
+RSP > Text=0;Data=0;Bss=0
+RSP < g
+RSP > 000000000000000000000000000000000000000000000000000000000000000000ff7f00000000
+RSP < qfThreadInfo
+RSP > l
+RSP < qSymbol::
+RSP > 
+RSP < qXfer:memory-map:read::0,7fb
+RSP > l<memory-map><memory type="flash" start="0x0" length="0x20000"><property name="blocksize">0x200</property></memory><memory type="ram" start="0x804000" length="0x4000"/><memory type="flash" start="0x810000" length="0x200"><property name="blocksize">0x1</property></memory><memory type="flash" start="0x820000" length="0x10"><property name="blocksize">0x1</property></memory><memory type="flash" start="0x830000" length="0x4"><property name="blocksize">0x1</property></memory><memory type="rom" start="0x840000" length="0x40"/><memory type="flash" start="0x850000" length="0x20"><property name="blocksize">0x20</property></memory></memory-map>
+RSP < m3ec,22
+RSP > 0e940d0e0e941c096fef83ef9de80e949e110e94b80f6fef83ef9de80e946511f1cf
+RSP < m3ec,22
+RSP > 0e940d0e0e941c096fef83ef9de80e949e110e94b80f6fef83ef9de80e946511f1cf
+RSP < m3ec,2
+RSP > 0e94
+RSP < Z1,3ec,2
+RSP > OK
+RSP < Hc0
+RSP > OK
+RSP < c
+RSP > T05hwbreak:;thread:1;
+RSP < g
+RSP > 0000000000000000000000000000000000414700000000000000b147ff7f4e4802fd7fec030000
+RSP < qfThreadInfo
+RSP > l
+RSP < z1,3ec,2
+RSP > OK
+RSP < m807ffe,2
+RSP > 006f
+RSP < md4,a
+RSP > a13bb207e1f70e94f601
+RSP < qfThreadInfo
+RSP > l
+RSP < qThreadExtraInfo,1
+RSP > 
+RSP < qP0000001f0000000000000001
+RSP > 
+RSP < qP0000001f0000000000000001
+RSP > 
+RSP < qRcmd,6176726f73207461736b73
+RSP > O202020204C6564735F736D2020202020202020202073746174653D28696E6974290A20202020636F6D6D616E645F6C696E655F534D202073746174653D28696E6974290A
+RSP > OK
+RSP < D
+RSP > OK

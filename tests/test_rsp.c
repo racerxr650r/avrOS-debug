@@ -1317,6 +1317,45 @@ static void qSupported_advertises_vRun_vAttach_vKill_no_multiprocess(void)
     TEST_ASSERT_NOT_NULL(strstr(payload, "vKill+"));
 }
 
+/* Replay of the demote-correctness invariants from a real captured GDB
+ * session — tests/fixtures/rsp/break_hit_bt.log, recorded on AVR128DA28
+ * hardware: the exact monitor-reset -> break -> hit -> bt -> info threads ->
+ * monitor avros tasks sequence that used to crash avr-gdb.  Feeding the
+ * captured GDB request packets through the current server proves FSM-as-GDB-
+ * threads cannot reappear (a single implicit thread, no multiprocess, no
+ * per-FSM labels), which is what makes `bt` safe. */
+static void captured_session_replay_holds_demote_invariants(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    char stream[1024], payload[1024];
+
+    /* qSupported reply must NOT advertise multiprocess+ (lifecycle stays). */
+    rsp_dispatch(sock_pair[1], "qSupported:multiprocess+;swbreak+;hwbreak+", &h);
+    drain(sock_pair[0], stream, sizeof stream);
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_NULL(strstr(payload, "multiprocess+"));
+    TEST_ASSERT_NOT_NULL(strstr(payload, "vRun+"));
+
+    /* qfThreadInfo: single implicit thread (l) — no FSM enumeration. */
+    rsp_dispatch(sock_pair[1], "qfThreadInfo", &h);
+    drain(sock_pair[0], stream, sizeof stream);
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("l", payload);
+
+    /* qThreadExtraInfo,1: no per-FSM GDB-thread label (empty packet). */
+    rsp_dispatch(sock_pair[1], "qThreadExtraInfo,1", &h);
+    drain(sock_pair[0], stream, sizeof stream);
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("", payload);
+
+    /* Bare thread-id set-thread (GDB uses Hg0/Hc-1 because multiprocess is
+     * off) is accepted. */
+    rsp_dispatch(sock_pair[1], "Hg0", &h);
+    drain(sock_pair[0], stream, sizeof stream);
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("OK", payload);
+}
+
 /* ── HLR-062 (LLR-RSP-44/45): swbreak/hwbreak stop-cause tags ─────── */
 
 static void qSupported_advertises_swbreak_and_hwbreak(void)
@@ -2045,6 +2084,7 @@ int main(void)
     RUN_TEST(vKill_replies_ok_closes_socket_does_not_set_quit);
     RUN_TEST(vKill_sets_disconnect_reason_to_vKill);
     RUN_TEST(qSupported_advertises_vRun_vAttach_vKill_no_multiprocess);
+    RUN_TEST(captured_session_replay_holds_demote_invariants);
     RUN_TEST(qSupported_advertises_swbreak_and_hwbreak);
     RUN_TEST(continue_emits_swbreak_when_pc_matches_sw_bp_shadow);
     RUN_TEST(continue_emits_hwbreak_when_pc_matches_hw_bp_shadow);
