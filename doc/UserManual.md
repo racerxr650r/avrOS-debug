@@ -3,7 +3,7 @@
 `avrOSdb` is a host-side GDB Remote Serial Protocol (RSP) server that
 bridges `avr-gdb` to AVR DA/DB targets over the UPDI single-wire debug
 interface. It adds first-class awareness of [avrOS](https://github.com/racerxr650r/avrOS)
-cooperative FSM tasks, exposing each registered FSM as a GDB virtual thread.
+cooperative FSM tasks, exposing each registered FSM's state through `monitor avros` introspection.
 
 This manual covers installation, hardware connection, command-line invocation,
 worked examples, and integration with VS Code's built-in debugger UI.
@@ -153,6 +153,7 @@ avrOSdb --device [--baud <baud>] [--no-autobaud] [--force-device <family>] <seri
 | `--allow-erase` | flag | unset | Permit the GDB-side `monitor erase` and `monitor chip-erase` verbs to issue a UPDI chip-erase on the running target. Without this flag both verbs return an error code (`E11`) and leave the silicon untouched. Has no effect on the boot-time `--erase` flag. (HLR-055.) |
 | `--device` | flag | unset | One-shot diagnostic: open UPDI, run an auto-baud link-quality probe (unless `--no-autobaud`), read the SIGROW signature + serial number, ASI status bytes, FUSES, and LOCK byte, print a human-readable report (including the per-rung baud table and a decoded fuse listing) to stdout, then exit. No TCP listener is opened, no ELF is loaded, the target CPU is not halted. Mutually exclusive with `--load` and `--prog`. Makes `<elf-file>` optional. |
 | `--force-device <family>` | string | unset | Override automatic family detection. Accepts one of `AVR-DA`, `AVR-DB`, `AVR-DD`, `AVR-DU`, `AVR-SD` (case-insensitive). When set, this string is passed verbatim to the UPDI device-table selector and suppresses the ELF-vs-silicon family mismatch check (see §4.1 below). Use this when you knowingly want to debug an ELF against a different silicon family. |
+| `--no-introspect` | flag | unset | Disable the avrOS FSM introspection reads behind `monitor avros tasks` / `events` / `queues`. The GDB thread model is unaffected — the live CPU is always the sole GDB thread either way. Use when debugging non-avrOS firmware or to avoid the background UPDI reads. |
 
 ### 4.1 Exit Status
 
@@ -206,7 +207,7 @@ avrOSdb /dev/ttyUSB0 build/firmware.elf
 # Terminal 2 — connect with avr-gdb
 avr-gdb build/firmware.elf
 (gdb) target remote :1234
-(gdb) info threads             # shows FSM virtual threads
+(gdb) monitor avros tasks      # list avrOS FSMs and their state
 (gdb) break fsm_blink_state
 (gdb) continue
 ```
@@ -274,13 +275,15 @@ link, no dedicated debugger probe required.
   reset vector, so the very first `continue` from GDB starts execution
   from a clean state.
 
-* **Hardware breakpoints.** The AVR-Dx OCD provides exactly **two**
-  hardware breakpoint comparators. Both `break` (Z0) and `hbreak`
-  (Z1) requests from GDB are routed to these slots — flash patching
-  with the AVR `BREAK` opcode is *not* used, which avoids the
-  state-destroying NVMPROG round-trip on every breakpoint set.
-  Setting a third breakpoint while two are already armed returns
-  GDB error `E08`; remove one first.
+* **Breakpoints.** The AVR-Dx OCD has **two** PC comparators, but
+  avrOSdb reserves **one for single-stepping** (so stepping always
+  works, regardless of your breakpoints), leaving **one** for a user
+  hardware breakpoint. By default `break` (Z0) installs an unlimited
+  **software** breakpoint (the AVR `BREAK` opcode patched into FLASH);
+  `hbreak` (Z1) — or any breakpoint under `monitor bp-mode hw-only` —
+  uses the single user comparator. Requesting a **second** hardware
+  breakpoint returns GDB error `E08`; remove one first, or rely on
+  software breakpoints.
 
 * **Run / step / continue.** `c`, `s`, `si`, and `ni` are all handled
   by the OCD primitives (RUN, single-step, STOP). A halt is reported
@@ -299,12 +302,12 @@ Example session:
 
 ```
 (gdb) target remote :1234
-(gdb) break main
-(gdb) break my_isr_handler        # 2nd HW comparator used
-(gdb) break some_other_fn         # FAILS — E08 (no slots left)
+(gdb) break main                   # software breakpoint (unlimited)
+(gdb) hbreak my_isr_handler        # the single user HW comparator
+(gdb) hbreak some_other_fn         # FAILS — E08 (HW comparator in use)
 (gdb) continue
 ^C                                 # halts target, prints SIGINT
-(gdb) step
+(gdb) step                         # always works (reserved step comparator)
 (gdb) detach                       # releases both comparators
 ```
 
@@ -423,16 +426,14 @@ avrOSdb 0.1.0  (built 2026-05-20)
 Family:    AVR128DA28
 Signature: 1E 97 0A   Rev: A6
 Flash:     128 KiB    SRAM: 16 KiB
-(gdb) info threads
-  Id   Target Id                    Frame
-* 1    CPU                          __vectors ()
-  2    FSM blink     (state=BLINK)  fsm_blink_state ()
-  3    FSM uart_rx   (state=IDLE)   fsm_uart_state ()
+(gdb) monitor avros tasks
+  * blink            state=BLINK
+    uart_rx          state=IDLE
 ```
 
-Each registered avrOS FSM appears as its own GDB virtual thread; the
-state-function name in the `Target Id` column is the current state
-pointer read from the FSM table.
+avrOSdb exposes a single GDB thread (the live CPU); each registered avrOS
+FSM is listed by `monitor avros tasks` with an active marker, its name, and
+its current state name, read non-intrusively from the FSM table.
 
 #### 3. Load (or reload) firmware from inside GDB
 
@@ -474,8 +475,9 @@ fine-grained run control without changing PC:
 
 #### 5. Set breakpoints
 
-The OCD provides 2 **hardware** comparators; `avrOSdb` additionally
-implements up to 64 **software** breakpoints by patching the AVR
+The OCD has 2 PC comparators — `avrOSdb` reserves one for
+single-stepping and exposes **one** as a user **hardware** breakpoint —
+plus up to 64 **software** breakpoints implemented by patching the AVR
 `BREAK` opcode (`0x9598`, little-endian) into FLASH via the NVM
 controller. The original FLASH word is kept in an in-memory shadow
 so `z0` packets restore it cleanly, and CPU state (R0–R31, SREG, SP,
@@ -604,26 +606,31 @@ resuming normal execution. For a one-off check, prefer a breakpoint
 at the writer/reader site combined with `print` over an active
 watchpoint.
 
-#### 10. avrOS FSM threads
+#### 10. avrOS introspection
 
-Switch to an FSM context to inspect its locals and state:
-
-```
-(gdb) info threads
-(gdb) thread 3                      # switch to FSM "uart_rx"
-[Switching to thread 3 (FSM uart_rx)]
-#0 fsm_uart_state () at src/fsm_uart.c:112
-(gdb) backtrace
-(gdb) print rx_buffer[0]@8
-```
-
-The avrOS-specific monitor verbs dump runtime state for the whole
-system, independent of which thread is selected:
+avrOSdb exposes a **single GDB thread** (the live CPU). avrOS cooperative
+FSMs are surfaced through `monitor avros` commands — not as GDB threads —
+because a run-to-completion FSM has no independent call stack to unwind:
 
 ```
-(gdb) monitor avros events          # global event mask
-(gdb) monitor avros queues          # message-queue depths
+(gdb) monitor avros tasks           # list FSMs: active marker, name, state
+(gdb) monitor avros events          # named events and their status
+(gdb) monitor avros queues          # message-queue capacity / element size
 ```
+
+`monitor avros tasks` reads the avrOS FSM registration table
+non-intrusively (no halt required) and prints one line per FSM — an
+active marker (`*`), the FSM name, and its current state name (`(init)`
+until the FSM has first dispatched). For example:
+
+```
+(gdb) monitor avros tasks
+  * Leds_sm          state=blinkOn
+    command_line_SM  state=(init)
+```
+
+Launch `avrOSdb` with `--no-introspect` to disable the avrOS
+introspection reads entirely.
 
 #### 11. Restart, detach, and quit
 
@@ -716,9 +723,9 @@ Recommended workflow:
 2. Press **F5** to launch the `Debug AVR via avrOSdb` configuration.
    VS Code spawns `avr-gdb`, which connects to `localhost:1234` and
    downloads symbols.
-3. Set breakpoints in the editor margin; the **Call Stack** view shows
-   each avrOS FSM as a virtual thread with its current state function
-   at the top of the stack.
+3. Set breakpoints in the editor margin. The **Call Stack** view shows
+   the single CPU thread; run `monitor avros tasks` in the **Debug
+   Console** to list each avrOS FSM and its current state.
 4. Use the **Debug Console** for ad-hoc commands, e.g.
    `-exec monitor avros events`.
 
@@ -746,7 +753,7 @@ launch script already manages the stub.
 - [`avr-gdb`(1)](https://sourceware.org/gdb/) — the GDB client.
 - [`avrdude`(1)](https://github.com/avrdudes/avrdude) — non-debug UPDI flashing.
 - [avrOS](https://github.com/racerxr650r/avrOS) — the cooperative-FSM
-  runtime whose tasks become GDB virtual threads.
+  runtime; its FSM state is surfaced via `monitor avros` introspection.
 - `doc/avrOSdb.1` — Unix man page (installed by `make install`).
 - [doc/PVD.md](PVD.md), [doc/SDD.md](SDD.md) — product vision and
   software design document.

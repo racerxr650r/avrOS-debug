@@ -924,6 +924,40 @@ This is not a fixable detail — it is a **model mismatch**. avrOS is a cooperat
 - **CI net (host, `make test`):** `test_rsp_seq` replays the captured transcripts green; `qfThreadInfo` returns only TID 1; no FSM register-frame path remains.
 - **Gate:** full unit suite passes, `make` builds with 0 warnings, `python3 tools/lint_project.py` reports 0 errors / 0 warnings, and `doc/Traceability.md` shows the retired HLRs removed with no orphaned trace references.
 
+### Phase 13 — HW-Comparator Arbiter with a Reserved Single-Step Slot
+
+> **Status: ✅ Complete — merges via PR [#46](https://github.com/racerxr650r/avrOS-debug/pull/46) (closes #45).** A single comparator arbiter formalizes the reservation: comparator 0 is the sole user HW-breakpoint slot (`E08` on a second), comparator 1 is reserved for the 32-bit `LDS`/`STS` single-step-over, so stepping is always possible regardless of user breakpoints. HLR-016 / LLR-RSP-09 already specified the model (confirmed by the hardware capture `tests/fixtures/rsp/hwbp_one_user_slot.log`), so the change was implementation hygiene + docs: named constants (`RSP_HW_BP_USER_SLOTS` / `RSP_HW_BP_STEP_SLOT`) replacing the magic `< 1`/`< 2` loop bounds, a defensive step-slot clear on detach, a corrected code comment, a `test_rsp` unit test, and `hw-test-gdb` G15 (user HW breakpoint) + G16 (user SW breakpoint) — both validated on AVR128DA28 (`/dev/ttyAMA2`). The deferred Phase-12 User Manual rewrite (introspection model) is reconciled here alongside the Phase-13 breakpoint model. `make`: 0 warnings; `make test`: all suites pass; `lint_project`: 0 errors / 0 warnings.
+
+**Motivation.** The two AVR-Dx OCD program-counter comparators (`OCD_BP0A`/`OCD_BP1A`, `RspContext.hw_bp_addr[2]`) are managed informally. A hardware capture (`tests/fixtures/rsp/hwbp_one_user_slot.log`, AVR128DA28) shows the de-facto behaviour: `dh_insert_bp` accepts exactly **one** user HW breakpoint (slot 0) and returns `E08` for a second, because both its dup-scan and free-slot scan are bounded `for (i = 0; i < 1; i++)` -- an undocumented magic literal that already implicitly reserves **slot 1** for the single-step-over workaround (`updi_step_32bit(fd, 1, ...)`). So the contention originally flagged in the diagnosis (a user HW BP in slot 1 being clobbered by a step) cannot actually occur -- but the reservation is fragile and wrong on paper: the comment directly above the loop still claims *"up to two simultaneous breakpoints,"* and HLR-016 / the README advertise two HW breakpoints. Direct 32-bit `CALL`/`JMP` stepping no longer needs a slot (issue-#40 OCD emulation via `updi_ocd_emulate_cof_32bit()`); the only HW-BP-consuming step case is the 32-bit non-CoF `LDS`/`STS`, which uses the reserved slot 1. Phase 13 makes the reservation **explicit, documented, and robust** -- a single arbiter owning both comparators with a named reserved step slot and a capacity-1 user pool, replacing the magic `< 1` bounds; the misleading comment is fixed; and HLR-016 / the README / the User Manual are reconciled to "1 user HW breakpoint + 1 reserved single-step comparator (SW breakpoints unlimited)."
+
+**Design decision.** Introduce a **single comparator arbiter** that owns both slots and **permanently reserves slot 1 for the single-step-over workaround**. User/auto HW breakpoints may use **only slot 0**. Single-stepping over a 32-bit `LDS`/`STS` is then **always possible regardless of which user breakpoints are set** — the step slot is never contended. Cost: user-visible HW breakpoints drop from 2 to 1; SW breakpoints (FLASH `BREAK`, HLR-054) remain unlimited and are the default (`bp-mode sw`), and the recommended `set breakpoint auto-hw off` keeps flash breakpoints on the SW path, so normal debugging is unaffected.
+
+**Architectural constraint.** Same Layered Architecture rule as Phases 11–12: the arbiter lives in the RSP layer (it owns `RspContext.hw_bp_addr[]`); UPDI-layer helpers (`updi_ocd_set_hw_bp`/`clear_hw_bp`, `updi_step_32bit`) take an explicit slot index and never choose one.
+
+**Scope summary.**
+
+| # | Area | Behaviour | Source file(s) |
+| - | ---- | --------- | -------------- |
+| 1 | Comparator arbiter | One owner of `hw_bp_addr[2]`: slot 0 = user HW-BP pool (capacity 1), slot 1 = reserved step slot. API: `hw_bp_user_insert/remove`, `hw_bp_step_acquire/release`, and a classifier that tells a step-slot stop from a user `hwbreak` | `gdb_rsp.c` |
+| 2 | Z1/z1 insert/remove | User HW BPs allocate slot 0 only via the arbiter; `E08` when occupied (1 HW BP max) | `gdb_rsp.c` |
+| 3 | `LDS`/`STS` step | `dh_step` + `updi_step_32bit` borrow the reserved step slot (1); no save/restore needed | `gdb_rsp.c`, `updi.c` |
+| 4 | Stop classification / teardown | `classify_stop_cause`, `rsp_hw_bp_clear_all` route through the arbiter (a stop at the step slot is `SC_STEP`, not `SC_HWBREAK`) | `gdb_rsp.c` |
+| 5 | Spec + docs | Revise the breakpoints HLR/LLRs for "1 user HW BP + 1 reserved step comparator". **User Manual:** capture the functional changes of **both Phase 12 and Phase 13** — replace all "FSM virtual thread / Call Stack / `info threads`" language with the introspection model (`monitor avros tasks`, single GDB thread, `--no-introspect`), and state the HW-BP count (1 user + 1 reserved step slot; SW breakpoints unlimited). The Phase-12 manual rewrite was deferred, so it is folded in here. | `doc/Project.xml`, `doc/UserManual.md` |
+| 6 | Tests | Unit (2nd HW BP → `E08`; `stepi` over `LDS` with a user HW BP in slot 0 leaves it armed); host replay; stringent `hw-test-gdb` G-group | `tests/test_rsp.c`, `tests/hw/gdb_acceptance.py` |
+
+**Plan (C → A → B).**
+
+1. **(C) Confirm on the wire.** With the target connected, set two HW breakpoints (or one `hbreak` + GDB auto-HW), `stepi` over a 32-bit `LDS`/`STS`, and capture `--log-rsp` evidence that the slot-1 breakpoint is disarmed in silicon (desync) — the empirical pin, committed under `tests/fixtures/rsp/`.
+
+2. **(A) Requirement restructure (tracer).** Revise HLR-016 (Breakpoints) and the relevant LLRs to specify exactly one user-allocatable HW comparator plus one reserved single-step comparator; document the `E08`-on-second-HW-BP contract and the "stepping always possible" guarantee. Render + lint to 0/0.
+
+3. **(B) Implement + regression net.** Add the arbiter; route `dh_insert_bp`/`dh_remove_bp`/`dh_step`/`updi_step_32bit`/`classify_stop_cause`/`rsp_hw_bp_clear_all` through it; add the unit test, the host replay assertion, and a `hw-test-gdb` G-group (set `hbreak`, `stepi` over an `LDS`, assert the `hbreak` still fires).
+
+**Acceptance.**
+- **Unit:** a second HW-breakpoint request returns `E08`; `stepi` over a 32-bit `LDS`/`STS` with a user HW BP in slot 0 leaves that BP armed (shadow and silicon consistent).
+- **Hardware (`hw-test-gdb`):** set an `hbreak`, `stepi` over an `LDS`/`STS`, and confirm the `hbreak` still fires afterward — no desync; stepping succeeds with the user HW BP present.
+- **Gate:** full unit suite passes, `make` 0 warnings, `python3 tools/lint_project.py` 0 errors / 0 warnings.
+
 ## 9. Risks & Open Questions
 
 *   **Half-duplex echo cancellation in UPDI tests.** Every byte transmitted over the UPDI UART is echoed back on the RX line by the hardware. PTY pairs do not auto-echo, so the PTY test harness must explicitly write back the echo bytes before injecting each simulated AVR response. If this is omitted, UPDI functions will block waiting to drain echoes that never arrive, causing PTY tests to time out even though the production logic is correct.

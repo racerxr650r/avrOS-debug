@@ -867,6 +867,40 @@ static void on_step_s_uses_32bit_breakpoint_workaround_for_call(void)
     TEST_ASSERT_EQUAL(0, strncmp(payload, "T05thread:", 10));
 }
 
+/* HLR-016: the HW comparators are arbitrated — comparator 0 is the single
+ * user HW-BP slot, comparator 1 is reserved for the 32-bit LDS/STS
+ * single-step-over.  Stepping must always use the reserved slot and must
+ * never disturb the user's HW breakpoint, so stepping is possible no matter
+ * what user breakpoints are set. */
+static void step_over_32bit_lds_uses_reserved_slot_and_keeps_user_hw_bp(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+
+    /* A user HW breakpoint occupies the single user comparator (slot 0). */
+    rsp_dispatch(sock_pair[1], "Z1,200,2", &h);
+    char stream[64], payload[64];
+    drain(sock_pair[0], stream, sizeof stream);
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("OK", payload);
+    TEST_ASSERT_EQUAL_HEX32(0x200u, mock_hw_bp_silicon[0]);
+
+    /* Step over a 32-bit LDS (non-CoF): w0 = 0x9000, (w0 & 0xFE0F) == 0x9000. */
+    mock_ocd_status1 = 0x00;
+    mock_ocd_pc = 0x3f0u;
+    mock_read_canned_len = 4;
+    mock_read_canned[0] = 0x00; mock_read_canned[1] = 0x90;   /* LDS */
+    mock_read_canned[2] = 0x34; mock_read_canned[3] = 0x12;   /* address word */
+    rsp_dispatch(sock_pair[1], "s", &h);
+    drain(sock_pair[0], stream, sizeof stream);
+
+    /* The step used the RESERVED comparator (slot 1), not the user slot. */
+    TEST_ASSERT_EQUAL(1, mock_step_32bit_calls);
+    TEST_ASSERT_EQUAL(1, mock_step_32bit_slot);     /* RSP_HW_BP_STEP_SLOT */
+    /* The user HW breakpoint in slot 0 is untouched. */
+    TEST_ASSERT_EQUAL_HEX32(0x200u, mock_hw_bp_silicon[0]);
+    TEST_ASSERT_EQUAL_HEX32(0x200u, ctx.hw_bp_addr[0] & GDB_AVR_ADDR_MASK);
+}
+
 static void z0_in_sw_mode_stabilizes_pc_after_restore(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
@@ -1064,7 +1098,10 @@ static void on_detach_clears_hw_bps_before_run(void)
     char drain_buf[256]; drain(sock_pair[0], drain_buf, sizeof drain_buf);
     int events_before = mock_event_count;
     rsp_dispatch(sock_pair[1], "D", &h);
-    TEST_ASSERT_EQUAL(1, mock_hw_bp_clear_calls);
+    /* Two clears: the user comparator (slot 0) plus the reserved
+     * single-step comparator, which the arbiter always disarms on detach
+     * to guarantee clean silicon (HLR-016). */
+    TEST_ASSERT_EQUAL(2, mock_hw_bp_clear_calls);
     TEST_ASSERT_EQUAL(0xFFFFFFFFu, mock_hw_bp_silicon[0]);
     /* Both EV_OCD_CLEAR_BP events must precede the EV_RUN event. */
     int run_idx = -1, last_clear_idx = -1;
@@ -2057,6 +2094,7 @@ int main(void)
     RUN_TEST(on_insert_bp_returns_E08_when_slot_occupied);
     RUN_TEST(on_step_s_calls_updi_step_and_sends_T05_stop_reason);
     RUN_TEST(on_step_s_uses_32bit_breakpoint_workaround_for_call);
+    RUN_TEST(step_over_32bit_lds_uses_reserved_slot_and_keeps_user_hw_bp);
     RUN_TEST(on_continue_calls_updi_run_then_fsm_invalidate);
     RUN_TEST(on_continue_rebuilds_thread_list_after_halt_and_sends_stop);
     RUN_TEST(on_continue_ctrl_c_returns_T02);

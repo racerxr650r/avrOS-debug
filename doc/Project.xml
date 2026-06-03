@@ -3186,7 +3186,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/gdb_rsp.c unit tests                                     -->
     <!-- ============================================================ -->
-    <file path="tests/test_rsp.c" role="unit" count="86">
+    <file path="tests/test_rsp.c" role="unit" count="87">
       <header><![CDATA[Unit tests for `src/gdb_rsp.c`: socket configuration, RSP packet framing, register and memory handlers, hardware-breakpoint comparator management, OCD-based execution control, async Ctrl-C interrupt, detach cleanup, session lifecycle packets, and monitor relay. Uses a `socketpair()` as a drop-in socket substitute and replaces every `updi_*`, `fsm_*`, and `monitor_dispatch` call site with `ld --wrap` mocks so all tests run without real silicon.]]></header>
 
       <test name="rsp_listen_sets_so_reuseaddr_before_bind">
@@ -3424,6 +3424,11 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="captured_session_replay_holds_demote_invariants">
         <purpose><![CDATA[Replay the demote-correctness invariants from a real captured GDB session (tests/fixtures/rsp/break_hit_bt.log, AVR128DA28 hardware: the monitor-reset/break/hit/bt/info-threads/monitor-avros-tasks sequence that previously crashed avr-gdb). Feed the captured GDB request packets through the server and assert: the qSupported reply omits multiprocess+ (keeps vRun+), qfThreadInfo replies l, qThreadExtraInfo,1 replies empty, and bare Hg0 is accepted. Proves FSM-as-GDB-threads cannot reappear, which is what makes bt safe. Per LLR-RSP-26.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-26"/></traces>
+      </test>
+
+      <test name="step_over_32bit_lds_uses_reserved_slot_and_keeps_user_hw_bp">
+        <purpose><![CDATA[Insert a user HW breakpoint (Z1 -> comparator 0) and confirm it occupies the silicon slot, then dispatch a single-step over a 32-bit LDS (opcode w0=0x9000). Assert the step used updi_step_32bit with the RESERVED comparator (slot 1, RSP_HW_BP_STEP_SLOT) and that the user HW breakpoint in slot 0 is left untouched (silicon and shadow). Confirms the HW-comparator arbiter keeps single-stepping always possible regardless of the user breakpoint, per HLR-016.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-016" name="Breakpoints"/></traces>
       </test>
 
       <test name="Z2_replies_empty_packet_so_gdb_falls_back_to_sw_watch">

@@ -43,6 +43,17 @@ bool rsp_get_noack(void)   { return g_noack; }
 /* Sentinel: no breakpoint installed in this HW comparator slot. */
 #define HW_BP_SLOT_EMPTY    0xFFFFFFFFu
 
+/* HW-comparator allocation policy (HLR-016).  The AVR-Dx OCD exposes two
+ * program-counter comparators (BP0/BP1, shadowed in `hw_bp_addr[2]`):
+ *   - comparator 0 is the sole *user* HW-breakpoint slot (Z1/`hbreak`, or
+ *     Z0 in `hw-only` mode); a second user HW BP returns E08.
+ *   - comparator 1 is reserved exclusively for the single-step-over of a
+ *     32-bit non-CoF (`LDS`/`STS`) instruction, so stepping is always
+ *     possible regardless of which user breakpoints are set.
+ * SW breakpoints (FLASH `BREAK`, the default) remain unlimited. */
+#define RSP_HW_BP_USER_SLOTS  1          /* comparators usable by GDB     */
+#define RSP_HW_BP_STEP_SLOT   1          /* comparator reserved for step  */
+
 /* HLR-053: byte length of the most recently received packet.  Set by
  * rsp_dispatch_n(); read by binary handlers (vFlashWrite) that need the
  * true length because the payload may contain embedded NUL bytes that
@@ -361,7 +372,7 @@ static int classify_stop_cause(RspContext *ctx, int hint)
             return SC_SWBREAK;
         }
     }
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < RSP_HW_BP_USER_SLOTS; i++) {
         if (ctx->hw_bp_addr[i] != HW_BP_SLOT_EMPTY &&
             ctx->hw_bp_addr[i] == pc) {
             return SC_HWBREAK;
@@ -402,12 +413,16 @@ static void select_stop_thread(RspContext *ctx, int tid)
  * Idempotent and tolerant of UPDI errors (used on detach).            */
 void rsp_hw_bp_clear_all(RspContext *ctx)
 {
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < RSP_HW_BP_USER_SLOTS; i++) {
         if (ctx->hw_bp_addr[i] != HW_BP_SLOT_EMPTY) {
             (void)updi_ocd_clear_hw_bp(ctx->updi_fd, i);
             ctx->hw_bp_addr[i] = HW_BP_SLOT_EMPTY;
         }
     }
+    /* The arbiter owns both comparators: also disarm the reserved
+     * single-step slot in silicon so detach always leaves clean state,
+     * even if a step was interrupted before it released the slot. */
+    (void)updi_ocd_clear_hw_bp(ctx->updi_fd, RSP_HW_BP_STEP_SLOT);
 }
 
 #define hw_bp_clear_all rsp_hw_bp_clear_all
@@ -489,7 +504,7 @@ static int sw_bp_patch_flash(RspContext *ctx, uint32_t byte_addr,
 
     if (updi_enter_debug(updi_fd) < 0) return -1;
 
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < RSP_HW_BP_USER_SLOTS; i++) {
         if (ctx->hw_bp_addr[i] != HW_BP_SLOT_EMPTY) {
             uint32_t flash_byte = ctx->hw_bp_addr[i] & GDB_AVR_ADDR_MASK;
             if (updi_ocd_set_hw_bp(updi_fd, i, flash_byte) < 0)
@@ -985,7 +1000,7 @@ static int dh_step(int fd, const char *pkt, void *vctx)
                                            0u, target_pc) < 0)
                 return reply_err(fd, "E01");
         } else {
-            if (updi_step_32bit(ctx->updi_fd, 1,
+            if (updi_step_32bit(ctx->updi_fd, RSP_HW_BP_STEP_SLOT,
                                 target_pc, halt_on_jump) < 0)
                 return reply_err(fd, "E01");
         }
@@ -1082,11 +1097,12 @@ static int dh_insert_bp(int fd, const char *pkt, void *vctx)
      * then re-entering OCD — a sequence that destroys live CPU state
      * (PC/SREG/GPRs) and is non-trivial to save/restore over UPDI.
      *
-     * Pragmatic choice: route Z0 to the same two HW comparators so
-     * plain `break` Just Works up to two simultaneous breakpoints,
-     * matching what microchip-pic-avr-tools / pyedbglib do for the
-     * same silicon.  When all slots are full we return E08 so GDB
-     * surfaces the limit to the user.                                */
+     * Pragmatic choice: route Z0 (in hw-only mode) and Z1 to the single
+     * user HW comparator (slot 0; RSP_HW_BP_USER_SLOTS).  Comparator 1 is
+     * reserved for the single-step-over workaround (RSP_HW_BP_STEP_SLOT),
+     * so only one user HW breakpoint is available; a second returns E08.
+     * SW breakpoints (FLASH `BREAK`, the default `bp-mode sw`) are
+     * unlimited, so this 1-slot limit only bites `hbreak` / hw-only.   */
     char kind = pkt[1];
     /* HLR-056: Z2/Z3/Z4 — AVR-Dx OCD over UPDI exposes no data-address
      * watchpoint hardware (see src/updi.h, doc/reference/guesswork.md).
@@ -1134,11 +1150,11 @@ static int dh_insert_bp(int fd, const char *pkt, void *vctx)
     }
 
     /* Already set?  Idempotent OK. */
-    for (int i = 0; i < 1; i++) {
+    for (int i = 0; i < RSP_HW_BP_USER_SLOTS; i++) {
         if (ctx->hw_bp_addr[i] == addr) return reply_ok(fd);
     }
     int slot_i = -1;
-    for (int i = 0; i < 1; i++) {
+    for (int i = 0; i < RSP_HW_BP_USER_SLOTS; i++) {
         if (ctx->hw_bp_addr[i] == HW_BP_SLOT_EMPTY) { slot_i = i; break; }
     }
     if (slot_i < 0) return reply_err(fd, "E08");          /* slot used */
@@ -1186,7 +1202,7 @@ static int dh_remove_bp(int fd, const char *pkt, void *vctx)
         /* Not in SW shadow — fall through to HW shadow scan below.   */
     }
 
-    for (int i = 0; i < 1; i++) {
+    for (int i = 0; i < RSP_HW_BP_USER_SLOTS; i++) {
         if (ctx->hw_bp_addr[i] == addr) {
             if (updi_ocd_clear_hw_bp(ctx->updi_fd, i) < 0)
                 return reply_err(fd, "E01");
