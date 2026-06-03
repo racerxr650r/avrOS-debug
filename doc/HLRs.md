@@ -156,6 +156,10 @@ Requirements in this section govern the custom `monitor avros` commands that exp
     The application shall implement a `monitor avros queues` command that iterates the avrOS `QUE_TABLE` and reports each registered queue's `capacity` and `sizeOfElement` from the FLASH descriptor via UPDI background read, returning a human-readable table to the GDB console without halting the CPU core.
     *Trace:* [SDD Section 8.2.2](SDD.md), [SDD Section 8.3.1](SDD.md).
 
+*   <a id="HLR-069"></a>**HLR-069: Monitor Tasks Command.**
+    The application shall implement a `monitor avros tasks` command that lists each registered avrOS FSM with an active marker, its name, and its current state name, reading the FSM registration table and each FSM's `currStateName` via UPDI background reads (reusing `fsm_build_thread_list()`), without halting the CPU. avrOS FSMs surface as introspection here, not as GDB threads.
+    *Trace:* [SDD Section 8.2.2](SDD.md), [SDD Section 8.3.1](SDD.md).
+
 *   <a id="HLR-032"></a>**HLR-032: Introspection Reliability.**
     The `monitor avros events` command shall accurately reflect the current event status flags across at least 10,000 consecutive invocations of `monitor_dispatch()` with the `avros events` sub-command without producing a UPDI protocol desync, a corrupted response, or a server crash.
     *Trace:* [SDD Section 4.3.1](SDD.md), [SDD Section 8.1](SDD.md).

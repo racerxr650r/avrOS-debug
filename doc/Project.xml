@@ -1420,6 +1420,14 @@ Errors are propagated upward through the module stack without retrying:
         </traces>
       </hlr>
 
+      <hlr id="HLR-069" name="Monitor Tasks Command">
+        <text><![CDATA[The application shall implement a `monitor avros tasks` command that lists each registered avrOS FSM with an active marker, its name, and its current state name, reading the FSM registration table and each FSM's `currStateName` via UPDI background reads (reusing `fsm_build_thread_list()`), without halting the CPU. avrOS FSMs surface as introspection here, not as GDB threads.]]></text>
+        <traces>
+          <trace target="SDD" ref="8.2.2"/>
+          <trace target="SDD" ref="8.3.1"/>
+        </traces>
+      </hlr>
+
       <hlr id="HLR-032" name="Introspection Reliability">
         <text><![CDATA[The `monitor avros events` command shall accurately reflect the current event status flags across at least 10,000 consecutive invocations of `monitor_dispatch()` with the `avros events` sub-command without producing a UPDI protocol desync, a corrupted response, or a server crash.]]></text>
         <traces>
@@ -2545,6 +2553,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <text><![CDATA[The `monitor reset` verb shall call `updi_enter_debug(ctx->updi_fd)` (issuing the OCD KEY + ASI_RESET_REQ pulse and waiting for the STOPPED bit so the CPU is halted at the reset vector), discard all hardware-breakpoint shadow entries via `rsp_hw_bp_clear_all(ctx)`, invalidate the FSM snapshot cache via `fsm_invalidate(ctx->fsm)` when `ctx->fsm` is non-NULL, emit one diagnostic O-packet line `"target reset, halted at reset vector\n"`, and return 0 so `dh_monitor` appends the trailing `OK`.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-055" name="avarice-Compatible Monitor Commands"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MON-16">
+        <text><![CDATA[`monitor_dispatch()` shall route the decoded sub-command `tasks` to `cmd_tasks()`, which builds the FSM snapshot via `fsm_build_thread_list()` and emits one O-packet line per FSM (an active marker, the FSM name, and the current state name, or `(init)` when `currStateName` is NULL), returning 0. When no FSMs are registered it emits a single "(no FSMs registered)" line.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-069" name="Monitor Tasks Command"/>
         </traces>
       </llr>
 
@@ -3732,12 +3747,17 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/monitor.c unit tests                                     -->
     <!-- ============================================================ -->
-    <file path="tests/test_monitor.c" role="unit" count="20">
+    <file path="tests/test_monitor.c" role="unit" count="21">
       <header><![CDATA[Unit tests for `src/monitor.c`: hex command decoding, prefix matching, per-sub-command UPDI reads, O-packet output formatting, 512-byte buffer constraint, and the no-halt guarantee. All UPDI calls are intercepted by a mock layer that records calls and returns injected data.]]></header>
 
       <test name="monitor_dispatch_hex_decodes_cmd_before_prefix_matching">
         <purpose><![CDATA[Pass `monitor_dispatch()` a hex-encoded `"avros events"` command and verify the function routes to `cmd_events()`, confirming that decoding occurs before prefix matching.]]></purpose>
         <traces><trace target="LLR" ref="LLR-MON-01"/></traces>
+      </test>
+
+      <test name="monitor_dispatch_avros_tasks_routes_to_cmd_tasks">
+        <purpose><![CDATA[Dispatch hex-encoded `avros tasks` with a non-empty FSM table (fsm_table_count=2). Assert monitor_dispatch returns 0, that cmd_tasks invoked fsm_build_thread_list (wrapped), and that at least one O-packet was emitted. Confirms `tasks` routes to cmd_tasks and renders the FSM introspection snapshot. Per LLR-MON-10.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-16"/></traces>
       </test>
 
       <test name="monitor_dispatch_treats_invalid_hex_sequence_as_unrecognised">

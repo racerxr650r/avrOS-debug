@@ -371,6 +371,9 @@ Requirements for `monitor_dispatch()` and its static sub-command helpers `cmd_ev
 *   <a id="LLR-MON-09"></a>**LLR-MON-09** — The `monitor reset` verb shall call `updi_enter_debug(ctx->updi_fd)` (issuing the OCD KEY + ASI_RESET_REQ pulse and waiting for the STOPPED bit so the CPU is halted at the reset vector), discard all hardware-breakpoint shadow entries via `rsp_hw_bp_clear_all(ctx)`, invalidate the FSM snapshot cache via `fsm_invalidate(ctx->fsm)` when `ctx->fsm` is non-NULL, emit one diagnostic O-packet line `"target reset, halted at reset vector\n"`, and return 0 so `dh_monitor` appends the trailing `OK`.
     *Trace:* HLR-055 (avarice-Compatible Monitor Commands).
 
+*   <a id="LLR-MON-16"></a>**LLR-MON-16** — `monitor_dispatch()` shall route the decoded sub-command `tasks` to `cmd_tasks()`, which builds the FSM snapshot via `fsm_build_thread_list()` and emits one O-packet line per FSM (an active marker, the FSM name, and the current state name, or `(init)` when `currStateName` is NULL), returning 0. When no FSMs are registered it emits a single "(no FSMs registered)" line.
+    *Trace:* HLR-069 (Monitor Tasks Command).
+
 *   <a id="LLR-MON-10"></a>**LLR-MON-10** — The `monitor halt` verb shall call `updi_halt(ctx->updi_fd)` and then emit the same stop-reply packet shape used by the step/continue paths — `T05thread:<id>;` where `<id>` is `fsm_get_active_thread(ctx->fsm)` (or 1 when no FSM mapping is available) — via `rsp_send_packet()`. The verb shall return -3 so `dh_monitor` suppresses the trailing `OK` and the GDB client sees exactly one packet per halt.
     *Trace:* HLR-055 (avarice-Compatible Monitor Commands).
 
