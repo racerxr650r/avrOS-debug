@@ -379,13 +379,35 @@ static int format_stop_reply(int fd, RspContext *ctx,
     const char *tag = "";
     if (cause == SC_SWBREAK) tag = "swbreak:;";
     else if (cause == SC_HWBREAK) tag = "hwbreak:;";
-    int aid = (ctx && ctx->fsm) ? fsm_get_active_thread(ctx->fsm) : 0;
-    if (aid <= 0) aid = 1;
+    (void)ctx;
     char reply[64];
     snprintf(reply, sizeof reply, "%s%sthread:%x;",
-             sig, tag, (unsigned)aid);
+             sig, tag, (unsigned)FSM_SYSTEM_THREAD_ID);
     return rsp_send_packet(fd, reply);
 }
+
+/* Stop-state ownership lives in the protocol control paths, not in the
+ * wire formatter.  Whenever avrOSdb emits a stop reply for the live CPU,
+ * rebind both the register-selection and continue-selection threads to the
+ * reported stop thread so a subsequent plain `g` observes the same thread
+ * the stop reply named.                                                */
+static void select_stop_thread(RspContext *ctx, int tid)
+{
+    if (ctx == NULL || tid <= 0) return;
+    if (ctx->g_thread_p != NULL) *ctx->g_thread_p = tid;
+    if (ctx->c_thread_p != NULL) *ctx->c_thread_p = tid;
+}
+
+static const FsmThread *find_fsm_thread_by_id(const FsmContext *ctx, int tid)
+{
+    if (ctx == NULL || !ctx->valid) return NULL;
+    for (int i = 0; i < ctx->thread_count; ++i) {
+        if (ctx->threads[i].gdb_id == tid) return &ctx->threads[i];
+    }
+    return NULL;
+}
+
+static bool refresh_fsm_threads_if_needed(RspContext *ctx);
 
 /* Clear all OCD HW breakpoints in silicon and reset the local shadow.
  * Idempotent and tolerant of UPDI errors (used on detach).            */
@@ -444,6 +466,7 @@ static int sw_bp_restore_cpu(int updi_fd, const uint8_t gpr[32],
     if (updi_ocd_write_sreg(updi_fd, sreg) < 0) return -1;
     if (updi_ocd_write_sp  (updi_fd, sp)   < 0) return -1;
     if (updi_ocd_write_pc  (updi_fd, pc)   < 0) return -1;
+    if (updi_ocd_stabilize_pc_after_write(updi_fd) < 0) return -1;
     return 0;
 }
 
@@ -509,6 +532,7 @@ static int dh_halt_reason(int fd, const char *pkt, void *vctx)
     if (ctx->last_stop_cause == SC_NONE) {
         ctx->last_stop_cause = classify_stop_cause(ctx, SC_NONE);
     }
+    select_stop_thread(ctx, FSM_SYSTEM_THREAD_ID);
     return format_stop_reply(fd, ctx,
                              signal_for_halt_status(ctx->updi_fd),
                              ctx->last_stop_cause);
@@ -555,22 +579,18 @@ static int dh_read_regs(int fd, const char *pkt, void *vctx)
 {
     (void)pkt;
     RspContext *ctx = (RspContext *)vctx;
-    int tid = ctx->g_thread_p ? *ctx->g_thread_p : 0;
-    int aid = ctx->fsm ? fsm_get_active_thread(ctx->fsm) : 0;
-    if (tid <= 0) tid = aid;
-    if (tid <= 0) tid = 1;
-
-    /* Active thread → live CPU regs via OCD; non-active threads → the
-     * FSM-reconstructed view (PC = saved state_fn, R-file zeros).
-     * When no FSM thread is active (e.g. --load without --device), we
-     * still want live CPU state from OCD rather than synthetic zeros.  */
+    int requested_tid = ctx->g_thread_p ? *ctx->g_thread_p : 0;
     char reg[80] = {0};
-    if (aid <= 0 || tid == aid) {
-        if (ocd_read_avr_regblock(ctx->updi_fd, reg) < 0)
-            return reply_err(fd, "E01");
-        return rsp_send_packet(fd, reg);
+
+    if (requested_tid > FSM_SYSTEM_THREAD_ID && refresh_fsm_threads_if_needed(ctx)) {
+        if (find_fsm_thread_by_id(ctx->fsm, requested_tid) != NULL) {
+            if (fsm_get_registers(ctx->fsm, requested_tid, reg) < 0)
+                return reply_err(fd, "E01");
+            return rsp_send_packet(fd, reg);
+        }
     }
-    if (fsm_get_registers(ctx->fsm, tid, reg) < 0)
+
+    if (ocd_read_avr_regblock(ctx->updi_fd, reg) < 0)
         return reply_err(fd, "E01");
     return rsp_send_packet(fd, reg);
 }
@@ -791,6 +811,46 @@ static int dh_write_mem(int fd, const char *pkt, void *vctx)
     return (rc < 0) ? reply_err(fd, "E01") : reply_ok(fd);
 }
 
+/* HLR-062 (issue #40): the AVR-Dx OCD misses the *first* change-of-flow
+ * after a RUN — a direct 32-bit CALL/JMP at the resume PC runs straight
+ * through the callee and halts at the next outer-frame breakpoint,
+ * silently skipping every breakpoint reached inside that callee.  This
+ * is the same silicon quirk dh_step() compensates for via
+ * updi_ocd_emulate_cof_32bit().  Before a free-run we therefore detect a
+ * direct 32-bit CALL/JMP at the current PC and emulate it over OCD
+ * (push the return address for CALL, set PC to the branch target) so the
+ * subsequent RUN resumes at a non-CoF instruction.  16-bit CoF (RJMP/
+ * RCALL/branches/RET/ICALL) and the resume-from-SW-BREAK case read back
+ * as non-matching opcodes and fall through to a plain RUN unchanged.
+ * Returns 0 on success (with or without an emulation), -1 on UPDI error. */
+static int continue_step_over_leading_cof(RspContext *ctx)
+{
+    int updi_fd = ctx->updi_fd;
+    uint32_t pc_byte = 0;
+    if (updi_ocd_read_pc(updi_fd, &pc_byte) < 0) return -1;
+
+    uint8_t opcode[4] = {0};
+    if (updi_mem_read(updi_fd, pc_byte | UPDI_FLASH_BASE, opcode, 4) < 0)
+        return -1;
+
+    uint16_t w0 = (uint16_t)opcode[0] | ((uint16_t)opcode[1] << 8);
+    uint16_t w1 = (uint16_t)opcode[2] | ((uint16_t)opcode[3] << 8);
+
+    if ((w0 & 0xFE0Eu) == 0x940Eu) {            /* CALL k (32-bit) */
+        uint32_t k = (uint32_t)w1
+                   | (((uint32_t)w0 & 0x0001u) << 16)
+                   | ((((uint32_t)w0 & 0x01F0u) >> 4) << 17);
+        return updi_ocd_emulate_cof_32bit(updi_fd, pc_byte + 4u, k * 2u);
+    }
+    if ((w0 & 0xFE0Eu) == 0x940Cu) {            /* JMP k  (32-bit) */
+        uint32_t k = (uint32_t)w1
+                   | (((uint32_t)w0 & 0x0001u) << 16)
+                   | ((((uint32_t)w0 & 0x01F0u) >> 4) << 17);
+        return updi_ocd_emulate_cof_32bit(updi_fd, 0u, k * 2u);
+    }
+    return 0;
+}
+
 static int dh_continue(int fd, const char *pkt, void *vctx)
 {
     (void)pkt;
@@ -799,6 +859,10 @@ static int dh_continue(int fd, const char *pkt, void *vctx)
     /* HLR-062: clear the previous-halt cause hint so a stale tag
      * never bleeds across resumes.                                  */
     ctx->last_stop_cause = SC_NONE;
+    /* HLR-062 (issue #40): emulate a direct 32-bit CALL/JMP parked at
+     * the resume PC so the OCD "first change-of-flow after RUN" quirk
+     * does not skip breakpoints inside the callee.                   */
+    if (continue_step_over_leading_cof(ctx) < 0) return reply_err(fd, "E01");
     if (updi_run(ctx->updi_fd) < 0) return reply_err(fd, "E01");
     fsm_invalidate(ctx->fsm);
 
@@ -871,6 +935,7 @@ static int dh_continue(int fd, const char *pkt, void *vctx)
         const char *sig = got_ctrl_c ? "T02" : "T05";
         int hint = got_ctrl_c ? SC_INTR : SC_NONE;
         ctx->last_stop_cause = classify_stop_cause(ctx, hint);
+        select_stop_thread(ctx, FSM_SYSTEM_THREAD_ID);
         return format_stop_reply(fd, ctx, sig, ctx->last_stop_cause);
     }
 }
@@ -896,37 +961,52 @@ static int dh_step(int fd, const char *pkt, void *vctx)
     uint16_t w1 = (uint16_t)opcode[2] | ((uint16_t)opcode[3] << 8);
 
     bool is_32bit = false;
+    bool is_call_32bit = false;     /* direct 32-bit CALL — needs return push */
+    bool is_jmp_32bit  = false;     /* direct 32-bit JMP  — no return push    */
     uint32_t target_pc = pc_byte + 4;
 
     if ((w0 & 0xFE0F) == 0x9000 || (w0 & 0xFE0F) == 0x9200) {
-        /* LDS or STS */
+        /* LDS or STS — 32-bit non-CoF: HW-BP@PC+4 workaround is fine. */
         is_32bit = true;
-    } else if ((w0 & 0xFE0E) == 0x940E || (w0 & 0xFE0E) == 0x940C) {
-        /* CALL or JMP */
-        uint32_t k = (uint32_t)w1 | (((uint32_t)w0 & 0x0001) << 16) | ((((uint32_t)w0 & 0x01F0) >> 4) << 17);
-        target_pc = k * 2;
+    } else if ((w0 & 0xFE0E) == 0x940E) {
+        /* CALL k  (1001 010k kkkk 111k) */
+        uint32_t k = (uint32_t)w1
+                   | (((uint32_t)w0 & 0x0001u) << 16)
+                   | ((((uint32_t)w0 & 0x01F0u) >> 4) << 17);
+        target_pc = k * 2u;
         is_32bit = true;
+        is_call_32bit = true;
+    } else if ((w0 & 0xFE0E) == 0x940C) {
+        /* JMP k   (1001 010k kkkk 110k) */
+        uint32_t k = (uint32_t)w1
+                   | (((uint32_t)w0 & 0x0001u) << 16)
+                   | ((((uint32_t)w0 & 0x01F0u) >> 4) << 17);
+        target_pc = k * 2u;
+        is_32bit = true;
+        is_jmp_32bit = true;
     }
+    bool halt_on_jump = is_call_32bit || is_jmp_32bit;
 
     if (is_32bit) {
-        if (updi_ocd_set_hw_bp(ctx->updi_fd, 1, target_pc) < 0) return reply_err(fd, "E01");
-        if (updi_run(ctx->updi_fd) < 0) return reply_err(fd, "E01");
-
-        bool halted = false;
-        long total_wait_ms = 0;
-        int max_wait_ms = 200; /* generous timeout for one instruction */
-        
-        while (total_wait_ms < max_wait_ms) {
-            int s = updi_ocd_poll_halted(ctx->updi_fd, 10);
-            if (s == 0) { halted = true; break; }
-            if (s < 0) break;
-            total_wait_ms += 10;
-        }
-
-        (void)updi_ocd_clear_hw_bp(ctx->updi_fd, 1);
-        if (!halted) {
-             (void)updi_halt(ctx->updi_fd);
-             return reply_err(fd, "E01");
+        /* HLR-062 (issue #40): for direct 32-bit CoF (CALL/JMP) the
+         * AVR-Dx OCD comparator and OCD_CTRL1_JMP both fail to halt
+         * on the very first change-of-flow after RUN.  Emulate
+         * entirely via OCD primitives instead — push return address
+         * for CALL, then set OCD PC = target and settle the pipeline.
+         * Plain HW-BP@PC+4 (via updi_step_32bit) is still correct for
+         * the 32-bit non-CoF case (LDS/STS).                          */
+        if (is_call_32bit) {
+            if (updi_ocd_emulate_cof_32bit(ctx->updi_fd,
+                                           pc_byte + 4u, target_pc) < 0)
+                return reply_err(fd, "E01");
+        } else if (is_jmp_32bit) {
+            if (updi_ocd_emulate_cof_32bit(ctx->updi_fd,
+                                           0u, target_pc) < 0)
+                return reply_err(fd, "E01");
+        } else {
+            if (updi_step_32bit(ctx->updi_fd, 1,
+                                target_pc, halt_on_jump) < 0)
+                return reply_err(fd, "E01");
         }
     } else {
         if (updi_step(ctx->updi_fd) < 0) return reply_err(fd, "E01");
@@ -1000,6 +1080,7 @@ static int dh_range_step(int fd, const char *pkt, void *vctx)
     }
     ctx->last_stop_cause =
         classify_stop_cause(ctx, got_ctrl_c ? SC_INTR : SC_STEP);
+    select_stop_thread(ctx, FSM_SYSTEM_THREAD_ID);
     return format_stop_reply(fd, ctx,
                              got_ctrl_c ? "T02" : "T05",
                              ctx->last_stop_cause);
@@ -1137,23 +1218,33 @@ static int dh_remove_bp(int fd, const char *pkt, void *vctx)
     return reply_ok(fd);
 }
 
+static bool refresh_fsm_threads_if_needed(RspContext *ctx)
+{
+    if (ctx == NULL || ctx->fsm == NULL) return false;
+    if (ctx->fsm->valid) return true;
+    (void)fsm_build_thread_list(ctx->fsm, ctx->idx, ctx->updi_fd);
+    return ctx->fsm->valid;
+}
+
 static int dh_thread_info(int fd, const char *pkt, void *vctx)
 {
     RspContext *ctx = (RspContext *)vctx;
     bool first = (strncmp(pkt, "qfThreadInfo", 12) == 0);
     if (!first) return rsp_send_packet(fd, "l");   /* end of list */
 
-    char reply[256] = "m";
-    size_t off = 1;
-    int n = ctx->fsm ? ctx->fsm->thread_count : 0;
-    for (int i = 0; i < n; ++i) {
+    if (!refresh_fsm_threads_if_needed(ctx)) {
+        return rsp_send_packet(fd, "l");
+    }
+
+    char reply[256] = "m1";
+    size_t off = 2;
+    for (int i = 0; i < ctx->fsm->thread_count; ++i) {
         int written = snprintf(reply + off, sizeof reply - off,
-                               "%s%x", (i == 0 ? "" : ","),
+                               ",%x",
                                (unsigned)ctx->fsm->threads[i].gdb_id);
         if (written < 0 || (size_t)written >= sizeof reply - off) break;
         off += (size_t)written;
     }
-    if (n == 0) return rsp_send_packet(fd, "l");
     return rsp_send_packet(fd, reply);
 }
 
@@ -1294,15 +1385,20 @@ static int dh_thread_extra(int fd, const char *pkt, void *vctx)
     if (parse_mp_thread_id(&p, &pid, &tid, &any) < 0) return reply_err(fd, "E01");
     (void)pid;
     if (any) return reply_empty(fd);
-    if (ctx->fsm == NULL || !ctx->fsm->valid) return reply_empty(fd);
+    if (!refresh_fsm_threads_if_needed(ctx)) return reply_empty(fd);
 
-    const FsmThread *match = NULL;
-    for (int i = 0; i < ctx->fsm->thread_count; ++i) {
-        if ((uint32_t)ctx->fsm->threads[i].gdb_id == tid) {
-            match = &ctx->fsm->threads[i];
-            break;
+    if (tid == FSM_SYSTEM_THREAD_ID) {
+        static const char label[] = "System [live CPU]";
+        char reply[2 * sizeof label + 1];
+        size_t lab_len = sizeof label - 1u;
+        for (size_t i = 0; i < lab_len; ++i) {
+            byte_to_hex((uint8_t)label[i], &reply[i * 2u]);
         }
+        reply[lab_len * 2u] = '\0';
+        return rsp_send_packet(fd, reply);
     }
+
+    const FsmThread *match = find_fsm_thread_by_id(ctx->fsm, (int)tid);
     if (match == NULL) return reply_empty(fd);
 
     /* Render label "FSM <name> [active|quiescent] state=0xNNNN".
@@ -1330,7 +1426,7 @@ static int dh_thread_extra(int fd, const char *pkt, void *vctx)
 
 /* HLR-060 / LLR-RSP-41: parse the thread-id payload of an Hg/Hc/Hs
  * packet via parse_mp_thread_id().  *out_tid is set to the resolved
- * tid (the parsed value, or fsm_get_active_thread() when any=true).   */
+ * tid (the parsed value, or the System thread when any=true).         */
 static int parse_h_tid(const RspContext *ctx, const char *pkt, int *out_tid)
 {
     /* Hg<tid> / Hc<tid> / Hs<tid> — skip the H<op> prefix. */
@@ -1340,9 +1436,8 @@ static int parse_h_tid(const RspContext *ctx, const char *pkt, int *out_tid)
     if (parse_mp_thread_id(&p, &pid, &tid, &any) < 0) return -1;
     (void)pid;
     if (any) {
-        int active = (ctx != NULL && ctx->fsm) ? fsm_get_active_thread(ctx->fsm) : 1;
-        if (active <= 0) active = 1;
-        *out_tid = active;
+        (void)ctx;
+        *out_tid = FSM_SYSTEM_THREAD_ID;
     } else {
         *out_tid = (int)tid;
     }
@@ -1354,8 +1449,7 @@ static int dh_set_thread_g(int fd, const char *pkt, void *vctx)
     RspContext *ctx = (RspContext *)vctx;
     int tid;
     if (parse_h_tid(ctx, pkt, &tid) < 0) return reply_err(fd, "E01");
-    if (tid <= 0) tid = ctx->fsm ? fsm_get_active_thread(ctx->fsm) : 1;
-    if (tid <= 0) tid = 1;
+    if (tid <= 0) tid = FSM_SYSTEM_THREAD_ID;
     if (ctx->g_thread_p) *ctx->g_thread_p = tid;
     return reply_ok(fd);
 }
@@ -1365,8 +1459,7 @@ static int dh_set_thread_c(int fd, const char *pkt, void *vctx)
     RspContext *ctx = (RspContext *)vctx;
     int tid;
     if (parse_h_tid(ctx, pkt, &tid) < 0) return reply_err(fd, "E01");
-    if (tid <= 0) tid = ctx->fsm ? fsm_get_active_thread(ctx->fsm) : 1;
-    if (tid <= 0) tid = 1;
+    if (tid <= 0) tid = FSM_SYSTEM_THREAD_ID;
     if (ctx->c_thread_p) *ctx->c_thread_p = tid;
     return reply_ok(fd);
 }
@@ -1463,16 +1556,13 @@ static int dh_thread_alive(int fd, const char *pkt, void *vctx)
     if (parse_mp_thread_id(&p, &pid, &tid, &any) < 0) return reply_err(fd, "E01");
     (void)pid;
     if (any) return reply_ok(fd);
-    if (ctx->fsm != NULL && ctx->fsm->valid) {
-        for (int i = 0; i < ctx->fsm->thread_count; ++i) {
-            if ((uint32_t)ctx->fsm->threads[i].gdb_id == tid) {
-                return reply_ok(fd);
-            }
-        }
-        return reply_err(fd, "E01");
+    if (tid == FSM_SYSTEM_THREAD_ID) return reply_ok(fd);
+    if (refresh_fsm_threads_if_needed(ctx)) {
+        return (find_fsm_thread_by_id(ctx->fsm, (int)tid) != NULL)
+            ? reply_ok(fd)
+            : reply_err(fd, "E01");
     }
-    /* No valid FSM context — accept the default thread id 1. */
-    return (tid == 1u) ? reply_ok(fd) : reply_err(fd, "E01");
+    return reply_err(fd, "E01");
 }
 
 /* HLR-059 (LLR-RSP-22): R<XX> — extended-remote restart.  Behaves as

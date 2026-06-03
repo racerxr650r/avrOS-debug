@@ -11,6 +11,12 @@ the Phase-10 *avarice feature-parity* acceptance criteria from the SDP:
     G4  ``break main`` + ``continue`` → halts at main
     G6  ``monitor reset`` / ``halt`` / ``info`` verbs behave
     G7  ``detach`` + re-attach extended-remote lifecycle
+    G10 select thread 2, verify its synthetic PC, reset, then re-select
+        thread 2 without losing the FSM thread model or reverting to the
+        live CPU/reset-vector frame
+    G11 stop at ``main.c:139`` in the avrOS example and ``step`` into
+        ``fsmDispatch()`` rather than running on to the later
+        ``gpioClearOutput()`` call
 
 (Data watchpoints — G5 in earlier drafts — are intentionally not
 exercised here: AVR-Dx UPDI silicon does not expose data-watchpoint
@@ -50,6 +56,9 @@ import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+THIS_DIR = os.path.dirname(__file__)
+DEFAULT_G10_ELF = os.path.join(THIS_DIR, "fixtures", "avrOS_example_main.elf")
+
 # Marker emitted between sections in the GDB script so we can slice the
 # transcript into per-test windows.
 MARK = "===G{n}==="
@@ -84,10 +93,10 @@ def emit(r: Result) -> None:
         tail = f"({r.ms:7.1f} ms)"
     elif r.status == "FAIL":
         stat = FAIL_TAG
-        tail = f"— {r.detail}" if r.detail else ""
+        tail = f"- {r.detail}" if r.detail else ""
     else:
         stat = SKIP_TAG
-        tail = f"— {r.detail}" if r.detail else ""
+        tail = f"- {r.detail}" if r.detail else ""
     title = r.title.ljust(WIDTH)
     print(f"hw-test: {r.tag:4s} {title} {stat}  {tail}", flush=True)
 
@@ -164,7 +173,7 @@ PER_TEST_CMDS: dict[int, str] = {
     7: ("detach\n"
         "target extended-remote :{rsp_port}\n"
         "info registers pc\n"),
-    8: ("mem 0x0 0x20000 rw\n"
+    8: ("mem 0x0 0x20000 rw\nmem 0x804000 0x808000 rw\n"
         "monitor reset\n"
         "hbreak blink\n"
         "break blink2\n"
@@ -176,6 +185,51 @@ PER_TEST_CMDS: dict[int, str] = {
         "continue\n"
         "delete breakpoints\n"),
     9: "info threads\n",
+        10: ("info threads\n"
+            "thread 2\n"
+            "info registers pc\n"
+            "monitor reset\n"
+            "info threads\n"
+            "thread 2\n"
+            "info registers pc\n"),
+            11: ("mem 0x0 0x20000 rw\nmem 0x804000 0x808000 rw\n"
+         "monitor reset\n"
+         "tbreak main\n"
+         "continue\n"
+         "break main.c:139\n"
+         "continue\n"
+         "step\n"
+         "frame\n"
+         "info line *$pc\n"),
+    # G12: validate the emulated CALL pushed a correct return address.
+    # After stepping into fsmDispatch, `finish` runs until the matching
+    # RET pops back to the caller.  Must land in main near line 141
+    # (the statement immediately after fsmDispatch()).  Issue #40.
+    12: ("mem 0x0 0x20000 rw\nmem 0x804000 0x808000 rw\n"
+         "monitor reset\n"
+         "tbreak main\n"
+         "continue\n"
+         "break main.c:139\n"
+         "continue\n"
+         "step\n"
+         "print/x $sp\n"
+         "x/8bx 0x807ff8\n"
+         "tbreak main.c:141\n"
+         "continue\n"
+         "print/x $pc\n"
+         "print/x $sp\n"
+         "frame\n"
+         "info line *$pc\n"),
+    # G13: cortex-debug attach-sequence replay.  Mirrors the
+    # `overrideAttachCommands` array used by the live avrOS repo's
+    # .vscode/launch.json so we catch regressions that would break the
+    # generic GDB frontend.  Issue #40.
+    13: ("mem 0x0 0x20000 rw\nmem 0x804000 0x808000 rw\n"
+         "monitor reset\n"
+         "tbreak main\n"
+         "continue\n"
+         "info registers pc\n"
+         "frame\n"),
 }
 
 # Per-test wall-clock cap (s) when running `avr-gdb -batch`. G2 has to
@@ -189,6 +243,10 @@ PER_TEST_TIMEOUT: dict[int, float] = {
     6: 15.0,
     7: 15.0,
     8: 15.0,
+    10: 15.0,
+    11: 20.0,
+    12: 25.0,
+    13: 20.0,
 }
 
 def build_test_script(n: int, rsp_port: int) -> str:
@@ -206,6 +264,13 @@ PC_RE = re.compile(r"pc\s+0x([0-9a-fA-F]+)")
 def pc_value(text: str) -> Optional[int]:
     m = PC_RE.search(text)
     return int(m.group(1), 16) if m else None
+
+def pc_values(text: str) -> List[int]:
+    return [int(v, 16) for v in PC_RE.findall(text)]
+
+def pc_matches_state(pc: int, state: int) -> bool:
+    byte_pc = pc << 1
+    return pc == state or byte_pc == state or (byte_pc | 1) == state
 
 # ──────────────────────────────────────────────────────────────────────
 #  Per-test verdicts
@@ -294,6 +359,80 @@ def verdict_G9(sect: str) -> Tuple[str, str]:
         return "PASS", ""
     return "FAIL", "No threads found"
 
+def verdict_G10(sect: str) -> Tuple[str, str]:
+    if "Error in sourced command file" in sect:
+        return "FAIL", "thread selection or reset command failed"
+    if ("Unknown thread 2" in sect or "No thread 2" in sect or
+            "Cannot find thread 2" in sect or "No registers." in sect):
+        return "FAIL", "thread 2 was lost across reset"
+    # Expect thread 2 to appear before and after reset.
+    hits = re.findall(r"\b2\s+Thread \d+\.2\b", sect)
+    if len(hits) < 2:
+        return "FAIL", "thread 2 did not survive the reset sequence"
+    states = [int(v, 16) for v in re.findall(r"\b2\s+Thread \d+\.2\b.*state=0x([0-9a-fA-F]+)", sect)]
+    if len(states) < 2:
+        return "FAIL", "thread 2 state labels missing before or after reset"
+    pcs = pc_values(sect)
+    if len(pcs) < 2:
+        return "FAIL", "no register reads while thread 2 selected"
+    if not pc_matches_state(pcs[0], states[0]):
+        return "FAIL", f"pre-reset thread 2 PC 0x{pcs[0]:x} not consistent with state 0x{states[0]:x}"
+    if not pc_matches_state(pcs[1], states[1]):
+        return "FAIL", f"post-reset thread 2 PC 0x{pcs[1]:x} not consistent with state 0x{states[1]:x}"
+    return "PASS", ""
+
+def verdict_G11(sect: str) -> Tuple[str, str]:
+    if "Error in sourced command file" in sect:
+        return "FAIL", "GDB step command failed"
+    if "remote failure" in sect.lower():
+        return "FAIL", "remote step failed"
+    if re.search(r"^#0\s+fsmDispatch\b", sect, re.MULTILINE):
+        return "PASS", ""
+    if re.search(r"^#0\s+gpioClearOutput\b", sect, re.MULTILINE):
+        return "FAIL", "step skipped fsmDispatch and landed in gpioClearOutput"
+    return "FAIL", "step did not land in fsmDispatch"
+
+def verdict_G12(sect: str) -> Tuple[str, str]:
+    # Issue #40: validates that the emulated CALL pushed a return
+    # address the silicon RET pops back into the right place.  After
+    # `step` into fsmDispatch we set a temp breakpoint at the line
+    # immediately following the CALL (main.c:141) and `continue`.
+    # When fsmDispatch executes its RET, silicon pops the bytes we
+    # pushed and jumps to 0x3f4 — if our push was wrong the CPU would
+    # return to a bogus PC and never reach main.c:141.
+    if "Error in sourced command file" in sect:
+        return "FAIL", "GDB command failed before RET site"
+    if "remote failure" in sect.lower():
+        return "FAIL", "remote step/continue failed"
+    # The frame banner printed after the final tbreak is the source
+    # of truth — `#0  main () at main.c:<line>` — not the earlier
+    # tbreak transcript which still mentions main.c:133.
+    m = re.search(r"^#0\s+main\b.*?\bmain\.c:(\d+)",
+                  sect, re.MULTILINE | re.DOTALL)
+    if m is None:
+        return "FAIL", "did not return to main (stack push wrong?)"
+    ln = int(m.group(1))
+    if not (139 <= ln <= 145):
+        return "FAIL", f"landed at main.c:{ln} (expected 140..144)"
+    return "PASS", ""
+
+def verdict_G13(sect: str) -> Tuple[str, str]:
+    # Issue #40: replays the cortex-debug launch.json
+    # `overrideAttachCommands` sequence.  Must reach main, have a
+    # plausible PC, and report no protocol errors.
+    if "Error in sourced command file" in sect:
+        return "FAIL", "cortex-debug attach sequence failed"
+    if "remote failure" in sect.lower() or "Connection refused" in sect:
+        return "FAIL", "remote failure during attach sequence"
+    if not re.search(r"[Bb]reakpoint \d+,.*\bmain\b", sect):
+        return "FAIL", "tbreak main never hit"
+    if not re.search(r"^#0\s+main\b", sect, re.MULTILINE):
+        return "FAIL", "frame did not report main"
+    pc = pc_value(sect)
+    if pc is None or pc == 0:
+        return "FAIL", f"PC unexpected after attach sequence: {pc}"
+    return "PASS", ""
+
 def verdict_G8(sect: str) -> Tuple[str, str]:
     # Continue must produce breakpoint hit lines for blink, blink2, blink3
     hits_blink = len(re.findall(r"Breakpoint \d+,.*\bblink\b", sect))
@@ -318,6 +457,11 @@ VERDICTS = {
     7: ("detach + re-attach lifecycle",   verdict_G7),
     8: ("multiple breakpoints correctly hit during execution", verdict_G8),
     9: ("--no-fsm-threads switch yields single thread", verdict_G9),
+    10: ("reset preserves selected FSM register view", verdict_G10),
+    11: ("step enters fsmDispatch from main", verdict_G11),
+    12: ("finish from fsmDispatch returns to main (CALL stack push)",
+         verdict_G12),
+    13: ("cortex-debug attach sequence reaches main", verdict_G13),
 }
 
 # ──────────────────────────────────────────────────────────────────────
@@ -331,6 +475,10 @@ def main() -> int:
     ap.add_argument("--elf",        default=os.environ.get("HW_TEST_ELF",
                                             "build/fixtures/gdb_target.elf"),
                     help="ELF to load via `(gdb) load` (default %(default)s)")
+    ap.add_argument("--g10-elf",    default=os.environ.get("HW_GDB_G10_ELF",
+                                            DEFAULT_G10_ELF),
+                    help="ELF used only for G10 FSM-thread reset coverage "
+                         "(default %(default)s)")
     ap.add_argument("--rsp-port",   type=int,
                     default=int(os.environ.get("HW_RSP_PORT", "1234")),
                     help="TCP port for avrOSdb (default %(default)s)")
@@ -354,16 +502,23 @@ def main() -> int:
         print(f"hw-test: gdb_acceptance: missing fixture ELF {args.elf}",
               file=sys.stderr)
         return 1
+    if not os.path.isfile(args.g10_elf):
+        print(f"hw-test: gdb_acceptance: missing G10 ELF {args.g10_elf}",
+              file=sys.stderr)
+        return 1
 
     print(
-        "hw-test: ─── Group G (full-stack avr-gdb acceptance) ──────────────",
+        "hw-test: --- Group G (full-stack avr-gdb acceptance) ---",
         flush=True,
     )
 
     # 1) Spawn avrOSdb.
+    current_extra_args = ["--log-rsp"]
+    current_elf = args.elf
     server_log = "/tmp/avrosdb_gdb_g.log"
     server = spawn_server(args.avros_bin, args.port, args.rsp_port,
-                          args.elf, server_log, extra_args=["--log-rsp"])
+                          current_elf, server_log,
+                          extra_args=current_extra_args)
     try:
         if not wait_for_tcp(args.rsp_port, timeout_s=8.0):
             print(f"hw-test: server did not bind 127.0.0.1:{args.rsp_port}",
@@ -375,12 +530,24 @@ def main() -> int:
         all_transcripts: List[str] = []
         for n in sorted(VERDICTS):
             if n == 9:
+                desired_extra_args = ["--log-rsp", "--no-fsm-threads"]
+            elif n in (10, 11, 12, 13):
+                desired_extra_args = ["--log-rsp", "--load"]
+            else:
+                desired_extra_args = ["--log-rsp"]
+            desired_elf = args.g10_elf if n in (10, 11, 12, 13) else args.elf
+            force_restart = (n in (11, 12, 13))
+            if (force_restart or desired_extra_args != current_extra_args or
+                    desired_elf != current_elf):
                 kill_server(server)
-                server_log = "/tmp/avrosdb_gdb_g9.log"
+                server_log = f"/tmp/avrosdb_gdb_g{n}.log"
                 server = spawn_server(args.avros_bin, args.port, args.rsp_port,
-                                      args.elf, server_log, extra_args=["--no-fsm-threads"])
+                                      desired_elf, server_log,
+                                      extra_args=desired_extra_args)
+                current_extra_args = desired_extra_args
+                current_elf = desired_elf
                 if not wait_for_tcp(args.rsp_port, timeout_s=8.0):
-                    print(f"hw-test: G9 server did not bind", file=sys.stderr)
+                    print(f"hw-test: G{n} server did not bind", file=sys.stderr)
                     return 1
 
             title, fn = VERDICTS[n]
@@ -402,7 +569,7 @@ def main() -> int:
             try:
                 cp = subprocess.run(
                     [args.gdb_bin, "-batch", "-nx", "-x", script_path,
-                     args.elf],
+                     desired_elf],
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL,
                     timeout=timeout_s, check=False,
@@ -439,7 +606,7 @@ def main() -> int:
                 pass
 
         print(
-            "hw-test: ─────────────────────────────────────────────────────────",
+            "hw-test: ---------------------------------------------------------",
             flush=True,
         )
         passed  = sum(1 for line in [] for _ in line)  # placeholder

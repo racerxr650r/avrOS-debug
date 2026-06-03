@@ -144,7 +144,7 @@ int fsm_build_thread_list(FsmContext *ctx, const AvrOsSymbolIndex *idx, int updi
         }
 
         FsmThread *t = &ctx->threads[produced];
-        t->gdb_id   = produced + 1; /* GDB threads are 1-based         */
+        t->gdb_id   = FSM_FIRST_PSEUDO_THREAD_ID + produced;
         t->is_active = (sm_ptr == current_sm);
 
         /* Read currState (function pointer) from SRAM at sm_ptr + 9.
@@ -197,8 +197,12 @@ int fsm_build_thread_list(FsmContext *ctx, const AvrOsSymbolIndex *idx, int updi
 /* ── fsm_invalidate ───────────────────────────────────────────────────── */
 void fsm_invalidate(FsmContext *ctx)
 {
-    if (ctx != NULL)
+    if (ctx != NULL) {
+        memset(ctx->threads, 0, sizeof(ctx->threads));
+        ctx->thread_count = 0;
+        ctx->active_id = 0;
         ctx->valid = false;
+    }
 }
 
 /* ── fsm_get_active_thread ────────────────────────────────────────────── */
@@ -229,10 +233,16 @@ int fsm_get_registers(const FsmContext *ctx, int thread_id, char *reg_buf)
 {
     if (ctx == NULL || reg_buf == NULL || !ctx->valid)
         return -1;
-    if (thread_id < 1 || thread_id > ctx->thread_count)
-        return -1;
 
-    const FsmThread *t = &ctx->threads[thread_id - 1];
+    const FsmThread *t = NULL;
+    for (int i = 0; i < ctx->thread_count; i++) {
+        if (ctx->threads[i].gdb_id == thread_id) {
+            t = &ctx->threads[i];
+            break;
+        }
+    }
+    if (t == NULL)
+        return -1;
 
     /* Start with a fully-zeroed hex buffer (covers R0..R31 and any
      * field we don't subsequently overwrite). */

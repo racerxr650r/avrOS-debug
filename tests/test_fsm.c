@@ -179,16 +179,16 @@ void test_fsm_build_thread_list_returns_minus1_on_updi_failure(void)
     TEST_ASSERT_EQUAL_INT(-1, n);
 }
 
-/* 3) assigns 1-based thread IDs in order */
-void test_fsm_build_thread_list_assigns_1_based_thread_ids_in_order(void)
+/* 3) assigns pseudo-thread IDs after the System thread */
+void test_fsm_build_thread_list_assigns_pseudo_thread_ids_after_system_thread(void)
 {
     AvrOsSymbolIndex idx;
     install_2entry_fixture(&idx);
 
     FsmContext ctx;
     TEST_ASSERT_EQUAL_INT(2, fsm_build_thread_list(&ctx, &idx, 7));
-    TEST_ASSERT_EQUAL_INT(1, ctx.threads[0].gdb_id);
-    TEST_ASSERT_EQUAL_INT(2, ctx.threads[1].gdb_id);
+    TEST_ASSERT_EQUAL_INT(2, ctx.threads[0].gdb_id);
+    TEST_ASSERT_EQUAL_INT(3, ctx.threads[1].gdb_id);
 }
 
 /* 4) thread IDs stable across calls */
@@ -219,7 +219,7 @@ void test_fsm_build_thread_list_sets_active_thread_from_current_fsm_ptr(void)
     TEST_ASSERT_EQUAL_INT(2, fsm_build_thread_list(&ctx, &idx, 7));
     TEST_ASSERT_FALSE(ctx.threads[0].is_active);
     TEST_ASSERT_TRUE (ctx.threads[1].is_active);
-    TEST_ASSERT_EQUAL_INT(2, ctx.active_id);
+    TEST_ASSERT_EQUAL_INT(3, ctx.active_id);
 }
 
 /* 6) active_id = 0 when currStateMachine matches no entry */
@@ -250,7 +250,7 @@ void test_fsm_get_registers_places_state_fn_as_pc_at_hex_positions_70_77(void)
 
     char reg[80];
     memset(reg, 'X', sizeof(reg));
-    TEST_ASSERT_EQUAL_INT(0, fsm_get_registers(&ctx, 2, reg));
+    TEST_ASSERT_EQUAL_INT(0, fsm_get_registers(&ctx, 3, reg));
 
     /* PC = 0xABCD → LE bytes CD AB 00 00 → hex "cdab00000" sequence */
     TEST_ASSERT_EQUAL_STRING_LEN("cdab0000", &reg[70], 8);
@@ -267,7 +267,7 @@ void test_fsm_get_registers_non_active_r0_r31_sreg_spl_sph_all_zero(void)
     TEST_ASSERT_EQUAL_INT(2, fsm_build_thread_list(&ctx, &idx, 7));
 
     char reg[80];
-    TEST_ASSERT_EQUAL_INT(0, fsm_get_registers(&ctx, 1, reg)); /* non-active */
+    TEST_ASSERT_EQUAL_INT(0, fsm_get_registers(&ctx, 2, reg)); /* non-active */
 
     /* Positions [0..69] must all be '0' chars. */
     for (int i = 0; i < 70; i++)
@@ -290,7 +290,7 @@ void test_fsm_get_registers_active_thread_reads_live_sreg_spl_sph(void)
     /* Snapshot call count before fsm_get_registers. */
     int before = g_call_count;
     char reg[80];
-    TEST_ASSERT_EQUAL_INT(0, fsm_get_registers(&ctx, 2, reg)); /* active */
+    TEST_ASSERT_EQUAL_INT(0, fsm_get_registers(&ctx, 3, reg)); /* active */
     int after = g_call_count;
     TEST_ASSERT_GREATER_THAN_MESSAGE(before, after,
         "active fsm_get_registers must issue >=1 updi_mem_read");
@@ -341,10 +341,33 @@ void test_fsm_get_registers_non_active_no_updi_read_of_stack(void)
 
     int before = g_call_count;
     char reg[80];
-    TEST_ASSERT_EQUAL_INT(0, fsm_get_registers(&ctx, 1, reg)); /* non-active */
+    TEST_ASSERT_EQUAL_INT(0, fsm_get_registers(&ctx, 2, reg)); /* non-active */
     int after = g_call_count;
     TEST_ASSERT_EQUAL_INT_MESSAGE(before, after,
         "non-active fsm_get_registers must issue 0 updi_mem_read");
+}
+
+/* 12) fsm_invalidate drops any cached thread metadata */
+void test_fsm_invalidate_clears_thread_cache_and_active_id(void)
+{
+    AvrOsSymbolIndex idx;
+    install_2entry_fixture(&idx);
+
+    FsmContext ctx;
+    TEST_ASSERT_EQUAL_INT(2, fsm_build_thread_list(&ctx, &idx, 7));
+    TEST_ASSERT_TRUE(ctx.valid);
+    TEST_ASSERT_EQUAL_INT(2, ctx.thread_count);
+    TEST_ASSERT_EQUAL_INT(3, ctx.active_id);
+
+    fsm_invalidate(&ctx);
+
+    TEST_ASSERT_FALSE(ctx.valid);
+    TEST_ASSERT_EQUAL_INT(0, ctx.thread_count);
+    TEST_ASSERT_EQUAL_INT(0, ctx.active_id);
+    TEST_ASSERT_EQUAL_INT(0, ctx.threads[0].gdb_id);
+    TEST_ASSERT_EQUAL_INT(0, ctx.threads[1].gdb_id);
+    TEST_ASSERT_FALSE(ctx.threads[0].is_active);
+    TEST_ASSERT_FALSE(ctx.threads[1].is_active);
 }
 
 /* ── Runner ──────────────────────────────────────────────────────────── */
@@ -353,7 +376,7 @@ int main(void)
     UNITY_BEGIN();
     RUN_TEST(test_fsm_build_thread_list_reads_fsm_table_from_flash_via_updi);
     RUN_TEST(test_fsm_build_thread_list_returns_minus1_on_updi_failure);
-    RUN_TEST(test_fsm_build_thread_list_assigns_1_based_thread_ids_in_order);
+    RUN_TEST(test_fsm_build_thread_list_assigns_pseudo_thread_ids_after_system_thread);
     RUN_TEST(test_fsm_build_thread_list_thread_ids_stable_across_calls);
     RUN_TEST(test_fsm_build_thread_list_sets_active_thread_from_current_fsm_ptr);
     RUN_TEST(test_fsm_build_thread_list_sets_active_id_0_when_no_entry_matches);
@@ -362,5 +385,6 @@ int main(void)
     RUN_TEST(test_fsm_get_registers_active_thread_reads_live_sreg_spl_sph);
     RUN_TEST(test_fsm_build_thread_list_caps_at_32_entries_and_logs_warning);
     RUN_TEST(test_fsm_get_registers_non_active_no_updi_read_of_stack);
+    RUN_TEST(test_fsm_invalidate_clears_thread_cache_and_active_id);
     return UNITY_END();
 }

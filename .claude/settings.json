@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Edit",
+      "Write",
+
+      "Bash(make:*)",
+      "Bash(gcovr:*)",
+
+      "Bash(python3 tools/lint_project.py:*)",
+      "Bash(python3 tools/render_doc.py:*)",
+      "Bash(python3 tests/hw/gdb_acceptance.py:*)",
+
+      "Bash(./build/avrOSdb:*)",
+      "Bash(build/avrOSdb:*)",
+      "Bash(avr-gdb:*)",
+      "Bash(gdb:*)",
+      "Bash(avr-nm:*)",
+      "Bash(avr-objdump:*)",
+      "Bash(avr-readelf:*)",
+      "Bash(avr-size:*)",
+      "Bash(readelf:*)",
+
+      "Bash(git:*)",
+      "Bash(gh:*)"
+    ]
+  }
+}

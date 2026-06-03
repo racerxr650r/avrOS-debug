@@ -157,6 +157,30 @@ int  updi_enter_debug(int fd);
 int  updi_halt(int fd);
 int  updi_run(int fd);
 int  updi_step(int fd);
+int  updi_step_32bit(int fd, int bp_slot,
+                     uint32_t target_pc, bool halt_on_jump);
+
+/* Emulate a single direct 32-bit change-of-flow (CALL/JMP) entirely
+ * via OCD primitives.  HW BPs at the CoF target and OCD_CTRL1_JMP
+ * both proved unreliable for the very first CoF after RUN on
+ * AVR-Dx silicon (issue #40): the comparator failed to latch the
+ * immediate target, and JMP-halt fired only on the SECOND CoF
+ * (skipping the called function entirely).  We therefore advance
+ * the CPU without ever running it:
+ *   - if `push_return_byte_addr` != 0, push it as the AVR-Dx 3-byte
+ *     return address (high@SP, mid@SP-1, low@SP-2; SP -= 3) — this
+ *     converts the operation into a CALL so a subsequent RET inside
+ *     `target` lands at the expected instruction after the CALL;
+ *   - if `push_return_byte_addr` == 0 the operation is a pure JMP;
+ *   - finally set OCD PC = `target_byte_addr` and stabilise the
+ *     pipeline (NOP+PCHOLD inject-step) so the next debugger STEP /
+ *     CONTINUE executes the first instruction at the target.
+ * CPU MUST be halted on entry; remains halted on return.  Caller is
+ * responsible for opcode classification (this helper does not look
+ * at flash).                                                        */
+int  updi_ocd_emulate_cof_32bit(int fd,
+                                uint32_t push_return_byte_addr,
+                                uint32_t target_byte_addr);
 /* Poll the OCD STOPPED status for up to `timeout_ms` (1 ms ticks).
  * Returns:
  *   0  = CPU is halted now
@@ -170,6 +194,7 @@ int  updi_ocd_read_gpr (int fd, uint8_t n, uint8_t *val);
 int  updi_ocd_write_gpr(int fd, uint8_t n, uint8_t val);
 int  updi_ocd_read_pc  (int fd, uint32_t *byte_addr);
 int  updi_ocd_write_pc (int fd, uint32_t byte_addr);
+int  updi_ocd_stabilize_pc_after_write(int fd);
 int  updi_ocd_read_sp  (int fd, uint16_t *val);
 int  updi_ocd_write_sp (int fd, uint16_t val);
 int  updi_ocd_read_sreg(int fd, uint8_t *val);

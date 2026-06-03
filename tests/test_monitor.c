@@ -92,6 +92,7 @@ static int g_run_rc;
 static int g_chip_erase_calls;
 static int g_chip_erase_rc;
 static int g_fsm_invalidate_calls;
+static int g_fsm_build_calls;
 static int g_hw_bp_clear_calls;
 static int g_sw_bp_clear_calls;
 
@@ -110,6 +111,14 @@ void __wrap_fsm_invalidate(struct FsmContext *c)
     (void)c; g_fsm_invalidate_calls++;
 }
 int __wrap_fsm_get_active_thread(struct FsmContext *c) { (void)c; return 1; }
+int __wrap_fsm_build_thread_list(struct FsmContext *c,
+                                 const AvrOsSymbolIndex *idx,
+                                 int updi_fd)
+{
+    (void)c; (void)idx; (void)updi_fd;
+    g_fsm_build_calls++;
+    return 0;
+}
 
 struct RspContext;
 void __wrap_rsp_hw_bp_clear_all(struct RspContext *c)
@@ -129,6 +138,7 @@ static void hlr055_mock_reset(void)
     g_run_calls = 0;         g_run_rc = 0;
     g_chip_erase_calls = 0;  g_chip_erase_rc = 0;
     g_fsm_invalidate_calls = 0;
+    g_fsm_build_calls = 0;
     g_hw_bp_clear_calls = 0;
     g_sw_bp_clear_calls = 0;
     g_halt_rc = 0;
@@ -460,6 +470,25 @@ void test_verb_reset_pulses_updi_and_clears_shadows(void)
     free(hex);
 }
 
+void test_verb_reset_rebuilds_fsm_threads_when_ctx_has_fsm_and_symbols(void)
+{
+    mock_reset(); hlr055_mock_reset();
+    RspContext ctx = make_ctx();
+    FsmContext fsm;
+    AvrOsSymbolIndex idx;
+    memset(&fsm, 0, sizeof fsm);
+    memset(&idx, 0, sizeof idx);
+    ctx.fsm = &fsm;
+    ctx.idx = &idx;
+
+    char *hex = hexify("reset");
+    int rc = monitor_dispatch_ex(1, &ctx, hex);
+    TEST_ASSERT_EQUAL_INT(0, rc);
+    TEST_ASSERT_EQUAL_INT(1, g_fsm_invalidate_calls);
+    TEST_ASSERT_EQUAL_INT(1, g_fsm_build_calls);
+    free(hex);
+}
+
 void test_verb_halt_emits_T05_stop_reply_and_suppresses_OK(void)
 {
     mock_reset(); hlr055_mock_reset();
@@ -611,6 +640,7 @@ int main(void)
     RUN_TEST(test_cmd_queues_formats_capacity_and_sizeofelement_for_each_entry);
     RUN_TEST(test_monitor_dispatch_and_helpers_never_call_updi_halt);
     RUN_TEST(test_verb_reset_pulses_updi_and_clears_shadows);
+    RUN_TEST(test_verb_reset_rebuilds_fsm_threads_when_ctx_has_fsm_and_symbols);
     RUN_TEST(test_verb_halt_emits_T05_stop_reply_and_suppresses_OK);
     RUN_TEST(test_verb_go_calls_updi_run_and_returns_OK);
     RUN_TEST(test_verb_erase_refused_without_allow_erase_flag);
