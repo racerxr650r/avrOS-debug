@@ -942,7 +942,7 @@ This is not a fixable detail — it is a **model mismatch**. avrOS is a cooperat
 | 2 | Z1/z1 insert/remove | User HW BPs allocate slot 0 only via the arbiter; `E08` when occupied (1 HW BP max) | `gdb_rsp.c` |
 | 3 | `LDS`/`STS` step | `dh_step` + `updi_step_32bit` borrow the reserved step slot (1); no save/restore needed | `gdb_rsp.c`, `updi.c` |
 | 4 | Stop classification / teardown | `classify_stop_cause`, `rsp_hw_bp_clear_all` route through the arbiter (a stop at the step slot is `SC_STEP`, not `SC_HWBREAK`) | `gdb_rsp.c` |
-| 5 | Spec + docs | Revise the breakpoints HLR/LLRs for "1 user HW BP + 1 reserved step comparator"; update `doc/UserManual.md` HW-BP count | `doc/Project.xml`, `doc/UserManual.md` |
+| 5 | Spec + docs | Revise the breakpoints HLR/LLRs for "1 user HW BP + 1 reserved step comparator". **User Manual:** capture the functional changes of **both Phase 12 and Phase 13** — replace all "FSM virtual thread / Call Stack / `info threads`" language with the introspection model (`monitor avros tasks`, single GDB thread, `--no-introspect`), and state the HW-BP count (1 user + 1 reserved step slot; SW breakpoints unlimited). The Phase-12 manual rewrite was deferred, so it is folded in here. | `doc/Project.xml`, `doc/UserManual.md` |
 | 6 | Tests | Unit (2nd HW BP → `E08`; `stepi` over `LDS` with a user HW BP in slot 0 leaves it armed); host replay; stringent `hw-test-gdb` G-group | `tests/test_rsp.c`, `tests/hw/gdb_acceptance.py` |
 
 **Plan (C → A → B).**
