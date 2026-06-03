@@ -342,18 +342,27 @@ int elf_find_avros_tables(ElfContext *ctx, AvrOsSymbolIndex *idx)
      *   queDescriptor_t (no QUE_STATS) = 10 bytes
      *   evntDescriptor_t        = 4 bytes
      */
-    if (found & B_FSM_S)
-        idx->fsm_table_addr  = fsm_start;
+    /* The table symbols are data-space VMAs in the AVR-Dx mapped-flash
+     * window (0x8000..0xFFFF).  Translate each to its physical FLASH byte
+     * (LMA) via the PT_LOAD p_paddr basis — the same translation the
+     * loader uses — so UPDI reads hit the real flash location rather than
+     * the (FLMAP-unmapped) linear low-flash offset.  Also record the
+     * window's LMA-VMA delta so fsm_mapper can translate the per-entry
+     * name pointers it reads at runtime. */
+    if (found & B_FSM_S) {
+        idx->fsm_table_addr = elf_phys_flash_byte_addr(ctx, fsm_start);
+        idx->flash_lma_off  = idx->fsm_table_addr - fsm_start;
+    }
     if ((found & (B_FSM_S | B_FSM_E)) == (B_FSM_S | B_FSM_E))
         idx->fsm_table_count = (uint8_t)((fsm_end - fsm_start) / 9U);
 
     if (found & B_Q_S)
-        idx->queue_table_addr = queue_start;
+        idx->queue_table_addr = elf_phys_flash_byte_addr(ctx, queue_start);
     if ((found & (B_Q_S | B_Q_E)) == (B_Q_S | B_Q_E))
         idx->queue_count = (uint8_t)((queue_end - queue_start) / 10U);
 
     if (found & B_EVT_S)
-        idx->event_table_addr = event_start;
+        idx->event_table_addr = elf_phys_flash_byte_addr(ctx, event_start);
     if ((found & (B_EVT_S | B_EVT_E)) == (B_EVT_S | B_EVT_E))
         idx->event_count = (uint8_t)((event_end - event_start) / 4U);
 

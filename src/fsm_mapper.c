@@ -22,17 +22,19 @@
  *
  * Address spaces (all addresses below are GDB-AVR ELF form — bit 23
  * SET = data space, bit 23 CLEAR = flash):
- *   • idx->fsm_table_addr is a 16-bit data-space VMA inside the
- *     AVR-Dx mapped-flash window (0x8000..0xFFFF).  We route reads
- *     through UPDI's flash mirror via flash_to_updi() so the chip's
- *     FLMAP hardware resolves the physical page transparently.
+ *   • idx->fsm_table_addr is the physical FLASH byte address (LMA) of
+ *     FSM_TABLE — elf_parser already translated the mapped-flash VMA to
+ *     its LMA via the PT_LOAD p_paddr basis.  We read it through UPDI's
+ *     flash mirror with flash_to_updi().  (UPDI flash reads are LINEAR:
+ *     the mapped-flash window's FLMAP is NOT applied, which is exactly
+ *     why the LMA — not the 0x8000-window VMA — must be used.)
  *   • idx->current_fsm_addr is a GDB-AVR data-space address; we strip
  *     the data flag with sram_to_updi() before passing it to UPDI.
  *   • Per-entry stateMachine pointers and currStateMachine are bare
- *     16-bit AVR data-space byte addresses (already in UPDI form,
- *     no flag bit set).  Per-entry name pointers are 16-bit C
- *     pointers; on AVR-Dx they land in the mapped-flash window
- *     (>= 0x8000) and we read them via flash_to_updi() likewise.
+ *     16-bit AVR data-space (SRAM) byte addresses, read directly.
+ *   • Per-entry name pointers are data-space mapped-flash VMAs
+ *     (>= 0x8000); we add idx->flash_lma_off to obtain the physical
+ *     FLASH byte (LMA) before routing through flash_to_updi().
  */
 #include <stdio.h>
 #include <string.h>
@@ -157,7 +159,13 @@ int fsm_build_thread_list(FsmContext *ctx, const AvrOsSymbolIndex *idx, int updi
          * literals live in the mapped-flash window (>= 0x8000) and
          * the chip resolves FLMAP via UPDI's flash mirror. */
         if (name_ptr != 0) {
-            if (read_flash_string(updi_fd, (uint32_t)name_ptr,
+            /* name_ptr is a data-space mapped-flash VMA; translate to the
+             * physical FLASH byte (LMA) the same way the table address was
+             * (idx->flash_lma_off) before routing through the UPDI flash
+             * mirror — otherwise the read hits the wrong (FLMAP-unmapped)
+             * linear flash offset and returns 0xFF garbage. */
+            if (read_flash_string(updi_fd,
+                                  (uint32_t)name_ptr + idx->flash_lma_off,
                                   t->name, sizeof(t->name)) < 0) {
                 fprintf(stderr,
                         "fsm: failed to read name at 0x%04x\n",

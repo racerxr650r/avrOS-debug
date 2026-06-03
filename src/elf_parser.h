@@ -62,6 +62,10 @@ typedef struct {
     uint32_t event_table_addr;   /* FLASH byte LMA of EVNT_TABLE   */
     uint8_t  event_count;        /* entries: stride 4              */
     uint32_t current_fsm_addr;   /* SRAM VMA of currStateMachine   */
+    uint32_t flash_lma_off;      /* LMA-VMA delta for the mapped-flash
+                                  * window (0 when unknown); add to a
+                                  * data-space mapped-flash pointer to get
+                                  * the physical FLASH byte (LMA) for UPDI. */
 } AvrOsSymbolIndex;
 
 int      elf_open(const char *path, ElfContext *ctx);
