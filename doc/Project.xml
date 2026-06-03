@@ -2214,7 +2214,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-RSP-16">
-        <text><![CDATA[The `H` (set-thread) packet handler shall store the requested GDB thread ID in the session context and use it to select the virtual thread for subsequent `g`/`G`/`P` register operations. Thread ID -1 (all threads) and 0 (any thread) shall both be interpreted as selecting the active FSM thread.]]></text>
+        <text><![CDATA[The `H` (set-thread) packet handler shall store the requested GDB thread ID in the session context. The live CPU is the sole GDB thread (TID 1); thread IDs -1 (all threads) and 0 (any thread) shall both be interpreted as the live-CPU thread. Register and memory operations always target the live CPU.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-025" name="Active Thread Identification"/>
         </traces>
@@ -3186,7 +3186,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/gdb_rsp.c unit tests                                     -->
     <!-- ============================================================ -->
-    <file path="tests/test_rsp.c" role="unit" count="83">
+    <file path="tests/test_rsp.c" role="unit" count="85">
       <header><![CDATA[Unit tests for `src/gdb_rsp.c`: socket configuration, RSP packet framing, register and memory handlers, hardware-breakpoint comparator management, OCD-based execution control, async Ctrl-C interrupt, detach cleanup, session lifecycle packets, and monitor relay. Uses a `socketpair()` as a drop-in socket substitute and replaces every `updi_*`, `fsm_*`, and `monitor_dispatch` call site with `ld --wrap` mocks so all tests run without real silicon.]]></header>
 
       <test name="rsp_listen_sets_so_reuseaddr_before_bind">
@@ -3365,10 +3365,6 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces><trace target="LLR" ref="LLR-RSP-15"/></traces>
       </test>
 
-      <test name="H_packet_stores_thread_id_for_register_operations">
-        <purpose><![CDATA[Dispatch `Hg3` (set thread 3 for register operations) and then a `g` packet, and verify that `fsm_get_registers()` is called with the thread entry for GDB thread ID 3.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-RSP-16"/></traces>
-      </test>
 
       <test name="H_packet_minus1_and_0_both_map_to_active_fsm_thread">
         <purpose><![CDATA[Dispatch `Hg-1` and `Hg0` in turn, each followed by a `g` packet, and verify that both select the active FSM thread's register frame.]]></purpose>
@@ -3420,8 +3416,8 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces><trace target="LLR" ref="LLR-RSP-25"/></traces>
       </test>
 
-      <test name="qSupported_advertises_multiprocess_vRun_vAttach_vKill">
-        <purpose><![CDATA[Dispatch `qSupported:multiprocess+` and verify the reply contains the substrings `multiprocess+`, `vRun+`, `vAttach+`, and `vKill+`, and does NOT contain `multiprocess-`.]]></purpose>
+      <test name="qSupported_advertises_vRun_vAttach_vKill_no_multiprocess">
+        <purpose><![CDATA[Dispatch `qSupported` and verify the reply does NOT contain `multiprocess+` (FSM threading is demoted to introspection; the live CPU is the sole GDB thread) and DOES contain `vRun+`, `vAttach+`, and `vKill+`.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-26"/></traces>
       </test>
 

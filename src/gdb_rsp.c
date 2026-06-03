@@ -398,17 +398,6 @@ static void select_stop_thread(RspContext *ctx, int tid)
     if (ctx->c_thread_p != NULL) *ctx->c_thread_p = tid;
 }
 
-static const FsmThread *find_fsm_thread_by_id(const FsmContext *ctx, int tid)
-{
-    if (ctx == NULL || !ctx->valid) return NULL;
-    for (int i = 0; i < ctx->thread_count; ++i) {
-        if (ctx->threads[i].gdb_id == tid) return &ctx->threads[i];
-    }
-    return NULL;
-}
-
-static bool refresh_fsm_threads_if_needed(RspContext *ctx);
-
 /* Clear all OCD HW breakpoints in silicon and reset the local shadow.
  * Idempotent and tolerant of UPDI errors (used on detach).            */
 void rsp_hw_bp_clear_all(RspContext *ctx)
@@ -579,17 +568,9 @@ static int dh_read_regs(int fd, const char *pkt, void *vctx)
 {
     (void)pkt;
     RspContext *ctx = (RspContext *)vctx;
-    int requested_tid = ctx->g_thread_p ? *ctx->g_thread_p : 0;
+    /* The live CPU is the sole GDB thread — always serve the OCD register
+     * file (avrOS FSM state is surfaced via introspection, not threads). */
     char reg[80] = {0};
-
-    if (requested_tid > FSM_SYSTEM_THREAD_ID && refresh_fsm_threads_if_needed(ctx)) {
-        if (find_fsm_thread_by_id(ctx->fsm, requested_tid) != NULL) {
-            if (fsm_get_registers(ctx->fsm, requested_tid, reg) < 0)
-                return reply_err(fd, "E01");
-            return rsp_send_packet(fd, reg);
-        }
-    }
-
     if (ocd_read_avr_regblock(ctx->updi_fd, reg) < 0)
         return reply_err(fd, "E01");
     return rsp_send_packet(fd, reg);
@@ -1218,34 +1199,13 @@ static int dh_remove_bp(int fd, const char *pkt, void *vctx)
     return reply_ok(fd);
 }
 
-static bool refresh_fsm_threads_if_needed(RspContext *ctx)
-{
-    if (ctx == NULL || ctx->fsm == NULL) return false;
-    if (ctx->fsm->valid) return true;
-    (void)fsm_build_thread_list(ctx->fsm, ctx->idx, ctx->updi_fd);
-    return ctx->fsm->valid;
-}
-
 static int dh_thread_info(int fd, const char *pkt, void *vctx)
 {
-    RspContext *ctx = (RspContext *)vctx;
-    bool first = (strncmp(pkt, "qfThreadInfo", 12) == 0);
-    if (!first) return rsp_send_packet(fd, "l");   /* end of list */
-
-    if (!refresh_fsm_threads_if_needed(ctx)) {
-        return rsp_send_packet(fd, "l");
-    }
-
-    char reply[256] = "m1";
-    size_t off = 2;
-    for (int i = 0; i < ctx->fsm->thread_count; ++i) {
-        int written = snprintf(reply + off, sizeof reply - off,
-                               ",%x",
-                               (unsigned)ctx->fsm->threads[i].gdb_id);
-        if (written < 0 || (size_t)written >= sizeof reply - off) break;
-        off += (size_t)written;
-    }
-    return rsp_send_packet(fd, reply);
+    (void)pkt; (void)vctx;
+    /* The live CPU is the sole GDB thread; reply with the empty thread
+     * list so GDB uses its single implicit thread.  avrOS FSM state is
+     * surfaced via `monitor avros`, not as GDB threads. */
+    return rsp_send_packet(fd, "l");
 }
 
 /* HLR-063 / LLR-RSP-47: qXfer:memory-map:read::<offset>,<length> —
@@ -1376,52 +1336,10 @@ static int dh_qxfer_memory_map(int fd, const char *pkt, void *vctx)
  * also reply empty — no aggregate label exists.                       */
 static int dh_thread_extra(int fd, const char *pkt, void *vctx)
 {
-    RspContext *ctx = (RspContext *)vctx;
-    const char *p = strchr(pkt, ',');
-    if (p == NULL) return reply_err(fd, "E01");
-    ++p;
-    uint32_t pid, tid;
-    bool any;
-    if (parse_mp_thread_id(&p, &pid, &tid, &any) < 0) return reply_err(fd, "E01");
-    (void)pid;
-    if (any) return reply_empty(fd);
-    if (!refresh_fsm_threads_if_needed(ctx)) return reply_empty(fd);
-
-    if (tid == FSM_SYSTEM_THREAD_ID) {
-        static const char label[] = "System [live CPU]";
-        char reply[2 * sizeof label + 1];
-        size_t lab_len = sizeof label - 1u;
-        for (size_t i = 0; i < lab_len; ++i) {
-            byte_to_hex((uint8_t)label[i], &reply[i * 2u]);
-        }
-        reply[lab_len * 2u] = '\0';
-        return rsp_send_packet(fd, reply);
-    }
-
-    const FsmThread *match = find_fsm_thread_by_id(ctx->fsm, (int)tid);
-    if (match == NULL) return reply_empty(fd);
-
-    /* Render label "FSM <name> [active|quiescent] state=0xNNNN".
-     * Truncate the FSM name to 32 bytes so the assembled string fits
-     * the 80-byte budget noted in LLR-RSP-42.                          */
-    char name_buf[33];
-    size_t nl = strnlen(match->name, sizeof name_buf - 1);
-    memcpy(name_buf, match->name, nl);
-    name_buf[nl] = '\0';
-
-    char label[96];
-    int lab_len = snprintf(label, sizeof label,
-                           "FSM %s [%s] state=0x%04x",
-                           name_buf,
-                           match->is_active ? "active" : "quiescent",
-                           (unsigned)match->state_fn);
-    if (lab_len < 0) return reply_empty(fd);
-    if ((size_t)lab_len >= sizeof label) lab_len = (int)sizeof label - 1;
-
-    char reply[2 * sizeof label + 1];
-    for (int i = 0; i < lab_len; ++i) byte_to_hex((uint8_t)label[i], &reply[i * 2]);
-    reply[lab_len * 2] = '\0';
-    return rsp_send_packet(fd, reply);
+    (void)pkt; (void)vctx;
+    /* No per-FSM GDB threads — avrOS FSM detail is exposed via
+     * `monitor avros`, not qThreadExtraInfo.  Reply the empty packet. */
+    return reply_empty(fd);
 }
 
 /* HLR-060 / LLR-RSP-41: parse the thread-id payload of an Hg/Hc/Hs
@@ -1549,19 +1467,14 @@ static int dh_query_offsets(int fd, const char *pkt, void *vctx)
  * without a membership check.                                         */
 static int dh_thread_alive(int fd, const char *pkt, void *vctx)
 {
-    RspContext *ctx = (RspContext *)vctx;
+    (void)vctx;
     const char *p = pkt + 1;            /* skip 'T' */
     uint32_t pid, tid;
     bool any;
     if (parse_mp_thread_id(&p, &pid, &tid, &any) < 0) return reply_err(fd, "E01");
     (void)pid;
-    if (any) return reply_ok(fd);
-    if (tid == FSM_SYSTEM_THREAD_ID) return reply_ok(fd);
-    if (refresh_fsm_threads_if_needed(ctx)) {
-        return (find_fsm_thread_by_id(ctx->fsm, (int)tid) != NULL)
-            ? reply_ok(fd)
-            : reply_err(fd, "E01");
-    }
+    /* The live CPU (TID 1) is the only thread; any-thread forms also OK. */
+    if (any || tid == FSM_SYSTEM_THREAD_ID) return reply_ok(fd);
     return reply_err(fd, "E01");
 }
 
@@ -1846,7 +1759,7 @@ int rsp_dispatch_n(int fd, const char *packet, size_t plen, RspHandlers *h)
     /* ── Inline-handled (no target access) ─────────────────────────── */
     if (strncmp(packet, "qSupported", 10) == 0) {
         return rsp_send_packet(fd,
-            "PacketSize=800;QStartNoAckMode+;multiprocess+;vContSupported+"
+            "PacketSize=800;QStartNoAckMode+;vContSupported+"
             ";vRun+;vAttach+;vKill+;vFlashErase+;vFlashWrite+;vFlashDone+"
             ";swbreak+;hwbreak+;qXfer:memory-map:read+");
     }
