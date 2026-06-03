@@ -27,7 +27,7 @@ A GDB server for debugging your code on the modern AVR-Dx family of processors. 
 ```bash
 git clone https://github.com/racerxr650r/avrOS-debug
 cd avrOS-debug
-make al                              # Build avrOSdb
+make all                             # Build avrOSdb
 make install                         # Install avrOSdb
 cd ${avrOS project directory}        # Go to your avrOS project          
 avrOSdb /dev/ttyUSB0 build/main.elf  # start GDB server on localhost:1234
