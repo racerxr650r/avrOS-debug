@@ -323,17 +323,6 @@ int __wrap_fsm_build_thread_list(FsmContext *ctx, const AvrOsSymbolIndex *idx, i
     return ctx ? ctx->thread_count : 0;
 }
 
-int __wrap_fsm_get_registers(const FsmContext *ctx, int tid, char *reg_buf)
-{
-    (void)ctx;
-    mock_get_regs_last_tid = tid;
-    memset(reg_buf, '0', 78);
-    reg_buf[78] = '\0';
-    /* PC=0xDEADBEEF LE at hex positions 70-77. */
-    memcpy(reg_buf + 70, "efbeadde", 8);
-    return 0;
-}
-
 int __wrap_fsm_get_active_thread(const FsmContext *ctx)
 {
     (void)ctx; return mock_active_thread;

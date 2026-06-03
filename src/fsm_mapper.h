@@ -27,6 +27,5 @@ typedef struct {
 int  fsm_build_thread_list(FsmContext *ctx, const AvrOsSymbolIndex *idx, int updi_fd);
 void fsm_invalidate(FsmContext *ctx);
 int  fsm_get_active_thread(const FsmContext *ctx);
-int  fsm_get_registers(const FsmContext *ctx, int thread_id, char *reg_buf);
 
 #endif /* AOD_FSM_MAPPER_H */

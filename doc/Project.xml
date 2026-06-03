@@ -757,11 +757,11 @@ Both buffers are freed by `elf_close()`. Peak heap usage occurs between `elf_ope
       </module>
 
       <module path="src/fsm_mapper.c">
-        <purpose><![CDATA[translates the runtime state of avrOS FSM registration tables — read from the target via UPDI — into GDB virtual threads, providing per-thread synthetic register frames to the RSP layer.]]></purpose>
+        <purpose><![CDATA[translates the runtime state of avrOS FSM registration tables — read from the target via UPDI — into an internal introspection snapshot (per-FSM name, active flag, and current-state function pointer).]]></purpose>
         <responsibility><![CDATA[Use the `AvrOsSymbolIndex` to read FSM state bytes from the target's SRAM over UPDI.]]></responsibility>
         <responsibility>Assign a stable GDB thread ID to each registered FSM entry.</responsibility>
         <responsibility>Identify and report which FSM is currently executing as the active GDB thread.</responsibility>
-        <responsibility>Synthesize a minimal GDB register frame for each virtual thread, setting PC to the FSM's current state function pointer.</responsibility>
+        <responsibility>Record each FSM's name, active flag, and current-state function pointer in the introspection snapshot.</responsibility>
         <responsibility>Cache the thread list and invalidate it whenever the CPU resumes.</responsibility>
         <interfaces>
           <interface title="Public C API (src/fsm_mapper.h)"><![CDATA[All functions exported from `src/fsm_mapper.c` and declared in `src/fsm_mapper.h`:
@@ -778,9 +778,6 @@ void fsm_invalidate(FsmContext *ctx);
 /* Per-thread queries */
 int  fsm_get_active_thread(const FsmContext *ctx);
     /* Returns: GDB thread ID of active FSM; 0 if not identified. */
-int  fsm_get_registers(const FsmContext *ctx, int thread_id, char *reg_buf);
-    /* Fills reg_buf with a 78-character hex string (39 bytes binary, hex-encoded: R0-R31, SREG, SPL, SPH, PC in g-packet order) plus NUL terminator; buf must be >= 79 bytes. */
-    /* Returns: 0 on success; -1 if thread_id out of range. */
 ```
 
 The `FsmContext` struct is declared in `src/fsm_mapper.h` and must be zero-initialised by the caller before the first `fsm_build_thread_list()` call.]]></interface>
@@ -812,18 +809,6 @@ The `FsmContext` struct is declared in `src/fsm_mapper.h` and must be zero-initi
           </function>
           <function signature="int fsm_get_active_thread(const FsmContext *ctx)"
                     summary="Return the GDB thread ID of the currently executing FSM."/>
-          <function signature="int fsm_get_registers(const FsmContext *ctx, int thread_id, char *reg_buf)">
-            <purpose>Synthesize a GDB g-packet register frame for the requested virtual thread and write it into reg_buf.</purpose>
-            <pre><![CDATA[`ctx->valid` is true; `thread_id` is in the range [1, ctx->thread_count]; `reg_buf` points to a caller-allocated buffer of at least 79 bytes (39 binary bytes × 2 hex chars + NUL).]]></pre>
-            <post><![CDATA[`reg_buf` contains a 78-character hex string representing the 36 AVR GDB register values (R0–R31, SREG, SPL, SPH, PC) in GDB `g`-packet order.]]></post>
-            <returns>0 on success; -1 if thread_id is out of range.</returns>
-            <logic>
-              <step>Zero-initialise all 79 bytes of the register buffer.</step>
-              <step><![CDATA[Set the PC field (GDB register index 35, 4-byte little-endian) at hex positions 70–77 of the buffer to `thread->state_fn`.]]></step>
-              <step><![CDATA[If `thread->is_active` is true, read SREG (register 32), SPL (register 33), and SPH (register 34) from the target SRAM via `updi_mem_read()` and write them at hex positions 64–65, 66–67, and 68–69, respectively.]]></step>
-            </logic>
-            <notes>Non-active threads return zeroed R0–R31 and SREG; only PC and SP are meaningful for suspended FSMs in the avrOS cooperative model.</notes>
-          </function>
           <function signature="void fsm_invalidate(FsmContext *ctx)"
                     summary="Clear the cached thread list; called on every CPU resume."/>
         </functions>
@@ -867,7 +852,7 @@ Total g-packet payload: 39 bytes × 2 hex chars = 78 hex characters + NUL. (Regi
 | Read FLASH name string per retained entry (up to 32 chars) | N reads | <=32N bytes |
 | **Total** | 3N+1 transactions | <=43N+2 bytes |
 
-**Test approach for `src/fsm_mapper.c`:** Unit-testable by providing a pre-populated `AvrOsSymbolIndex` and a mock `updi_mem_read()` returning canned byte sequences. Test cases cover: GDB thread ID assignment (1-based), correct `state_fn` FLASH word-address derivation, active thread identification, `FSM_MAX_THREADS` cap with warning, cache-invalidation round-trip, and `fsm_get_registers()` PC encoding verification.]]></algorithm>
+**Test approach for `src/fsm_mapper.c`:** Unit-testable by providing a pre-populated `AvrOsSymbolIndex` and a mock `updi_mem_read()` returning canned byte sequences. Test cases cover: GDB thread ID assignment (1-based), correct `state_fn` FLASH word-address derivation, active thread identification, `FSM_MAX_THREADS` cap with warning, cache-invalidation round-trip.]]></algorithm>
         <dependencies>
           <dep><![CDATA[`src/updi.c` — `updi_mem_read()` for SRAM reads.]]></dep>
           <dep><![CDATA[`src/elf_parser.c` — `AvrOsSymbolIndex` for table addresses and entry counts.]]></dep>
@@ -2480,7 +2465,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     </function>
 
     <function number="6" title="src/fsm_mapper.c — FSM State Snapshot Provider" name="fsm" source="src/fsm_mapper.c">
-      <intro><![CDATA[Requirements for `fsm_build_thread_list()`, `fsm_invalidate()`, `fsm_get_active_thread()`, and `fsm_get_registers()`.]]></intro>
+      <intro><![CDATA[Requirements for `fsm_build_thread_list()`, `fsm_invalidate()`, and `fsm_get_active_thread()`.]]></intro>
 
       <llr id="LLR-FSM-01">
         <text><![CDATA[`fsm_build_thread_list()` shall read `idx->fsm_table_count` consecutive 9-byte `fsmStateMachineDescr_t` records from the FLASH address `idx->fsm_table_addr` via `updi_mem_read()`. Each descriptor carries a 2-byte `name` pointer (FLASH), a 2-byte `stateMachine` pointer (SRAM, or NULL for an initializer slot that shall be skipped), a 2-byte `handler` function pointer, a 1-byte `priority`, and a 2-byte `instance`. For each non-NULL `stateMachine` pointer, the function shall read 2 bytes from `stateMachine + 9` (the `currState` field of `fsmStateMachine_t`) to obtain the current state function pointer and store it in `thread->state_fn`. A UPDI read failure at any point shall cause the function to return -1.]]></text>

@@ -787,12 +787,12 @@ Both buffers are freed by `elf_close()`. Peak heap usage occurs between `elf_ope
 ## 7. Detailed Design for [src/fsm_mapper.c](../src/fsm_mapper.c)
 
 ### 7.1 Purpose and Responsibilities
-[src/fsm_mapper.c](../src/fsm_mapper.c) translates the runtime state of avrOS FSM registration tables — read from the target via UPDI — into GDB virtual threads, providing per-thread synthetic register frames to the RSP layer.
+[src/fsm_mapper.c](../src/fsm_mapper.c) translates the runtime state of avrOS FSM registration tables — read from the target via UPDI — into an internal introspection snapshot (per-FSM name, active flag, and current-state function pointer).
 
 *   Use the `AvrOsSymbolIndex` to read FSM state bytes from the target's SRAM over UPDI.
 *   Assign a stable GDB thread ID to each registered FSM entry.
 *   Identify and report which FSM is currently executing as the active GDB thread.
-*   Synthesize a minimal GDB register frame for each virtual thread, setting PC to the FSM's current state function pointer.
+*   Record each FSM's name, active flag, and current-state function pointer in the introspection snapshot.
 *   Cache the thread list and invalidate it whenever the CPU resumes.
 
 ### 7.2 External Interfaces
@@ -812,9 +812,6 @@ void fsm_invalidate(FsmContext *ctx);
 /* Per-thread queries */
 int  fsm_get_active_thread(const FsmContext *ctx);
     /* Returns: GDB thread ID of active FSM; 0 if not identified. */
-int  fsm_get_registers(const FsmContext *ctx, int thread_id, char *reg_buf);
-    /* Fills reg_buf with a 78-character hex string (39 bytes binary, hex-encoded: R0-R31, SREG, SPL, SPH, PC in g-packet order) plus NUL terminator; buf must be >= 79 bytes. */
-    /* Returns: 0 on success; -1 if thread_id out of range. */
 ```
 
 The `FsmContext` struct is declared in `src/fsm_mapper.h` and must be zero-initialised by the caller before the first `fsm_build_thread_list()` call.
@@ -851,17 +848,6 @@ The `FsmContext` struct is declared in `src/fsm_mapper.h` and must be zero-initi
         6.  Assign `thread->gdb_id = produced_index + 1` for each retained thread (GDB thread IDs are 1-based and never reuse a slot from a NULL-skipped initializer entry).
 
 *   **`int fsm_get_active_thread(const FsmContext *ctx)`** — Return the GDB thread ID of the currently executing FSM.
-*   **`int fsm_get_registers(const FsmContext *ctx, int thread_id, char *reg_buf)`**
-    *   Purpose: Synthesize a GDB g-packet register frame for the requested virtual thread and write it into reg_buf.
-    *   Pre-condition: `ctx->valid` is true; `thread_id` is in the range [1, ctx->thread_count]; `reg_buf` points to a caller-allocated buffer of at least 79 bytes (39 binary bytes × 2 hex chars + NUL).
-    *   Post-condition: `reg_buf` contains a 78-character hex string representing the 36 AVR GDB register values (R0–R31, SREG, SPL, SPH, PC) in GDB `g`-packet order.
-    *   Return Value: 0 on success; -1 if thread_id is out of range.
-    *   Logic:
-        1.  Zero-initialise all 79 bytes of the register buffer.
-        2.  Set the PC field (GDB register index 35, 4-byte little-endian) at hex positions 70–77 of the buffer to `thread->state_fn`.
-        3.  If `thread->is_active` is true, read SREG (register 32), SPL (register 33), and SPH (register 34) from the target SRAM via `updi_mem_read()` and write them at hex positions 64–65, 66–67, and 68–69, respectively.
-    *   Notes: Non-active threads return zeroed R0–R31 and SREG; only PC and SP are meaningful for suspended FSMs in the avrOS cooperative model.
-
 *   **`void fsm_invalidate(FsmContext *ctx)`** — Clear the cached thread list; called on every CPU resume.
 
 #### 7.3.3 Parsing Strategy / Algorithm
@@ -906,7 +892,7 @@ Total g-packet payload: 39 bytes × 2 hex chars = 78 hex characters + NUL. (Regi
 | Read FLASH name string per retained entry (up to 32 chars) | N reads | <=32N bytes |
 | **Total** | 3N+1 transactions | <=43N+2 bytes |
 
-**Test approach for `src/fsm_mapper.c`:** Unit-testable by providing a pre-populated `AvrOsSymbolIndex` and a mock `updi_mem_read()` returning canned byte sequences. Test cases cover: GDB thread ID assignment (1-based), correct `state_fn` FLASH word-address derivation, active thread identification, `FSM_MAX_THREADS` cap with warning, cache-invalidation round-trip, and `fsm_get_registers()` PC encoding verification.
+**Test approach for `src/fsm_mapper.c`:** Unit-testable by providing a pre-populated `AvrOsSymbolIndex` and a mock `updi_mem_read()` returning canned byte sequences. Test cases cover: GDB thread ID assignment (1-based), correct `state_fn` FLASH word-address derivation, active thread identification, `FSM_MAX_THREADS` cap with warning, cache-invalidation round-trip.
 
 ### 7.4 Dependencies
 
