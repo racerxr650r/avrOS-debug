@@ -354,7 +354,7 @@ def verdict_G7(sect: str) -> Tuple[str, str]:
 
 def verdict_G9(sect: str) -> Tuple[str, str]:
     if "FSM" in sect or "state=" in sect:
-        return "FAIL", "Found FSM thread labels despite --no-fsm-threads"
+        return "FAIL", "Found FSM thread labels despite --no-introspect"
     if "Id   Target Id" in sect and re.search(r"1\s+Thread \d+\.1", sect):
         return "PASS", ""
     return "FAIL", "No threads found"
@@ -456,7 +456,7 @@ VERDICTS = {
     6: ("monitor reset/halt/version verbs",  verdict_G6),
     7: ("detach + re-attach lifecycle",   verdict_G7),
     8: ("multiple breakpoints correctly hit during execution", verdict_G8),
-    9: ("--no-fsm-threads switch yields single thread", verdict_G9),
+    9: ("--no-introspect switch yields single thread", verdict_G9),
     10: ("reset preserves selected FSM register view", verdict_G10),
     11: ("step enters fsmDispatch from main", verdict_G11),
     12: ("finish from fsmDispatch returns to main (CALL stack push)",
@@ -530,7 +530,7 @@ def main() -> int:
         all_transcripts: List[str] = []
         for n in sorted(VERDICTS):
             if n == 9:
-                desired_extra_args = ["--log-rsp", "--no-fsm-threads"]
+                desired_extra_args = ["--log-rsp", "--no-introspect"]
             elif n in (10, 11, 12, 13):
                 desired_extra_args = ["--log-rsp", "--load"]
             else:
