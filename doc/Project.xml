@@ -35,7 +35,7 @@
       <file path="src/updi.c">UPDI physical layer: UART serial management, UPDI protocol framing, NVM flash programming, and UPDI console bridge.</file>
       <file path="src/gdb_rsp.c">GDB Remote Serial Protocol server: packet codec, command dispatch, and session lifecycle management.</file>
       <file path="src/elf_parser.c">ELF parser: locates avrOS FLASH-resident system tables and produces the AvrOsSymbolIndex.</file>
-      <file path="src/fsm_mapper.c">avrOS FSM-to-GDB virtual thread translator: maps FSM state tables to GDB thread objects and synthesizes per-thread register frames.</file>
+      <file path="src/fsm_mapper.c">avrOS FSM introspection snapshot provider: reads the FSM registration tables and exposes each FSM's name, active flag, and current state.</file>
       <file path="src/monitor.c">Custom monitor command handler: implements the `avros events` and `avros queues` sub-commands via non-intrusive UPDI reads.</file>
       <file path="Makefile">Build orchestration: compile, test, install, uninstall, check-tools, and bundle (Debian .deb, Red Hat .rpm, Homebrew formula) targets.</file>
       <file path="tests/hw/hw_test.c">On-target hardware integration test harness: links against `src/updi.c` and exercises the live UPDI silicon, device-info report, SRAM round-trips, NVM page programming, and the RSP server's TCP path. Manual-only — never wired into `make test`.</file>
@@ -46,7 +46,7 @@
     <overview>
       <para><![CDATA[`avrOSdb` is a POSIX C99 GDB stub that bridges the UPDI debug interface of modern AVR microcontrollers (DA/DB families) to standard IDEs over the GDB Remote Serial Protocol (RSP). A developer launches the stub, points it at a serial device and an ELF binary, and connects any GDB-compatible front-end — VS Code with Cortex-Debug, Zed with its DAP adapter, or bare `avr-gdb` — using the standard `target extended-remote` command.]]></para>
       <para><![CDATA[The server connects to the target via a TTL-level UART serial adapter with a 1 kΩ resistor on the UPDI line. No external JTAG programmer or proprietary debugger hardware is required — only a USB-to-serial adapter or direct Raspberry Pi UART pins.]]></para>
-      <para><![CDATA[Unlike conventional GDB stubs that expose a flat memory model, `avrOSdb` provides native avrOS state-machine awareness. At attach time it parses the supplied ELF binary to locate the avrOS FSM registration tables in FLASH, then presents each registered finite state machine as a standard GDB virtual thread. The currently executing FSM appears as the active thread; all suspended FSMs appear as additional threads, each with a synthetic register frame whose PC points to the FSM's current state function pointer.]]></para>
+      <para><![CDATA[Unlike conventional GDB stubs that expose a flat memory model, `avrOSdb` provides native avrOS state-machine awareness. At attach time it parses the supplied ELF binary to locate the avrOS FSM registration tables in FLASH, then reads each registered finite state machine's runtime state into a snapshot the developer can inspect via `monitor` commands (which FSM is active, and each FSM's current state). avrOS FSMs are surfaced as introspection, not as GDB threads: the live CPU is the sole GDB thread.]]></para>
       <para><![CDATA[The project ships with a `make install` target that installs the compiled binary to `$(PREFIX)/bin/` and the accompanying Unix man page to `$(PREFIX)/share/man/man1/`. A `make check-tools` target validates that all required build tools (`gcc`, `make`, `avr-gcc`, `avr-binutils`) are present on the host before any compilation is attempted. A `make bundle` target produces native distribution packages for three platforms: a Debian binary package (`.deb`), a Red Hat RPM package (`.rpm`), and a Homebrew formula (`dist/avrOSdb.rb`) for macOS. All output artefacts are written under the `dist/` directory. These targets ensure the project can be built, deployed, and distributed by a developer from a single `make` command sequence with no manual file copying.]]></para>
       <para><![CDATA[**Planned — Phase 9 — CI-Grade Loader & Link Diagnostics (not yet implemented).** A forthcoming iteration extends the programmer and the `--device` diagnostic mode with the following capabilities so the tool can be trusted as a CI build/flash step and used as a first-line link-health probe. Tracked in GitHub issue #28; not yet bound to HLRs/LLRs.
 
@@ -75,7 +75,7 @@ Phase 10 work shall continue to honour the layered architecture (§2.1) and the 
       <term name="FSM"><![CDATA[Finite State Machine — the cooperative task unit in avrOS, represented at runtime by a function pointer into a FLASH-resident state table. All FSMs share the single hardware stack.]]></term>
       <term name="ELF"><![CDATA[Executable and Linkable Format — the binary file produced by `avr-gcc` that carries machine code, DWARF debug information, and the symbol table used to locate avrOS system tables.]]></term>
       <term name="avrOS"><![CDATA[A cooperative real-time operating system for AVR microcontrollers. Tasks are modelled as FSMs; inter-task communication uses queues and named events.]]></term>
-      <term name="Virtual Thread"><![CDATA[A GDB thread object synthesized from an avrOS FSM entry. Each virtual thread has a unique GDB thread ID and a synthesized register frame whose PC is set to the FSM's current state function pointer.]]></term>
+      <term name="FSM Snapshot"><![CDATA[An internal record of the avrOS FSM registration table read from the target at halt -- per-FSM name, active flag, and current-state function pointer -- exposed to the developer via `monitor avros` introspection commands. avrOS FSMs are not presented as GDB threads.]]></term>
       <term name="Harvard Architecture"><![CDATA[The AVR memory model, in which FLASH (program memory) and SRAM (data memory) occupy separate address spaces. ELF virtual addresses must be converted to physical FLASH word addresses during symbol resolution.]]></term>
     </definitions>
 
@@ -128,14 +128,14 @@ Layer 1 (`src/main.c`) is the orchestrator and is permitted to reach into any mo
       <component path="src/updi.c"><![CDATA[UPDI physical layer; owns the UART serial file descriptor, UPDI protocol framing, execution-control primitives (halt, run, step), NVM flash programming, and the UPDI console bridge.]]></component>
       <component path="src/gdb_rsp.c"><![CDATA[GDB RSP layer; owns the GDB TCP socket, RSP packet codec, and command dispatch table.]]></component>
       <component path="src/elf_parser.c"><![CDATA[ELF parser; produces the `AvrOsSymbolIndex` (FLASH addresses of avrOS system tables) at attach time.]]></component>
-      <component path="src/fsm_mapper.c"><![CDATA[FSM mapper; reads UPDI memory using the symbol index and exposes avrOS FSMs as GDB virtual threads.]]></component>
+      <component path="src/fsm_mapper.c"><![CDATA[FSM mapper; reads UPDI memory using the symbol index and exposes avrOS FSM state as introspection.]]></component>
       <component path="src/monitor.c"><![CDATA[Monitor handler; implements the custom `monitor avros events|queues` introspection commands without halting the CPU.]]></component>
       <flow>
         <intro>The startup and attach sequence proceeds as follows:</intro>
         <step><![CDATA[`main()` parses argv, opens the UART serial device, and starts the GDB TCP listener socket.]]></step>
         <step><![CDATA[A GDB client connects; the RSP layer sends the initial hello and negotiates capabilities via `qSupported`.]]></step>
         <step><![CDATA[On the first `vAttach` or `?` packet, the ELF parser scans the supplied `.elf` file and populates the `AvrOsSymbolIndex` with avrOS FSM table addresses.]]></step>
-        <step>The FSM mapper reads the FLASH-resident tables via UPDI background reads and builds the virtual thread list.</step>
+        <step>The FSM mapper reads the FLASH-resident tables via UPDI background reads and builds the FSM introspection snapshot.</step>
         <step><![CDATA[Subsequent GDB packets (register reads, memory reads, breakpoints, step/continue) are dispatched through the RSP layer to the UPDI layer.]]></step>
         <step><![CDATA[`monitor avros` commands are intercepted by the monitor handler, which issues UPDI background reads without halting the CPU core.]]></step>
       </flow>
@@ -546,7 +546,7 @@ The `RspHandlers` and `RspContext` structs are declared in `src/gdb_rsp.h`. The 
 | Field | Packet(s) handled | Description |
 | ----- | ----------------- | ----------- |
 | `on_halt_reason`  | `?`                       | Stop-reason query; calls `signal_for_halt_status()` (reads `OCD_STATUS1` via `updi_ocd_read_halt_status()`) and replies `T02thread:<id>;` (SIGINT) when `OCD_STATUS1.EXTBRK` is set or `T05thread:<id>;` (SIGTRAP) otherwise. |
-| `on_read_regs`    | `g`                       | Read all 35 GDB AVR registers (R0-R31, SREG, SP, PC; 78 hex chars) live from the OCD register file via `updi_ocd_read_gpr()` / `read_sreg()` / `read_sp()` / `read_pc()` when the selected GDB thread is the active FSM thread (or when no FSM thread is established); delegate to `fsm_get_registers()` for non-active virtual threads. |
+| `on_read_regs`    | `g`                       | Read all 35 GDB AVR registers (R0-R31, SREG, SP, PC; 78 hex chars) live from the OCD register file via `updi_ocd_read_gpr()` / `read_sreg()` / `read_sp()` / `read_pc()`. The live CPU is the sole GDB thread. |
 | `on_write_regs`   | `G`, `P`                  | Write all registers (`G`) or a single register (`P n=vv`); both route per-slot to `updi_ocd_write_gpr/sreg/sp/pc` (no `updi_mem_write()`). |
 | `on_read_mem`     | `m addr,len`              | Read memory; flips GDB unified-address bit 23 to produce the UPDI physical address before calling `updi_mem_read()`. |
 | `on_write_mem`    | `M addr,len:data`, `X addr,len:bin` | Write memory: `updi_nvm_write_flash()` for program-space addresses (GDB bit 23 clear), `updi_mem_write()` for data-space addresses (GDB bit 23 set). |
@@ -554,9 +554,9 @@ The `RspHandlers` and `RspContext` structs are declared in `src/gdb_rsp.h`. The 
 | `on_step`         | `s`, `vCont;s`            | Single-step via `updi_step()`, rebuild the FSM thread list, reply with the stop-reason packet produced by `on_halt_reason`. |
 | `on_insert_bp`    | `Z0`, `Z1`                | Install a hardware-breakpoint comparator in one of two `RspContext.hw_bp_addr[]` slots via `updi_ocd_set_hw_bp()`; both `Z0` and `Z1` route to the same two comparators. |
 | `on_remove_bp`    | `z0`, `z1`                | Release a hardware-breakpoint comparator via `updi_ocd_clear_hw_bp()` and reset the shadow slot. |
-| `on_thread_info`  | `qfThreadInfo`/`qsThreadInfo` | Enumerate virtual thread IDs from `FsmContext`. |
+| `on_thread_info`  | `qfThreadInfo`/`qsThreadInfo` | Reply `l` -- a single implicit GDB thread (the live CPU). |
 | `on_thread_extra` | `qThreadExtraInfo`        | Return FSM name string as hex-encoded ASCII. |
-| `on_set_thread_g` | `Hg<tid>`                 | Select virtual thread for subsequent `g`/`G`/`P` operations; thread IDs -1 and 0 both map to the active FSM thread. |
+| `on_set_thread_g` | `Hg<tid>`                 | Accept the set-thread packet; only the live-CPU thread (TID 1) is valid. |
 | `on_set_thread_c` | `Hc<tid>`                 | Select virtual thread for subsequent `c`/`s` operations. |
 | `on_monitor`      | `qRcmd`                   | Forward the raw ASCII-hex command body to `monitor_dispatch()`. |
 | `on_detach`       | `D`, `k`                  | Detach (`D`: call `hw_bp_clear_all(ctx)` to release both OCD comparators, then `updi_run()` and close the client fd) or kill (`k`: set the global quit flag). |
@@ -1155,7 +1155,7 @@ Errors are propagated upward through the module stack without retrying:
       <theme name="UPDI Physical Layer"               sections="§4 (src/updi.c)"/>
       <theme name="GDB RSP Server"                    sections="§5 (src/gdb_rsp.c)"/>
       <theme name="ELF Parsing and Symbol Resolution" sections="§6 (src/elf_parser.c)"/>
-      <theme name="FSM Virtual Thread Mapping"        sections="§7 (src/fsm_mapper.c)"/>
+      <theme name="FSM State Snapshot"        sections="§7 (src/fsm_mapper.c)"/>
       <theme name="System Introspection"              sections="§8 (src/monitor.c)"/>
       <theme name="Flash Programming"                 sections="§4 (src/updi.c)"/>
       <theme name="Console Bridge"                    sections="§4 (src/updi.c)"/>
@@ -1394,8 +1394,8 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
     </section>
 
-    <section number="5" title="FSM Virtual Thread Mapping">
-      <intro><![CDATA[Requirements in this section govern how the server translates the avrOS cooperative scheduler state into GDB virtual threads visible in the IDE's call-stack and thread panes.]]></intro>
+    <section number="5" title="FSM State Snapshot (Introspection)">
+      <intro><![CDATA[Requirements in this section govern how the server reads the avrOS cooperative scheduler state into an internal snapshot for developer introspection (surfaced via `monitor` commands, HLR-029 et seq.). avrOS FSMs are NOT presented as GDB virtual threads -- the live CPU is the sole GDB thread.]]></intro>
 
       <hlr id="HLR-024" name="FSM Thread Enumeration">
         <text><![CDATA[Upon halting the target, the application shall read the avrOS FSM registration table from target SRAM via UPDI into an internal snapshot (per-FSM name, active flag, and current-state function pointer). The snapshot is exposed to the developer through introspection commands (HLR-029 et seq.) and is NOT presented as GDB virtual threads — the live CPU is the sole GDB thread.]]></text>
@@ -1612,7 +1612,7 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-055" name="avarice-Compatible Monitor Commands">
-        <text><![CDATA[The application shall expose a top-level set of `monitor` verbs that mirror the `avarice` command surface, so that GDB scripts written for `avarice` work unchanged: `monitor reset` (issue `updi_reset()` and leave the CPU halted at the reset vector, then invalidate the FSM thread cache so the next `qfThreadInfo` reflects post-reset state), `monitor halt` (call `updi_halt()` and reply with the same `T05thread:<id>;` packet as a step boundary), `monitor go` (call `updi_run()` and reply `OK` — the subsequent stop-reason packet is emitted when the CPU next halts), `monitor erase` and `monitor chip-erase` (issue `updi_chip_erase()`, but only when the server was launched with the new `--allow-erase` flag — without that flag the verb shall reply with an O-packet diagnostic and `E22`), `monitor version` (one O-packet line carrying the server version, git short SHA, build date, and the active device family name from HLR-048), `monitor bp-mode <hw-only|sw>` (configure the breakpoint installation policy per HLR-054), and `monitor help` (one O-packet per recognised verb summarising syntax and side-effects, terminating with `OK`). The dispatcher in `src/monitor.c` shall continue to route the `avros ` prefix to the existing avrOS-specific handlers (`events`, `queues`); unknown verbs shall reply with the existing usage hint plus `E22`. None of the new verbs shall alter the FSM thread mapping path other than via the explicit cache invalidation noted above.]]></text>
+        <text><![CDATA[The application shall expose a top-level set of `monitor` verbs that mirror the `avarice` command surface, so that GDB scripts written for `avarice` work unchanged: `monitor reset` (issue `updi_reset()` and leave the CPU halted at the reset vector, then invalidate the FSM snapshot cache so the next introspection read reflects post-reset state), `monitor halt` (call `updi_halt()` and reply with the same `T05thread:<id>;` packet as a step boundary), `monitor go` (call `updi_run()` and reply `OK` — the subsequent stop-reason packet is emitted when the CPU next halts), `monitor erase` and `monitor chip-erase` (issue `updi_chip_erase()`, but only when the server was launched with the new `--allow-erase` flag — without that flag the verb shall reply with an O-packet diagnostic and `E22`), `monitor version` (one O-packet line carrying the server version, git short SHA, build date, and the active device family name from HLR-048), `monitor bp-mode <hw-only|sw>` (configure the breakpoint installation policy per HLR-054), and `monitor help` (one O-packet per recognised verb summarising syntax and side-effects, terminating with `OK`). The dispatcher in `src/monitor.c` shall continue to route the `avros ` prefix to the existing avrOS-specific handlers (`events`, `queues`); unknown verbs shall reply with the existing usage hint plus `E22`. None of the new verbs shall alter the FSM snapshot path other than via the explicit cache invalidation noted above.]]></text>
         <traces>
           <trace target="SDD" ref="8.1"/>
           <trace target="SDD" ref="5.3.1"/>
@@ -2479,7 +2479,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
     </function>
 
-    <function number="6" title="src/fsm_mapper.c — FSM Virtual Thread Mapper" name="fsm" source="src/fsm_mapper.c">
+    <function number="6" title="src/fsm_mapper.c — FSM State Snapshot Provider" name="fsm" source="src/fsm_mapper.c">
       <intro><![CDATA[Requirements for `fsm_build_thread_list()`, `fsm_invalidate()`, `fsm_get_active_thread()`, and `fsm_get_registers()`.]]></intro>
 
       <llr id="LLR-FSM-01">
@@ -2557,7 +2557,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-MON-09">
-        <text><![CDATA[The `monitor reset` verb shall call `updi_enter_debug(ctx->updi_fd)` (issuing the OCD KEY + ASI_RESET_REQ pulse and waiting for the STOPPED bit so the CPU is halted at the reset vector), discard all hardware-breakpoint shadow entries via `rsp_hw_bp_clear_all(ctx)`, invalidate the FSM thread cache via `fsm_invalidate(ctx->fsm)` when `ctx->fsm` is non-NULL, emit one diagnostic O-packet line `"target reset, halted at reset vector\n"`, and return 0 so `dh_monitor` appends the trailing `OK`.]]></text>
+        <text><![CDATA[The `monitor reset` verb shall call `updi_enter_debug(ctx->updi_fd)` (issuing the OCD KEY + ASI_RESET_REQ pulse and waiting for the STOPPED bit so the CPU is halted at the reset vector), discard all hardware-breakpoint shadow entries via `rsp_hw_bp_clear_all(ctx)`, invalidate the FSM snapshot cache via `fsm_invalidate(ctx->fsm)` when `ctx->fsm` is non-NULL, emit one diagnostic O-packet line `"target reset, halted at reset vector\n"`, and return 0 so `dh_monitor` appends the trailing `OK`.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-055" name="avarice-Compatible Monitor Commands"/>
         </traces>
@@ -2578,7 +2578,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-MON-12">
-        <text><![CDATA[The `monitor erase` verb (alias `monitor chip-erase`) shall consult `ctx->allow_erase` before issuing any UPDI traffic. When the flag is zero, the verb shall emit one diagnostic O-packet `"monitor erase: refused — launch the server with --allow-erase to enable.\n"` and return -1 so `dh_monitor` sends an `E22` error packet. When the flag is set the verb shall call `updi_chip_erase(ctx->updi_fd)`, then re-enter OCD via `updi_enter_debug()`, discard all BP/WP shadow entries, invalidate the FSM thread cache, emit a confirmation O-packet, and return 0.]]></text>
+        <text><![CDATA[The `monitor erase` verb (alias `monitor chip-erase`) shall consult `ctx->allow_erase` before issuing any UPDI traffic. When the flag is zero, the verb shall emit one diagnostic O-packet `"monitor erase: refused — launch the server with --allow-erase to enable.\n"` and return -1 so `dh_monitor` sends an `E22` error packet. When the flag is set the verb shall call `updi_chip_erase(ctx->updi_fd)`, then re-enter OCD via `updi_enter_debug()`, discard all BP/WP shadow entries, invalidate the FSM snapshot cache, emit a confirmation O-packet, and return 0.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-055" name="avarice-Compatible Monitor Commands"/>
         </traces>
