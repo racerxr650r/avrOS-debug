@@ -275,13 +275,15 @@ link, no dedicated debugger probe required.
   reset vector, so the very first `continue` from GDB starts execution
   from a clean state.
 
-* **Hardware breakpoints.** The AVR-Dx OCD provides exactly **two**
-  hardware breakpoint comparators. Both `break` (Z0) and `hbreak`
-  (Z1) requests from GDB are routed to these slots — flash patching
-  with the AVR `BREAK` opcode is *not* used, which avoids the
-  state-destroying NVMPROG round-trip on every breakpoint set.
-  Setting a third breakpoint while two are already armed returns
-  GDB error `E08`; remove one first.
+* **Breakpoints.** The AVR-Dx OCD has **two** PC comparators, but
+  avrOSdb reserves **one for single-stepping** (so stepping always
+  works, regardless of your breakpoints), leaving **one** for a user
+  hardware breakpoint. By default `break` (Z0) installs an unlimited
+  **software** breakpoint (the AVR `BREAK` opcode patched into FLASH);
+  `hbreak` (Z1) — or any breakpoint under `monitor bp-mode hw-only` —
+  uses the single user comparator. Requesting a **second** hardware
+  breakpoint returns GDB error `E08`; remove one first, or rely on
+  software breakpoints.
 
 * **Run / step / continue.** `c`, `s`, `si`, and `ni` are all handled
   by the OCD primitives (RUN, single-step, STOP). A halt is reported
@@ -300,12 +302,12 @@ Example session:
 
 ```
 (gdb) target remote :1234
-(gdb) break main
-(gdb) break my_isr_handler        # 2nd HW comparator used
-(gdb) break some_other_fn         # FAILS — E08 (no slots left)
+(gdb) break main                   # software breakpoint (unlimited)
+(gdb) hbreak my_isr_handler        # the single user HW comparator
+(gdb) hbreak some_other_fn         # FAILS — E08 (HW comparator in use)
 (gdb) continue
 ^C                                 # halts target, prints SIGINT
-(gdb) step
+(gdb) step                         # always works (reserved step comparator)
 (gdb) detach                       # releases both comparators
 ```
 
@@ -473,8 +475,9 @@ fine-grained run control without changing PC:
 
 #### 5. Set breakpoints
 
-The OCD provides 2 **hardware** comparators; `avrOSdb` additionally
-implements up to 64 **software** breakpoints by patching the AVR
+The OCD has 2 PC comparators — `avrOSdb` reserves one for
+single-stepping and exposes **one** as a user **hardware** breakpoint —
+plus up to 64 **software** breakpoints implemented by patching the AVR
 `BREAK` opcode (`0x9598`, little-endian) into FLASH via the NVM
 controller. The original FLASH word is kept in an in-memory shadow
 so `z0` packets restore it cleanly, and CPU state (R0–R31, SREG, SP,
