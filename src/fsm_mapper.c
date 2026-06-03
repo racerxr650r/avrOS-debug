@@ -14,25 +14,29 @@
  *     +6  priority (uint8_t)         1 byte
  *     +7  instance (uint16_t)        2 bytes
  *
- *   fsmStateMachine_t       (in SRAM):
- *     +9  currState (fn *)           2 bytes   current state function ptr
+ *   fsmStateMachine_t       (in SRAM, sizeof 21):
+ *     +0  currStateName (char *)     2 bytes   FLASH ptr to current
+ *                                              state's name string
+ *                                              (NULL until first dispatch)
  *
  *   currStateMachine        (file-static SRAM pointer, 2 bytes)
  *     The currently-running fsmStateMachine_t (set on each dispatch).
  *
  * Address spaces (all addresses below are GDB-AVR ELF form — bit 23
  * SET = data space, bit 23 CLEAR = flash):
- *   • idx->fsm_table_addr is a 16-bit data-space VMA inside the
- *     AVR-Dx mapped-flash window (0x8000..0xFFFF).  We route reads
- *     through UPDI's flash mirror via flash_to_updi() so the chip's
- *     FLMAP hardware resolves the physical page transparently.
+ *   • idx->fsm_table_addr is the physical FLASH byte address (LMA) of
+ *     FSM_TABLE — elf_parser already translated the mapped-flash VMA to
+ *     its LMA via the PT_LOAD p_paddr basis.  We read it through UPDI's
+ *     flash mirror with flash_to_updi().  (UPDI flash reads are LINEAR:
+ *     the mapped-flash window's FLMAP is NOT applied, which is exactly
+ *     why the LMA — not the 0x8000-window VMA — must be used.)
  *   • idx->current_fsm_addr is a GDB-AVR data-space address; we strip
  *     the data flag with sram_to_updi() before passing it to UPDI.
  *   • Per-entry stateMachine pointers and currStateMachine are bare
- *     16-bit AVR data-space byte addresses (already in UPDI form,
- *     no flag bit set).  Per-entry name pointers are 16-bit C
- *     pointers; on AVR-Dx they land in the mapped-flash window
- *     (>= 0x8000) and we read them via flash_to_updi() likewise.
+ *     16-bit AVR data-space (SRAM) byte addresses, read directly.
+ *   • Per-entry name pointers are data-space mapped-flash VMAs
+ *     (>= 0x8000); we add idx->flash_lma_off to obtain the physical
+ *     FLASH byte (LMA) before routing through flash_to_updi().
  */
 #include <stdio.h>
 #include <string.h>
@@ -42,9 +46,11 @@
 
 extern int updi_mem_read(int fd, uint32_t addr, uint8_t *buf, size_t len);
 
-#define FSM_DESCR_SIZE        9U   /* sizeof(fsmStateMachineDescr_t)        */
-#define FSM_CURRSTATE_OFFSET  9U   /* offset of currState in fsmStateMachine_t */
-#define REG_BUF_HEX_LEN      78U   /* 32+1+1+1+4 bytes × 2 hex chars         */
+#define FSM_DESCR_SIZE            9U   /* sizeof(fsmStateMachineDescr_t)    */
+#define FSM_CURRSTATENAME_OFFSET  0U   /* offset of currStateName (char *)
+                                        * in fsmStateMachine_t — the first
+                                        * member; a FLASH string pointer to
+                                        * the FSM's current state name.     */
 
 /* AVR data-space pointers are 16-bit; zero-extend into uint32_t. */
 static uint16_t read_le16(const uint8_t *p)
@@ -70,20 +76,16 @@ static int read_flash_string(int updi_fd, uint32_t byte_addr,
         uint8_t b;
         if (updi_mem_read(updi_fd, base_addr + (uint32_t)off, &b, 1) < 0)
             return -1;
-        if (b == 0)
+        /* Stop at NUL or the first non-printable byte: a stale/garbage
+         * pointer (e.g. a NULL currStateName that resolved through the
+         * flash mirror) then yields an empty string rather than binary
+         * junk in the introspection output. */
+        if (b == 0 || b < 0x20u || b > 0x7Eu)
             break;
         dst[off++] = (char)b;
     }
     dst[off] = '\0';
     return 0;
-}
-
-/* Encode one byte as two lower-case hex chars at *p, advance *p by 2. */
-static void hex_byte(char **p, uint8_t b)
-{
-    static const char H[] = "0123456789abcdef";
-    *(*p)++ = H[(b >> 4) & 0xFu];
-    *(*p)++ = H[b & 0xFu];
 }
 
 /* ── fsm_build_thread_list ─────────────────────────────────────────────
@@ -147,26 +149,46 @@ int fsm_build_thread_list(FsmContext *ctx, const AvrOsSymbolIndex *idx, int updi
         t->gdb_id   = FSM_FIRST_PSEUDO_THREAD_ID + produced;
         t->is_active = (sm_ptr == current_sm);
 
-        /* Read currState (function pointer) from SRAM at sm_ptr + 9.
-         * sm_ptr is a raw 16-bit AVR data-space byte address (already
-         * in UPDI form — no flag bit set). */
-        uint8_t cs[2];
+        /* Read currStateName (a FLASH string pointer) at offset 0 of the
+         * fsmStateMachine_t, then resolve it to the FSM's current state
+         * name.  sm_ptr is a raw 16-bit AVR data-space (SRAM) byte address
+         * (already in UPDI form — no flag bit set).  A NULL pointer means
+         * the FSM has not dispatched yet → empty state name. */
+        uint8_t csn[2];
         if (updi_mem_read(updi_fd,
-                          (uint32_t)sm_ptr + FSM_CURRSTATE_OFFSET,
-                          cs, sizeof(cs)) < 0) {
+                          (uint32_t)sm_ptr + FSM_CURRSTATENAME_OFFSET,
+                          csn, sizeof(csn)) < 0) {
             fprintf(stderr,
-                    "fsm: failed to read currState at 0x%04x\n",
-                    (unsigned)(sm_ptr + FSM_CURRSTATE_OFFSET));
+                    "fsm: failed to read currStateName at 0x%04x\n",
+                    (unsigned)(sm_ptr + FSM_CURRSTATENAME_OFFSET));
             return -1;
         }
-        t->state_fn = (uint32_t)read_le16(cs);
+        uint16_t state_name_ptr = read_le16(csn);
+        if (state_name_ptr != 0) {
+            if (read_flash_string(updi_fd,
+                                  (uint32_t)state_name_ptr + idx->flash_lma_off,
+                                  t->state_name, sizeof(t->state_name)) < 0) {
+                fprintf(stderr,
+                        "fsm: failed to read currStateName string at 0x%04x\n",
+                        (unsigned)state_name_ptr);
+                return -1;
+            }
+        } else {
+            t->state_name[0] = '\0';
+        }
 
         /* Read the descriptor name (NUL-terminated, in FLASH).
          * name_ptr is a 16-bit AVR C pointer; on AVR-Dx parts string
          * literals live in the mapped-flash window (>= 0x8000) and
          * the chip resolves FLMAP via UPDI's flash mirror. */
         if (name_ptr != 0) {
-            if (read_flash_string(updi_fd, (uint32_t)name_ptr,
+            /* name_ptr is a data-space mapped-flash VMA; translate to the
+             * physical FLASH byte (LMA) the same way the table address was
+             * (idx->flash_lma_off) before routing through the UPDI flash
+             * mirror — otherwise the read hits the wrong (FLMAP-unmapped)
+             * linear flash offset and returns 0xFF garbage. */
+            if (read_flash_string(updi_fd,
+                                  (uint32_t)name_ptr + idx->flash_lma_off,
                                   t->name, sizeof(t->name)) < 0) {
                 fprintf(stderr,
                         "fsm: failed to read name at 0x%04x\n",
@@ -213,66 +235,3 @@ int fsm_get_active_thread(const FsmContext *ctx)
     return ctx->active_id;
 }
 
-/* ── fsm_get_registers ────────────────────────────────────────────────── *
- * Build a 78-char hex-encoded register payload (plus NUL) for `thread_id`.
- *
- * Layout (positions in the hex buffer):
- *   [ 0..63]  R0..R31           (32 bytes × 2 hex)  — always zero in stub
- *   [64..65]  SREG              ( 1 byte  × 2 hex)
- *   [66..67]  SPL               ( 1 byte  × 2 hex)
- *   [68..69]  SPH               ( 1 byte  × 2 hex)
- *   [70..77]  PC (4-byte LE)    (state_fn, zero-extended)
- *   [78]      '\0'
- *
- * For the active thread, SREG/SPL/SPH are read live over UPDI.
- * For non-active threads we issue ZERO UPDI reads (LLR-FSM-06): the
- * stack frame in SRAM doesn't carry an inspectable CPU state, so we
- * report zeros for those bytes and the FSM's currState as the PC.
- */
-int fsm_get_registers(const FsmContext *ctx, int thread_id, char *reg_buf)
-{
-    if (ctx == NULL || reg_buf == NULL || !ctx->valid)
-        return -1;
-
-    const FsmThread *t = NULL;
-    for (int i = 0; i < ctx->thread_count; i++) {
-        if (ctx->threads[i].gdb_id == thread_id) {
-            t = &ctx->threads[i];
-            break;
-        }
-    }
-    if (t == NULL)
-        return -1;
-
-    /* Start with a fully-zeroed hex buffer (covers R0..R31 and any
-     * field we don't subsequently overwrite). */
-    memset(reg_buf, '0', REG_BUF_HEX_LEN);
-    reg_buf[REG_BUF_HEX_LEN] = '\0';
-
-    uint8_t sreg = 0, spl = 0, sph = 0;
-    if (t->is_active) {
-        /* Live read of CPU state register + stack pointer (AVR128DA
-         * I/O space: SREG @0x003F, SPL @0x003D, SPH @0x003E). */
-        uint8_t io[3];
-        if (updi_mem_read(0 /* fd unused by mock */, 0x3DU, io, 3) < 0)
-            return -1;
-        spl  = io[0];
-        sph  = io[1];
-        sreg = io[2];
-    }
-
-    /* Emit SREG, SPL, SPH (positions 64..69). */
-    char *p = reg_buf + 64;
-    hex_byte(&p, sreg);  /* 64..65 */
-    hex_byte(&p, spl);   /* 66..67 */
-    hex_byte(&p, sph);   /* 68..69 */
-
-    /* Emit PC: 4 bytes LE of state_fn (positions 70..77). */
-    uint32_t pc = t->state_fn;
-    hex_byte(&p, (uint8_t)(pc      ));
-    hex_byte(&p, (uint8_t)(pc >>  8));
-    hex_byte(&p, (uint8_t)(pc >> 16));
-    hex_byte(&p, (uint8_t)(pc >> 24));
-
-    return 0;
-}

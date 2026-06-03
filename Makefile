@@ -231,7 +231,7 @@ TEST_WRAP_test_rsp  := updi_mem_read updi_mem_write updi_halt updi_run updi_step
 					   updi_ocd_stabilize_pc_after_write \
                        updi_ocd_emulate_cof_32bit \
                        updi_ocd_set_hw_bp updi_ocd_clear_hw_bp \
-                       fsm_build_thread_list fsm_get_registers \
+                       fsm_build_thread_list \
                        fsm_get_active_thread fsm_invalidate \
                        monitor_dispatch monitor_dispatch_ex
 TEST_EXTRA_LDFLAGS_test_rsp :=

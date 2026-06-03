@@ -18,7 +18,7 @@ This document describes the design of the source modules that implement the avrO
 *   [src/updi.c](../src/updi.c): UPDI physical layer: UART serial management, UPDI protocol framing, NVM flash programming, and UPDI console bridge.
 *   [src/gdb_rsp.c](../src/gdb_rsp.c): GDB Remote Serial Protocol server: packet codec, command dispatch, and session lifecycle management.
 *   [src/elf_parser.c](../src/elf_parser.c): ELF parser: locates avrOS FLASH-resident system tables and produces the AvrOsSymbolIndex.
-*   [src/fsm_mapper.c](../src/fsm_mapper.c): avrOS FSM-to-GDB virtual thread translator: maps FSM state tables to GDB thread objects and synthesizes per-thread register frames.
+*   [src/fsm_mapper.c](../src/fsm_mapper.c): avrOS FSM introspection snapshot provider: reads the FSM registration tables and exposes each FSM's name, active flag, and current state.
 *   [src/monitor.c](../src/monitor.c): Custom monitor command handler: implements the `avros events` and `avros queues` sub-commands via non-intrusive UPDI reads.
 *   [Makefile](../Makefile): Build orchestration: compile, test, install, uninstall, check-tools, and bundle (Debian .deb, Red Hat .rpm, Homebrew formula) targets.
 *   [tests/hw/hw_test.c](../tests/hw/hw_test.c): On-target hardware integration test harness: links against `src/updi.c` and exercises the live UPDI silicon, device-info report, SRAM round-trips, NVM page programming, and the RSP server's TCP path. Manual-only — never wired into `make test`.
@@ -31,7 +31,7 @@ It does not cover the build system, IDE adapter layers (Cortex-Debug, Zed DAP), 
 
 The server connects to the target via a TTL-level UART serial adapter with a 1 kΩ resistor on the UPDI line. No external JTAG programmer or proprietary debugger hardware is required — only a USB-to-serial adapter or direct Raspberry Pi UART pins.
 
-Unlike conventional GDB stubs that expose a flat memory model, `avrOSdb` provides native avrOS state-machine awareness. At attach time it parses the supplied ELF binary to locate the avrOS FSM registration tables in FLASH, then presents each registered finite state machine as a standard GDB virtual thread. The currently executing FSM appears as the active thread; all suspended FSMs appear as additional threads, each with a synthetic register frame whose PC points to the FSM's current state function pointer.
+Unlike conventional GDB stubs that expose a flat memory model, `avrOSdb` provides native avrOS state-machine awareness. At attach time it parses the supplied ELF binary to locate the avrOS FSM registration tables in FLASH, then reads each registered finite state machine's runtime state into a snapshot the developer can inspect via `monitor` commands (which FSM is active, and each FSM's current state). avrOS FSMs are surfaced as introspection, not as GDB threads: the live CPU is the sole GDB thread.
 
 The project ships with a `make install` target that installs the compiled binary to `$(PREFIX)/bin/` and the accompanying Unix man page to `$(PREFIX)/share/man/man1/`. A `make check-tools` target validates that all required build tools (`gcc`, `make`, `avr-gcc`, `avr-binutils`) are present on the host before any compilation is attempted. A `make bundle` target produces native distribution packages for three platforms: a Debian binary package (`.deb`), a Red Hat RPM package (`.rpm`), and a Homebrew formula (`dist/avrOSdb.rb`) for macOS. All output artefacts are written under the `dist/` directory. These targets ensure the project can be built, deployed, and distributed by a developer from a single `make` command sequence with no manual file copying.
 
@@ -62,7 +62,7 @@ Phase 10 work shall continue to honour the layered architecture (§2.1) and the 
 *   **FSM:** Finite State Machine — the cooperative task unit in avrOS, represented at runtime by a function pointer into a FLASH-resident state table. All FSMs share the single hardware stack.
 *   **ELF:** Executable and Linkable Format — the binary file produced by `avr-gcc` that carries machine code, DWARF debug information, and the symbol table used to locate avrOS system tables.
 *   **avrOS:** A cooperative real-time operating system for AVR microcontrollers. Tasks are modelled as FSMs; inter-task communication uses queues and named events.
-*   **Virtual Thread:** A GDB thread object synthesized from an avrOS FSM entry. Each virtual thread has a unique GDB thread ID and a synthesized register frame whose PC is set to the FSM's current state function pointer.
+*   **FSM Snapshot:** An internal record of the avrOS FSM registration table read from the target at halt -- per-FSM name, active flag, and current-state function pointer -- exposed to the developer via `monitor avros` introspection commands. avrOS FSMs are not presented as GDB threads.
 *   **Harvard Architecture:** The AVR memory model, in which FLASH (program memory) and SRAM (data memory) occupy separate address spaces. ELF virtual addresses must be converted to physical FLASH word addresses during symbol resolution.
 
 ### 1.5 References
@@ -128,7 +128,7 @@ Layer 1 (`src/main.c`) is the orchestrator and is permitted to reach into any mo
 *   **[src/updi.c](../src/updi.c)** — UPDI physical layer; owns the UART serial file descriptor, UPDI protocol framing, execution-control primitives (halt, run, step), NVM flash programming, and the UPDI console bridge.
 *   **[src/gdb_rsp.c](../src/gdb_rsp.c)** — GDB RSP layer; owns the GDB TCP socket, RSP packet codec, and command dispatch table.
 *   **[src/elf_parser.c](../src/elf_parser.c)** — ELF parser; produces the `AvrOsSymbolIndex` (FLASH addresses of avrOS system tables) at attach time.
-*   **[src/fsm_mapper.c](../src/fsm_mapper.c)** — FSM mapper; reads UPDI memory using the symbol index and exposes avrOS FSMs as GDB virtual threads.
+*   **[src/fsm_mapper.c](../src/fsm_mapper.c)** — FSM mapper; reads UPDI memory using the symbol index and exposes avrOS FSM state as introspection.
 *   **[src/monitor.c](../src/monitor.c)** — Monitor handler; implements the custom `monitor avros events|queues` introspection commands without halting the CPU.
 
 The startup and attach sequence proceeds as follows:
@@ -136,7 +136,7 @@ The startup and attach sequence proceeds as follows:
 1.  `main()` parses argv, opens the UART serial device, and starts the GDB TCP listener socket.
 2.  A GDB client connects; the RSP layer sends the initial hello and negotiates capabilities via `qSupported`.
 3.  On the first `vAttach` or `?` packet, the ELF parser scans the supplied `.elf` file and populates the `AvrOsSymbolIndex` with avrOS FSM table addresses.
-4.  The FSM mapper reads the FLASH-resident tables via UPDI background reads and builds the virtual thread list.
+4.  The FSM mapper reads the FLASH-resident tables via UPDI background reads and builds the FSM introspection snapshot.
 5.  Subsequent GDB packets (register reads, memory reads, breakpoints, step/continue) are dispatched through the RSP layer to the UPDI layer.
 6.  `monitor avros` commands are intercepted by the monitor handler, which issues UPDI background reads without halting the CPU core.
 
@@ -564,7 +564,7 @@ TCP server socket on the configured port (default `1234`). Accepts exactly one c
 | Field | Packet(s) handled | Description |
 | ----- | ----------------- | ----------- |
 | `on_halt_reason`  | `?`                       | Stop-reason query; calls `signal_for_halt_status()` (reads `OCD_STATUS1` via `updi_ocd_read_halt_status()`) and replies `T02thread:<id>;` (SIGINT) when `OCD_STATUS1.EXTBRK` is set or `T05thread:<id>;` (SIGTRAP) otherwise. |
-| `on_read_regs`    | `g`                       | Read all 35 GDB AVR registers (R0-R31, SREG, SP, PC; 78 hex chars) live from the OCD register file via `updi_ocd_read_gpr()` / `read_sreg()` / `read_sp()` / `read_pc()` when the selected GDB thread is the active FSM thread (or when no FSM thread is established); delegate to `fsm_get_registers()` for non-active virtual threads. |
+| `on_read_regs`    | `g`                       | Read all 35 GDB AVR registers (R0-R31, SREG, SP, PC; 78 hex chars) live from the OCD register file via `updi_ocd_read_gpr()` / `read_sreg()` / `read_sp()` / `read_pc()`. The live CPU is the sole GDB thread. |
 | `on_write_regs`   | `G`, `P`                  | Write all registers (`G`) or a single register (`P n=vv`); both route per-slot to `updi_ocd_write_gpr/sreg/sp/pc` (no `updi_mem_write()`). |
 | `on_read_mem`     | `m addr,len`              | Read memory; flips GDB unified-address bit 23 to produce the UPDI physical address before calling `updi_mem_read()`. |
 | `on_write_mem`    | `M addr,len:data`, `X addr,len:bin` | Write memory: `updi_nvm_write_flash()` for program-space addresses (GDB bit 23 clear), `updi_mem_write()` for data-space addresses (GDB bit 23 set). |
@@ -572,9 +572,9 @@ TCP server socket on the configured port (default `1234`). Accepts exactly one c
 | `on_step`         | `s`, `vCont;s`            | Single-step via `updi_step()`, rebuild the FSM thread list, reply with the stop-reason packet produced by `on_halt_reason`. |
 | `on_insert_bp`    | `Z0`, `Z1`                | Install a hardware-breakpoint comparator in one of two `RspContext.hw_bp_addr[]` slots via `updi_ocd_set_hw_bp()`; both `Z0` and `Z1` route to the same two comparators. |
 | `on_remove_bp`    | `z0`, `z1`                | Release a hardware-breakpoint comparator via `updi_ocd_clear_hw_bp()` and reset the shadow slot. |
-| `on_thread_info`  | `qfThreadInfo`/`qsThreadInfo` | Enumerate virtual thread IDs from `FsmContext`. |
+| `on_thread_info`  | `qfThreadInfo`/`qsThreadInfo` | Reply `l` -- a single implicit GDB thread (the live CPU). |
 | `on_thread_extra` | `qThreadExtraInfo`        | Return FSM name string as hex-encoded ASCII. |
-| `on_set_thread_g` | `Hg<tid>`                 | Select virtual thread for subsequent `g`/`G`/`P` operations; thread IDs -1 and 0 both map to the active FSM thread. |
+| `on_set_thread_g` | `Hg<tid>`                 | Accept the set-thread packet; only the live-CPU thread (TID 1) is valid. |
 | `on_set_thread_c` | `Hc<tid>`                 | Select virtual thread for subsequent `c`/`s` operations. |
 | `on_monitor`      | `qRcmd`                   | Forward the raw ASCII-hex command body to `monitor_dispatch()`. |
 | `on_detach`       | `D`, `k`                  | Detach (`D`: call `hw_bp_clear_all(ctx)` to release both OCD comparators, then `updi_run()` and close the client fd) or kill (`k`: set the global quit flag). |
@@ -787,12 +787,12 @@ Both buffers are freed by `elf_close()`. Peak heap usage occurs between `elf_ope
 ## 7. Detailed Design for [src/fsm_mapper.c](../src/fsm_mapper.c)
 
 ### 7.1 Purpose and Responsibilities
-[src/fsm_mapper.c](../src/fsm_mapper.c) translates the runtime state of avrOS FSM registration tables — read from the target via UPDI — into GDB virtual threads, providing per-thread synthetic register frames to the RSP layer.
+[src/fsm_mapper.c](../src/fsm_mapper.c) translates the runtime state of avrOS FSM registration tables — read from the target via UPDI — into an internal introspection snapshot (per-FSM name, active flag, and current-state function pointer).
 
 *   Use the `AvrOsSymbolIndex` to read FSM state bytes from the target's SRAM over UPDI.
 *   Assign a stable GDB thread ID to each registered FSM entry.
 *   Identify and report which FSM is currently executing as the active GDB thread.
-*   Synthesize a minimal GDB register frame for each virtual thread, setting PC to the FSM's current state function pointer.
+*   Record each FSM's name, active flag, and current-state function pointer in the introspection snapshot.
 *   Cache the thread list and invalidate it whenever the CPU resumes.
 
 ### 7.2 External Interfaces
@@ -812,9 +812,6 @@ void fsm_invalidate(FsmContext *ctx);
 /* Per-thread queries */
 int  fsm_get_active_thread(const FsmContext *ctx);
     /* Returns: GDB thread ID of active FSM; 0 if not identified. */
-int  fsm_get_registers(const FsmContext *ctx, int thread_id, char *reg_buf);
-    /* Fills reg_buf with a 78-character hex string (39 bytes binary, hex-encoded: R0-R31, SREG, SPL, SPH, PC in g-packet order) plus NUL terminator; buf must be >= 79 bytes. */
-    /* Returns: 0 on success; -1 if thread_id out of range. */
 ```
 
 The `FsmContext` struct is declared in `src/fsm_mapper.h` and must be zero-initialised by the caller before the first `fsm_build_thread_list()` call.
@@ -851,17 +848,6 @@ The `FsmContext` struct is declared in `src/fsm_mapper.h` and must be zero-initi
         6.  Assign `thread->gdb_id = produced_index + 1` for each retained thread (GDB thread IDs are 1-based and never reuse a slot from a NULL-skipped initializer entry).
 
 *   **`int fsm_get_active_thread(const FsmContext *ctx)`** — Return the GDB thread ID of the currently executing FSM.
-*   **`int fsm_get_registers(const FsmContext *ctx, int thread_id, char *reg_buf)`**
-    *   Purpose: Synthesize a GDB g-packet register frame for the requested virtual thread and write it into reg_buf.
-    *   Pre-condition: `ctx->valid` is true; `thread_id` is in the range [1, ctx->thread_count]; `reg_buf` points to a caller-allocated buffer of at least 79 bytes (39 binary bytes × 2 hex chars + NUL).
-    *   Post-condition: `reg_buf` contains a 78-character hex string representing the 36 AVR GDB register values (R0–R31, SREG, SPL, SPH, PC) in GDB `g`-packet order.
-    *   Return Value: 0 on success; -1 if thread_id is out of range.
-    *   Logic:
-        1.  Zero-initialise all 79 bytes of the register buffer.
-        2.  Set the PC field (GDB register index 35, 4-byte little-endian) at hex positions 70–77 of the buffer to `thread->state_fn`.
-        3.  If `thread->is_active` is true, read SREG (register 32), SPL (register 33), and SPH (register 34) from the target SRAM via `updi_mem_read()` and write them at hex positions 64–65, 66–67, and 68–69, respectively.
-    *   Notes: Non-active threads return zeroed R0–R31 and SREG; only PC and SP are meaningful for suspended FSMs in the avrOS cooperative model.
-
 *   **`void fsm_invalidate(FsmContext *ctx)`** — Clear the cached thread list; called on every CPU resume.
 
 #### 7.3.3 Parsing Strategy / Algorithm
@@ -906,7 +892,7 @@ Total g-packet payload: 39 bytes × 2 hex chars = 78 hex characters + NUL. (Regi
 | Read FLASH name string per retained entry (up to 32 chars) | N reads | <=32N bytes |
 | **Total** | 3N+1 transactions | <=43N+2 bytes |
 
-**Test approach for `src/fsm_mapper.c`:** Unit-testable by providing a pre-populated `AvrOsSymbolIndex` and a mock `updi_mem_read()` returning canned byte sequences. Test cases cover: GDB thread ID assignment (1-based), correct `state_fn` FLASH word-address derivation, active thread identification, `FSM_MAX_THREADS` cap with warning, cache-invalidation round-trip, and `fsm_get_registers()` PC encoding verification.
+**Test approach for `src/fsm_mapper.c`:** Unit-testable by providing a pre-populated `AvrOsSymbolIndex` and a mock `updi_mem_read()` returning canned byte sequences. Test cases cover: GDB thread ID assignment (1-based), correct `state_fn` FLASH word-address derivation, active thread identification, `FSM_MAX_THREADS` cap with warning, cache-invalidation round-trip.
 
 ### 7.4 Dependencies
 
@@ -1214,7 +1200,7 @@ should be reconciled against the latest revisions of those documents.)
 | UPDI Physical Layer | §4 (src/updi.c) |
 | GDB RSP Server | §5 (src/gdb_rsp.c) |
 | ELF Parsing and Symbol Resolution | §6 (src/elf_parser.c) |
-| FSM Virtual Thread Mapping | §7 (src/fsm_mapper.c) |
+| FSM State Snapshot | §7 (src/fsm_mapper.c) |
 | System Introspection | §8 (src/monitor.c) |
 | Flash Programming | §4 (src/updi.c) |
 | Console Bridge | §4 (src/updi.c) |

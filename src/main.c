@@ -51,7 +51,7 @@ typedef struct {
                                 *  monitor erase / chip-erase verbs   */
     const char *force_device;    /* --force-device=<family>: skip SIGROW
                                   *  autodetect and use the named family  */
-    bool        no_fsm_threads;  /* --no-fsm-threads: disable FSM/RTOS threading */
+    bool        no_introspect;  /* --no-introspect: disable avrOS FSM introspection */
     bool        reset_cpu;       /* --reset: pulse UPDI system reset and exit    */
     /* fds owned by main; -1 = closed/unset */
     int         listen_fd;
@@ -120,8 +120,10 @@ static void usage(const char *prog)
         "                     Redundant when combined with --prog.\n"
         "  --log-rsp          Log all incoming and outgoing GDB RSP packets\n"
         "                     to standard error.\n"
-        "  --no-fsm-threads   Disable RTOS multi-thread reporting. Exposes\n"
-        "                     only the single hardware CPU thread.\n",
+        "  --no-introspect    Disable avrOS FSM introspection (the `monitor\n"
+        "                     avros` task/state view). The GDB thread model is\n"
+        "                     unaffected: the live CPU is always the sole GDB\n"
+        "                     thread.\n",
         prog, prog, prog, prog);
 }
 
@@ -404,7 +406,7 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
     cfg->force_device  = NULL;
     cfg->allow_erase   = false;
     cfg->log_rsp       = false;
-    cfg->no_fsm_threads = false;
+    cfg->no_introspect = false;
     cfg->reset_cpu      = false;
     cfg->listen_fd     = -1;
     cfg->gdb_fd        = -1;
@@ -446,8 +448,8 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
             cfg->allow_erase = true;
         } else if (strcmp(a, "--log-rsp") == 0) {
             cfg->log_rsp = true;
-        } else if (strcmp(a, "--no-fsm-threads") == 0) {
-            cfg->no_fsm_threads = true;
+        } else if (strcmp(a, "--no-introspect") == 0) {
+            cfg->no_introspect = true;
         } else if (strcmp(a, "--reset") == 0) {
             cfg->reset_cpu = true;
         } else if (a[0] == '-' && a[1] != '\0') {
@@ -1462,8 +1464,8 @@ int MAIN_NAME(int argc, char *argv[])
     if (elf_find_avros_tables(&elf_ctx, &idx) == 0) {
         have_fsm_symbols = (elf_has_fsm_symbols(&idx) != 0);
     }
-    bool enable_fsm_threads = !cfg.no_fsm_threads && have_fsm_symbols;
-    if (enable_fsm_threads) {
+    bool enable_introspect = !cfg.no_introspect && have_fsm_symbols;
+    if (enable_introspect) {
         (void)fsm_build_thread_list(&fsm_ctx, &idx, cfg.updi_fd);
     }
 
@@ -1498,7 +1500,7 @@ int MAIN_NAME(int argc, char *argv[])
     RspContext rctx = {
         .updi_fd    = cfg.updi_fd,
         .gdb_fd_p   = &cfg.gdb_fd,
-        .fsm        = enable_fsm_threads ? &fsm_ctx : NULL,
+        .fsm        = enable_introspect ? &fsm_ctx : NULL,
         .idx        = &idx,
         .g_thread_p = &g_thread,
         .c_thread_p = &c_thread,

@@ -11,9 +11,10 @@
 #define FSM_FIRST_PSEUDO_THREAD_ID 2
 
 typedef struct {
-    int    gdb_id;
-    char   name[32];
-    uint32_t state_fn;
+    int    gdb_id;        /* stable per-FSM index (display/order only)   */
+    char   name[32];      /* FSM name (from descriptor name pointer)      */
+    char   state_name[32];/* current state name (FSM currStateName), or
+                           * "" when the FSM has not yet dispatched       */
     bool   is_active;
 } FsmThread;
 
@@ -27,6 +28,5 @@ typedef struct {
 int  fsm_build_thread_list(FsmContext *ctx, const AvrOsSymbolIndex *idx, int updi_fd);
 void fsm_invalidate(FsmContext *ctx);
 int  fsm_get_active_thread(const FsmContext *ctx);
-int  fsm_get_registers(const FsmContext *ctx, int thread_id, char *reg_buf);
 
 #endif /* AOD_FSM_MAPPER_H */

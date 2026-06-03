@@ -257,6 +257,21 @@ void test_monitor_dispatch_hex_decodes_cmd_before_prefix_matching(void)
     free(hex);
 }
 
+/* T1b: "avros tasks" routes to cmd_tasks → builds the FSM snapshot + O-packet */
+void test_monitor_dispatch_avros_tasks_routes_to_cmd_tasks(void)
+{
+    AvrOsSymbolIndex idx = make_idx();
+    idx.fsm_table_count = 2;      /* non-empty → cmd_tasks builds the snapshot */
+    char *hex = hexify("avros tasks");
+
+    int rc = monitor_dispatch(/*rsp*/1, /*updi*/2, &idx, hex);
+
+    TEST_ASSERT_EQUAL_INT(0, rc);
+    TEST_ASSERT_GREATER_THAN(0, g_fsm_build_calls);  /* cmd_tasks invoked the builder */
+    TEST_ASSERT_GREATER_THAN(0, g_packet_count);     /* o-packet emitted */
+    free(hex);
+}
+
 /* T2: odd-length hex string → -2, no packet, no read */
 void test_monitor_dispatch_treats_invalid_hex_sequence_as_unrecognised(void)
 {
@@ -630,6 +645,7 @@ int main(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_monitor_dispatch_hex_decodes_cmd_before_prefix_matching);
+    RUN_TEST(test_monitor_dispatch_avros_tasks_routes_to_cmd_tasks);
     RUN_TEST(test_monitor_dispatch_treats_invalid_hex_sequence_as_unrecognised);
     RUN_TEST(test_monitor_dispatch_rejects_cmd_without_avros_space_prefix);
     RUN_TEST(test_monitor_dispatch_sends_usage_hint_o_packet_on_bad_prefix);

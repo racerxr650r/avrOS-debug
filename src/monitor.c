@@ -139,7 +139,8 @@ static int cmd_events(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx)
         char name[MON_NAME_MAX];
         if (name_ptr == 0u) {
             snprintf(name, sizeof name, "<null>");
-        } else if (read_target_string(updi_fd, name_ptr, name, sizeof name) < 0) {
+        } else if (read_target_string(updi_fd, name_ptr + idx->flash_lma_off,
+                                      name, sizeof name) < 0) {
             return -1;
         }
 
@@ -201,12 +202,47 @@ static int cmd_queues(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx)
     return send_text_as_o_packet(rsp_fd, text, off);
 }
 
+/* ── sub-command: tasks ──────────────────────────────────────────────── */
+
+/* List the registered avrOS FSMs as introspection: an active marker, the
+ * FSM name, and its current-state function pointer.  Reuses
+ * fsm_build_thread_list() so the (LMA-correct) flash/SRAM reads live in one
+ * place.  avrOS FSMs are surfaced here, NOT as GDB threads. */
+static int cmd_tasks(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx)
+{
+    if (idx->fsm_table_count == 0u) {
+        const char *msg = "  (no FSMs registered)\n";
+        return send_text_as_o_packet(rsp_fd, msg, strlen(msg));
+    }
+
+    static FsmContext fc;
+    if (fsm_build_thread_list(&fc, idx, updi_fd) < 0) return -1;
+
+    char text[MON_TEXT_BUF_SIZE];
+    size_t off = 0;
+    for (int i = 0; i < fc.thread_count; ++i) {
+        const FsmThread *t = &fc.threads[i];
+        int n = snprintf(text + off, sizeof text - off,
+                         "  %c %-16s state=%s\n",
+                         t->is_active ? '*' : ' ',
+                         (t->name[0] != '\0') ? t->name : "<unnamed>",
+                         (t->state_name[0] != '\0') ? t->state_name : "(init)");
+        if (n < 0) return -1;
+        if ((size_t)n >= sizeof text - off) {
+            off = sizeof text - 1u;
+            break;
+        }
+        off += (size_t)n;
+    }
+    return send_text_as_o_packet(rsp_fd, text, off);
+}
+
 /* ── usage hint ──────────────────────────────────────────────────────── */
 
 static void send_usage_hint(int rsp_fd)
 {
     static const char usage[] =
-        "usage: monitor avros <events|queues>\n";
+        "usage: monitor avros <events|queues|tasks>\n";
     (void)send_text_as_o_packet(rsp_fd, usage, sizeof usage - 1u);
 }
 
@@ -236,6 +272,9 @@ int monitor_dispatch(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx,
     }
     if (strcmp(sub, "queues") == 0) {
         return cmd_queues(rsp_fd, updi_fd, idx);
+    }
+    if (strcmp(sub, "tasks") == 0) {
+        return cmd_tasks(rsp_fd, updi_fd, idx);
     }
 
     send_usage_hint(rsp_fd);
@@ -362,6 +401,7 @@ static int verb_help(int rsp_fd)
         "monitor help             — this help text\n",
         "monitor avros events     — list avrOS event descriptors\n",
         "monitor avros queues     — list avrOS queue descriptors\n",
+        "monitor avros tasks      — list avrOS FSMs (active marker + state)\n",
     };
     for (size_t i = 0; i < sizeof lines / sizeof lines[0]; ++i) {
         if (o_line(rsp_fd, lines[i]) < 0) return -1;

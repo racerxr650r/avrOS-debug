@@ -1,6 +1,6 @@
 /* tests/test_fsm.c — Unity tests for src/fsm_mapper.c (Phase 3)
  *
- * Validates fsm_build_thread_list / fsm_get_registers / fsm_invalidate
+ * Validates fsm_build_thread_list / fsm_invalidate
  * / fsm_get_active_thread against the real avrOS FSM_TABLE layout:
  *
  *   fsmStateMachineDescr_t  (9 bytes, FLASH):
@@ -98,26 +98,25 @@ void tearDown(void) { mock_reset(); }
 #define FSM_TABLE_ADDR    0x1000U
 #define CURRENT_FSM_ADDR  0x802100U
 
-/* Entry 1: name="t1", sm_ptr=0x4000, state=0x00AA */
-/* Entry 2: name="t2", sm_ptr=0x4100, state=0xABCD  (active) */
+/* Entry 1: name="t1", sm_ptr=0x4000, currStateName -> "sA" */
+/* Entry 2: name="t2", sm_ptr=0x4100, currStateName -> "sB"  (active) */
 static const uint8_t fsm_table_2entries[2 * 9] = {
     /* descr[0] @0x1000: name=0x6000, sm=0x4000, handler=0, prio=0, inst=0 */
     0x00, 0x60,  0x00, 0x40,  0x00, 0x00,  0x00,  0x00, 0x00,
     /* descr[1] @0x1009: name=0x6010, sm=0x4100, handler=0, prio=0, inst=0 */
     0x10, 0x60,  0x00, 0x41,  0x00, 0x00,  0x00,  0x00, 0x00,
 };
-/* SRAM @0x4000: 0..8 padding, +9 = currState LE = 0xAA, 0x00 */
-static const uint8_t sm1_sram[11] = {
-    0,0,0,0,0,0,0,0,0, 0xAA, 0x00
-};
-static const uint8_t sm2_sram[11] = {
-    0,0,0,0,0,0,0,0,0, 0xCD, 0xAB
-};
+/* SRAM @ sm_ptr: offset 0 = currStateName (FLASH string pointer). */
+static const uint8_t sm1_sram[2] = { 0x20, 0x60 };   /* -> 0x6020 "sA" */
+static const uint8_t sm2_sram[2] = { 0x30, 0x60 };   /* -> 0x6030 "sB" */
 /* currStateMachine SRAM: LE 0x4100 = entry-2 is active */
 static const uint8_t current_active2[2] = { 0x00, 0x41 };
 /* FLASH name strings */
 static const uint8_t name1[] = { 't','1', 0 };
 static const uint8_t name2[] = { 't','2', 0 };
+/* FLASH current-state-name strings */
+static const uint8_t state1[] = { 's','A', 0 };
+static const uint8_t state2[] = { 's','B', 0 };
 
 static void install_2entry_fixture(AvrOsSymbolIndex *idx)
 {
@@ -136,8 +135,11 @@ static void install_2entry_fixture(AvrOsSymbolIndex *idx)
     mock_add_region(0x4100,           sm2_sram,           sizeof(sm2_sram));
     mock_add_region(flash_to_updi(0x6000), name1,         sizeof(name1));
     mock_add_region(flash_to_updi(0x6010), name2,         sizeof(name2));
+    /* currStateMachine kept at region index 5 (a test pokes g_regions[5]). */
     mock_add_region(sram_to_updi(CURRENT_FSM_ADDR),
                     current_active2, sizeof(current_active2));
+    mock_add_region(flash_to_updi(0x6020), state1,        sizeof(state1));
+    mock_add_region(flash_to_updi(0x6030), state2,        sizeof(state2));
 }
 
 /* ──────────────────────────────────────────────────────────────────────
@@ -154,6 +156,13 @@ void test_fsm_build_thread_list_reads_fsm_table_from_flash_via_updi(void)
     int n = fsm_build_thread_list(&ctx, &idx, /*fd*/ 7);
     TEST_ASSERT_EQUAL_INT(2, n);
     TEST_ASSERT_TRUE(ctx.valid);
+
+    /* Names come from the descriptor name pointer; state names from the
+     * fsmStateMachine_t currStateName (offset 0). */
+    TEST_ASSERT_EQUAL_STRING("t1", ctx.threads[0].name);
+    TEST_ASSERT_EQUAL_STRING("sA", ctx.threads[0].state_name);
+    TEST_ASSERT_EQUAL_STRING("t2", ctx.threads[1].name);
+    TEST_ASSERT_EQUAL_STRING("sB", ctx.threads[1].state_name);
 
     /* At least one UPDI read hit the FSM_TABLE address (in UPDI flash
      * mirror form). */
@@ -205,8 +214,8 @@ void test_fsm_build_thread_list_thread_ids_stable_across_calls(void)
 
     TEST_ASSERT_EQUAL_INT(a.threads[0].gdb_id, b.threads[0].gdb_id);
     TEST_ASSERT_EQUAL_INT(a.threads[1].gdb_id, b.threads[1].gdb_id);
-    TEST_ASSERT_EQUAL_UINT32(a.threads[0].state_fn, b.threads[0].state_fn);
-    TEST_ASSERT_EQUAL_UINT32(a.threads[1].state_fn, b.threads[1].state_fn);
+    TEST_ASSERT_EQUAL_STRING(a.threads[0].state_name, b.threads[0].state_name);
+    TEST_ASSERT_EQUAL_STRING(a.threads[1].state_name, b.threads[1].state_name);
 }
 
 /* 5) sets active thread from currStateMachine ptr */
@@ -238,69 +247,6 @@ void test_fsm_build_thread_list_sets_active_id_0_when_no_entry_matches(void)
     TEST_ASSERT_EQUAL_INT(0, ctx.active_id);
 }
 
-/* 7) PC bytes at hex positions [70..77] = LE(state_fn) */
-void test_fsm_get_registers_places_state_fn_as_pc_at_hex_positions_70_77(void)
-{
-    AvrOsSymbolIndex idx;
-    install_2entry_fixture(&idx);
-
-    FsmContext ctx;
-    TEST_ASSERT_EQUAL_INT(2, fsm_build_thread_list(&ctx, &idx, 7));
-    TEST_ASSERT_EQUAL_UINT32(0xABCDU, ctx.threads[1].state_fn);
-
-    char reg[80];
-    memset(reg, 'X', sizeof(reg));
-    TEST_ASSERT_EQUAL_INT(0, fsm_get_registers(&ctx, 3, reg));
-
-    /* PC = 0xABCD → LE bytes CD AB 00 00 → hex "cdab00000" sequence */
-    TEST_ASSERT_EQUAL_STRING_LEN("cdab0000", &reg[70], 8);
-    TEST_ASSERT_EQUAL_CHAR('\0', reg[78]);
-}
-
-/* 8) non-active thread: R0..R31 & SREG/SPL/SPH all zero */
-void test_fsm_get_registers_non_active_r0_r31_sreg_spl_sph_all_zero(void)
-{
-    AvrOsSymbolIndex idx;
-    install_2entry_fixture(&idx);
-
-    FsmContext ctx;
-    TEST_ASSERT_EQUAL_INT(2, fsm_build_thread_list(&ctx, &idx, 7));
-
-    char reg[80];
-    TEST_ASSERT_EQUAL_INT(0, fsm_get_registers(&ctx, 2, reg)); /* non-active */
-
-    /* Positions [0..69] must all be '0' chars. */
-    for (int i = 0; i < 70; i++)
-        TEST_ASSERT_EQUAL_CHAR_MESSAGE('0', reg[i], "non-active byte must be 0");
-}
-
-/* 9) active thread: reads live SREG/SPL/SPH via UPDI */
-void test_fsm_get_registers_active_thread_reads_live_sreg_spl_sph(void)
-{
-    AvrOsSymbolIndex idx;
-    install_2entry_fixture(&idx);
-    /* Install I/O-space region with SPL=0x12, SPH=0x34, SREG=0xC0
-     * at byte address 0x3D (SPL),0x3E (SPH),0x3F (SREG). */
-    static const uint8_t io_state[3] = { 0x12, 0x34, 0xC0 };
-    mock_add_region(0x3D, io_state, sizeof(io_state));
-
-    FsmContext ctx;
-    TEST_ASSERT_EQUAL_INT(2, fsm_build_thread_list(&ctx, &idx, 7));
-
-    /* Snapshot call count before fsm_get_registers. */
-    int before = g_call_count;
-    char reg[80];
-    TEST_ASSERT_EQUAL_INT(0, fsm_get_registers(&ctx, 3, reg)); /* active */
-    int after = g_call_count;
-    TEST_ASSERT_GREATER_THAN_MESSAGE(before, after,
-        "active fsm_get_registers must issue >=1 updi_mem_read");
-
-    /* SREG @ hex pos 64..65 = "c0", SPL @ 66..67 = "12", SPH @ 68..69 = "34". */
-    TEST_ASSERT_EQUAL_STRING_LEN("c0", &reg[64], 2);
-    TEST_ASSERT_EQUAL_STRING_LEN("12", &reg[66], 2);
-    TEST_ASSERT_EQUAL_STRING_LEN("34", &reg[68], 2);
-}
-
 /* 10) caps at 32 entries and logs warning */
 void test_fsm_build_thread_list_caps_at_32_entries_and_logs_warning(void)
 {
@@ -328,23 +274,6 @@ void test_fsm_build_thread_list_caps_at_32_entries_and_logs_warning(void)
     int n = fsm_build_thread_list(&ctx, &idx, 7);
     TEST_ASSERT_EQUAL_INT(FSM_MAX_THREADS, n);
     TEST_ASSERT_EQUAL_INT(FSM_MAX_THREADS, ctx.thread_count);
-}
-
-/* 11) non-active fsm_get_registers issues ZERO updi_mem_read calls */
-void test_fsm_get_registers_non_active_no_updi_read_of_stack(void)
-{
-    AvrOsSymbolIndex idx;
-    install_2entry_fixture(&idx);
-
-    FsmContext ctx;
-    TEST_ASSERT_EQUAL_INT(2, fsm_build_thread_list(&ctx, &idx, 7));
-
-    int before = g_call_count;
-    char reg[80];
-    TEST_ASSERT_EQUAL_INT(0, fsm_get_registers(&ctx, 2, reg)); /* non-active */
-    int after = g_call_count;
-    TEST_ASSERT_EQUAL_INT_MESSAGE(before, after,
-        "non-active fsm_get_registers must issue 0 updi_mem_read");
 }
 
 /* 12) fsm_invalidate drops any cached thread metadata */
@@ -380,11 +309,7 @@ int main(void)
     RUN_TEST(test_fsm_build_thread_list_thread_ids_stable_across_calls);
     RUN_TEST(test_fsm_build_thread_list_sets_active_thread_from_current_fsm_ptr);
     RUN_TEST(test_fsm_build_thread_list_sets_active_id_0_when_no_entry_matches);
-    RUN_TEST(test_fsm_get_registers_places_state_fn_as_pc_at_hex_positions_70_77);
-    RUN_TEST(test_fsm_get_registers_non_active_r0_r31_sreg_spl_sph_all_zero);
-    RUN_TEST(test_fsm_get_registers_active_thread_reads_live_sreg_spl_sph);
     RUN_TEST(test_fsm_build_thread_list_caps_at_32_entries_and_logs_warning);
-    RUN_TEST(test_fsm_get_registers_non_active_no_updi_read_of_stack);
     RUN_TEST(test_fsm_invalidate_clears_thread_cache_and_active_id);
     return UNITY_END();
 }

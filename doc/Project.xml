@@ -35,7 +35,7 @@
       <file path="src/updi.c">UPDI physical layer: UART serial management, UPDI protocol framing, NVM flash programming, and UPDI console bridge.</file>
       <file path="src/gdb_rsp.c">GDB Remote Serial Protocol server: packet codec, command dispatch, and session lifecycle management.</file>
       <file path="src/elf_parser.c">ELF parser: locates avrOS FLASH-resident system tables and produces the AvrOsSymbolIndex.</file>
-      <file path="src/fsm_mapper.c">avrOS FSM-to-GDB virtual thread translator: maps FSM state tables to GDB thread objects and synthesizes per-thread register frames.</file>
+      <file path="src/fsm_mapper.c">avrOS FSM introspection snapshot provider: reads the FSM registration tables and exposes each FSM's name, active flag, and current state.</file>
       <file path="src/monitor.c">Custom monitor command handler: implements the `avros events` and `avros queues` sub-commands via non-intrusive UPDI reads.</file>
       <file path="Makefile">Build orchestration: compile, test, install, uninstall, check-tools, and bundle (Debian .deb, Red Hat .rpm, Homebrew formula) targets.</file>
       <file path="tests/hw/hw_test.c">On-target hardware integration test harness: links against `src/updi.c` and exercises the live UPDI silicon, device-info report, SRAM round-trips, NVM page programming, and the RSP server's TCP path. Manual-only — never wired into `make test`.</file>
@@ -46,7 +46,7 @@
     <overview>
       <para><![CDATA[`avrOSdb` is a POSIX C99 GDB stub that bridges the UPDI debug interface of modern AVR microcontrollers (DA/DB families) to standard IDEs over the GDB Remote Serial Protocol (RSP). A developer launches the stub, points it at a serial device and an ELF binary, and connects any GDB-compatible front-end — VS Code with Cortex-Debug, Zed with its DAP adapter, or bare `avr-gdb` — using the standard `target extended-remote` command.]]></para>
       <para><![CDATA[The server connects to the target via a TTL-level UART serial adapter with a 1 kΩ resistor on the UPDI line. No external JTAG programmer or proprietary debugger hardware is required — only a USB-to-serial adapter or direct Raspberry Pi UART pins.]]></para>
-      <para><![CDATA[Unlike conventional GDB stubs that expose a flat memory model, `avrOSdb` provides native avrOS state-machine awareness. At attach time it parses the supplied ELF binary to locate the avrOS FSM registration tables in FLASH, then presents each registered finite state machine as a standard GDB virtual thread. The currently executing FSM appears as the active thread; all suspended FSMs appear as additional threads, each with a synthetic register frame whose PC points to the FSM's current state function pointer.]]></para>
+      <para><![CDATA[Unlike conventional GDB stubs that expose a flat memory model, `avrOSdb` provides native avrOS state-machine awareness. At attach time it parses the supplied ELF binary to locate the avrOS FSM registration tables in FLASH, then reads each registered finite state machine's runtime state into a snapshot the developer can inspect via `monitor` commands (which FSM is active, and each FSM's current state). avrOS FSMs are surfaced as introspection, not as GDB threads: the live CPU is the sole GDB thread.]]></para>
       <para><![CDATA[The project ships with a `make install` target that installs the compiled binary to `$(PREFIX)/bin/` and the accompanying Unix man page to `$(PREFIX)/share/man/man1/`. A `make check-tools` target validates that all required build tools (`gcc`, `make`, `avr-gcc`, `avr-binutils`) are present on the host before any compilation is attempted. A `make bundle` target produces native distribution packages for three platforms: a Debian binary package (`.deb`), a Red Hat RPM package (`.rpm`), and a Homebrew formula (`dist/avrOSdb.rb`) for macOS. All output artefacts are written under the `dist/` directory. These targets ensure the project can be built, deployed, and distributed by a developer from a single `make` command sequence with no manual file copying.]]></para>
       <para><![CDATA[**Planned — Phase 9 — CI-Grade Loader & Link Diagnostics (not yet implemented).** A forthcoming iteration extends the programmer and the `--device` diagnostic mode with the following capabilities so the tool can be trusted as a CI build/flash step and used as a first-line link-health probe. Tracked in GitHub issue #28; not yet bound to HLRs/LLRs.
 
@@ -75,7 +75,7 @@ Phase 10 work shall continue to honour the layered architecture (§2.1) and the 
       <term name="FSM"><![CDATA[Finite State Machine — the cooperative task unit in avrOS, represented at runtime by a function pointer into a FLASH-resident state table. All FSMs share the single hardware stack.]]></term>
       <term name="ELF"><![CDATA[Executable and Linkable Format — the binary file produced by `avr-gcc` that carries machine code, DWARF debug information, and the symbol table used to locate avrOS system tables.]]></term>
       <term name="avrOS"><![CDATA[A cooperative real-time operating system for AVR microcontrollers. Tasks are modelled as FSMs; inter-task communication uses queues and named events.]]></term>
-      <term name="Virtual Thread"><![CDATA[A GDB thread object synthesized from an avrOS FSM entry. Each virtual thread has a unique GDB thread ID and a synthesized register frame whose PC is set to the FSM's current state function pointer.]]></term>
+      <term name="FSM Snapshot"><![CDATA[An internal record of the avrOS FSM registration table read from the target at halt -- per-FSM name, active flag, and current-state function pointer -- exposed to the developer via `monitor avros` introspection commands. avrOS FSMs are not presented as GDB threads.]]></term>
       <term name="Harvard Architecture"><![CDATA[The AVR memory model, in which FLASH (program memory) and SRAM (data memory) occupy separate address spaces. ELF virtual addresses must be converted to physical FLASH word addresses during symbol resolution.]]></term>
     </definitions>
 
@@ -128,14 +128,14 @@ Layer 1 (`src/main.c`) is the orchestrator and is permitted to reach into any mo
       <component path="src/updi.c"><![CDATA[UPDI physical layer; owns the UART serial file descriptor, UPDI protocol framing, execution-control primitives (halt, run, step), NVM flash programming, and the UPDI console bridge.]]></component>
       <component path="src/gdb_rsp.c"><![CDATA[GDB RSP layer; owns the GDB TCP socket, RSP packet codec, and command dispatch table.]]></component>
       <component path="src/elf_parser.c"><![CDATA[ELF parser; produces the `AvrOsSymbolIndex` (FLASH addresses of avrOS system tables) at attach time.]]></component>
-      <component path="src/fsm_mapper.c"><![CDATA[FSM mapper; reads UPDI memory using the symbol index and exposes avrOS FSMs as GDB virtual threads.]]></component>
+      <component path="src/fsm_mapper.c"><![CDATA[FSM mapper; reads UPDI memory using the symbol index and exposes avrOS FSM state as introspection.]]></component>
       <component path="src/monitor.c"><![CDATA[Monitor handler; implements the custom `monitor avros events|queues` introspection commands without halting the CPU.]]></component>
       <flow>
         <intro>The startup and attach sequence proceeds as follows:</intro>
         <step><![CDATA[`main()` parses argv, opens the UART serial device, and starts the GDB TCP listener socket.]]></step>
         <step><![CDATA[A GDB client connects; the RSP layer sends the initial hello and negotiates capabilities via `qSupported`.]]></step>
         <step><![CDATA[On the first `vAttach` or `?` packet, the ELF parser scans the supplied `.elf` file and populates the `AvrOsSymbolIndex` with avrOS FSM table addresses.]]></step>
-        <step>The FSM mapper reads the FLASH-resident tables via UPDI background reads and builds the virtual thread list.</step>
+        <step>The FSM mapper reads the FLASH-resident tables via UPDI background reads and builds the FSM introspection snapshot.</step>
         <step><![CDATA[Subsequent GDB packets (register reads, memory reads, breakpoints, step/continue) are dispatched through the RSP layer to the UPDI layer.]]></step>
         <step><![CDATA[`monitor avros` commands are intercepted by the monitor handler, which issues UPDI background reads without halting the CPU core.]]></step>
       </flow>
@@ -546,7 +546,7 @@ The `RspHandlers` and `RspContext` structs are declared in `src/gdb_rsp.h`. The 
 | Field | Packet(s) handled | Description |
 | ----- | ----------------- | ----------- |
 | `on_halt_reason`  | `?`                       | Stop-reason query; calls `signal_for_halt_status()` (reads `OCD_STATUS1` via `updi_ocd_read_halt_status()`) and replies `T02thread:<id>;` (SIGINT) when `OCD_STATUS1.EXTBRK` is set or `T05thread:<id>;` (SIGTRAP) otherwise. |
-| `on_read_regs`    | `g`                       | Read all 35 GDB AVR registers (R0-R31, SREG, SP, PC; 78 hex chars) live from the OCD register file via `updi_ocd_read_gpr()` / `read_sreg()` / `read_sp()` / `read_pc()` when the selected GDB thread is the active FSM thread (or when no FSM thread is established); delegate to `fsm_get_registers()` for non-active virtual threads. |
+| `on_read_regs`    | `g`                       | Read all 35 GDB AVR registers (R0-R31, SREG, SP, PC; 78 hex chars) live from the OCD register file via `updi_ocd_read_gpr()` / `read_sreg()` / `read_sp()` / `read_pc()`. The live CPU is the sole GDB thread. |
 | `on_write_regs`   | `G`, `P`                  | Write all registers (`G`) or a single register (`P n=vv`); both route per-slot to `updi_ocd_write_gpr/sreg/sp/pc` (no `updi_mem_write()`). |
 | `on_read_mem`     | `m addr,len`              | Read memory; flips GDB unified-address bit 23 to produce the UPDI physical address before calling `updi_mem_read()`. |
 | `on_write_mem`    | `M addr,len:data`, `X addr,len:bin` | Write memory: `updi_nvm_write_flash()` for program-space addresses (GDB bit 23 clear), `updi_mem_write()` for data-space addresses (GDB bit 23 set). |
@@ -554,9 +554,9 @@ The `RspHandlers` and `RspContext` structs are declared in `src/gdb_rsp.h`. The 
 | `on_step`         | `s`, `vCont;s`            | Single-step via `updi_step()`, rebuild the FSM thread list, reply with the stop-reason packet produced by `on_halt_reason`. |
 | `on_insert_bp`    | `Z0`, `Z1`                | Install a hardware-breakpoint comparator in one of two `RspContext.hw_bp_addr[]` slots via `updi_ocd_set_hw_bp()`; both `Z0` and `Z1` route to the same two comparators. |
 | `on_remove_bp`    | `z0`, `z1`                | Release a hardware-breakpoint comparator via `updi_ocd_clear_hw_bp()` and reset the shadow slot. |
-| `on_thread_info`  | `qfThreadInfo`/`qsThreadInfo` | Enumerate virtual thread IDs from `FsmContext`. |
+| `on_thread_info`  | `qfThreadInfo`/`qsThreadInfo` | Reply `l` -- a single implicit GDB thread (the live CPU). |
 | `on_thread_extra` | `qThreadExtraInfo`        | Return FSM name string as hex-encoded ASCII. |
-| `on_set_thread_g` | `Hg<tid>`                 | Select virtual thread for subsequent `g`/`G`/`P` operations; thread IDs -1 and 0 both map to the active FSM thread. |
+| `on_set_thread_g` | `Hg<tid>`                 | Accept the set-thread packet; only the live-CPU thread (TID 1) is valid. |
 | `on_set_thread_c` | `Hc<tid>`                 | Select virtual thread for subsequent `c`/`s` operations. |
 | `on_monitor`      | `qRcmd`                   | Forward the raw ASCII-hex command body to `monitor_dispatch()`. |
 | `on_detach`       | `D`, `k`                  | Detach (`D`: call `hw_bp_clear_all(ctx)` to release both OCD comparators, then `updi_run()` and close the client fd) or kill (`k`: set the global quit flag). |
@@ -757,11 +757,11 @@ Both buffers are freed by `elf_close()`. Peak heap usage occurs between `elf_ope
       </module>
 
       <module path="src/fsm_mapper.c">
-        <purpose><![CDATA[translates the runtime state of avrOS FSM registration tables — read from the target via UPDI — into GDB virtual threads, providing per-thread synthetic register frames to the RSP layer.]]></purpose>
+        <purpose><![CDATA[translates the runtime state of avrOS FSM registration tables — read from the target via UPDI — into an internal introspection snapshot (per-FSM name, active flag, and current-state function pointer).]]></purpose>
         <responsibility><![CDATA[Use the `AvrOsSymbolIndex` to read FSM state bytes from the target's SRAM over UPDI.]]></responsibility>
         <responsibility>Assign a stable GDB thread ID to each registered FSM entry.</responsibility>
         <responsibility>Identify and report which FSM is currently executing as the active GDB thread.</responsibility>
-        <responsibility>Synthesize a minimal GDB register frame for each virtual thread, setting PC to the FSM's current state function pointer.</responsibility>
+        <responsibility>Record each FSM's name, active flag, and current-state function pointer in the introspection snapshot.</responsibility>
         <responsibility>Cache the thread list and invalidate it whenever the CPU resumes.</responsibility>
         <interfaces>
           <interface title="Public C API (src/fsm_mapper.h)"><![CDATA[All functions exported from `src/fsm_mapper.c` and declared in `src/fsm_mapper.h`:
@@ -778,9 +778,6 @@ void fsm_invalidate(FsmContext *ctx);
 /* Per-thread queries */
 int  fsm_get_active_thread(const FsmContext *ctx);
     /* Returns: GDB thread ID of active FSM; 0 if not identified. */
-int  fsm_get_registers(const FsmContext *ctx, int thread_id, char *reg_buf);
-    /* Fills reg_buf with a 78-character hex string (39 bytes binary, hex-encoded: R0-R31, SREG, SPL, SPH, PC in g-packet order) plus NUL terminator; buf must be >= 79 bytes. */
-    /* Returns: 0 on success; -1 if thread_id out of range. */
 ```
 
 The `FsmContext` struct is declared in `src/fsm_mapper.h` and must be zero-initialised by the caller before the first `fsm_build_thread_list()` call.]]></interface>
@@ -812,18 +809,6 @@ The `FsmContext` struct is declared in `src/fsm_mapper.h` and must be zero-initi
           </function>
           <function signature="int fsm_get_active_thread(const FsmContext *ctx)"
                     summary="Return the GDB thread ID of the currently executing FSM."/>
-          <function signature="int fsm_get_registers(const FsmContext *ctx, int thread_id, char *reg_buf)">
-            <purpose>Synthesize a GDB g-packet register frame for the requested virtual thread and write it into reg_buf.</purpose>
-            <pre><![CDATA[`ctx->valid` is true; `thread_id` is in the range [1, ctx->thread_count]; `reg_buf` points to a caller-allocated buffer of at least 79 bytes (39 binary bytes × 2 hex chars + NUL).]]></pre>
-            <post><![CDATA[`reg_buf` contains a 78-character hex string representing the 36 AVR GDB register values (R0–R31, SREG, SPL, SPH, PC) in GDB `g`-packet order.]]></post>
-            <returns>0 on success; -1 if thread_id is out of range.</returns>
-            <logic>
-              <step>Zero-initialise all 79 bytes of the register buffer.</step>
-              <step><![CDATA[Set the PC field (GDB register index 35, 4-byte little-endian) at hex positions 70–77 of the buffer to `thread->state_fn`.]]></step>
-              <step><![CDATA[If `thread->is_active` is true, read SREG (register 32), SPL (register 33), and SPH (register 34) from the target SRAM via `updi_mem_read()` and write them at hex positions 64–65, 66–67, and 68–69, respectively.]]></step>
-            </logic>
-            <notes>Non-active threads return zeroed R0–R31 and SREG; only PC and SP are meaningful for suspended FSMs in the avrOS cooperative model.</notes>
-          </function>
           <function signature="void fsm_invalidate(FsmContext *ctx)"
                     summary="Clear the cached thread list; called on every CPU resume."/>
         </functions>
@@ -867,7 +852,7 @@ Total g-packet payload: 39 bytes × 2 hex chars = 78 hex characters + NUL. (Regi
 | Read FLASH name string per retained entry (up to 32 chars) | N reads | <=32N bytes |
 | **Total** | 3N+1 transactions | <=43N+2 bytes |
 
-**Test approach for `src/fsm_mapper.c`:** Unit-testable by providing a pre-populated `AvrOsSymbolIndex` and a mock `updi_mem_read()` returning canned byte sequences. Test cases cover: GDB thread ID assignment (1-based), correct `state_fn` FLASH word-address derivation, active thread identification, `FSM_MAX_THREADS` cap with warning, cache-invalidation round-trip, and `fsm_get_registers()` PC encoding verification.]]></algorithm>
+**Test approach for `src/fsm_mapper.c`:** Unit-testable by providing a pre-populated `AvrOsSymbolIndex` and a mock `updi_mem_read()` returning canned byte sequences. Test cases cover: GDB thread ID assignment (1-based), correct `state_fn` FLASH word-address derivation, active thread identification, `FSM_MAX_THREADS` cap with warning, cache-invalidation round-trip.]]></algorithm>
         <dependencies>
           <dep><![CDATA[`src/updi.c` — `updi_mem_read()` for SRAM reads.]]></dep>
           <dep><![CDATA[`src/elf_parser.c` — `AvrOsSymbolIndex` for table addresses and entry counts.]]></dep>
@@ -1155,7 +1140,7 @@ Errors are propagated upward through the module stack without retrying:
       <theme name="UPDI Physical Layer"               sections="§4 (src/updi.c)"/>
       <theme name="GDB RSP Server"                    sections="§5 (src/gdb_rsp.c)"/>
       <theme name="ELF Parsing and Symbol Resolution" sections="§6 (src/elf_parser.c)"/>
-      <theme name="FSM Virtual Thread Mapping"        sections="§7 (src/fsm_mapper.c)"/>
+      <theme name="FSM State Snapshot"        sections="§7 (src/fsm_mapper.c)"/>
       <theme name="System Introspection"              sections="§8 (src/monitor.c)"/>
       <theme name="Flash Programming"                 sections="§4 (src/updi.c)"/>
       <theme name="Console Bridge"                    sections="§4 (src/updi.c)"/>
@@ -1306,7 +1291,7 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-014" name="Register Read and Write">
-        <text><![CDATA[The application shall respond to GDB register read (`g`) and write (`G`, `P`) packets, returning or updating the current AVR CPU register state (32 general-purpose registers, PC, SP, and status register) obtained from or written to the target via the AVR-Dx OCD register file at UPDI base `0x0F80`. Reads against the active GDB thread (or against any thread when no FSM context is established) shall return live OCD values; reads against a non-active virtual FSM thread shall return the synthesized register frame from the FSM mapper.]]></text>
+        <text><![CDATA[The application shall respond to GDB register read (`g`) and write (`G`, `P`) packets, returning or updating the current AVR CPU register state (32 general-purpose registers, PC, SP, and status register) obtained from or written to the target via the AVR-Dx OCD register file at UPDI base `0x0F80`. All register reads shall return live OCD values: the live CPU is the sole GDB thread (avrOS FSM state is exposed via introspection, HLR-029 et seq., not as GDB threads).]]></text>
         <traces>
           <trace target="SDD" ref="5.3.1"/>
         </traces>
@@ -1394,11 +1379,11 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
     </section>
 
-    <section number="5" title="FSM Virtual Thread Mapping">
-      <intro><![CDATA[Requirements in this section govern how the server translates the avrOS cooperative scheduler state into GDB virtual threads visible in the IDE's call-stack and thread panes.]]></intro>
+    <section number="5" title="FSM State Snapshot (Introspection)">
+      <intro><![CDATA[Requirements in this section govern how the server reads the avrOS cooperative scheduler state into an internal snapshot for developer introspection (surfaced via `monitor` commands, HLR-029 et seq.). avrOS FSMs are NOT presented as GDB virtual threads -- the live CPU is the sole GDB thread.]]></intro>
 
       <hlr id="HLR-024" name="FSM Thread Enumeration">
-        <text><![CDATA[Upon halting the target, the application shall read the avrOS FSM registration table from target SRAM via UPDI and present each registered FSM entry as a distinct GDB virtual thread, identified by a stable thread ID.]]></text>
+        <text><![CDATA[Upon halting the target, the application shall read the avrOS FSM registration table from target SRAM via UPDI into an internal snapshot (per-FSM name, active flag, and current-state function pointer). The snapshot is exposed to the developer through introspection commands (HLR-029 et seq.) and is NOT presented as GDB virtual threads — the live CPU is the sole GDB thread.]]></text>
         <traces>
           <trace target="SDD" ref="7.1"/>
           <trace target="SDD" ref="7.3.1"/>
@@ -1406,35 +1391,14 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-025" name="Active Thread Identification">
-        <text><![CDATA[The application shall identify the currently executing avrOS FSM from the runtime state read via UPDI and report it to the GDB client as the active thread. All register reads and memory operations issued without an explicit thread context shall operate on the active thread's context.]]></text>
+        <text><![CDATA[The application shall identify the currently executing avrOS FSM from the runtime state read via UPDI and mark it as active in the introspection snapshot (HLR-024). All GDB register reads and memory operations target the single live-CPU thread; the active-FSM identification is surfaced via introspection, not as a GDB active-thread selection.]]></text>
         <traces>
           <trace target="SDD" ref="7.3.1"/>
         </traces>
       </hlr>
 
-      <hlr id="HLR-026" name="Virtual Thread Register Frame">
-        <text><![CDATA[Each virtual thread shall present a synthesized GDB register frame in which the program counter (PC) is set to the function pointer of the FSM's current state handler. For the active virtual thread, SP and SREG shall be read live from the target's hardware registers and inserted into the register frame. For all non-active virtual threads, SP and SREG shall be set to zero, as dormant FSMs do not maintain independent stacks in the avrOS cooperative scheduler model.]]></text>
-        <traces>
-          <trace target="SDD" ref="7.1"/>
-          <trace target="SDD" ref="7.3.1"/>
-        </traces>
-      </hlr>
 
-      <hlr id="HLR-027" name="Complete FSM Thread Coverage">
-        <text><![CDATA[All FSMs registered in the avrOS FSM table shall appear as virtual threads in the GDB client thread pane upon halting at or after `main()`, up to a maximum of `FSM_MAX_THREADS` (32) entries. If more than `FSM_MAX_THREADS` FSMs are registered, the server shall silently cap the virtual thread list at 32 and log a diagnostic warning; no registered FSM within the cap shall be omitted.]]></text>
-        <traces>
-          <trace target="SDD" ref="7.1"/>
-          <trace target="SDD" ref="7.3.1"/>
-        </traces>
-      </hlr>
 
-      <hlr id="HLR-028" name="Stack-Free Thread Model">
-        <text><![CDATA[The application shall not attempt to unwind stack frames for suspended FSMs. The execution context of a non-active virtual thread shall be defined solely by its state function pointer; the server shall never dereference a dormant stack pointer to infer thread state.]]></text>
-        <traces>
-          <trace target="SDD" ref="2.2"/>
-          <trace target="SDD" ref="7.1"/>
-        </traces>
-      </hlr>
     </section>
 
     <section number="6" title="System Introspection">
@@ -1450,6 +1414,14 @@ Errors are propagated upward through the module stack without retrying:
 
       <hlr id="HLR-030" name="Monitor Queues Command">
         <text><![CDATA[The application shall implement a `monitor avros queues` command that iterates the avrOS `QUE_TABLE` and reports each registered queue's `capacity` and `sizeOfElement` from the FLASH descriptor via UPDI background read, returning a human-readable table to the GDB console without halting the CPU core.]]></text>
+        <traces>
+          <trace target="SDD" ref="8.2.2"/>
+          <trace target="SDD" ref="8.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-069" name="Monitor Tasks Command">
+        <text><![CDATA[The application shall implement a `monitor avros tasks` command that lists each registered avrOS FSM with an active marker, its name, and its current state name, reading the FSM registration table and each FSM's `currStateName` via UPDI background reads (reusing `fsm_build_thread_list()`), without halting the CPU. avrOS FSMs surface as introspection here, not as GDB threads.]]></text>
         <traces>
           <trace target="SDD" ref="8.2.2"/>
           <trace target="SDD" ref="8.3.1"/>
@@ -1633,7 +1605,7 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-055" name="avarice-Compatible Monitor Commands">
-        <text><![CDATA[The application shall expose a top-level set of `monitor` verbs that mirror the `avarice` command surface, so that GDB scripts written for `avarice` work unchanged: `monitor reset` (issue `updi_reset()` and leave the CPU halted at the reset vector, then invalidate the FSM thread cache so the next `qfThreadInfo` reflects post-reset state), `monitor halt` (call `updi_halt()` and reply with the same `T05thread:<id>;` packet as a step boundary), `monitor go` (call `updi_run()` and reply `OK` — the subsequent stop-reason packet is emitted when the CPU next halts), `monitor erase` and `monitor chip-erase` (issue `updi_chip_erase()`, but only when the server was launched with the new `--allow-erase` flag — without that flag the verb shall reply with an O-packet diagnostic and `E22`), `monitor version` (one O-packet line carrying the server version, git short SHA, build date, and the active device family name from HLR-048), `monitor bp-mode <hw-only|sw>` (configure the breakpoint installation policy per HLR-054), and `monitor help` (one O-packet per recognised verb summarising syntax and side-effects, terminating with `OK`). The dispatcher in `src/monitor.c` shall continue to route the `avros ` prefix to the existing avrOS-specific handlers (`events`, `queues`); unknown verbs shall reply with the existing usage hint plus `E22`. None of the new verbs shall alter the FSM thread mapping path other than via the explicit cache invalidation noted above.]]></text>
+        <text><![CDATA[The application shall expose a top-level set of `monitor` verbs that mirror the `avarice` command surface, so that GDB scripts written for `avarice` work unchanged: `monitor reset` (issue `updi_reset()` and leave the CPU halted at the reset vector, then invalidate the FSM snapshot cache so the next introspection read reflects post-reset state), `monitor halt` (call `updi_halt()` and reply with the same `T05thread:<id>;` packet as a step boundary), `monitor go` (call `updi_run()` and reply `OK` — the subsequent stop-reason packet is emitted when the CPU next halts), `monitor erase` and `monitor chip-erase` (issue `updi_chip_erase()`, but only when the server was launched with the new `--allow-erase` flag — without that flag the verb shall reply with an O-packet diagnostic and `E22`), `monitor version` (one O-packet line carrying the server version, git short SHA, build date, and the active device family name from HLR-048), `monitor bp-mode <hw-only|sw>` (configure the breakpoint installation policy per HLR-054), and `monitor help` (one O-packet per recognised verb summarising syntax and side-effects, terminating with `OK`). The dispatcher in `src/monitor.c` shall continue to route the `avros ` prefix to the existing avrOS-specific handlers (`events`, `queues`); unknown verbs shall reply with the existing usage hint plus `E22`. None of the new verbs shall alter the FSM snapshot path other than via the explicit cache invalidation noted above.]]></text>
         <traces>
           <trace target="SDD" ref="8.1"/>
           <trace target="SDD" ref="5.3.1"/>
@@ -1648,7 +1620,7 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-058" name="Extended-Remote Lifecycle Packets">
-        <text><![CDATA[The application shall support the `target extended-remote` connection mode by implementing the `vRun;<arg>;<arg>...` packet (treat the first argument as a path to a new `.elf` file, swap it into the existing `AppConfig`, re-run ELF parsing, re-build the FSM context, and reply with a `T05` stop at the new reset vector), the `vAttach;<pid>` packet (reply `OK` followed by the standard stop-reply; `pid` is informational only on a single-target stub), and the `vKill;<pid>` packet (call `updi_run()` to release the target, close the GDB client fd, and return to the listen state without exiting the server process). Existing `D` (detach) and `k` (kill) handlers shall remain operational; `k` shall continue to mean process-exit so that scripts that hard-stop the server keep working. The `qSupported` feature string shall be extended with `multiprocess+;vRun+;vAttach+;vKill+` and the `multiprocess-` entry removed so GDB treats the connection as multi-target capable.]]></text>
+        <text><![CDATA[The application shall support the `target extended-remote` connection mode by implementing the `vRun;<arg>;<arg>...` packet (treat the first argument as a path to a new `.elf` file, swap it into the existing `AppConfig`, re-run ELF parsing, re-build the FSM context, and reply with a `T05` stop at the new reset vector), the `vAttach;<pid>` packet (reply `OK` followed by the standard stop-reply; `pid` is informational only on a single-target stub), and the `vKill;<pid>` packet (call `updi_run()` to release the target, close the GDB client fd, and return to the listen state without exiting the server process). Existing `D` (detach) and `k` (kill) handlers shall remain operational; `k` shall continue to mean process-exit so that scripts that hard-stop the server keep working. The `qSupported` feature string shall be extended with `vRun+;vAttach+;vKill+`. The server shall **not** advertise `multiprocess+`: it presents a single GDB thread (the live CPU), so multiprocess thread-id forms are unnecessary, and avrOS FSM state is exposed via introspection (`monitor avros tasks`, HLR-029 et seq.) rather than as GDB threads.]]></text>
         <traces>
           <trace target="SDD" ref="5.1"/>
           <trace target="SDD" ref="5.3.1"/>
@@ -1656,25 +1628,13 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-059" name="Protocol Cleanup — qC, qOffsets, T, R">
-        <text><![CDATA[The application shall stop replying with the empty packet for the standard small queries that `avarice` answers but Phase 1–8 leaves unimplemented, because some IDE configurations promote the resulting `unsupported feature` warnings to fatal errors. Specifically: `qC` shall return `QC<tid>` where `<tid>` is the currently selected `c`-thread (or `0` when no thread is selected); `qOffsets` shall return `Text=0;Data=0;Bss=0` because the AVR reset vector is fixed at address zero and no position-independent loading is performed; `T<tid>` (is-thread-alive) shall return `OK` for any `<tid>` present in the current `FsmContext.threads[]` array and `E01` otherwise; and `R<XX>` (RCmd restart) shall behave as `monitor reset` followed by `c` and reply with the resulting stop packet. None of these handlers shall alter execution state beyond the explicit semantics above.]]></text>
+        <text><![CDATA[The application shall stop replying with the empty packet for the standard small queries that `avarice` answers but Phase 1–8 leaves unimplemented, because some IDE configurations promote the resulting `unsupported feature` warnings to fatal errors. Specifically: `qC` shall return `QC<tid>` where `<tid>` is the currently selected `c`-thread (or `0` when no thread is selected); `qOffsets` shall return `Text=0;Data=0;Bss=0` because the AVR reset vector is fixed at address zero and no position-independent loading is performed; `T<tid>` (is-thread-alive) shall return `OK` for the single live-CPU thread (TID 1) and `E01` otherwise; and `R<XX>` (RCmd restart) shall behave as `monitor reset` followed by `c` and reply with the resulting stop packet. None of these handlers shall alter execution state beyond the explicit semantics above.]]></text>
         <traces>
           <trace target="SDD" ref="5.3.1"/>
         </traces>
       </hlr>
 
-      <hlr id="HLR-060" name="Multiprocess Thread-ID Parsing">
-        <text><![CDATA[Because the application advertises `multiprocess+` in its `qSupported` reply (HLR-058), every RSP packet whose payload contains a thread-id field shall accept the GDB multiprocess form `p<PID>.<TID>` in addition to the legacy bare-hex form. Specifically: `Hg<tid>`, `Hc<tid>`, `Hs<tid>`, `T<tid>` (is-thread-alive), `qThreadExtraInfo,<tid>`, and any `:<tid>` action target inside a `vCont` packet shall be parsed by a single helper that recognises (a) bare hex `<TID>` (the GDB process id is implied to be the server's process id), (b) signed `-1` decoded as "all threads" / "any thread", (c) bare `0` decoded as "any thread", (d) `p<PID>.<TID>` with both fields hex, (e) `p0.0`, `p-1.-1`, `p<PID>.0`, and `p<PID>.-1` all decoded as "any thread in that process". The application shall use a fixed compile-time process-id constant `RSP_PID` (currently `0xa410`) for every reply that needs to emit a `<pid>` field; the value shall not be read from any uninitialised storage. Packets that fail this expanded parse shall reply `E01` exactly as before; packets that parse successfully but reference a TID not present in `FsmContext.threads[]` shall reply `E01` for `Hg`/`Hc`/`Hs`/`T` and the empty packet for `qThreadExtraInfo`. The implementation shall preserve the layered architecture (`SDD` §2.2): the parser lives entirely in `src/gdb_rsp.c` and the FSM-context lookup goes through the existing `RspContext.fsm` pointer.]]></text>
-        <traces>
-          <trace target="SDD" ref="5.3.1"/>
-        </traces>
-      </hlr>
 
-      <hlr id="HLR-061" name="qThreadExtraInfo with FSM Name and State">
-        <text><![CDATA[The `qThreadExtraInfo,<tid>` reply shall encode a human-readable label that lets a GDB front-end (e.g. VS Code's Call Stack view) distinguish individual avrOS FSMs at a glance. The label payload shall be the ASCII string `"FSM <name> [<active|quiescent>] state=0x<state_fn_hex>"` where `<name>` is the `FsmThread.name` field populated by `fsm_build_thread_list()` from the avrOS FSM table (HLR-013), `<active|quiescent>` reflects the `FsmThread.is_active` flag at the time the FSM context was last built, and `<state_fn_hex>` is the four-hex-digit FLASH word address of the FSM's next dispatch entry-point read from FSM_TABLE+offset (LLR-FSM-09). The label shall be hex-encoded byte-by-byte per the RSP spec and replied as a normal packet. The avrOS runtime is a cooperative run-to-completion FSM scheduler: every FSM executes on the **single shared hardware stack** set up by the C-runtime init code (`__stack` symbol from the linker map, growing down from `RAMEND`). At any halt, only the currently-running FSM has a live call stack; the other N−1 FSMs are quiescent between dispatches and have no preserved register frame anywhere in SRAM. The `[quiescent]` suffix therefore signals to the user that GDB will produce a one-frame backtrace for that FSM — the FSM `state` function — which is documented behaviour, not a bug. Unknown TIDs shall reply with the empty packet (signalling "unknown" per the RSP spec) rather than `E01`. The total reply payload shall not exceed `PacketSize=800`/2 = 400 bytes; FSM names longer than 32 bytes shall be silently truncated.]]></text>
-        <traces>
-          <trace target="SDD" ref="5.3.1"/>
-        </traces>
-      </hlr>
 
       <hlr id="HLR-064" name="vKill Listener Survival">
         <text><![CDATA[The `vKill[;<pid>]` packet shall close the GDB client connection but shall not terminate the avrOSdb server process. After replying `OK` and closing the client `fd`, `event_loop()` shall return to its `select()` loop and continue listening on the configured TCP port for a new GDB session. This makes avrOSdb honest about the GDB extended-remote contract: `vKill` ends the *debug session*, not the *debugger*, so a subsequent F5 / `target extended-remote :1234` from the same operator shall succeed without restarting the server. Concretely, `dh_vkill()` shall: (a) call `updi_halt()` on the target so the next session attaches to a stopped CPU; (b) release both AVR-Dx OCD hardware-breakpoint comparators via `rsp_hw_bp_clear_all()`; (c) drop the per-session software-breakpoint shadow via `rsp_sw_bp_clear_all()` (FLASH BREAK rewrite is not required — the shadow is purely host-side bookkeeping per LLR-RSP-30 et seq.); (d) reply `OK`; (e) record `ctx->disconnect_reason = "vKill"` for the lifecycle logger (HLR-065); (f) close the GDB socket via `*ctx->gdb_fd_p` and set the pointed-at fd to `-1`. The handler shall **not** set `*ctx->quit_p = 1`. The `--prog` mode (HLR-019/Phase 8) is unaffected: it never opens the GDB listener and never reaches `dh_vkill()`. The pre-Phase-11 legacy `k` packet path (`dh_detach` with `pkt[0] == 'k'`) is preserved and still sets `quit_p = 1` so existing operators relying on `kill` to shut the server down retain that behaviour.]]></text>
@@ -2152,10 +2112,9 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-RSP-03">
-        <text><![CDATA[The `on_read_regs` handler for the `g` packet shall produce a 78-character hex string in GDB's AVR register-block layout: R0-R31 at hex positions 0-63, SREG at 64-65, SPL at 66-67, SPH at 68-69, and PC as 4-byte little-endian byte-address at positions 70-77. Reads against the active virtual thread — or against any thread when the FSM mapper has not identified one (e.g. `--load` without `--device`) — shall use the live OCD register file via `updi_ocd_read_gpr()`, `updi_ocd_read_sreg()`, `updi_ocd_read_sp()`, and `updi_ocd_read_pc()`. Reads against a non-active virtual thread shall delegate to `fsm_get_registers()` for the synthesized FSM register frame.]]></text>
+        <text><![CDATA[The `on_read_regs` handler for the `g` packet shall produce a 78-character hex string in GDB's AVR register-block layout: R0-R31 at hex positions 0-63, SREG at 64-65, SPL at 66-67, SPH at 68-69, and PC as 4-byte little-endian byte-address at positions 70-77. All `g` reads shall use the live OCD register file via `updi_ocd_read_gpr()`, `updi_ocd_read_sreg()`, `updi_ocd_read_sp()`, and `updi_ocd_read_pc()` — the live CPU is the sole GDB thread.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-014" name="Register Read and Write"/>
-          <trace target="HLR" ref="HLR-026" name="Virtual Thread Register Frame"/>
         </traces>
       </llr>
 
@@ -2248,7 +2207,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-RSP-16">
-        <text><![CDATA[The `H` (set-thread) packet handler shall store the requested GDB thread ID in the session context and use it to select the virtual thread for subsequent `g`/`G`/`P` register operations. Thread ID -1 (all threads) and 0 (any thread) shall both be interpreted as selecting the active FSM thread.]]></text>
+        <text><![CDATA[The `H` (set-thread) packet handler shall store the requested GDB thread ID in the session context. The live CPU is the sole GDB thread (TID 1); thread IDs -1 (all threads) and 0 (any thread) shall both be interpreted as the live-CPU thread. Register and memory operations always target the live CPU.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-025" name="Active Thread Identification"/>
         </traces>
@@ -2390,26 +2349,8 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         </traces>
       </llr>
 
-      <llr id="LLR-RSP-40">
-        <text><![CDATA[A static helper `parse_mp_thread_id(const char *s, uint32_t *pid_out, uint32_t *tid_out, bool *any_out)` shall parse a GDB thread-id field at `s` and return 0 on success, -1 on syntax error. It shall accept five forms: (a) bare hex `<TID>` → `*pid_out = RSP_PID`, `*tid_out = parsed`, `*any_out = false`; (b) bare `0` → `*any_out = true`, `*pid_out = RSP_PID`, `*tid_out = 0`; (c) bare `-1` → `*any_out = true`, `*pid_out = RSP_PID`, `*tid_out = (uint32_t)-1`; (d) `p<PID>.<TID>` with both fields hex (or each independently `0` / `-1`) → `*pid_out = parsed_pid` (or `RSP_PID` if `0` / `-1`), `*tid_out = parsed_tid`, `*any_out = (pid_zero || pid_neg1 || tid_zero || tid_neg1)`; (e) `pPID.0` / `pPID.-1` → `any = true`. The compile-time constant `RSP_PID` shall equal `0xa410` and shall be the only value the server emits in any `<pid>` field. The helper shall not write its outputs unless it returns 0. The helper shall not allocate memory and shall not call into UPDI or FSM-mapper layers.]]></text>
-        <traces>
-          <trace target="HLR" ref="HLR-060" name="Multiprocess Thread-ID Parsing"/>
-        </traces>
-      </llr>
 
-      <llr id="LLR-RSP-41">
-        <text><![CDATA[The handlers `dh_set_thread_g()` (`Hg<tid>`), `dh_set_thread_c()` (`Hc<tid>`), `dh_thread_alive()` (`T<tid>`), and `dh_thread_extra()` (`qThreadExtraInfo,<tid>`) shall use `parse_mp_thread_id()` (LLR-RSP-40) to decode their thread-id argument. For `Hg`/`Hc`, on `any = true` the selected thread shall be `fsm_get_active_thread(ctx->fsm)` (or `1` when no FSM context is built); on `any = false` the parsed `tid` shall be stored verbatim in `*ctx->g_thread_p` / `*ctx->c_thread_p`. Reply `OK` on success, `E01` on syntax error. For `T`, on `any = true` the reply shall be `OK` (every-thread query is a no-op success); on `any = false` the existing membership test against `FsmContext.threads[]` shall apply with reply `OK` / `E01`. For `qThreadExtraInfo`, on `any = true` the reply shall be the empty packet (no aggregate label exists for "any thread"); on `any = false` the existing TID lookup shall apply but unknown TIDs shall reply with the empty packet rather than `E01` (LLR-RSP-42 details the new label format).]]></text>
-        <traces>
-          <trace target="HLR" ref="HLR-060" name="Multiprocess Thread-ID Parsing"/>
-        </traces>
-      </llr>
 
-      <llr id="LLR-RSP-42">
-        <text><![CDATA[The `dh_thread_extra()` handler shall format its reply as the ASCII string `"FSM <name> [<active|quiescent>] state=0x<state_fn_hex>"` and hex-encode it byte-by-byte for the RSP wire. `<name>` is `FsmThread.name` (truncated at 32 bytes), `<active|quiescent>` is `"active"` when `FsmThread.is_active == true` and `"quiescent"` otherwise, and `<state_fn_hex>` is `FsmThread.state_fn` printed as four lowercase hex digits via `%04x`. The total ASCII length shall not exceed 80 bytes; the hex-encoded reply shall not exceed 160 bytes which fits inside `PacketSize=800` with substantial headroom. When `ctx->fsm` is NULL or `ctx->fsm->valid` is false the handler shall reply with the empty packet for every TID. The handler shall not call into the UPDI layer (no live silicon access is required — the `FsmThread.state_fn` field is populated by `fsm_build_thread_list()` at the previous halt).]]></text>
-        <traces>
-          <trace target="HLR" ref="HLR-061" name="qThreadExtraInfo with FSM Name and State"/>
-        </traces>
-      </llr>
 
       <llr id="LLR-RSP-43">
         <text><![CDATA[`RspContext` shall expose a new field `const char *disconnect_reason` (default `NULL`). The `dh_detach()` handler shall set this field to the static string `"D"` immediately before closing the GDB socket on the `D`-packet path. The `dh_vkill()` handler shall set it to the static string `"vKill"` immediately before closing the GDB socket per LLR-RSP-25 (HLR-064 listener-survival semantics). The protocol layer shall never call into the entry/event-loop layer to log; the field is the sole upward signal channel and is consumed (read and reset to `NULL`) by `event_loop()` in `src/main.c` per LLR-MAIN-22. This preserves the layered-architecture constraint (SDD §2.2) — no new include from `gdb_rsp.c` to `main.c`.]]></text>
@@ -2531,50 +2472,26 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
     </function>
 
-    <function number="6" title="src/fsm_mapper.c — FSM Virtual Thread Mapper" name="fsm" source="src/fsm_mapper.c">
-      <intro><![CDATA[Requirements for `fsm_build_thread_list()`, `fsm_invalidate()`, `fsm_get_active_thread()`, and `fsm_get_registers()`.]]></intro>
+    <function number="6" title="src/fsm_mapper.c — FSM State Snapshot Provider" name="fsm" source="src/fsm_mapper.c">
+      <intro><![CDATA[Requirements for `fsm_build_thread_list()`, `fsm_invalidate()`, and `fsm_get_active_thread()`.]]></intro>
 
       <llr id="LLR-FSM-01">
-        <text><![CDATA[`fsm_build_thread_list()` shall read `idx->fsm_table_count` consecutive 9-byte `fsmStateMachineDescr_t` records from the FLASH address `idx->fsm_table_addr` via `updi_mem_read()`. Each descriptor carries a 2-byte `name` pointer (FLASH), a 2-byte `stateMachine` pointer (SRAM, or NULL for an initializer slot that shall be skipped), a 2-byte `handler` function pointer, a 1-byte `priority`, and a 2-byte `instance`. For each non-NULL `stateMachine` pointer, the function shall read 2 bytes from `stateMachine + 9` (the `currState` field of `fsmStateMachine_t`) to obtain the current state function pointer and store it in `thread->state_fn`. A UPDI read failure at any point shall cause the function to return -1.]]></text>
+        <text><![CDATA[`fsm_build_thread_list()` shall read `idx->fsm_table_count` consecutive 9-byte `fsmStateMachineDescr_t` records from the FLASH address `idx->fsm_table_addr` via `updi_mem_read()`. Each descriptor carries a 2-byte `name` pointer (FLASH), a 2-byte `stateMachine` pointer (SRAM, or NULL for an initializer slot that shall be skipped), a 2-byte `handler` function pointer, a 1-byte `priority`, and a 2-byte `instance`. The FLASH addresses (`fsm_table_addr` and the per-entry `name` pointers) are physical byte LMAs / translated by `idx->flash_lma_off` before the UPDI flash read, because the AVR-Dx mapped-flash window FLMAP is not applied to linear UPDI flash reads. For each non-NULL `stateMachine` pointer, the function shall read the 2-byte `currStateName` pointer at offset 0 of `fsmStateMachine_t` and resolve it (NUL-terminated; a non-printable byte is treated as the terminator) into `thread->state_name`; a NULL pointer (FSM not yet dispatched) yields an empty state name. A UPDI read failure at any point shall cause the function to return -1.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-024" name="FSM Thread Enumeration"/>
         </traces>
       </llr>
 
-      <llr id="LLR-FSM-02">
-        <text><![CDATA[`fsm_build_thread_list()` shall assign `thread->gdb_id = loop_index + 1` (1-based) to each FSM entry in the order the entries appear in the FLASH table. Thread IDs shall not be reassigned within a debug session, ensuring the same FSM always maps to the same GDB thread ID.]]></text>
-        <traces>
-          <trace target="HLR" ref="HLR-024" name="FSM Thread Enumeration"/>
-        </traces>
-      </llr>
 
       <llr id="LLR-FSM-03">
-        <text><![CDATA[`fsm_build_thread_list()` shall read the 2-byte SRAM value at `idx->current_fsm_addr` (avrOS `currStateMachine`) and compare it against each retained FSM entry's `stateMachine` pointer. The matching entry shall have `thread->is_active = true` and its `gdb_id` stored in `ctx->active_id`. If no entry matches, `ctx->active_id` shall be set to 0.]]></text>
+        <text><![CDATA[`fsm_build_thread_list()` shall read the 2-byte SRAM value at `idx->current_fsm_addr` (avrOS `currStateMachine`) and compare it against each retained FSM entry's `stateMachine` pointer. The matching entry shall have `thread->is_active = true` and its identifier stored in `ctx->active_id`. If no entry matches, `ctx->active_id` shall be set to 0.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-025" name="Active Thread Identification"/>
         </traces>
       </llr>
 
-      <llr id="LLR-FSM-04">
-        <text><![CDATA[`fsm_get_registers()` shall set the PC field (GDB register index 35, 4-byte little-endian at hex positions 70–77 of the 78-character g-packet buffer) to `thread->state_fn`. For non-active threads, R0–R31 (indices 0–31) and SREG (index 32) shall be zero-filled, and SPL (index 33) and SPH (index 34) shall be set to zero. For the active thread, SREG (index 32, hex positions 64–65), SPL (index 33, hex positions 66–67), and SPH (index 34, hex positions 68–69) shall be read from the target SRAM via `updi_mem_read()`.]]></text>
-        <traces>
-          <trace target="HLR" ref="HLR-026" name="Virtual Thread Register Frame"/>
-        </traces>
-      </llr>
 
-      <llr id="LLR-FSM-05">
-        <text><![CDATA[`fsm_build_thread_list()` shall process at most `FSM_MAX_THREADS` (32) entries from the FSM registration table regardless of `idx->fsm_table_count`. If `idx->fsm_table_count` exceeds `FSM_MAX_THREADS`, the function shall log a diagnostic warning and return `FSM_MAX_THREADS` as the thread count without returning an error to the GDB client.]]></text>
-        <traces>
-          <trace target="HLR" ref="HLR-027" name="Complete FSM Thread Coverage"/>
-        </traces>
-      </llr>
 
-      <llr id="LLR-FSM-06">
-        <text><![CDATA[`fsm_get_registers()` shall not issue any UPDI memory read targeting a non-active thread's stack region. The suspended FSM register frame shall be constructed entirely from the cached `thread->state_fn` value; the SP field shall be zeroed for non-active threads.]]></text>
-        <traces>
-          <trace target="HLR" ref="HLR-028" name="Stack-Free Thread Model"/>
-        </traces>
-      </llr>
     </function>
 
     <function number="7" title="src/monitor.c — avrOS System Introspection" name="monitor" source="src/monitor.c">
@@ -2633,9 +2550,16 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-MON-09">
-        <text><![CDATA[The `monitor reset` verb shall call `updi_enter_debug(ctx->updi_fd)` (issuing the OCD KEY + ASI_RESET_REQ pulse and waiting for the STOPPED bit so the CPU is halted at the reset vector), discard all hardware-breakpoint shadow entries via `rsp_hw_bp_clear_all(ctx)`, invalidate the FSM thread cache via `fsm_invalidate(ctx->fsm)` when `ctx->fsm` is non-NULL, emit one diagnostic O-packet line `"target reset, halted at reset vector\n"`, and return 0 so `dh_monitor` appends the trailing `OK`.]]></text>
+        <text><![CDATA[The `monitor reset` verb shall call `updi_enter_debug(ctx->updi_fd)` (issuing the OCD KEY + ASI_RESET_REQ pulse and waiting for the STOPPED bit so the CPU is halted at the reset vector), discard all hardware-breakpoint shadow entries via `rsp_hw_bp_clear_all(ctx)`, invalidate the FSM snapshot cache via `fsm_invalidate(ctx->fsm)` when `ctx->fsm` is non-NULL, emit one diagnostic O-packet line `"target reset, halted at reset vector\n"`, and return 0 so `dh_monitor` appends the trailing `OK`.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-055" name="avarice-Compatible Monitor Commands"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MON-16">
+        <text><![CDATA[`monitor_dispatch()` shall route the decoded sub-command `tasks` to `cmd_tasks()`, which builds the FSM snapshot via `fsm_build_thread_list()` and emits one O-packet line per FSM (an active marker, the FSM name, and the current state name, or `(init)` when `currStateName` is NULL), returning 0. When no FSMs are registered it emits a single "(no FSMs registered)" line.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-069" name="Monitor Tasks Command"/>
         </traces>
       </llr>
 
@@ -2654,7 +2578,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-MON-12">
-        <text><![CDATA[The `monitor erase` verb (alias `monitor chip-erase`) shall consult `ctx->allow_erase` before issuing any UPDI traffic. When the flag is zero, the verb shall emit one diagnostic O-packet `"monitor erase: refused — launch the server with --allow-erase to enable.\n"` and return -1 so `dh_monitor` sends an `E22` error packet. When the flag is set the verb shall call `updi_chip_erase(ctx->updi_fd)`, then re-enter OCD via `updi_enter_debug()`, discard all BP/WP shadow entries, invalidate the FSM thread cache, emit a confirmation O-packet, and return 0.]]></text>
+        <text><![CDATA[The `monitor erase` verb (alias `monitor chip-erase`) shall consult `ctx->allow_erase` before issuing any UPDI traffic. When the flag is zero, the verb shall emit one diagnostic O-packet `"monitor erase: refused — launch the server with --allow-erase to enable.\n"` and return -1 so `dh_monitor` sends an `E22` error packet. When the flag is set the verb shall call `updi_chip_erase(ctx->updi_fd)`, then re-enter OCD via `updi_enter_debug()`, discard all BP/WP shadow entries, invalidate the FSM snapshot cache, emit a confirmation O-packet, and return 0.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-055" name="avarice-Compatible Monitor Commands"/>
         </traces>
@@ -3262,7 +3186,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/gdb_rsp.c unit tests                                     -->
     <!-- ============================================================ -->
-    <file path="tests/test_rsp.c" role="unit" count="90">
+    <file path="tests/test_rsp.c" role="unit" count="86">
       <header><![CDATA[Unit tests for `src/gdb_rsp.c`: socket configuration, RSP packet framing, register and memory handlers, hardware-breakpoint comparator management, OCD-based execution control, async Ctrl-C interrupt, detach cleanup, session lifecycle packets, and monitor relay. Uses a `socketpair()` as a drop-in socket substitute and replaces every `updi_*`, `fsm_*`, and `monitor_dispatch` call site with `ld --wrap` mocks so all tests run without real silicon.]]></header>
 
       <test name="rsp_listen_sets_so_reuseaddr_before_bind">
@@ -3300,10 +3224,6 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces><trace target="LLR" ref="LLR-RSP-03"/></traces>
       </test>
 
-      <test name="on_read_regs_non_active_thread_uses_fsm_register_frame">
-        <purpose><![CDATA[Select a non-active virtual thread via `Hg`, dispatch a `g` packet, and verify that the handler routes the read through `fsm_get_registers()` (not the OCD register file).]]></purpose>
-        <traces><trace target="LLR" ref="LLR-RSP-03"/></traces>
-      </test>
 
       <test name="on_write_regs_G_writes_all_registers_via_ocd">
         <purpose><![CDATA[Dispatch a `G` packet containing 78 hex characters and verify that the handler calls `updi_ocd_write_gpr()` 32 times (one per GPR) plus `updi_ocd_write_sreg()`, `updi_ocd_write_sp()`, and `updi_ocd_write_pc()` once each with the decoded values, and replies `OK`.]]></purpose>
@@ -3445,10 +3365,6 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces><trace target="LLR" ref="LLR-RSP-15"/></traces>
       </test>
 
-      <test name="H_packet_stores_thread_id_for_register_operations">
-        <purpose><![CDATA[Dispatch `Hg3` (set thread 3 for register operations) and then a `g` packet, and verify that `fsm_get_registers()` is called with the thread entry for GDB thread ID 3.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-RSP-16"/></traces>
-      </test>
 
       <test name="H_packet_minus1_and_0_both_map_to_active_fsm_thread">
         <purpose><![CDATA[Dispatch `Hg-1` and `Hg0` in turn, each followed by a `g` packet, and verify that both select the active FSM thread's register frame.]]></purpose>
@@ -3500,8 +3416,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces><trace target="LLR" ref="LLR-RSP-25"/></traces>
       </test>
 
-      <test name="qSupported_advertises_multiprocess_vRun_vAttach_vKill">
-        <purpose><![CDATA[Dispatch `qSupported:multiprocess+` and verify the reply contains the substrings `multiprocess+`, `vRun+`, `vAttach+`, and `vKill+`, and does NOT contain `multiprocess-`.]]></purpose>
+      <test name="qSupported_advertises_vRun_vAttach_vKill_no_multiprocess">
+        <purpose><![CDATA[Dispatch `qSupported` and verify the reply does NOT contain `multiprocess+` (FSM threading is demoted to introspection; the live CPU is the sole GDB thread) and DOES contain `vRun+`, `vAttach+`, and `vKill+`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-26"/></traces>
+      </test>
+
+      <test name="captured_session_replay_holds_demote_invariants">
+        <purpose><![CDATA[Replay the demote-correctness invariants from a real captured GDB session (tests/fixtures/rsp/break_hit_bt.log, AVR128DA28 hardware: the monitor-reset/break/hit/bt/info-threads/monitor-avros-tasks sequence that previously crashed avr-gdb). Feed the captured GDB request packets through the server and assert: the qSupported reply omits multiprocess+ (keeps vRun+), qfThreadInfo replies l, qThreadExtraInfo,1 replies empty, and bare Hg0 is accepted. Proves FSM-as-GDB-threads cannot reappear, which is what makes bt safe. Per LLR-RSP-26.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-26"/></traces>
       </test>
 
@@ -3595,35 +3516,11 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces><trace target="LLR" ref="LLR-RSP-39"/></traces>
       </test>
 
-      <test name="parse_mp_thread_id_accepts_legacy_and_multiprocess_forms">
-        <purpose><![CDATA[Drive the new thread-id parser indirectly through `Hg<...>` dispatch (the helper is `static`). For each legal form — bare hex (`Hg2`), multiprocess (`Hgpa410.2`), unknown-TID multiprocess (`Hgpa410.5`), any-thread shorthand (`Hgp0.0`, `Hgp-1.-1`, `Hg-1`) — assert reply `OK` and that `g_thread` ends up at the expected value (parsed TID, or active TID for any-thread). For each malformed form (`Hgp`, `Hgp1`, `Hgp1.`, `Hgp.5`) assert reply `E01`. Exercises every branch of LLR-RSP-40.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-RSP-40"/></traces>
-      </test>
 
-      <test name="Hg_accepts_multiprocess_thread_id_form">
-        <purpose><![CDATA[Build a 3-thread `FsmContext` with `gdb_id` 1/2/3, dispatch `Hgpa410.2`, verify the reply is `OK` and `g_thread == 2`. Then dispatch `Hgpa410.3` (live-trace P0 input from issue #34, which previously returned `E01`) and verify reply `OK` and `g_thread == 3`. Per LLR-RSP-41.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-RSP-41"/></traces>
-      </test>
 
-      <test name="Hc_accepts_multiprocess_thread_id_form">
-        <purpose><![CDATA[Equivalent to `Hg_accepts_multiprocess_thread_id_form` for the `Hc` packet: drives `Hcpa410.3`, `Hcp-1.-1`, and `Hc-1`, asserting reply `OK` and the expected value in `c_thread` (parsed TID for explicit forms, active TID for any-thread). Per LLR-RSP-41.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-RSP-41"/></traces>
-      </test>
 
-      <test name="T_thread_alive_accepts_multiprocess_form">
-        <purpose><![CDATA[Build a 2-thread FsmContext (TIDs 1, 2). Dispatch `Tpa410.1` → `OK`. Dispatch `Tpa410.99` → `E01`. Dispatch `Tp0.0` → `OK` (any-thread). Dispatch malformed `Tpa410.` → `E01`. Per LLR-RSP-41.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-RSP-41"/></traces>
-      </test>
 
-      <test name="qThreadExtraInfo_returns_FSM_label_with_state_and_active_flag">
-        <purpose><![CDATA[Build an FsmContext with thread 1 = `{name:"sched", state_fn:0x0140, is_active:true}`, thread 2 = `{name:"blinker", state_fn:0x01A4, is_active:false}`. Dispatch `qThreadExtraInfo,pa410.1` and assert the reply hex-decodes to exactly `"FSM sched [active] state=0x0140"`. Dispatch `qThreadExtraInfo,pa410.2` and assert hex-decodes to `"FSM blinker [quiescent] state=0x01a4"`. Per LLR-RSP-42.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-RSP-42"/></traces>
-      </test>
 
-      <test name="qThreadExtraInfo_unknown_tid_replies_empty_packet">
-        <purpose><![CDATA[Dispatch `qThreadExtraInfo,pa410.99` against a 2-thread FsmContext and assert the reply is the empty RSP packet (zero-length payload), not `E01`. Then dispatch `qThreadExtraInfo,p0.0` and assert empty packet (no aggregate label exists for the any-thread form). Confirms LLR-RSP-41 / LLR-RSP-42 unknown-TID and any-thread semantics.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-RSP-42"/></traces>
-      </test>
 
       <test name="on_detach_D_sets_disconnect_reason_to_D">
         <purpose><![CDATA[Build a default `RspContext`, assert `ctx.disconnect_reason == NULL`, dispatch the RSP packet `D`, and assert `ctx.disconnect_reason` is now the string `"D"`. Confirms `dh_detach` records the disconnect classification before closing the GDB socket so the entry-layer lifecycle logger can name the cause without a reverse include. Per LLR-RSP-43.]]></purpose>
@@ -3821,7 +3718,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/fsm_mapper.c unit tests                                  -->
     <!-- ============================================================ -->
-    <file path="tests/test_fsm.c" role="unit" count="11">
+    <file path="tests/test_fsm.c" role="unit" count="4">
       <header><![CDATA[Unit tests for `src/fsm_mapper.c`: FSM table reading, stable GDB thread ID assignment, active-thread identification, g-packet register frame construction, thread count capping, and stack-free guarantees. All UPDI calls are stubbed via a mock layer.]]></header>
 
       <test name="fsm_build_thread_list_reads_fsm_table_from_flash_via_updi">
@@ -3834,15 +3731,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces><trace target="LLR" ref="LLR-FSM-01"/></traces>
       </test>
 
-      <test name="fsm_build_thread_list_assigns_1_based_thread_ids_in_order">
-        <purpose><![CDATA[Build a thread list from 3 FSM entries and verify that the resulting `gdb_id` values are 1, 2, and 3, in the order the entries appear in the FLASH table.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-FSM-02"/></traces>
-      </test>
 
-      <test name="fsm_build_thread_list_thread_ids_stable_across_calls">
-        <purpose><![CDATA[Call `fsm_build_thread_list()` twice with the same FSM table content and verify that each FSM entry maps to the same `gdb_id` on both calls.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-FSM-02"/></traces>
-      </test>
 
       <test name="fsm_build_thread_list_sets_active_thread_from_current_fsm_ptr">
         <purpose><![CDATA[Inject a mock `currStateMachine` SRAM value matching the second FSM entry's `stateMachine` pointer and verify that only that entry has `is_active == true` and `ctx->active_id == 2`.]]></purpose>
@@ -3854,41 +3743,26 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces><trace target="LLR" ref="LLR-FSM-03"/></traces>
       </test>
 
-      <test name="fsm_get_registers_places_state_fn_as_pc_at_hex_positions_70_77">
-        <purpose><![CDATA[Call `fsm_get_registers()` for a thread whose `state_fn = 0xABCD` and verify that the 78-character g-packet buffer contains the little-endian encoding of 0xABCD at hex character positions 70–77.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-FSM-04"/></traces>
-      </test>
 
-      <test name="fsm_get_registers_non_active_r0_r31_sreg_spl_sph_all_zero">
-        <purpose><![CDATA[Call `fsm_get_registers()` for a non-active thread and verify that hex positions 0–69 of the 78-character buffer are all `'0'`.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-FSM-04"/></traces>
-      </test>
 
-      <test name="fsm_get_registers_active_thread_reads_live_sreg_spl_sph">
-        <purpose><![CDATA[Call `fsm_get_registers()` for the active thread with a mock that returns known SREG, SPL, and SPH values, and verify they appear at hex positions 64–65, 66–67, and 68–69 respectively.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-FSM-04"/></traces>
-      </test>
 
-      <test name="fsm_build_thread_list_caps_at_32_entries_and_logs_warning">
-        <purpose><![CDATA[Inject an FSM table with 33 entries and verify that `fsm_build_thread_list()` returns `FSM_MAX_THREADS` (32) and emits a diagnostic warning without returning an error.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-FSM-05"/></traces>
-      </test>
 
-      <test name="fsm_get_registers_non_active_no_updi_read_of_stack">
-        <purpose><![CDATA[Call `fsm_get_registers()` for a non-active thread and verify that `updi_mem_read()` is never called with any stack-region address.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-FSM-06"/></traces>
-      </test>
     </file>
 
     <!-- ============================================================ -->
     <!-- src/monitor.c unit tests                                     -->
     <!-- ============================================================ -->
-    <file path="tests/test_monitor.c" role="unit" count="20">
+    <file path="tests/test_monitor.c" role="unit" count="21">
       <header><![CDATA[Unit tests for `src/monitor.c`: hex command decoding, prefix matching, per-sub-command UPDI reads, O-packet output formatting, 512-byte buffer constraint, and the no-halt guarantee. All UPDI calls are intercepted by a mock layer that records calls and returns injected data.]]></header>
 
       <test name="monitor_dispatch_hex_decodes_cmd_before_prefix_matching">
         <purpose><![CDATA[Pass `monitor_dispatch()` a hex-encoded `"avros events"` command and verify the function routes to `cmd_events()`, confirming that decoding occurs before prefix matching.]]></purpose>
         <traces><trace target="LLR" ref="LLR-MON-01"/></traces>
+      </test>
+
+      <test name="monitor_dispatch_avros_tasks_routes_to_cmd_tasks">
+        <purpose><![CDATA[Dispatch hex-encoded `avros tasks` with a non-empty FSM table (fsm_table_count=2). Assert monitor_dispatch returns 0, that cmd_tasks invoked fsm_build_thread_list (wrapped), and that at least one O-packet was emitted. Confirms `tasks` routes to cmd_tasks and renders the FSM introspection snapshot. Per LLR-MON-10.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MON-16"/></traces>
       </test>
 
       <test name="monitor_dispatch_treats_invalid_hex_sequence_as_unrecognised">
