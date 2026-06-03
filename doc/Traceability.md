@@ -71,7 +71,7 @@ catalogue is in [STP.md §3](STP.md#3-test-catalogue).
 
 | HLR | Name | LLRs | Tests |
 | --- | ---- | ---- | ----- |
-| [`HLR-068`](HLRs.md#HLR-068) | Detailed RSP Traffic Logging | [`LLR-MAIN-23`](LLRs.md#LLR-MAIN-23), [`LLR-RSP-49`](LLRs.md#LLR-RSP-49) | [`test_parse_args_log_rsp_sets_flag`](STP.md#test_parse_args_log_rsp_sets_flag) |
+| [`HLR-068`](HLRs.md#HLR-068) | Detailed RSP Traffic Logging | [`LLR-MAIN-23`](LLRs.md#LLR-MAIN-23), [`LLR-RSP-49`](LLRs.md#LLR-RSP-49) | [`rsp_logging_disabled_emits_no_markers`](STP.md#rsp_logging_disabled_emits_no_markers), [`rsp_logging_enabled_emits_tx_and_rx_markers_to_stderr`](STP.md#rsp_logging_enabled_emits_tx_and_rx_markers_to_stderr), [`test_parse_args_log_rsp_sets_flag`](STP.md#test_parse_args_log_rsp_sets_flag) |
 | [`HLR-001`](HLRs.md#HLR-001) | CLI Argument Parsing | [`LLR-MAIN-01`](LLRs.md#LLR-MAIN-01), [`LLR-MAIN-02`](LLRs.md#LLR-MAIN-02) | [`parse_args_default_port_baud_load_when_not_supplied`](STP.md#parse_args_default_port_baud_load_when_not_supplied), [`parse_args_missing_elf_file_exits_1`](STP.md#parse_args_missing_elf_file_exits_1), [`parse_args_missing_serial_device_exits_1`](STP.md#parse_args_missing_serial_device_exits_1), [`parse_args_unrecognised_flag_exits_1`](STP.md#parse_args_unrecognised_flag_exits_1), [`parse_args_valid_positional_args_populate_config`](STP.md#parse_args_valid_positional_args_populate_config) |
 | [`HLR-002`](HLRs.md#HLR-002) | Serial Device Initialisation | [`LLR-MAIN-03`](LLRs.md#LLR-MAIN-03) | [`main_rsp_listen_failure_closes_updi_and_returns_1`](STP.md#main_rsp_listen_failure_closes_updi_and_returns_1), [`main_updi_open_failure_releases_resources_and_returns_1`](STP.md#main_updi_open_failure_releases_resources_and_returns_1) |
 | [`HLR-003`](HLRs.md#HLR-003) | GDB Listener Startup | [`LLR-MAIN-03`](LLRs.md#LLR-MAIN-03), [`LLR-MAIN-05`](LLRs.md#LLR-MAIN-05), [`LLR-RSP-01`](LLRs.md#LLR-RSP-01) | [`event_loop_accepts_gdb_client_when_gdb_fd_is_minus1`](STP.md#event_loop_accepts_gdb_client_when_gdb_fd_is_minus1), [`event_loop_uses_single_select_no_pthread_create`](STP.md#event_loop_uses_single_select_no_pthread_create), [`main_rsp_listen_failure_closes_updi_and_returns_1`](STP.md#main_rsp_listen_failure_closes_updi_and_returns_1), [`main_updi_open_failure_releases_resources_and_returns_1`](STP.md#main_updi_open_failure_releases_resources_and_returns_1), [`rsp_accept_sets_tcp_nodelay_on_client_socket`](STP.md#rsp_accept_sets_tcp_nodelay_on_client_socket), [`rsp_listen_sets_so_reuseaddr_before_bind`](STP.md#rsp_listen_sets_so_reuseaddr_before_bind) |
@@ -145,7 +145,7 @@ locating areas of the spec that may need additional tests.
 
 | HLR Section | HLRs | LLRs | Tests | HLRs w/ no test |
 | ----------- | ---- | ---- | ----- | --------------- |
-| §1 System Startup and Command-Line Interface | 7 | 12 | 27 | — |
+| §1 System Startup and Command-Line Interface | 7 | 12 | 29 | — |
 | §2 UPDI Physical Layer | 9 | 21 | 41 | — |
 | §3 GDB Remote Serial Protocol Server | 9 | 24 | 47 | — |
 | §4 ELF Parsing and Symbol Resolution | 3 | 7 | 14 | — |
@@ -263,7 +263,7 @@ with **(no test)**; see
 | [`LLR-RSP-45`](LLRs.md#LLR-RSP-45) | `rsp` | [`HLR-062`](HLRs.md#HLR-062) | [`continue_emits_bare_T05_when_pc_matches_no_breakpoint`](STP.md#continue_emits_bare_T05_when_pc_matches_no_breakpoint), [`continue_emits_hwbreak_when_pc_matches_hw_bp_shadow`](STP.md#continue_emits_hwbreak_when_pc_matches_hw_bp_shadow), [`continue_emits_swbreak_when_pc_matches_sw_bp_shadow`](STP.md#continue_emits_swbreak_when_pc_matches_sw_bp_shadow), [`qSupported_advertises_swbreak_and_hwbreak`](STP.md#qSupported_advertises_swbreak_and_hwbreak) |
 | [`LLR-RSP-46`](LLRs.md#LLR-RSP-46) | `rsp` | [`HLR-066`](HLRs.md#HLR-066) | [`vCont_probe_advertises_range_step`](STP.md#vCont_probe_advertises_range_step), [`vCont_range_step_emits_T02_on_ctrl_c`](STP.md#vCont_range_step_emits_T02_on_ctrl_c), [`vCont_range_step_rejects_malformed_packet_with_E22`](STP.md#vCont_range_step_rejects_malformed_packet_with_E22), [`vCont_range_step_returns_immediately_when_pc_already_outside`](STP.md#vCont_range_step_returns_immediately_when_pc_already_outside), [`vCont_range_step_steps_until_pc_leaves_range`](STP.md#vCont_range_step_steps_until_pc_leaves_range) |
 | [`LLR-RSP-47`](LLRs.md#LLR-RSP-47) | `rsp` | [`HLR-063`](HLRs.md#HLR-063) | [`qSupported_advertises_qXfer_memory_map_read`](STP.md#qSupported_advertises_qXfer_memory_map_read), [`qXfer_memory_map_read_includes_eeprom_fuses_lock_sigrow_userrow`](STP.md#qXfer_memory_map_read_includes_eeprom_fuses_lock_sigrow_userrow), [`qXfer_memory_map_read_replies_l_when_no_elf_loaded`](STP.md#qXfer_memory_map_read_replies_l_when_no_elf_loaded), [`qXfer_memory_map_read_returns_xml_with_flash_and_ram_regions`](STP.md#qXfer_memory_map_read_returns_xml_with_flash_and_ram_regions), [`qXfer_memory_map_read_supports_chunked_offset_length`](STP.md#qXfer_memory_map_read_supports_chunked_offset_length) |
-| [`LLR-RSP-49`](LLRs.md#LLR-RSP-49) | `rsp` | [`HLR-068`](HLRs.md#HLR-068) | **(no test)** |
+| [`LLR-RSP-49`](LLRs.md#LLR-RSP-49) | `rsp` | [`HLR-068`](HLRs.md#HLR-068) | [`rsp_logging_disabled_emits_no_markers`](STP.md#rsp_logging_disabled_emits_no_markers), [`rsp_logging_enabled_emits_tx_and_rx_markers_to_stderr`](STP.md#rsp_logging_enabled_emits_tx_and_rx_markers_to_stderr) |
 | [`LLR-RSP-48`](LLRs.md#LLR-RSP-48) | `rsp` | [`HLR-067`](HLRs.md#HLR-067) | [`on_read_mem_allows_address_inside_eeprom_band`](STP.md#on_read_mem_allows_address_inside_eeprom_band), [`on_read_mem_permissive_when_no_memory_map_advertised`](STP.md#on_read_mem_permissive_when_no_memory_map_advertised), [`on_read_mem_returns_E14_for_address_outside_advertised_map`](STP.md#on_read_mem_returns_E14_for_address_outside_advertised_map) |
 | [`LLR-ELF-01`](LLRs.md#LLR-ELF-01) | `elf` | [`HLR-021`](HLRs.md#HLR-021) | [`elf_open_accepts_valid_avr_elf32_binary`](STP.md#elf_open_accepts_valid_avr_elf32_binary), [`elf_open_returns_minus1_on_invalid_elf_magic`](STP.md#elf_open_returns_minus1_on_invalid_elf_magic), [`elf_open_returns_minus1_on_wrong_machine_type`](STP.md#elf_open_returns_minus1_on_wrong_machine_type) |
 | [`LLR-ELF-02`](LLRs.md#LLR-ELF-02) | `elf` | [`HLR-021`](HLRs.md#HLR-021), [`HLR-040`](HLRs.md#HLR-040) | [`elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure`](STP.md#elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure), [`elf_open_loads_symtab_and_strtab_into_heap_buffers`](STP.md#elf_open_loads_symtab_and_strtab_into_heap_buffers) |
@@ -521,6 +521,8 @@ the [Software Test Plan](STP.md) catalogue.
 | [tests/test_rsp.c](../tests/test_rsp.c) | [`rsp_dispatch_qattached_returns_1_no_target_access`](STP.md#rsp_dispatch_qattached_returns_1_no_target_access) | [`LLR-RSP-12`](LLRs.md#LLR-RSP-12) | — |
 | [tests/test_rsp.c](../tests/test_rsp.c) | [`rsp_dispatch_qsupported_returns_feature_string_no_target_access`](STP.md#rsp_dispatch_qsupported_returns_feature_string_no_target_access) | [`LLR-RSP-12`](LLRs.md#LLR-RSP-12) | — |
 | [tests/test_rsp.c](../tests/test_rsp.c) | [`rsp_listen_sets_so_reuseaddr_before_bind`](STP.md#rsp_listen_sets_so_reuseaddr_before_bind) | [`LLR-RSP-01`](LLRs.md#LLR-RSP-01) | — |
+| [tests/test_rsp.c](../tests/test_rsp.c) | [`rsp_logging_disabled_emits_no_markers`](STP.md#rsp_logging_disabled_emits_no_markers) | [`LLR-RSP-49`](LLRs.md#LLR-RSP-49) | — |
+| [tests/test_rsp.c](../tests/test_rsp.c) | [`rsp_logging_enabled_emits_tx_and_rx_markers_to_stderr`](STP.md#rsp_logging_enabled_emits_tx_and_rx_markers_to_stderr) | [`LLR-RSP-49`](LLRs.md#LLR-RSP-49) | — |
 | [tests/test_rsp.c](../tests/test_rsp.c) | [`rsp_recv_packet_discards_leading_ack_nak_bytes`](STP.md#rsp_recv_packet_discards_leading_ack_nak_bytes) | [`LLR-RSP-02`](LLRs.md#LLR-RSP-02) | — |
 | [tests/test_rsp.c](../tests/test_rsp.c) | [`rsp_recv_packet_sends_minus_and_returns_minus1_on_bad_checksum`](STP.md#rsp_recv_packet_sends_minus_and_returns_minus1_on_bad_checksum) | [`LLR-RSP-02`](LLRs.md#LLR-RSP-02) | — |
 | [tests/test_rsp.c](../tests/test_rsp.c) | [`rsp_recv_packet_sends_plus_on_valid_checksum`](STP.md#rsp_recv_packet_sends_plus_on_valid_checksum) | [`LLR-RSP-02`](LLRs.md#LLR-RSP-02) | — |
@@ -603,7 +605,6 @@ than by a dedicated test).
 
 | LLR | Function | HLRs |
 | --- | -------- | ---- |
-| [`LLR-RSP-49`](LLRs.md#LLR-RSP-49) | `rsp` | [`HLR-068`](HLRs.md#HLR-068) |
 
 ### 6.2 HLRs Without a Bound Test
 

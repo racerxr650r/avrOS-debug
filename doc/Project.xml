@@ -3262,7 +3262,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/gdb_rsp.c unit tests                                     -->
     <!-- ============================================================ -->
-    <file path="tests/test_rsp.c" role="unit" count="88">
+    <file path="tests/test_rsp.c" role="unit" count="90">
       <header><![CDATA[Unit tests for `src/gdb_rsp.c`: socket configuration, RSP packet framing, register and memory handlers, hardware-breakpoint comparator management, OCD-based execution control, async Ctrl-C interrupt, detach cleanup, session lifecycle packets, and monitor relay. Uses a `socketpair()` as a drop-in socket substitute and replaces every `updi_*`, `fsm_*`, and `monitor_dispatch` call site with `ld --wrap` mocks so all tests run without real silicon.]]></header>
 
       <test name="rsp_listen_sets_so_reuseaddr_before_bind">
@@ -3718,6 +3718,16 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="on_read_mem_permissive_when_no_memory_map_advertised">
         <purpose><![CDATA[Regression guard for the no-ELF startup mode (where HLR-063 replies `l` with no map and GDB falls back to its built-in defaults). Leave all three sizing fields zero (`build_ctx` default); prime the UPDI mock with one canned byte `0x5A`; dispatch `m807ff8,1` — an address that would be rejected if the bounds check were active. Drain and assert the reply payload is exactly `5a` and `mock_read_count == 1`, proving the bounds check is correctly bypassed when no map was advertised. Per LLR-RSP-48.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-48"/></traces>
+      </test>
+
+      <test name="rsp_logging_enabled_emits_tx_and_rx_markers_to_stderr">
+        <purpose><![CDATA[Verify --log-rsp traffic logging. Call `rsp_set_logging(true)`, then capture fd-level stderr (pipe + dup2 of STDERR_FILENO) across each call. `rsp_send_packet(fd, "qSupported")` must emit a line containing `RSP > qSupported` before sending; after framing `g` to the peer, `rsp_recv_packet()` must return 1 with payload `g` and emit a line containing `RSP < g` after receipt. Confirms both the TX and RX markers and the `rsp_set_logging()` setter wired to `g_log_rsp`. Per LLR-RSP-49.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-49"/></traces>
+      </test>
+
+      <test name="rsp_logging_disabled_emits_no_markers">
+        <purpose><![CDATA[Negative companion: with `rsp_set_logging(false)` (the default), `rsp_send_packet(fd, "OK")` writes nothing to the captured stderr (captured length is 0), proving the `RSP > ` / `RSP < ` markers are gated entirely on `g_log_rsp`. Per LLR-RSP-49.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-49"/></traces>
       </test>
     </file>
 

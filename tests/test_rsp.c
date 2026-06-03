@@ -398,6 +398,38 @@ static size_t drain(int fd, char *buf, size_t cap)
     return off;
 }
 
+/* LLR-RSP-49: capture fd-level stderr across a single operation so the
+ * --log-rsp `RSP < ` / `RSP > ` traffic markers (written with
+ * fprintf(stderr,...) inside gdb_rsp.c) can be asserted.  Uses a pipe +
+ * dup2 of STDERR_FILENO; the captured payload here is a few bytes, well
+ * under the pipe buffer, so no reader is needed before restore.        */
+static int cap_saved_stderr = -1;
+static int cap_pipe[2]      = { -1, -1 };
+
+static void cap_stderr_start(void)
+{
+    fflush(stderr);
+    cap_saved_stderr = dup(STDERR_FILENO);
+    TEST_ASSERT_EQUAL(0, pipe(cap_pipe));
+    dup2(cap_pipe[1], STDERR_FILENO);
+    close(cap_pipe[1]);
+    cap_pipe[1] = -1;
+}
+
+static size_t cap_stderr_stop(char *out, size_t cap)
+{
+    fflush(stderr);
+    dup2(cap_saved_stderr, STDERR_FILENO);
+    close(cap_saved_stderr);
+    cap_saved_stderr = -1;
+    ssize_t n = read(cap_pipe[0], out, cap - 1u);
+    if (n < 0) n = 0;
+    out[n] = '\0';
+    close(cap_pipe[0]);
+    cap_pipe[0] = -1;
+    return (size_t)n;
+}
+
 static void dispatch_and_capture(RspHandlers *h, const char *pkt,
                                  char *payload, size_t cap);
 
@@ -568,6 +600,52 @@ static void rsp_recv_packet_sends_minus_and_returns_minus1_on_bad_checksum(void)
     char ack;
     TEST_ASSERT_EQUAL(1, read(sock_pair[0], &ack, 1));
     TEST_ASSERT_EQUAL('-', ack);
+}
+
+/* ── LLR-RSP-49 / HLR-068: --log-rsp traffic logging ─────────────────── */
+
+/* rsp_set_logging(true) makes rsp_send_packet() emit "RSP > <payload>"
+ * before sending and rsp_recv_packet() emit "RSP < <packet>" after
+ * receipt, both to stderr. */
+static void rsp_logging_enabled_emits_tx_and_rx_markers_to_stderr(void)
+{
+    char cap[256];
+    char sink[256];
+
+    /* TX: rsp_send_packet() logs "RSP > qSupported" to stderr. */
+    rsp_set_logging(true);
+    cap_stderr_start();
+    rsp_send_packet(sock_pair[1], "qSupported");
+    cap_stderr_stop(cap, sizeof cap);
+    TEST_ASSERT_NOT_NULL(strstr(cap, "RSP > qSupported"));
+    drain(sock_pair[0], sink, sizeof sink);   /* discard framed bytes */
+
+    /* RX: rsp_recv_packet() logs "RSP < g" to stderr after receipt. */
+    send_frame(sock_pair[0], "g");
+    cap_stderr_start();
+    char pkt[64];
+    int rc = rsp_recv_packet(sock_pair[1], pkt, sizeof pkt);
+    cap_stderr_stop(cap, sizeof cap);
+    TEST_ASSERT_EQUAL(1, rc);
+    TEST_ASSERT_EQUAL_STRING("g", pkt);
+    TEST_ASSERT_NOT_NULL(strstr(cap, "RSP < g"));
+    drain(sock_pair[0], sink, sizeof sink);   /* discard the '+' ack */
+
+    rsp_set_logging(false);
+}
+
+/* With logging disabled (the default), neither path writes to stderr. */
+static void rsp_logging_disabled_emits_no_markers(void)
+{
+    char cap[256];
+    char sink[64];
+
+    rsp_set_logging(false);
+    cap_stderr_start();
+    rsp_send_packet(sock_pair[1], "OK");
+    cap_stderr_stop(cap, sizeof cap);
+    TEST_ASSERT_EQUAL(0, (int)strlen(cap));
+    drain(sock_pair[0], sink, sizeof sink);
 }
 
 /* ── LLR-RSP-03: `g` ─────────────────────────────────────────────────── */
@@ -2186,6 +2264,8 @@ int main(void)
     RUN_TEST(rsp_recv_packet_discards_leading_ack_nak_bytes);
     RUN_TEST(rsp_recv_packet_sends_plus_on_valid_checksum);
     RUN_TEST(rsp_recv_packet_sends_minus_and_returns_minus1_on_bad_checksum);
+    RUN_TEST(rsp_logging_enabled_emits_tx_and_rx_markers_to_stderr);
+    RUN_TEST(rsp_logging_disabled_emits_no_markers);
     RUN_TEST(on_read_regs_g_returns_78_char_hex_string);
     RUN_TEST(on_read_regs_g_places_pc_little_endian_at_positions_70_77);
     RUN_TEST(on_read_regs_non_active_thread_uses_fsm_register_frame);

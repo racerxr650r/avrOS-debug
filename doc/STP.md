@@ -114,7 +114,7 @@ Role: **unit**. **47 test(s).**
 
 ### 3.3. [tests/test_rsp.c](../tests/test_rsp.c)
 
-Role: **unit**. **88 test(s).**
+Role: **unit**. **90 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -209,6 +209,8 @@ Role: **unit**. **88 test(s).**
 | 89 | <a id="on_read_mem_returns_E14_for_address_outside_advertised_map"></a>`on_read_mem_returns_E14_for_address_outside_advertised_map` | `LLR-RSP-48` | Negative bounds-check test reproducing the silicon scenario captured on 2026-05-20. Set `ctx.flash_size = 0x4740`, `ctx.sram_base = 0x804000`, `ctx.sram_size = 0x10e` (so the memory map is advertised); dispatch `m807ff8,2` — an address 0x3eea bytes past the advertised SRAM end and inside none of the seven advertised regions. Drain and assert the reply payload is exactly `E14`. Also assert `mock_read_count == 0` to prove the bounds check short-circuits before any UPDI transaction is issued. Per LLR-RSP-48. |
 | 90 | <a id="on_read_mem_allows_address_inside_eeprom_band"></a>`on_read_mem_allows_address_inside_eeprom_band` | `LLR-RSP-48` | Positive whitelist test confirming the bounds check accepts addresses that lie inside any of the five non-FLASH NVM bands, not just FLASH and SRAM. Set the same Flash/SRAM sizing as above so the advertisement is active; prime the UPDI mock with two canned bytes `0xCA 0xFE`; dispatch `m810000,2` (EEPROM base, GDB-side VMA — bit-23 flip yields UPDI 0x010000). Drain and assert the reply payload is exactly `cafe`, `mock_read_count == 1`, and `mock_reads[0].addr == 0x10000`. Confirms the EEPROM/FUSES/LOCK/SIGROW/USERROW ELF VMA bands are part of the whitelist. Per LLR-RSP-48. |
 | 91 | <a id="on_read_mem_permissive_when_no_memory_map_advertised"></a>`on_read_mem_permissive_when_no_memory_map_advertised` | `LLR-RSP-48` | Regression guard for the no-ELF startup mode (where HLR-063 replies `l` with no map and GDB falls back to its built-in defaults). Leave all three sizing fields zero (`build_ctx` default); prime the UPDI mock with one canned byte `0x5A`; dispatch `m807ff8,1` — an address that would be rejected if the bounds check were active. Drain and assert the reply payload is exactly `5a` and `mock_read_count == 1`, proving the bounds check is correctly bypassed when no map was advertised. Per LLR-RSP-48. |
+| 92 | <a id="rsp_logging_enabled_emits_tx_and_rx_markers_to_stderr"></a>`rsp_logging_enabled_emits_tx_and_rx_markers_to_stderr` | `LLR-RSP-49` | Verify --log-rsp traffic logging. Call `rsp_set_logging(true)`, then capture fd-level stderr (pipe + dup2 of STDERR_FILENO) across each call. `rsp_send_packet(fd, "qSupported")` must emit a line containing `RSP > qSupported` before sending; after framing `g` to the peer, `rsp_recv_packet()` must return 1 with payload `g` and emit a line containing `RSP < g` after receipt. Confirms both the TX and RX markers and the `rsp_set_logging()` setter wired to `g_log_rsp`. Per LLR-RSP-49. |
+| 93 | <a id="rsp_logging_disabled_emits_no_markers"></a>`rsp_logging_disabled_emits_no_markers` | `LLR-RSP-49` | Negative companion: with `rsp_set_logging(false)` (the default), `rsp_send_packet(fd, "OK")` writes nothing to the captured stderr (captured length is 0), proving the `RSP > ` / `RSP < ` markers are gated entirely on `g_log_rsp`. Per LLR-RSP-49. |
 
 ### 3.4. [tests/test_elf.c](../tests/test_elf.c)
 
@@ -457,7 +459,7 @@ verified by code review — see
 | `LLR-RSP-45` | `rsp` | `HLR-062` | `qSupported_advertises_swbreak_and_hwbreak`, `continue_emits_swbreak_when_pc_matches_sw_bp_shadow`, `continue_emits_hwbreak_when_pc_matches_hw_bp_shadow`, `continue_emits_bare_T05_when_pc_matches_no_breakpoint` |
 | `LLR-RSP-46` | `rsp` | `HLR-066` | `vCont_probe_advertises_range_step`, `vCont_range_step_steps_until_pc_leaves_range`, `vCont_range_step_returns_immediately_when_pc_already_outside`, `vCont_range_step_emits_T02_on_ctrl_c`, `vCont_range_step_rejects_malformed_packet_with_E22` |
 | `LLR-RSP-47` | `rsp` | `HLR-063` | `qSupported_advertises_qXfer_memory_map_read`, `qXfer_memory_map_read_returns_xml_with_flash_and_ram_regions`, `qXfer_memory_map_read_includes_eeprom_fuses_lock_sigrow_userrow`, `qXfer_memory_map_read_supports_chunked_offset_length`, `qXfer_memory_map_read_replies_l_when_no_elf_loaded` |
-| `LLR-RSP-49` | `rsp` | `HLR-068` | **(no direct test)** |
+| `LLR-RSP-49` | `rsp` | `HLR-068` | `rsp_logging_enabled_emits_tx_and_rx_markers_to_stderr`, `rsp_logging_disabled_emits_no_markers` |
 | `LLR-RSP-48` | `rsp` | `HLR-067` | `on_read_mem_returns_E14_for_address_outside_advertised_map`, `on_read_mem_allows_address_inside_eeprom_band`, `on_read_mem_permissive_when_no_memory_map_advertised` |
 | `LLR-ELF-01` | `elf` | `HLR-021` | `elf_open_accepts_valid_avr_elf32_binary`, `elf_open_returns_minus1_on_invalid_elf_magic`, `elf_open_returns_minus1_on_wrong_machine_type` |
 | `LLR-ELF-02` | `elf` | `HLR-021`, `HLR-040` | `elf_open_loads_symtab_and_strtab_into_heap_buffers`, `elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure` |
