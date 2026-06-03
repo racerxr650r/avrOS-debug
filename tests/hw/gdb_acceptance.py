@@ -230,6 +230,18 @@ PER_TEST_CMDS: dict[int, str] = {
          "continue\n"
          "info registers pc\n"
          "frame\n"),
+    # G14: demote regression net — the monitor-reset -> break -> hit -> bt ->
+    # info-threads -> monitor-avros-tasks sequence that used to crash avr-gdb.
+    # bt must be a clean backtrace reaching main, info threads must show a
+    # single GDB thread, and `monitor avros tasks` must list the FSMs via
+    # introspection (which replaces FSM-as-GDB-threads).  Issue #42.
+    14: ("mem 0x0 0x20000 rw\nmem 0x804000 0x808000 rw\n"
+         "monitor reset\n"
+         "tbreak main\n"
+         "continue\n"
+         "bt\n"
+         "info threads\n"
+         "monitor avros tasks\n"),
 }
 
 # Per-test wall-clock cap (s) when running `avr-gdb -batch`. G2 has to
@@ -247,6 +259,7 @@ PER_TEST_TIMEOUT: dict[int, float] = {
     11: 20.0,
     12: 25.0,
     13: 20.0,
+    14: 20.0,
 }
 
 def build_test_script(n: int, rsp_port: int) -> str:
@@ -433,6 +446,19 @@ def verdict_G13(sect: str) -> Tuple[str, str]:
         return "FAIL", f"PC unexpected after attach sequence: {pc}"
     return "PASS", ""
 
+def verdict_G14(sect: str) -> Tuple[str, str]:
+    # Demote regression net (issue #42): bt must produce a clean backtrace
+    # reaching main (avr-gdb must NOT crash on the FSM-aware session), info
+    # threads must show a single GDB thread, and `monitor avros tasks` must
+    # list FSMs via introspection.
+    if not re.search(r"#0\s+.*\bmain\b", sect):
+        return "FAIL", "bt produced no main frame (possible avr-gdb crash)"
+    if re.search(r"\bThread\s+2\b", sect):
+        return "FAIL", "more than one GDB thread present (FSM-as-threads regressed)"
+    if "state=" not in sect:
+        return "FAIL", "monitor avros tasks listed no FSMs"
+    return "PASS", ""
+
 def verdict_G8(sect: str) -> Tuple[str, str]:
     # Continue must produce breakpoint hit lines for blink, blink2, blink3
     hits_blink = len(re.findall(r"Breakpoint \d+,.*\bblink\b", sect))
@@ -462,6 +488,7 @@ VERDICTS = {
     12: ("finish from fsmDispatch returns to main (CALL stack push)",
          verdict_G12),
     13: ("cortex-debug attach sequence reaches main", verdict_G13),
+    14: ("demote: bt clean single-thread + avros tasks lists FSMs", verdict_G14),
 }
 
 # ──────────────────────────────────────────────────────────────────────
@@ -531,12 +558,12 @@ def main() -> int:
         for n in sorted(VERDICTS):
             if n == 9:
                 desired_extra_args = ["--log-rsp", "--no-introspect"]
-            elif n in (10, 11, 12, 13):
+            elif n in (10, 11, 12, 13, 14):
                 desired_extra_args = ["--log-rsp", "--load"]
             else:
                 desired_extra_args = ["--log-rsp"]
-            desired_elf = args.g10_elf if n in (10, 11, 12, 13) else args.elf
-            force_restart = (n in (11, 12, 13))
+            desired_elf = args.g10_elf if n in (10, 11, 12, 13, 14) else args.elf
+            force_restart = (n in (11, 12, 13, 14))
             if (force_restart or desired_extra_args != current_extra_args or
                     desired_elf != current_elf):
                 kill_server(server)
