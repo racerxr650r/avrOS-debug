@@ -98,26 +98,25 @@ void tearDown(void) { mock_reset(); }
 #define FSM_TABLE_ADDR    0x1000U
 #define CURRENT_FSM_ADDR  0x802100U
 
-/* Entry 1: name="t1", sm_ptr=0x4000, state=0x00AA */
-/* Entry 2: name="t2", sm_ptr=0x4100, state=0xABCD  (active) */
+/* Entry 1: name="t1", sm_ptr=0x4000, currStateName -> "sA" */
+/* Entry 2: name="t2", sm_ptr=0x4100, currStateName -> "sB"  (active) */
 static const uint8_t fsm_table_2entries[2 * 9] = {
     /* descr[0] @0x1000: name=0x6000, sm=0x4000, handler=0, prio=0, inst=0 */
     0x00, 0x60,  0x00, 0x40,  0x00, 0x00,  0x00,  0x00, 0x00,
     /* descr[1] @0x1009: name=0x6010, sm=0x4100, handler=0, prio=0, inst=0 */
     0x10, 0x60,  0x00, 0x41,  0x00, 0x00,  0x00,  0x00, 0x00,
 };
-/* SRAM @0x4000: 0..8 padding, +9 = currState LE = 0xAA, 0x00 */
-static const uint8_t sm1_sram[11] = {
-    0,0,0,0,0,0,0,0,0, 0xAA, 0x00
-};
-static const uint8_t sm2_sram[11] = {
-    0,0,0,0,0,0,0,0,0, 0xCD, 0xAB
-};
+/* SRAM @ sm_ptr: offset 0 = currStateName (FLASH string pointer). */
+static const uint8_t sm1_sram[2] = { 0x20, 0x60 };   /* -> 0x6020 "sA" */
+static const uint8_t sm2_sram[2] = { 0x30, 0x60 };   /* -> 0x6030 "sB" */
 /* currStateMachine SRAM: LE 0x4100 = entry-2 is active */
 static const uint8_t current_active2[2] = { 0x00, 0x41 };
 /* FLASH name strings */
 static const uint8_t name1[] = { 't','1', 0 };
 static const uint8_t name2[] = { 't','2', 0 };
+/* FLASH current-state-name strings */
+static const uint8_t state1[] = { 's','A', 0 };
+static const uint8_t state2[] = { 's','B', 0 };
 
 static void install_2entry_fixture(AvrOsSymbolIndex *idx)
 {
@@ -136,8 +135,11 @@ static void install_2entry_fixture(AvrOsSymbolIndex *idx)
     mock_add_region(0x4100,           sm2_sram,           sizeof(sm2_sram));
     mock_add_region(flash_to_updi(0x6000), name1,         sizeof(name1));
     mock_add_region(flash_to_updi(0x6010), name2,         sizeof(name2));
+    /* currStateMachine kept at region index 5 (a test pokes g_regions[5]). */
     mock_add_region(sram_to_updi(CURRENT_FSM_ADDR),
                     current_active2, sizeof(current_active2));
+    mock_add_region(flash_to_updi(0x6020), state1,        sizeof(state1));
+    mock_add_region(flash_to_updi(0x6030), state2,        sizeof(state2));
 }
 
 /* ──────────────────────────────────────────────────────────────────────
@@ -154,6 +156,13 @@ void test_fsm_build_thread_list_reads_fsm_table_from_flash_via_updi(void)
     int n = fsm_build_thread_list(&ctx, &idx, /*fd*/ 7);
     TEST_ASSERT_EQUAL_INT(2, n);
     TEST_ASSERT_TRUE(ctx.valid);
+
+    /* Names come from the descriptor name pointer; state names from the
+     * fsmStateMachine_t currStateName (offset 0). */
+    TEST_ASSERT_EQUAL_STRING("t1", ctx.threads[0].name);
+    TEST_ASSERT_EQUAL_STRING("sA", ctx.threads[0].state_name);
+    TEST_ASSERT_EQUAL_STRING("t2", ctx.threads[1].name);
+    TEST_ASSERT_EQUAL_STRING("sB", ctx.threads[1].state_name);
 
     /* At least one UPDI read hit the FSM_TABLE address (in UPDI flash
      * mirror form). */
@@ -205,8 +214,8 @@ void test_fsm_build_thread_list_thread_ids_stable_across_calls(void)
 
     TEST_ASSERT_EQUAL_INT(a.threads[0].gdb_id, b.threads[0].gdb_id);
     TEST_ASSERT_EQUAL_INT(a.threads[1].gdb_id, b.threads[1].gdb_id);
-    TEST_ASSERT_EQUAL_UINT32(a.threads[0].state_fn, b.threads[0].state_fn);
-    TEST_ASSERT_EQUAL_UINT32(a.threads[1].state_fn, b.threads[1].state_fn);
+    TEST_ASSERT_EQUAL_STRING(a.threads[0].state_name, b.threads[0].state_name);
+    TEST_ASSERT_EQUAL_STRING(a.threads[1].state_name, b.threads[1].state_name);
 }
 
 /* 5) sets active thread from currStateMachine ptr */

@@ -11,9 +11,10 @@
 #define FSM_FIRST_PSEUDO_THREAD_ID 2
 
 typedef struct {
-    int    gdb_id;
-    char   name[32];
-    uint32_t state_fn;
+    int    gdb_id;        /* stable per-FSM index (display/order only)   */
+    char   name[32];      /* FSM name (from descriptor name pointer)      */
+    char   state_name[32];/* current state name (FSM currStateName), or
+                           * "" when the FSM has not yet dispatched       */
     bool   is_active;
 } FsmThread;
 

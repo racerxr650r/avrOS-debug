@@ -223,10 +223,10 @@ static int cmd_tasks(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx)
     for (int i = 0; i < fc.thread_count; ++i) {
         const FsmThread *t = &fc.threads[i];
         int n = snprintf(text + off, sizeof text - off,
-                         "  %c %-16s state=0x%04x\n",
+                         "  %c %-16s state=%s\n",
                          t->is_active ? '*' : ' ',
                          (t->name[0] != '\0') ? t->name : "<unnamed>",
-                         (unsigned)t->state_fn);
+                         (t->state_name[0] != '\0') ? t->state_name : "(init)");
         if (n < 0) return -1;
         if ((size_t)n >= sizeof text - off) {
             off = sizeof text - 1u;

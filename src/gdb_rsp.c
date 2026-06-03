@@ -1328,12 +1328,9 @@ static int dh_qxfer_memory_map(int fd, const char *pkt, void *vctx)
     return rsp_send_packet(fd, reply);
 }
 
-/* HLR-061 / LLR-RSP-42: qThreadExtraInfo,<tid> — return a
- * human-readable label for the FSM identified by <tid>:
- *   "FSM <name> [active|quiescent] state=0x<state_fn>"
- * The label is hex-encoded byte-by-byte per the RSP spec.  Unknown
- * TIDs reply with the empty packet; "any-thread" forms (p0.0 / p-1.-1)
- * also reply empty — no aggregate label exists.                       */
+/* qThreadExtraInfo,<tid> — FSM threading is demoted to introspection, so
+ * there are no per-FSM GDB threads to label.  Reply the empty packet;
+ * avrOS FSM detail is available via `monitor avros tasks`.            */
 static int dh_thread_extra(int fd, const char *pkt, void *vctx)
 {
     (void)pkt; (void)vctx;

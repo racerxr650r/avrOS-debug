@@ -14,8 +14,10 @@
  *     +6  priority (uint8_t)         1 byte
  *     +7  instance (uint16_t)        2 bytes
  *
- *   fsmStateMachine_t       (in SRAM):
- *     +9  currState (fn *)           2 bytes   current state function ptr
+ *   fsmStateMachine_t       (in SRAM, sizeof 21):
+ *     +0  currStateName (char *)     2 bytes   FLASH ptr to current
+ *                                              state's name string
+ *                                              (NULL until first dispatch)
  *
  *   currStateMachine        (file-static SRAM pointer, 2 bytes)
  *     The currently-running fsmStateMachine_t (set on each dispatch).
@@ -44,8 +46,11 @@
 
 extern int updi_mem_read(int fd, uint32_t addr, uint8_t *buf, size_t len);
 
-#define FSM_DESCR_SIZE        9U   /* sizeof(fsmStateMachineDescr_t)        */
-#define FSM_CURRSTATE_OFFSET  9U   /* offset of currState in fsmStateMachine_t */
+#define FSM_DESCR_SIZE            9U   /* sizeof(fsmStateMachineDescr_t)    */
+#define FSM_CURRSTATENAME_OFFSET  0U   /* offset of currStateName (char *)
+                                        * in fsmStateMachine_t — the first
+                                        * member; a FLASH string pointer to
+                                        * the FSM's current state name.     */
 
 /* AVR data-space pointers are 16-bit; zero-extend into uint32_t. */
 static uint16_t read_le16(const uint8_t *p)
@@ -71,7 +76,11 @@ static int read_flash_string(int updi_fd, uint32_t byte_addr,
         uint8_t b;
         if (updi_mem_read(updi_fd, base_addr + (uint32_t)off, &b, 1) < 0)
             return -1;
-        if (b == 0)
+        /* Stop at NUL or the first non-printable byte: a stale/garbage
+         * pointer (e.g. a NULL currStateName that resolved through the
+         * flash mirror) then yields an empty string rather than binary
+         * junk in the introspection output. */
+        if (b == 0 || b < 0x20u || b > 0x7Eu)
             break;
         dst[off++] = (char)b;
     }
@@ -140,19 +149,33 @@ int fsm_build_thread_list(FsmContext *ctx, const AvrOsSymbolIndex *idx, int updi
         t->gdb_id   = FSM_FIRST_PSEUDO_THREAD_ID + produced;
         t->is_active = (sm_ptr == current_sm);
 
-        /* Read currState (function pointer) from SRAM at sm_ptr + 9.
-         * sm_ptr is a raw 16-bit AVR data-space byte address (already
-         * in UPDI form — no flag bit set). */
-        uint8_t cs[2];
+        /* Read currStateName (a FLASH string pointer) at offset 0 of the
+         * fsmStateMachine_t, then resolve it to the FSM's current state
+         * name.  sm_ptr is a raw 16-bit AVR data-space (SRAM) byte address
+         * (already in UPDI form — no flag bit set).  A NULL pointer means
+         * the FSM has not dispatched yet → empty state name. */
+        uint8_t csn[2];
         if (updi_mem_read(updi_fd,
-                          (uint32_t)sm_ptr + FSM_CURRSTATE_OFFSET,
-                          cs, sizeof(cs)) < 0) {
+                          (uint32_t)sm_ptr + FSM_CURRSTATENAME_OFFSET,
+                          csn, sizeof(csn)) < 0) {
             fprintf(stderr,
-                    "fsm: failed to read currState at 0x%04x\n",
-                    (unsigned)(sm_ptr + FSM_CURRSTATE_OFFSET));
+                    "fsm: failed to read currStateName at 0x%04x\n",
+                    (unsigned)(sm_ptr + FSM_CURRSTATENAME_OFFSET));
             return -1;
         }
-        t->state_fn = (uint32_t)read_le16(cs);
+        uint16_t state_name_ptr = read_le16(csn);
+        if (state_name_ptr != 0) {
+            if (read_flash_string(updi_fd,
+                                  (uint32_t)state_name_ptr + idx->flash_lma_off,
+                                  t->state_name, sizeof(t->state_name)) < 0) {
+                fprintf(stderr,
+                        "fsm: failed to read currStateName string at 0x%04x\n",
+                        (unsigned)state_name_ptr);
+                return -1;
+            }
+        } else {
+            t->state_name[0] = '\0';
+        }
 
         /* Read the descriptor name (NUL-terminated, in FLASH).
          * name_ptr is a 16-bit AVR C pointer; on AVR-Dx parts string
