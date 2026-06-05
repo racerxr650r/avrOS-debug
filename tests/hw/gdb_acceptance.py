@@ -250,8 +250,8 @@ PER_TEST_CMDS: dict[int, str] = {
          "info threads\n"
          "monitor avros tasks\n"),
     # G15: HW-comparator arbiter (issue #45). A user hardware breakpoint
-    # occupies the single user comparator (slot 0). fsmDispatch's entry
-    # contains a 32-bit LDS (0x123c: `lds r24, 0x4670`); single-stepping
+    # occupies the single user comparator (slot 0). fsmDispatch's first
+    # statement is a 32-bit LDS (0x1c0a: `lds r24, 0x467E`); single-stepping
     # through it uses the RESERVED comparator (slot 1), and the user hbreak
     # must survive — so `continue` re-hits fsmDispatch (>=2 hits total).
     # (No software breakpoint is used to position at the LDS: a SW BP would
@@ -536,7 +536,7 @@ def verdict_G15(sect: str) -> Tuple[str, str]:
     # (#2): >= 2 hits proves it survived the LDS step. If the step had
     # clobbered the user comparator, the final `continue` would not re-hit.
     if "lds" not in sect.lower():
-        return "FAIL", "did not reach / disassemble the 32-bit LDS at 0x123c"
+        return "FAIL", "did not reach / disassemble the 32-bit LDS at fsmDispatch entry"
     hits = len(re.findall(r"Breakpoint \d+,.*\bfsmDispatch\b", sect))
     if hits < 2:
         return "FAIL", f"hbreak at fsmDispatch fired {hits}x (<2): did not survive the LDS stepi"
