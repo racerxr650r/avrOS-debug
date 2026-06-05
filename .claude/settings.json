@@ -4,12 +4,9 @@
     "allow": [
       "Edit",
       "Write",
-
       "Bash(make:*)",
       "Bash(gcovr:*)",
-
       "Bash(python3:*)",
-
       "Bash(grep:*)",
       "Bash(rg:*)",
       "Bash(sed:*)",
@@ -24,7 +21,6 @@
       "Bash(file:*)",
       "Bash(du:*)",
       "Bash(diff:*)",
-
       "Bash(./build/avrOSdb:*)",
       "Bash(build/avrOSdb:*)",
       "Bash(avr-gdb:*)",
@@ -34,9 +30,30 @@
       "Bash(avr-readelf:*)",
       "Bash(avr-size:*)",
       "Bash(readelf:*)",
-
       "Bash(git:*)",
-      "Bash(gh:*)"
+      "Bash(gh:*)",
+      "Bash(command -v gh)",
+      "Bash(cd /home/john/Projects/avrOS-debug *)",
+      "Read(//tmp/**)",
+      "Bash(mkdir:*)",
+      "Bash(pkill:*)",
+      "Bash(fuser:*)",
+      "Bash(kill:*)",
+      "Bash(timeout:*)",
+      "Bash(env:*)",
+      "Bash(avr-gcc:*)",
+      "Bash(avr-objcopy:*)",
+      "Bash(avr-objdump:*)",
+      "Bash(command -v:*)",
+      "Bash(build/avrOSdb:*)",
+      "Bash(./build/avrOSdb:*)",
+      "Bash(build/tests/:*)",
+      "Bash(build/hw_test:*)",
+      "Skill(fewer-permission-prompts)",
+      "Skill(fewer-permission-prompts:*)"
+    ],
+    "additionalDirectories": [
+      "/home/john/Projects/avrOS-debug"
     ]
   }
 }
