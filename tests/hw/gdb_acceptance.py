@@ -11,9 +11,9 @@ the Phase-10 *avarice feature-parity* acceptance criteria from the SDP:
     G4  ``break main`` + ``continue`` → halts at main
     G6  ``monitor reset`` / ``halt`` / ``info`` verbs behave
     G7  ``detach`` + re-attach extended-remote lifecycle
-    G10 select thread 2, verify its synthetic PC, reset, then re-select
-        thread 2 without losing the FSM thread model or reverting to the
-        live CPU/reset-vector frame
+    G10 ``monitor avros tasks`` lists the avrOS FSMs both before and after
+        a ``monitor reset`` — the introspection view survives a reset and
+        no FSM-as-GDB-thread regresses (single GDB thread throughout)
     G11 stop at ``main.c:139`` in the avrOS example and ``step`` into
         ``fsmDispatch()`` rather than running on to the later
         ``gpioClearOutput()`` call
@@ -189,13 +189,16 @@ PER_TEST_CMDS: dict[int, str] = {
         "continue\n"
         "delete breakpoints\n"),
     9: "info threads\n",
-        10: ("info threads\n"
-            "thread 2\n"
-            "info registers pc\n"
-            "monitor reset\n"
-            "info threads\n"
-            "thread 2\n"
-            "info registers pc\n"),
+    # G10: the avrOS FSM introspection view must survive a target reset.
+    # `monitor avros tasks` lists the FSMs (state=...) before and after a
+    # `monitor reset`; both listings must enumerate FSMs and the session must
+    # stay a single GDB thread (Phase 14 replaced the FSM-as-GDB-threads model
+    # with `monitor avros tasks` — see G14).
+    10: ("info threads\n"
+         "monitor avros tasks\n"
+         "monitor reset\n"
+         "monitor avros tasks\n"
+         "info threads\n"),
             11: ("mem 0x0 0x20000 rw\nmem 0x804000 0x808000 rw\n"
          "monitor reset\n"
          "tbreak main\n"
@@ -358,13 +361,6 @@ def pc_value(text: str) -> Optional[int]:
     m = PC_RE.search(text)
     return int(m.group(1), 16) if m else None
 
-def pc_values(text: str) -> List[int]:
-    return [int(v, 16) for v in PC_RE.findall(text)]
-
-def pc_matches_state(pc: int, state: int) -> bool:
-    byte_pc = pc << 1
-    return pc == state or byte_pc == state or (byte_pc | 1) == state
-
 # ──────────────────────────────────────────────────────────────────────
 #  Per-test verdicts
 # ──────────────────────────────────────────────────────────────────────
@@ -448,30 +444,26 @@ def verdict_G7(sect: str) -> Tuple[str, str]:
 def verdict_G9(sect: str) -> Tuple[str, str]:
     if "FSM" in sect or "state=" in sect:
         return "FAIL", "Found FSM thread labels despite --no-introspect"
-    if "Id   Target Id" in sect and re.search(r"1\s+Thread \d+\.1", sect):
+    # avr-gdb prints a single GDB thread for --no-introspect. Accept both the
+    # bare "Thread 1" form (avr-gdb 16.3) and the legacy "Thread <pid>.1" form.
+    if "Id   Target Id" in sect and re.search(r"1\s+Thread (?:\d+\.)?1\b", sect):
         return "PASS", ""
     return "FAIL", "No threads found"
 
 def verdict_G10(sect: str) -> Tuple[str, str]:
+    # The avrOS FSM introspection view must survive a `monitor reset`.
+    # Phase 14 replaced the FSM-as-GDB-threads model with `monitor avros
+    # tasks`, so we no longer select a synthetic thread 2; instead the FSM
+    # listing (state=...) must appear both before and after the reset, and
+    # the session must remain a single GDB thread (no Thread 2 regression).
     if "Error in sourced command file" in sect:
-        return "FAIL", "thread selection or reset command failed"
-    if ("Unknown thread 2" in sect or "No thread 2" in sect or
-            "Cannot find thread 2" in sect or "No registers." in sect):
-        return "FAIL", "thread 2 was lost across reset"
-    # Expect thread 2 to appear before and after reset.
-    hits = re.findall(r"\b2\s+Thread \d+\.2\b", sect)
-    if len(hits) < 2:
-        return "FAIL", "thread 2 did not survive the reset sequence"
-    states = [int(v, 16) for v in re.findall(r"\b2\s+Thread \d+\.2\b.*state=0x([0-9a-fA-F]+)", sect)]
-    if len(states) < 2:
-        return "FAIL", "thread 2 state labels missing before or after reset"
-    pcs = pc_values(sect)
-    if len(pcs) < 2:
-        return "FAIL", "no register reads while thread 2 selected"
-    if not pc_matches_state(pcs[0], states[0]):
-        return "FAIL", f"pre-reset thread 2 PC 0x{pcs[0]:x} not consistent with state 0x{states[0]:x}"
-    if not pc_matches_state(pcs[1], states[1]):
-        return "FAIL", f"post-reset thread 2 PC 0x{pcs[1]:x} not consistent with state 0x{states[1]:x}"
+        return "FAIL", "monitor command failed"
+    if re.search(r"\bThread\s+2\b", sect):
+        return "FAIL", "FSM-as-GDB-threads regressed (Thread 2 present)"
+    # Two `monitor avros tasks` listings, one before and one after reset.
+    listings = len(re.findall(r"state=0x[0-9a-fA-F]+", sect))
+    if listings < 2:
+        return "FAIL", "monitor avros tasks did not list FSMs before and after reset"
     return "PASS", ""
 
 def verdict_G11(sect: str) -> Tuple[str, str]:
@@ -636,7 +628,7 @@ VERDICTS = {
     7: ("detach + re-attach lifecycle",   verdict_G7),
     8: ("multiple breakpoints correctly hit during execution", verdict_G8),
     9: ("--no-introspect switch yields single thread", verdict_G9),
-    10: ("reset preserves selected FSM register view", verdict_G10),
+    10: ("monitor avros tasks survives a reset (single GDB thread)", verdict_G10),
     11: ("step enters fsmDispatch from main", verdict_G11),
     12: ("finish from fsmDispatch returns to main (CALL stack push)",
          verdict_G12),
@@ -660,8 +652,8 @@ def main() -> int:
                     help="ELF to load via `(gdb) load` (default %(default)s)")
     ap.add_argument("--g10-elf",    default=os.environ.get("HW_GDB_G10_ELF",
                                             DEFAULT_G10_ELF),
-                    help="ELF used only for G10 FSM-thread reset coverage "
-                         "(default %(default)s)")
+                    help="avrOS ELF used for G10 FSM-introspection reset "
+                         "coverage (default %(default)s)")
     ap.add_argument("--g17-elf",    default=os.environ.get("HW_GDB_G17_ELF",
                                             "build/fixtures/gdb_locals.elf"),
                     help="ELF used only for G17 local-variable value "
