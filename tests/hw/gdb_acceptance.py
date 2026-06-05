@@ -11,12 +11,16 @@ the Phase-10 *avarice feature-parity* acceptance criteria from the SDP:
     G4  ``break main`` + ``continue`` → halts at main
     G6  ``monitor reset`` / ``halt`` / ``info`` verbs behave
     G7  ``detach`` + re-attach extended-remote lifecycle
-    G10 select thread 2, verify its synthetic PC, reset, then re-select
-        thread 2 without losing the FSM thread model or reverting to the
-        live CPU/reset-vector frame
+    G10 ``monitor avros tasks`` lists the avrOS FSMs both before and after
+        a ``monitor reset`` — the introspection view survives a reset and
+        no FSM-as-GDB-thread regresses (single GDB thread throughout)
     G11 stop at ``main.c:139`` in the avrOS example and ``step`` into
         ``fsmDispatch()`` rather than running on to the later
         ``gpioClearOutput()`` call
+    G17 break inside ``locals_probe()`` and read back every local (one per
+        representative C data type) from its own frame, verifying each
+        reported value matches the constant the fixture assigned — catches
+        SP/SRAM read bugs that surface as garbage locals in GDB / Cortex-Debug
 
 (Data watchpoints — G5 in earlier drafts — are intentionally not
 exercised here: AVR-Dx UPDI silicon does not expose data-watchpoint
@@ -185,13 +189,16 @@ PER_TEST_CMDS: dict[int, str] = {
         "continue\n"
         "delete breakpoints\n"),
     9: "info threads\n",
-        10: ("info threads\n"
-            "thread 2\n"
-            "info registers pc\n"
-            "monitor reset\n"
-            "info threads\n"
-            "thread 2\n"
-            "info registers pc\n"),
+    # G10: the avrOS FSM introspection view must survive a target reset.
+    # `monitor avros tasks` lists the FSMs (state=...) before and after a
+    # `monitor reset`; both listings must enumerate FSMs and the session must
+    # stay a single GDB thread (Phase 14 replaced the FSM-as-GDB-threads model
+    # with `monitor avros tasks` — see G14).
+    10: ("info threads\n"
+         "monitor avros tasks\n"
+         "monitor reset\n"
+         "monitor avros tasks\n"
+         "info threads\n"),
             11: ("mem 0x0 0x20000 rw\nmem 0x804000 0x808000 rw\n"
          "monitor reset\n"
          "tbreak main\n"
@@ -243,8 +250,8 @@ PER_TEST_CMDS: dict[int, str] = {
          "info threads\n"
          "monitor avros tasks\n"),
     # G15: HW-comparator arbiter (issue #45). A user hardware breakpoint
-    # occupies the single user comparator (slot 0). fsmDispatch's entry
-    # contains a 32-bit LDS (0x123c: `lds r24, 0x4670`); single-stepping
+    # occupies the single user comparator (slot 0). fsmDispatch's first
+    # statement is a 32-bit LDS (0x1c0a: `lds r24, 0x467E`); single-stepping
     # through it uses the RESERVED comparator (slot 1), and the user hbreak
     # must survive — so `continue` re-hits fsmDispatch (>=2 hits total).
     # (No software breakpoint is used to position at the LDS: a SW BP would
@@ -281,6 +288,40 @@ PER_TEST_CMDS: dict[int, str] = {
          "x/i $pc\n"
          "continue\n"                    # next dispatch must re-hit the SW BP (#2)
          "info registers pc\n"),
+    # G17: local-variable value correctness + backtrace integrity. Break
+    # INSIDE locals_probe() on the g_probe_hit anchor line where every local
+    # is assigned and still live, read each back, then `bt`. Both surfaces
+    # read SRAM off the stack and both were broken by the ST_PTR_WORD
+    # stale-high-byte bug (a Flash read by GDB left the UPDI pointer high byte
+    # at 0x80, so the following 16-bit-pointer SRAM read was misdirected into
+    # mapped Flash and returned erased 0xFF): locals came back as 0xFF/garbage
+    # and the return-address read gave a bogus 0x1fffe frame. With the 24-bit
+    # ST_PTR_LONG fix every local reads its known constant and `bt` reaches
+    # main. The `break gdb_locals.c:67` line must track the g_probe_hit anchor
+    # in tests/fixtures/gdb_locals.c. Runs against the -O0 gdb_locals fixture
+    # so the values are deterministic and not optimiser-dependent.
+    17: ("mem 0x0 0x20000 rw\nmem 0x804000 0x808000 rw\n"
+         "monitor reset\n"
+         "tbreak main\n"
+         "continue\n"
+         "break gdb_locals.c:67\n"       # the g_probe_hit anchor line
+         "continue\n"                    # stop inside locals_probe()
+         "info locals\n"
+         "print u8\n"
+         "print i8\n"
+         "print u16\n"
+         "print i16\n"
+         "print u32\n"
+         "print i32\n"
+         "print u64\n"
+         "print ch\n"
+         "print flag\n"
+         "print f\n"
+         "print arr\n"
+         "print pt\n"
+         "print name\n"
+         "print *pmark\n"
+         "bt\n"),                        # must reach main (return-addr SRAM read)
 }
 
 # Per-test wall-clock cap (s) when running `avr-gdb -batch`. G2 has to
@@ -301,6 +342,7 @@ PER_TEST_TIMEOUT: dict[int, float] = {
     14: 20.0,
     15: 25.0,
     16: 25.0,
+    17: 25.0,
 }
 
 def build_test_script(n: int, rsp_port: int) -> str:
@@ -318,13 +360,6 @@ PC_RE = re.compile(r"pc\s+0x([0-9a-fA-F]+)")
 def pc_value(text: str) -> Optional[int]:
     m = PC_RE.search(text)
     return int(m.group(1), 16) if m else None
-
-def pc_values(text: str) -> List[int]:
-    return [int(v, 16) for v in PC_RE.findall(text)]
-
-def pc_matches_state(pc: int, state: int) -> bool:
-    byte_pc = pc << 1
-    return pc == state or byte_pc == state or (byte_pc | 1) == state
 
 # ──────────────────────────────────────────────────────────────────────
 #  Per-test verdicts
@@ -409,30 +444,26 @@ def verdict_G7(sect: str) -> Tuple[str, str]:
 def verdict_G9(sect: str) -> Tuple[str, str]:
     if "FSM" in sect or "state=" in sect:
         return "FAIL", "Found FSM thread labels despite --no-introspect"
-    if "Id   Target Id" in sect and re.search(r"1\s+Thread \d+\.1", sect):
+    # avr-gdb prints a single GDB thread for --no-introspect. Accept both the
+    # bare "Thread 1" form (avr-gdb 16.3) and the legacy "Thread <pid>.1" form.
+    if "Id   Target Id" in sect and re.search(r"1\s+Thread (?:\d+\.)?1\b", sect):
         return "PASS", ""
     return "FAIL", "No threads found"
 
 def verdict_G10(sect: str) -> Tuple[str, str]:
+    # The avrOS FSM introspection view must survive a `monitor reset`.
+    # Phase 14 replaced the FSM-as-GDB-threads model with `monitor avros
+    # tasks`, so we no longer select a synthetic thread 2; instead the FSM
+    # listing (state=...) must appear both before and after the reset, and
+    # the session must remain a single GDB thread (no Thread 2 regression).
     if "Error in sourced command file" in sect:
-        return "FAIL", "thread selection or reset command failed"
-    if ("Unknown thread 2" in sect or "No thread 2" in sect or
-            "Cannot find thread 2" in sect or "No registers." in sect):
-        return "FAIL", "thread 2 was lost across reset"
-    # Expect thread 2 to appear before and after reset.
-    hits = re.findall(r"\b2\s+Thread \d+\.2\b", sect)
-    if len(hits) < 2:
-        return "FAIL", "thread 2 did not survive the reset sequence"
-    states = [int(v, 16) for v in re.findall(r"\b2\s+Thread \d+\.2\b.*state=0x([0-9a-fA-F]+)", sect)]
-    if len(states) < 2:
-        return "FAIL", "thread 2 state labels missing before or after reset"
-    pcs = pc_values(sect)
-    if len(pcs) < 2:
-        return "FAIL", "no register reads while thread 2 selected"
-    if not pc_matches_state(pcs[0], states[0]):
-        return "FAIL", f"pre-reset thread 2 PC 0x{pcs[0]:x} not consistent with state 0x{states[0]:x}"
-    if not pc_matches_state(pcs[1], states[1]):
-        return "FAIL", f"post-reset thread 2 PC 0x{pcs[1]:x} not consistent with state 0x{states[1]:x}"
+        return "FAIL", "monitor command failed"
+    if re.search(r"\bThread\s+2\b", sect):
+        return "FAIL", "FSM-as-GDB-threads regressed (Thread 2 present)"
+    # Two `monitor avros tasks` listings, one before and one after reset.
+    listings = len(re.findall(r"state=0x[0-9a-fA-F]+", sect))
+    if listings < 2:
+        return "FAIL", "monitor avros tasks did not list FSMs before and after reset"
     return "PASS", ""
 
 def verdict_G11(sect: str) -> Tuple[str, str]:
@@ -505,7 +536,7 @@ def verdict_G15(sect: str) -> Tuple[str, str]:
     # (#2): >= 2 hits proves it survived the LDS step. If the step had
     # clobbered the user comparator, the final `continue` would not re-hit.
     if "lds" not in sect.lower():
-        return "FAIL", "did not reach / disassemble the 32-bit LDS at 0x123c"
+        return "FAIL", "did not reach / disassemble the 32-bit LDS at fsmDispatch entry"
     hits = len(re.findall(r"Breakpoint \d+,.*\bfsmDispatch\b", sect))
     if hits < 2:
         return "FAIL", f"hbreak at fsmDispatch fired {hits}x (<2): did not survive the LDS stepi"
@@ -522,6 +553,55 @@ def verdict_G14(sect: str) -> Tuple[str, str]:
         return "FAIL", "more than one GDB thread present (FSM-as-threads regressed)"
     if "state=" not in sect:
         return "FAIL", "monitor avros tasks listed no FSMs"
+    return "PASS", ""
+
+def verdict_G17(sect: str) -> Tuple[str, str]:
+    # Local-variable value correctness. Stopped inside locals_probe(), each
+    # `print <var>` must report the exact constant the fixture assigned. A
+    # wrong value means avrOSdb mis-read SP/the frame pointer or mis-read
+    # SRAM — the failure that shows garbage locals in GDB / Cortex-Debug. We
+    # match each value as it appears in GDB's default formatting; the
+    # constants are deliberately distinctive.
+    if "Error in sourced command file" in sect:
+        return "FAIL", "GDB command failed before reading locals"
+    if "remote failure" in sect.lower():
+        return "FAIL", "remote read failed while inspecting locals"
+    if re.search(r"No symbol .* in current context", sect):
+        return "FAIL", "locals not in scope (frame/DWARF not resolved)"
+    if re.search(r"No locals\.", sect):
+        return "FAIL", "`info locals` reported no locals in locals_probe frame"
+
+    # (label, regex against the transcript) for each typed local. Anchored on
+    # `= <value>` so we match the `print` result, not an incidental address.
+    checks = [
+        ("u8",        r"=\s*165\b"),
+        ("i8",        r"=\s*-42\b"),
+        ("u16",       r"=\s*48879\b"),
+        ("i16",       r"=\s*-12345\b"),
+        ("u32",       r"=\s*3735928559\b"),
+        ("i32",       r"=\s*-123456789\b"),
+        ("u64",       r"=\s*81985529216486895\b"),
+        ("ch",        r"=\s*81 '[Q]'"),
+        ("flag",      r"=\s*true\b"),
+        ("f",         r"=\s*3\.5\b"),
+        ("arr",       r"=\s*\{4369,\s*8738,\s*13107,\s*17476\}"),
+        ("pt",        r"=\s*\{x\s*=\s*1000,\s*y\s*=\s*-2000\}"),
+        ("name",      r'=\s*"avrOS"'),
+        ("*pmark",    r"=\s*51966\b"),
+    ]
+    missing = [name for name, pat in checks
+               if not re.search(pat, sect)]
+    if missing:
+        return "FAIL", ("wrong/missing local value(s): "
+                        + ", ".join(missing))
+    # Backtrace must unwind locals_probe -> main. The same SRAM-read bug that
+    # corrupts locals also corrupts the return address read off the stack,
+    # which surfaces as a bogus "#1  0x0001fffe in ?? ()" frame.
+    if not re.search(r"^#1\s+.*\bmain\b", sect, re.MULTILINE):
+        if re.search(r"^#1\s+0x0*1fffe", sect, re.MULTILINE):
+            return "FAIL", ("backtrace return address read as 0xFF "
+                            "(#1 = 0x1fffe): stack SRAM read corrupted")
+        return "FAIL", "backtrace did not unwind locals_probe -> main"
     return "PASS", ""
 
 def verdict_G8(sect: str) -> Tuple[str, str]:
@@ -548,7 +628,7 @@ VERDICTS = {
     7: ("detach + re-attach lifecycle",   verdict_G7),
     8: ("multiple breakpoints correctly hit during execution", verdict_G8),
     9: ("--no-introspect switch yields single thread", verdict_G9),
-    10: ("reset preserves selected FSM register view", verdict_G10),
+    10: ("monitor avros tasks survives a reset (single GDB thread)", verdict_G10),
     11: ("step enters fsmDispatch from main", verdict_G11),
     12: ("finish from fsmDispatch returns to main (CALL stack push)",
          verdict_G12),
@@ -556,6 +636,7 @@ VERDICTS = {
     14: ("demote: bt clean single-thread + avros tasks lists FSMs", verdict_G14),
     15: ("HW-comparator arbiter: user hbreak survives a 32-bit LDS stepi", verdict_G15),
     16: ("HW-comparator arbiter: user SW breakpoint survives a 32-bit LDS stepi", verdict_G16),
+    17: ("local variable values are reported correctly", verdict_G17),
 }
 
 # ──────────────────────────────────────────────────────────────────────
@@ -571,8 +652,12 @@ def main() -> int:
                     help="ELF to load via `(gdb) load` (default %(default)s)")
     ap.add_argument("--g10-elf",    default=os.environ.get("HW_GDB_G10_ELF",
                                             DEFAULT_G10_ELF),
-                    help="ELF used only for G10 FSM-thread reset coverage "
-                         "(default %(default)s)")
+                    help="avrOS ELF used for G10 FSM-introspection reset "
+                         "coverage (default %(default)s)")
+    ap.add_argument("--g17-elf",    default=os.environ.get("HW_GDB_G17_ELF",
+                                            "build/fixtures/gdb_locals.elf"),
+                    help="ELF used only for G17 local-variable value "
+                         "coverage; built at -O0 (default %(default)s)")
     ap.add_argument("--rsp-port",   type=int,
                     default=int(os.environ.get("HW_RSP_PORT", "1234")),
                     help="TCP port for avrOSdb (default %(default)s)")
@@ -600,6 +685,10 @@ def main() -> int:
         print(f"hw-test: gdb_acceptance: missing G10 ELF {args.g10_elf}",
               file=sys.stderr)
         return 1
+    if not os.path.isfile(args.g17_elf):
+        print(f"hw-test: gdb_acceptance: missing G17 ELF {args.g17_elf}",
+              file=sys.stderr)
+        return 1
 
     print(
         "hw-test: --- Group G (full-stack avr-gdb acceptance) ---",
@@ -625,12 +714,17 @@ def main() -> int:
         for n in sorted(VERDICTS):
             if n == 9:
                 desired_extra_args = ["--log-rsp", "--no-introspect"]
-            elif n in (10, 11, 12, 13, 14, 15, 16):
+            elif n in (10, 11, 12, 13, 14, 15, 16, 17):
                 desired_extra_args = ["--log-rsp", "--load"]
             else:
                 desired_extra_args = ["--log-rsp"]
-            desired_elf = args.g10_elf if n in (10, 11, 12, 13, 14, 15, 16) else args.elf
-            force_restart = (n in (11, 12, 13, 14, 15, 16))
+            if n == 17:
+                desired_elf = args.g17_elf
+            elif n in (10, 11, 12, 13, 14, 15, 16):
+                desired_elf = args.g10_elf
+            else:
+                desired_elf = args.elf
+            force_restart = (n in (11, 12, 13, 14, 15, 16, 17))
             if (force_restart or desired_extra_args != current_extra_args or
                     desired_elf != current_elf):
                 kill_server(server)

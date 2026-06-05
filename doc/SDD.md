@@ -22,6 +22,7 @@ This document describes the design of the source modules that implement the avrO
 *   [src/monitor.c](../src/monitor.c): Custom monitor command handler: implements the `avros events` and `avros queues` sub-commands via non-intrusive UPDI reads.
 *   [Makefile](../Makefile): Build orchestration: compile, test, install, uninstall, check-tools, and bundle (Debian .deb, Red Hat .rpm, Homebrew formula) targets.
 *   [tests/hw/hw_test.c](../tests/hw/hw_test.c): On-target hardware integration test harness: links against `src/updi.c` and exercises the live UPDI silicon, device-info report, SRAM round-trips, NVM page programming, and the RSP server's TCP path. Manual-only — never wired into `make test`.
+*   [tests/hw/gdb_acceptance.py](../tests/hw/gdb_acceptance.py): On-target GDB acceptance harness (Group-G): drives a real `avr-gdb` against live silicon through `avrOSdb` over UPDI and applies per-test verdict functions to the transcript. Manual-only (`make hw-test-gdb`) — never wired into `make test`.
 *   [doc/avrOSdb.1](../doc/avrOSdb.1): Unix man page: reference documentation for the avrOSdb command.
 
 It does not cover the build system, IDE adapter layers (Cortex-Debug, Zed DAP), or Windows support, all of which are out of scope for the initial release (see `doc/PVD.md §7.2`).

@@ -371,39 +371,34 @@ static int updi_stcs(int fd, uint8_t cs, uint8_t val)
 }
 
 /*
- * Set the UPDI pointer register via
- *   16-bit form: SYNCH, ST_PTR_WORD (0x69), addr_lo, addr_hi
- *   24-bit form: SYNCH, ST_PTR_LONG (0x6A), addr_lo, addr_mid, addr_hi
+ * Set the UPDI pointer register using the 24-bit ST_PTR_LONG form:
+ *   SYNCH, ST_PTR_LONG (0x6A), addr_lo, addr_mid, addr_hi   → one ACK
  *
- * The 24-bit form is required for the AVR-Dx mapped-Flash region above
- * 0x0000FFFF on parts with > 64 KiB Flash (AVR128DA/DB) and is selected
- * automatically when `addr > 0xFFFF`. Sub-64-KiB targets (SIGROW, NVMCTRL,
- * SRAM, ASI registers, etc.) keep the 16-bit form for byte-for-byte
- * compatibility with avrdude's serialupdi cold-path captures.
+ * ALWAYS use the 24-bit form, even for addresses <= 0xFFFF.  The 16-bit
+ * ST_PTR_WORD form updates only the low two pointer bytes and leaves the
+ * high byte (bits 16..23) at whatever a previous ST_PTR_LONG set it to.
+ * AVR-Dx mapped-Flash reads use ST_PTR_LONG with a high byte of 0x80, so a
+ * subsequent ST_PTR_WORD read of SRAM (UPDI 0x4000..0x7FFF) would be
+ * misdirected to 0x80xxxx — mapped Flash — and return erased 0xFF on a
+ * sparsely-programmed part.  Because GDB interleaves Flash reads (code and
+ * line tables) with stack reads, that produced intermittently garbage
+ * locals and bogus (0x1fffe) backtraces whenever a Flash read preceded a
+ * stack read.  Writing the full 24-bit pointer every time removes the
+ * stale-high-byte hazard — this is also what avrdude's serialupdi does.
  *
- * Both forms expect one ACK back from the UPDI (datasheet §35.3.3.4).
+ * Expects one ACK back from the UPDI (datasheet §35.3.3.4).
  */
 static int updi_set_ptr(int fd, uint32_t addr)
 {
-    uint8_t frame[5];
-    size_t  frame_len;
+    uint8_t frame[5] = {
+        UPDI_SYNCH, UPDI_OP_ST_PTR_LONG,
+        (uint8_t)( addr        & 0xFFu),
+        (uint8_t)((addr >>  8) & 0xFFu),
+        (uint8_t)((addr >> 16) & 0xFFu),
+    };
     uint8_t ack;
 
-    frame[0] = UPDI_SYNCH;
-    if (addr > 0xFFFFu) {
-        frame[1] = UPDI_OP_ST_PTR_LONG;
-        frame[2] = (uint8_t)( addr        & 0xFFu);
-        frame[3] = (uint8_t)((addr >>  8) & 0xFFu);
-        frame[4] = (uint8_t)((addr >> 16) & 0xFFu);
-        frame_len = 5u;
-    } else {
-        frame[1] = UPDI_OP_ST_PTR_WORD;
-        frame[2] = (uint8_t)( addr       & 0xFFu);
-        frame[3] = (uint8_t)((addr >> 8) & 0xFFu);
-        frame_len = 4u;
-    }
-
-    if (updi_write_bytes(fd, frame, frame_len) < 0)
+    if (updi_write_bytes(fd, frame, sizeof(frame)) < 0)
         return -1;
     if (read(fd, &ack, 1) != (ssize_t)1)
         return -1;

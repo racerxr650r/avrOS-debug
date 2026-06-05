@@ -1,15 +1,13 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "permissions": {
+    "defaultMode": "bypassPermissions",
     "allow": [
       "Edit",
       "Write",
-
       "Bash(make:*)",
       "Bash(gcovr:*)",
-
       "Bash(python3:*)",
-
       "Bash(grep:*)",
       "Bash(rg:*)",
       "Bash(sed:*)",
@@ -24,7 +22,6 @@
       "Bash(file:*)",
       "Bash(du:*)",
       "Bash(diff:*)",
-
       "Bash(./build/avrOSdb:*)",
       "Bash(build/avrOSdb:*)",
       "Bash(avr-gdb:*)",
@@ -34,9 +31,24 @@
       "Bash(avr-readelf:*)",
       "Bash(avr-size:*)",
       "Bash(readelf:*)",
-
       "Bash(git:*)",
-      "Bash(gh:*)"
+      "Bash(gh:*)",
+      "Bash(command -v gh)",
+      "Bash(cd /home/john/Projects/avrOS-debug *)",
+      "Read(//tmp/**)",
+      "Bash(cd /home/john/Projects/avrOS-debug; mkdir -p AI-tmp; echo ok)",
+      "Bash(pkill -f 'avrOSdb.*1234')",
+      "Bash(build/avrOSdb --log-rsp --load --port 1234 /dev/ttyAMA2 build/fixtures/gdb_locals.elf)",
+      "Bash(timeout 30 avr-gdb -batch -nx -x AI-tmp/g17_a.gdb build/fixtures/gdb_locals.elf)",
+      "Bash(echo \"gdb exit=$?\")",
+      "Bash(fuser -k 1234/tcp)",
+      "Bash(build/tests/test_device)",
+      "Skill(fewer-permission-prompts)",
+      "Skill(fewer-permission-prompts:*)",
+      "Read(//home/john/Projects/**)"
+    ],
+    "additionalDirectories": [
+      "/home/john/Projects/avrOS-debug"
     ]
   }
 }

@@ -182,6 +182,14 @@ WRONG_FAMILY_ELF := $(FIXBINDIR)/wrong_family.elf
 NOT_AVR_SRC    := $(FIXTUREDIR)/not_avr.c
 NOT_AVR_ELF    := $(FIXBINDIR)/not_avr.elf
 
+# G17 local-variable fixture — built at -O0 (NOT the generic -Os pattern
+# rule) so every local gets a stable stack slot with trivial frame-base
+# DWARF.  This makes the values GDB reports for locals_probe()'s variables
+# deterministic, so the gdb_acceptance G17 test validates avrOSdb's
+# SP/unwind/SRAM read path rather than the optimiser's eliding of locals.
+GDB_LOCALS_SRC := $(FIXTUREDIR)/gdb_locals.c
+GDB_LOCALS_ELF := $(FIXBINDIR)/gdb_locals.elf
+
 # ── Per-test configuration ─────────────────────────────────────────────────────
 # Each entry: TEST_SRCS_<name>, TEST_WRAP_<name>, TEST_EXTRA_LDFLAGS_<name>
 #
@@ -329,6 +337,13 @@ $(NOT_AVR_ELF): $(NOT_AVR_SRC)
 	  $(CC) -o $@ $<
 	@echo "  CC (non-AVR fixture)  $<"
 
+# G17 locals fixture: -O0 so every local keeps a deterministic stack slot.
+# Explicit recipe overrides the generic -Os pattern rule above.
+$(GDB_LOCALS_ELF): $(GDB_LOCALS_SRC)
+	@mkdir -p $(FIXBINDIR)
+	$(Q)$(AVR_CC) -mmcu=$(AVR_MCU) $(DFP_FLAGS) -O0 -g -o $@ $<
+	@echo "  AVR-CC  $<  (-O0, locals fixture)"
+
 # ── Generic rule: build one test binary ──────────────────────────────────────
 # $(1) = test name (e.g. test_elf)
 define TEST_template
@@ -370,7 +385,7 @@ test: fixtures $(addprefix $(TESTBINDIR)/,$(TEST_NAMES))
 
 # ── fixtures target ───────────────────────────────────────────────────────────
 .PHONY: fixtures
-fixtures: $(FIXTURE_ELFS) $(NOT_AVR_ELF) $(WRONG_FAMILY_ELF)
+fixtures: $(FIXTURE_ELFS) $(NOT_AVR_ELF) $(WRONG_FAMILY_ELF) $(GDB_LOCALS_ELF)
 
 # ── test-ci target ────────────────────────────────────────────────────────────
 # Like 'test' but writes each suite's output to build/test-results/<name>.txt
@@ -546,7 +561,8 @@ hw-test-rsp: $(HW_TEST_BIN) all
 # reproducible. DESTRUCTIVE: `(gdb) load` reprograms FLASH from the active ELF.
 HW_GDB_ELF ?= $(FIXBINDIR)/gdb_target.elf
 HW_GDB_G10_ELF ?= tests/hw/fixtures/avrOS_example_main.elf
-hw-test-gdb: $(FIXBINDIR)/gdb_target.elf all
+HW_GDB_G17_ELF ?= $(GDB_LOCALS_ELF)
+hw-test-gdb: $(FIXBINDIR)/gdb_target.elf $(GDB_LOCALS_ELF) all
 	@if [ "$(HW_TEST_NVM_CONFIRM)" != "YES" ]; then \
 	    echo "hw-test-gdb: refused — set HW_TEST_NVM_CONFIRM=YES to confirm"; \
 	    echo "             (this reflashes the target via `(gdb) load`)"; \
@@ -562,6 +578,7 @@ hw-test-gdb: $(FIXBINDIR)/gdb_target.elf all
 	        --rsp-port  '$(if $(HW_RSP_PORT),$(HW_RSP_PORT),1234)' \
 	        --elf       '$(HW_GDB_ELF)' \
 	        --g10-elf   '$(HW_GDB_G10_ELF)' \
+	        --g17-elf   '$(HW_GDB_G17_ELF)' \
 	        --avros-bin '$(BUILDDIR)/$(TARGET)'
 
 # Run Groups A + B + C + D in one go. NVM still requires explicit confirm.

@@ -146,25 +146,27 @@ static void prestuff_fill(int master, uint8_t v, size_t n)
 }
 
 /*
- * Pre-stuff helpers matching the new 3-frame mem_read / mem_write protocol.
+ * Pre-stuff helpers matching the 3-frame mem_read / mem_write protocol.
  *
- *   ST_PTR_WORD frame  : SYNCH, 0x69, addr_lo, addr_hi  → 4 echo + 1 ACK
- *   REPEAT      frame  : SYNCH, 0xA0, count             → 3 echo
- *   LD/ST       frame  : SYNCH, 0x24 or 0x64            → 2 echo
+ * updi_set_ptr() always emits the 24-bit ST_PTR_LONG form (see the comment
+ * on updi_set_ptr in src/updi.c — the 16-bit ST_PTR_WORD form leaves a
+ * stale high pointer byte that misdirects SRAM reads into mapped Flash):
+ *
+ *   ST_PTR_LONG frame  : SYNCH, 0x6A, addr_lo, addr_mid, addr_hi → 5 echo + 1 ACK
+ *   REPEAT      frame  : SYNCH, 0xA0, count                      → 3 echo
+ *   LD/ST       frame  : SYNCH, 0x24 or 0x64                     → 2 echo
  */
 static void prestuff_setptr_ack(int master)
 {
     uint8_t ack = UPDI_ACK;
-    prestuff_fill(master, 0x00, 4);
+    prestuff_fill(master, 0x00, 5);
     prestuff(master, &ack, 1);
 }
 
-/* 24-bit pointer-set: SYNCH, 0x6A, addr_lo, addr_mid, addr_hi -> 5 echo + 1 ACK */
+/* Alias retained for tests that emphasise the 24-bit pointer-set explicitly. */
 static void prestuff_setptr_ack_long(int master)
 {
-    uint8_t ack = UPDI_ACK;
-    prestuff_fill(master, 0x00, 5);
-    prestuff(master, &ack, 1);
+    prestuff_setptr_ack(master);
 }
 
 static void prestuff_repeat_echo(int master)   { prestuff_fill(master, 0x00, 3); }
@@ -233,9 +235,9 @@ static void updi_console_poll_returns_0_when_output_buffer_empty(void)
 
 /*
  * Test 7: 512-byte read splits into two 256-byte bursts.
- * Each burst emits 9 setup bytes:
- *   ST_PTR_WORD (4) + REPEAT (3) + LD ptr++ (2)
- * Total captured TX setup = 18 bytes; total data RX = 512 bytes.
+ * Each burst emits 10 setup bytes:
+ *   ST_PTR_LONG (5) + REPEAT (3) + LD ptr++ (2)
+ * Total captured TX setup = 20 bytes; total data RX = 512 bytes.
  */
 static void updi_mem_read_splits_request_larger_than_256_bytes(void)
 {
@@ -261,34 +263,36 @@ static void updi_mem_read_splits_request_larger_than_256_bytes(void)
     TEST_ASSERT_EQUAL_INT(0, rc);
 
     n = drain_master(g_master_fd, captured, sizeof(captured));
-    TEST_ASSERT_EQUAL_size_t(18u, n);
+    TEST_ASSERT_EQUAL_size_t(20u, n);
 
-    /* Block 1: ST_PTR_WORD frame → 0x55, 0x69, 0x00, 0x01 */
+    /* Block 1: ST_PTR_LONG frame → 0x55, 0x6A, 0x00, 0x01, 0x00 */
     TEST_ASSERT_EQUAL_HEX8(UPDI_SYNCH, captured[0]);
-    TEST_ASSERT_EQUAL_HEX8(0x69u,      captured[1]);   /* ST ptr (word) */
-    TEST_ASSERT_EQUAL_HEX8(0x00u,      captured[2]);
-    TEST_ASSERT_EQUAL_HEX8(0x01u,      captured[3]);
+    TEST_ASSERT_EQUAL_HEX8(0x6Au,      captured[1]);   /* ST ptr (long) */
+    TEST_ASSERT_EQUAL_HEX8(0x00u,      captured[2]);   /* addr_lo       */
+    TEST_ASSERT_EQUAL_HEX8(0x01u,      captured[3]);   /* addr_mid      */
+    TEST_ASSERT_EQUAL_HEX8(0x00u,      captured[4]);   /* addr_hi       */
     /* REPEAT frame */
-    TEST_ASSERT_EQUAL_HEX8(UPDI_SYNCH, captured[4]);
-    TEST_ASSERT_EQUAL_HEX8(0xA0u,      captured[5]);
-    TEST_ASSERT_EQUAL_HEX8(0xFFu,      captured[6]);   /* count = 256-1 */
+    TEST_ASSERT_EQUAL_HEX8(UPDI_SYNCH, captured[5]);
+    TEST_ASSERT_EQUAL_HEX8(0xA0u,      captured[6]);
+    TEST_ASSERT_EQUAL_HEX8(0xFFu,      captured[7]);   /* count = 256-1 */
     /* LD ptr++ frame */
-    TEST_ASSERT_EQUAL_HEX8(UPDI_SYNCH, captured[7]);
-    TEST_ASSERT_EQUAL_HEX8(0x24u,      captured[8]);
+    TEST_ASSERT_EQUAL_HEX8(UPDI_SYNCH, captured[8]);
+    TEST_ASSERT_EQUAL_HEX8(0x24u,      captured[9]);
 
     /* Block 2: addr advances to 0x0200 */
-    TEST_ASSERT_EQUAL_HEX8(UPDI_SYNCH, captured[9]);
-    TEST_ASSERT_EQUAL_HEX8(0x69u,      captured[10]);
-    TEST_ASSERT_EQUAL_HEX8(0x00u,      captured[11]);
-    TEST_ASSERT_EQUAL_HEX8(0x02u,      captured[12]);
-    TEST_ASSERT_EQUAL_HEX8(UPDI_SYNCH, captured[13]);
-    TEST_ASSERT_EQUAL_HEX8(0xA0u,      captured[14]);
-    TEST_ASSERT_EQUAL_HEX8(0xFFu,      captured[15]);
-    TEST_ASSERT_EQUAL_HEX8(UPDI_SYNCH, captured[16]);
-    TEST_ASSERT_EQUAL_HEX8(0x24u,      captured[17]);
+    TEST_ASSERT_EQUAL_HEX8(UPDI_SYNCH, captured[10]);
+    TEST_ASSERT_EQUAL_HEX8(0x6Au,      captured[11]);
+    TEST_ASSERT_EQUAL_HEX8(0x00u,      captured[12]);  /* addr_lo  */
+    TEST_ASSERT_EQUAL_HEX8(0x02u,      captured[13]);  /* addr_mid */
+    TEST_ASSERT_EQUAL_HEX8(0x00u,      captured[14]);  /* addr_hi  */
+    TEST_ASSERT_EQUAL_HEX8(UPDI_SYNCH, captured[15]);
+    TEST_ASSERT_EQUAL_HEX8(0xA0u,      captured[16]);
+    TEST_ASSERT_EQUAL_HEX8(0xFFu,      captured[17]);
+    TEST_ASSERT_EQUAL_HEX8(UPDI_SYNCH, captured[18]);
+    TEST_ASSERT_EQUAL_HEX8(0x24u,      captured[19]);
 }
 
-/* Test 8: every mem_read block uses ST_PTR(0x69) + REPEAT(0xA0) + LD(0x24) */
+/* Test 8: every mem_read block uses ST_PTR_LONG(0x6A) + REPEAT(0xA0) + LD(0x24) */
 static void updi_mem_read_uses_repeat_ld_auto_increment_sequence(void)
 {
     uint8_t  databuf[16];
@@ -306,10 +310,10 @@ static void updi_mem_read_uses_repeat_ld_auto_increment_sequence(void)
     TEST_ASSERT_EQUAL_INT(0, rc);
 
     n = drain_master(g_master_fd, captured, sizeof(captured));
-    TEST_ASSERT_EQUAL_size_t(9u, n);
-    TEST_ASSERT_EQUAL_HEX8(0x69u, captured[1]);    /* ST ptr (word)  */
-    TEST_ASSERT_EQUAL_HEX8(0xA0u, captured[5]);    /* REPEAT         */
-    TEST_ASSERT_EQUAL_HEX8(0x24u, captured[8]);    /* LD ptr++       */
+    TEST_ASSERT_EQUAL_size_t(10u, n);
+    TEST_ASSERT_EQUAL_HEX8(0x6Au, captured[1]);    /* ST ptr (long)  */
+    TEST_ASSERT_EQUAL_HEX8(0xA0u, captured[6]);    /* REPEAT         */
+    TEST_ASSERT_EQUAL_HEX8(0x24u, captured[9]);    /* LD ptr++       */
 }
 
 /* Test 8b: mem_read uses 24-bit ST_PTR (0x6A) when addr > 0xFFFF
