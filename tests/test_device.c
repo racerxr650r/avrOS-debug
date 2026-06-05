@@ -271,12 +271,13 @@ static void prestuff_fill(int master, uint8_t v, size_t n)
     }
 }
 
-/* mem_read 3-frame setup: ST_PTR_WORD (4 echo + ACK) + REPEAT (3 echo)
- * + LD ptr++ (2 echo). */
+/* mem_read 3-frame setup: ST_PTR_LONG (5 echo + ACK) + REPEAT (3 echo)
+ * + LD ptr++ (2 echo).  updi_set_ptr() always uses the 24-bit ST_PTR_LONG
+ * form now (see the comment on updi_set_ptr in src/updi.c). */
 static void prestuff_memread_setup(int master)
 {
     uint8_t ack = UPDI_ACK;
-    prestuff_fill(master, 0x00, 4);          /* ST_PTR_WORD echo */
+    prestuff_fill(master, 0x00, 5);          /* ST_PTR_LONG echo */
     prestuff(master, &ack, 1);               /* ACK              */
     prestuff_fill(master, 0x00, 3);          /* REPEAT echo      */
     prestuff_fill(master, 0x00, 2);          /* LD ptr++ echo    */

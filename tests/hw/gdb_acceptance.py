@@ -17,6 +17,10 @@ the Phase-10 *avarice feature-parity* acceptance criteria from the SDP:
     G11 stop at ``main.c:139`` in the avrOS example and ``step`` into
         ``fsmDispatch()`` rather than running on to the later
         ``gpioClearOutput()`` call
+    G17 break inside ``locals_probe()`` and read back every local (one per
+        representative C data type) from its own frame, verifying each
+        reported value matches the constant the fixture assigned — catches
+        SP/SRAM read bugs that surface as garbage locals in GDB / Cortex-Debug
 
 (Data watchpoints — G5 in earlier drafts — are intentionally not
 exercised here: AVR-Dx UPDI silicon does not expose data-watchpoint
@@ -281,6 +285,40 @@ PER_TEST_CMDS: dict[int, str] = {
          "x/i $pc\n"
          "continue\n"                    # next dispatch must re-hit the SW BP (#2)
          "info registers pc\n"),
+    # G17: local-variable value correctness + backtrace integrity. Break
+    # INSIDE locals_probe() on the g_probe_hit anchor line where every local
+    # is assigned and still live, read each back, then `bt`. Both surfaces
+    # read SRAM off the stack and both were broken by the ST_PTR_WORD
+    # stale-high-byte bug (a Flash read by GDB left the UPDI pointer high byte
+    # at 0x80, so the following 16-bit-pointer SRAM read was misdirected into
+    # mapped Flash and returned erased 0xFF): locals came back as 0xFF/garbage
+    # and the return-address read gave a bogus 0x1fffe frame. With the 24-bit
+    # ST_PTR_LONG fix every local reads its known constant and `bt` reaches
+    # main. The `break gdb_locals.c:67` line must track the g_probe_hit anchor
+    # in tests/fixtures/gdb_locals.c. Runs against the -O0 gdb_locals fixture
+    # so the values are deterministic and not optimiser-dependent.
+    17: ("mem 0x0 0x20000 rw\nmem 0x804000 0x808000 rw\n"
+         "monitor reset\n"
+         "tbreak main\n"
+         "continue\n"
+         "break gdb_locals.c:67\n"       # the g_probe_hit anchor line
+         "continue\n"                    # stop inside locals_probe()
+         "info locals\n"
+         "print u8\n"
+         "print i8\n"
+         "print u16\n"
+         "print i16\n"
+         "print u32\n"
+         "print i32\n"
+         "print u64\n"
+         "print ch\n"
+         "print flag\n"
+         "print f\n"
+         "print arr\n"
+         "print pt\n"
+         "print name\n"
+         "print *pmark\n"
+         "bt\n"),                        # must reach main (return-addr SRAM read)
 }
 
 # Per-test wall-clock cap (s) when running `avr-gdb -batch`. G2 has to
@@ -301,6 +339,7 @@ PER_TEST_TIMEOUT: dict[int, float] = {
     14: 20.0,
     15: 25.0,
     16: 25.0,
+    17: 25.0,
 }
 
 def build_test_script(n: int, rsp_port: int) -> str:
@@ -524,6 +563,55 @@ def verdict_G14(sect: str) -> Tuple[str, str]:
         return "FAIL", "monitor avros tasks listed no FSMs"
     return "PASS", ""
 
+def verdict_G17(sect: str) -> Tuple[str, str]:
+    # Local-variable value correctness. Stopped inside locals_probe(), each
+    # `print <var>` must report the exact constant the fixture assigned. A
+    # wrong value means avrOSdb mis-read SP/the frame pointer or mis-read
+    # SRAM — the failure that shows garbage locals in GDB / Cortex-Debug. We
+    # match each value as it appears in GDB's default formatting; the
+    # constants are deliberately distinctive.
+    if "Error in sourced command file" in sect:
+        return "FAIL", "GDB command failed before reading locals"
+    if "remote failure" in sect.lower():
+        return "FAIL", "remote read failed while inspecting locals"
+    if re.search(r"No symbol .* in current context", sect):
+        return "FAIL", "locals not in scope (frame/DWARF not resolved)"
+    if re.search(r"No locals\.", sect):
+        return "FAIL", "`info locals` reported no locals in locals_probe frame"
+
+    # (label, regex against the transcript) for each typed local. Anchored on
+    # `= <value>` so we match the `print` result, not an incidental address.
+    checks = [
+        ("u8",        r"=\s*165\b"),
+        ("i8",        r"=\s*-42\b"),
+        ("u16",       r"=\s*48879\b"),
+        ("i16",       r"=\s*-12345\b"),
+        ("u32",       r"=\s*3735928559\b"),
+        ("i32",       r"=\s*-123456789\b"),
+        ("u64",       r"=\s*81985529216486895\b"),
+        ("ch",        r"=\s*81 '[Q]'"),
+        ("flag",      r"=\s*true\b"),
+        ("f",         r"=\s*3\.5\b"),
+        ("arr",       r"=\s*\{4369,\s*8738,\s*13107,\s*17476\}"),
+        ("pt",        r"=\s*\{x\s*=\s*1000,\s*y\s*=\s*-2000\}"),
+        ("name",      r'=\s*"avrOS"'),
+        ("*pmark",    r"=\s*51966\b"),
+    ]
+    missing = [name for name, pat in checks
+               if not re.search(pat, sect)]
+    if missing:
+        return "FAIL", ("wrong/missing local value(s): "
+                        + ", ".join(missing))
+    # Backtrace must unwind locals_probe -> main. The same SRAM-read bug that
+    # corrupts locals also corrupts the return address read off the stack,
+    # which surfaces as a bogus "#1  0x0001fffe in ?? ()" frame.
+    if not re.search(r"^#1\s+.*\bmain\b", sect, re.MULTILINE):
+        if re.search(r"^#1\s+0x0*1fffe", sect, re.MULTILINE):
+            return "FAIL", ("backtrace return address read as 0xFF "
+                            "(#1 = 0x1fffe): stack SRAM read corrupted")
+        return "FAIL", "backtrace did not unwind locals_probe -> main"
+    return "PASS", ""
+
 def verdict_G8(sect: str) -> Tuple[str, str]:
     # Continue must produce breakpoint hit lines for blink, blink2, blink3
     hits_blink = len(re.findall(r"Breakpoint \d+,.*\bblink\b", sect))
@@ -556,6 +644,7 @@ VERDICTS = {
     14: ("demote: bt clean single-thread + avros tasks lists FSMs", verdict_G14),
     15: ("HW-comparator arbiter: user hbreak survives a 32-bit LDS stepi", verdict_G15),
     16: ("HW-comparator arbiter: user SW breakpoint survives a 32-bit LDS stepi", verdict_G16),
+    17: ("local variable values are reported correctly", verdict_G17),
 }
 
 # ──────────────────────────────────────────────────────────────────────
@@ -573,6 +662,10 @@ def main() -> int:
                                             DEFAULT_G10_ELF),
                     help="ELF used only for G10 FSM-thread reset coverage "
                          "(default %(default)s)")
+    ap.add_argument("--g17-elf",    default=os.environ.get("HW_GDB_G17_ELF",
+                                            "build/fixtures/gdb_locals.elf"),
+                    help="ELF used only for G17 local-variable value "
+                         "coverage; built at -O0 (default %(default)s)")
     ap.add_argument("--rsp-port",   type=int,
                     default=int(os.environ.get("HW_RSP_PORT", "1234")),
                     help="TCP port for avrOSdb (default %(default)s)")
@@ -600,6 +693,10 @@ def main() -> int:
         print(f"hw-test: gdb_acceptance: missing G10 ELF {args.g10_elf}",
               file=sys.stderr)
         return 1
+    if not os.path.isfile(args.g17_elf):
+        print(f"hw-test: gdb_acceptance: missing G17 ELF {args.g17_elf}",
+              file=sys.stderr)
+        return 1
 
     print(
         "hw-test: --- Group G (full-stack avr-gdb acceptance) ---",
@@ -625,12 +722,17 @@ def main() -> int:
         for n in sorted(VERDICTS):
             if n == 9:
                 desired_extra_args = ["--log-rsp", "--no-introspect"]
-            elif n in (10, 11, 12, 13, 14, 15, 16):
+            elif n in (10, 11, 12, 13, 14, 15, 16, 17):
                 desired_extra_args = ["--log-rsp", "--load"]
             else:
                 desired_extra_args = ["--log-rsp"]
-            desired_elf = args.g10_elf if n in (10, 11, 12, 13, 14, 15, 16) else args.elf
-            force_restart = (n in (11, 12, 13, 14, 15, 16))
+            if n == 17:
+                desired_elf = args.g17_elf
+            elif n in (10, 11, 12, 13, 14, 15, 16):
+                desired_elf = args.g10_elf
+            else:
+                desired_elf = args.elf
+            force_restart = (n in (11, 12, 13, 14, 15, 16, 17))
             if (force_restart or desired_extra_args != current_extra_args or
                     desired_elf != current_elf):
                 kill_server(server)
