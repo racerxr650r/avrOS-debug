@@ -39,6 +39,7 @@
       <file path="src/monitor.c">Custom monitor command handler: implements the `avros events` and `avros queues` sub-commands via non-intrusive UPDI reads.</file>
       <file path="Makefile">Build orchestration: compile, test, install, uninstall, check-tools, and bundle (Debian .deb, Red Hat .rpm, Homebrew formula) targets.</file>
       <file path="tests/hw/hw_test.c">On-target hardware integration test harness: links against `src/updi.c` and exercises the live UPDI silicon, device-info report, SRAM round-trips, NVM page programming, and the RSP server's TCP path. Manual-only — never wired into `make test`.</file>
+      <file path="tests/hw/gdb_acceptance.py">On-target GDB acceptance harness (Group-G): drives a real `avr-gdb` against live silicon through `avrOSdb` over UPDI and applies per-test verdict functions to the transcript. Manual-only (`make hw-test-gdb`) — never wired into `make test`.</file>
       <file path="doc/avrOSdb.1">Unix man page: reference documentation for the avrOSdb command.</file>
       <outro><![CDATA[It does not cover the build system, IDE adapter layers (Cortex-Debug, Zed DAP), or Windows support, all of which are out of scope for the initial release (see `doc/PVD.md §7.2`).]]></outro>
     </scope>
@@ -1881,7 +1882,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-UPDI-04">
-        <text><![CDATA[`updi_mem_read()` and `updi_mem_write()` shall transfer up to `UPDI_MAX_BLOCK` (256) bytes per UPDI burst using a three-frame sequence per datasheet §35.3.3.4: (1) a pointer-set frame — `ST_PTR_WORD` (`0x69`) followed by the 16-bit target address in little-endian order when `addr ≤ 0xFFFF`, or `ST_PTR_LONG` (`0x6A`) followed by the 24-bit address in little-endian order when `addr > 0xFFFF` — with a single ACK readback; (2) `REPEAT` (`0xA0`) followed by `(block_len - 1)`; (3) `LD ptr++` (`0x24`) for reads or `ST ptr++` (`0x64`) for writes. The selection between the 16-bit and 24-bit pointer-set forms shall be automatic based on the requested address, with the 24-bit form required for access to the AVR128DA/DB mapped-Flash region above 64 KiB. If `len` exceeds `UPDI_MAX_BLOCK`, the function shall split the request into consecutive bursts automatically, with no size restriction imposed on the caller.]]></text>
+        <text><![CDATA[`updi_mem_read()` and `updi_mem_write()` shall transfer up to `UPDI_MAX_BLOCK` (256) bytes per UPDI burst using a three-frame sequence per datasheet §35.3.3.4: (1) a pointer-set frame — `ST_PTR_WORD` (`0x69`) followed by the 16-bit target address in little-endian order when `addr ≤ 0xFFFF`, or `ST_PTR_LONG` (`0x6A`) followed by the 24-bit address in little-endian order when `addr > 0xFFFF` — with a single ACK readback; (2) `REPEAT` (`0xA0`) followed by `(block_len - 1)`; (3) `LD ptr++` (`0x24`) for reads or `ST ptr++` (`0x64`) for writes. The pointer-set frame shall always use the 24-bit `ST_PTR_LONG` (`0x6A`) form regardless of the requested address (see LLR-UPDI-33, which mandates the 24-bit form unconditionally to avoid the stale-high-byte hazard); the 16-bit `ST_PTR_WORD` (`0x69`) form is never used. The 24-bit form covers every address, including the AVR128DA/DB mapped-Flash region above 64 KiB. If `len` exceeds `UPDI_MAX_BLOCK`, the function shall split the request into consecutive bursts automatically, with no size restriction imposed on the caller.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-007" name="Target Memory Read"/>
           <trace target="HLR" ref="HLR-008" name="Target Memory Write"/>
@@ -2089,6 +2090,14 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <text><![CDATA[`updi_format_fuses(family, fuse_buf, fuse_len, lock_buf, lock_len, out, out_size)` shall format a human-readable decode of the supplied FUSES window and 4-byte LOCK window into the caller-supplied `out` buffer (NUL-terminated, truncating at `out_size - 1` characters). The decode shall consist of: (1) a header line `Fuses (<family>, <fuse_len> bytes):`; (2) for each byte covered by the per-family fuse table, one indented line `  0x%02X  <FUSE_NAME>%-22s = 0x%02X` followed by indented sub-lines naming each documented bit-field with human-readable enum names (e.g. `WDTCFG.PERIOD = 8K`); (3) for each fuse byte without a registered decoder, one indented line `  0x%02X  (reserved) raw=0x%02X`; (4) a final line `Lock: 0x%08X (UNLOCKED|LOCKED)` where `UNLOCKED` is the canonical 4-byte little-endian value `UPDI_LOCK_UNLOCKED = 0x5CC5C55C` and any other value is reported as `LOCKED`. The decoder tables (`FuseField` struct and `g_avr_dx_fuses[]`) shall live alongside `g_device_table[]` in `src/updi.c` so they are selected by the same `updi_select_device()` runtime path. Phase 9 ships the AVR-DA/AVR-DB table; for other families the function shall emit only the reserved-style lines for every byte (no bit-field decoding). Returns the number of bytes written to `out` (excluding the terminating NUL).]]></text>
         <traces>
           <trace target="HLR" ref="HLR-051" name="Fuses Pretty-Printer in Device Mode"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-UPDI-33">
+        <text><![CDATA[`updi_set_ptr(fd, addr)` shall ALWAYS set the UPDI burst pointer with the 24-bit `ST_PTR_LONG` (`0x6A`) form — `SYNCH`, `ST_PTR_LONG`, `addr` bytes 0..2 in little-endian order, single ACK — for every address, including addresses ≤ 0xFFFF. The 16-bit `ST_PTR_WORD` (`0x69`) form shall never be used. Rationale: `ST_PTR_WORD` updates only the low two pointer bytes and leaves the high byte (bits 16..23) at whatever a previous `ST_PTR_LONG` left it. AVR-Dx mapped-Flash reads set that high byte to `0x80`, so a following 16-bit SRAM read (UPDI `0x004000..0x007FFF`) was misdirected to `0x80xxxx` (mapped Flash) and returned erased `0xFF` on a sparsely-programmed part. Because GDB interleaves Flash reads (code and line tables) with stack reads, this surfaced as intermittently garbage local-variable values and bogus `0x1fffe` backtraces whenever a Flash read preceded a stack read. Emitting the full 24-bit pointer on every pointer-set removes the stale-high-byte hazard (this is also what avrdude's `serialupdi` does). Verified on hardware: an interleaved 16-bit-vs-24-bit A/B test in the same fault window was 0/12 vs 12/12 correct.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-007" name="Target Memory Read"/>
+          <trace target="HLR" ref="HLR-008" name="Target Memory Write"/>
         </traces>
       </llr>
     </function>
@@ -2983,8 +2992,8 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </test>
 
       <test name="updi_mem_read_uses_repeat_ld_auto_increment_sequence">
-        <purpose><![CDATA[Capture the bytes written to the UART and verify the three-frame burst: byte 0 = `ST_PTR_WORD` (`0x69`), bytes 1–2 = address little-endian, frame 2 = `REPEAT` (`0xA0`) + count, frame 3 = `LD ptr++` (`0x24`).]]></purpose>
-        <traces><trace target="LLR" ref="LLR-UPDI-04"/></traces>
+        <purpose><![CDATA[Read a low SRAM address (`0x0100`) and capture the bytes written to the UART to verify the three-frame burst uses the 24-bit pointer-set even below 64 KiB: frame 1 = `ST_PTR_LONG` (`0x6A`, captured[1]) + 3 little-endian address bytes, frame 2 = `REPEAT` (`0xA0`, captured[6]) + count, frame 3 = `LD ptr++` (`0x24`, captured[9]) — a 10-byte burst. Regression guard for the always-24-bit pointer-set (LLR-UPDI-33).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-04"/><trace target="LLR" ref="LLR-UPDI-33"/></traces>
       </test>
 
       <test name="updi_mem_read_uses_24bit_addressing_above_64kib">
@@ -4129,6 +4138,18 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="F3_prog_mode_end_to_end_with_verify">
         <purpose><![CDATA[Destructive — gated by `HW_TEST_NVM_CONFIRM=YES`. With the harness UPDI fd closed, `fork` and `execl` the production `build/avrOSdb --prog --erase --baud <N> <port> <elf>` against the bench ELF (`build/fixtures/all_nvm.elf` by default, which intentionally avoids FUSES/LOCK windows so the bench stays in a known state). Capture the child's stdout+stderr through an 8 KiB buffer. PASS if `WEXITSTATUS == 0` AND the captured output contains the literal `verify: OK`. Validates `--prog` end-to-end including chip-erase, FLASH/EEPROM/USERROW programming, and read-back verify against live silicon.]]></purpose>
         <traces><trace target="LLR" ref="LLR-HWTEST-07"/><trace target="LLR" ref="LLR-MAIN-15"/><trace target="LLR" ref="LLR-MAIN-16"/></traces>
+      </test>
+    </file>
+
+    <!-- ============================================================ -->
+    <!-- On-target GDB acceptance harness (Group G; manual; not in CI)-->
+    <!-- ============================================================ -->
+    <file path="tests/hw/gdb_acceptance.py" role="hardware" count="1">
+      <header><![CDATA[On-target GDB acceptance harness (Group-G tests) that drives a real `avr-gdb` against a live AVR-Dx through `avrOSdb` over UPDI, scripting `-batch` command sequences and applying per-test verdict functions to the transcript. Manual-only: never invoked by `make test`. Driven by `make hw-test-gdb`. Only the test that regression-guards the ST_PTR_LONG SRAM-read fix is traced here; the remaining Group-G cases are not yet individually tracked.]]></header>
+
+      <test name="G17_local_variable_values_and_backtrace">
+        <purpose><![CDATA[Regression guard for the always-24-bit `ST_PTR_LONG` pointer-set (LLR-UPDI-33). Break inside `locals_probe()` in the `-O0` `gdb_locals` fixture where one local of each representative C type is assigned and still live, then `print` each local and run `bt`. Every local must read back the exact constant the fixture assigned and the backtrace must reach `main`. Both surfaces read SRAM off the stack and both were corrupted by the stale-high-byte bug — a Flash read by GDB left the UPDI pointer high byte at `0x80`, so the following 16-bit-pointer SRAM read was misdirected into mapped Flash and returned erased `0xFF`, yielding `0xFF`/garbage locals and a bogus `0x1fffe` return-address frame. With the 24-bit fix every local reads its known value and `bt` is clean.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-33"/></traces>
       </test>
     </file>
 
