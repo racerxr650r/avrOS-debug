@@ -30,6 +30,9 @@
 | [8](#phase-8--non-flash-nvm-programming) | EEPROM / FUSE / USERROW / LOCKBIT programming from ELF segments | 🔲 Not started |
 | [10](#phase-10--gdb-protocol-completion--avarice-feature-parity) | `vFlash*` + true SW breakpoints + watchpoints + monitor verbs + extended-remote | 🔲 Not started |
 | [11](#phase-11--rsp-capability-honesty--multiprocess-correctness) | Proper `multiprocess+` thread-ID parsing, `qThreadExtraInfo` FSM labels, `swbreak+`/`hwbreak+` stop tags, richer `qSupported`, `vKill` listener-survival, exit/disconnect logging, `vCont;r` range-step | 🔲 Not started |
+| [12](#phase-12--demote-fsm-threading-to-introspection--breakpoint-regression-net) | Demote FSM-as-GDB-threads to `monitor avros tasks` introspection + breakpoint regression net | ✅ Complete (PR [#43](https://github.com/racerxr650r/avrOS-debug/pull/43)) |
+| [13](#phase-13--hw-comparator-arbiter-with-a-reserved-single-step-slot) | HW-comparator arbiter: 1 user HW BP + 1 reserved single-step slot (SW BPs unlimited) | ✅ Complete (PR [#46](https://github.com/racerxr650r/avrOS-debug/pull/46)) |
+| [14](#phase-14--full-debug-session-hw-test-coverage) | Full interactive debug-session `hw-test` coverage (G18–G24): breakpoints, stepping, frames, locals/globals | 🚧 In progress |
 
 ## 0. Required Tools for Development
 
@@ -957,6 +960,36 @@ This is not a fixable detail — it is a **model mismatch**. avrOS is a cooperat
 - **Unit:** a second HW-breakpoint request returns `E08`; `stepi` over a 32-bit `LDS`/`STS` with a user HW BP in slot 0 leaves that BP armed (shadow and silicon consistent).
 - **Hardware (`hw-test-gdb`):** set an `hbreak`, `stepi` over an `LDS`/`STS`, and confirm the `hbreak` still fires afterward — no desync; stepping succeeds with the user HW BP present.
 - **Gate:** full unit suite passes, `make` 0 warnings, `python3 tools/lint_project.py` 0 errors / 0 warnings.
+
+### Phase 14 — Full Debug-Session `hw-test` Coverage
+
+> **Status: 🚧 In progress (issue [#48](https://github.com/racerxr650r/avrOS-debug/issues/48), branch `48-phase-14-debug-session-hw-tests`).** Implemented: the deterministic `-O0` fixture `tests/fixtures/gdb_debug_session.c` (`main → top → mid → leaf` chain, constant seed, scalar/struct/array globals, per-frame locals/params); its Makefile build rule + `fixtures` wiring + the new `--dbg-elf` / `HW_GDB_DBG_ELF` knob into `hw-test-gdb`; seven new Group-G cases **G18–G24** with strict verdicts in `tests/hw/gdb_acceptance.py`; and the spec (HLR-070 + STP G18–G24 entries, traced and rendered). **The new suite caught a real avrOSdb defect** (the headline goal of this phase): on resume after a software-breakpoint flash patch, the silicon's fresh-`OCD.PC`-write one-instruction skip silently dropped the instruction the CPU was halted on (function arguments read back as 0). Fixed via a `pc_dirty` flag + resume-time instruction injection (`updi_ocd_step_inject_word0`, `consume_pc_skip` in `dh_continue`/`dh_step`; **LLR-UPDI-34**, **LLR-RSP-50** + two unit tests). The four pre-existing avrOS-example timeouts (G11/G12/G15/G16) were also root-caused and fixed: (a) the committed `tests/hw/fixtures/avrOS_example_main.elf` was stale and hung in startup on the bench — refreshed from the current avrOS build (fixes G11/G12/G15); and (b) **G16** (SW breakpoint + 32-bit `LDS` stepi) could not re-fire because every SW-breakpoint flash patch enters NVMPROG, whose mandatory `ASI_RESET_REQ` system-reset pulse resets the AVR-Dx peripherals — including the avrOS tick timer — so the firmware's tick-driven `sysSleep()` blocks and the dispatch loop never iterates again (a fundamental UPDI/NVMPROG constraint, not an avrOSdb defect; the HW path G15 is unaffected and exercises re-fire). G16 was restructured to verify SW-BP survival of the LDS stepi structurally (fires once, PC advances across the LDS block, BP still installed) instead of by re-fire. Hardware-verified on AVR128DA28 (`/dev/ttyAMA2`): **all 24 Group-G cases (G1–G24) pass**. `make`: 0 warnings; `make test`: all suites pass except the pre-existing `test_device` fork-harness failure already present on `develop`; `lint_project`: 0/0. **Remaining gate:** flip this blockquote to ✅ Complete with the merge commit.
+
+**Motivation.** Validating avrOSdb against a real debugger has been a slow, manual loop: open a Cortex-Debug session, try a scenario by hand, notice something wrong, debug from there. Every issue we hit recently (garbage locals from the ST_PTR_LONG bug, bogus backtraces, step-over breakpoint clobbering) was reproducible and could have been caught automatically by an acceptance suite that emulates a *full interactive debug session* — instead of being found by hand. The existing Group-G cases cover individual primitives (load, single breakpoint, one `step`, `monitor` verbs, the comparator arbiter, G17 locals); they do **not** exercise the combinations a real session uses: a multi-frame call stack, step into/over/out across frames, frame-scoped locals, globals, conditional/multiple breakpoints, and specific-variable checks. Tracked as GitHub issue [#48](https://github.com/racerxr650r/avrOS-debug/issues/48); bound to **HLR-070** in `doc/Project.xml` §10.
+
+**Architectural constraint.** Phase 14 adds no source-code behaviour to `avrOSdb` itself — it is a test-harness + fixture + spec phase. The Layered Architecture rule is therefore unaffected; the only new build artefact is an AVR ELF fixture, and the only new host code is in `tests/hw/gdb_acceptance.py`.
+
+**Approach.**
+
+- New deterministic bare-metal fixture `tests/fixtures/gdb_debug_session.c` with an explicit 4-deep call chain (`main → top → mid → leaf`), globals (scalar, struct, array, constant marker), and per-frame locals/params, built at `-O0` (like `gdb_locals.c`) so frames and values are deterministic and the suite tests avrOSdb's plumbing rather than the optimiser. Functions are `noinline`; the harness sets breakpoints by **symbol** (never line number) so it is robust to edits in the fixture. Known first-hit values: `leaf(7,2)=49397`, `leaf(7,3)=49405`, `g_marker=49374`, `g_cfg={base=100,gain=-7}`, `g_arr={10,20,30,40}`.
+- New Group-G cases **G18–G24** with command sequences and strict verdict functions in `gdb_acceptance.py`, flashed via the server's `--load` path and selected through a new `--dbg-elf` / `HW_GDB_DBG_ELF` knob.
+- Spec: a new HLR (**HLR-070**) for the interactive debug-session acceptance suite plus per-case STP entries (via the **tracer** skill), rendered and lint-clean.
+
+**Scope summary.**
+
+| Case | Coverage |
+| ---- | -------- |
+| G18 | Multi-frame backtrace reaches `main` in order; frame selection (`frame N`/`up`/`down`) with per-frame `info args` |
+| G19 | `step` (into), `next` (over a call), `finish` (out) with the correct returned value (`49405`) |
+| G20 | Multiple simultaneous breakpoints hit in call order (`top → mid → leaf`) |
+| G21 | Conditional breakpoint (`break leaf if b == 3`) skips `leaf(7,2)`, stops at `leaf(7,3)` |
+| G22 | Globals: scalar, struct (+ fields), array (+ element) read back exactly |
+| G23 | Per-frame `info args` (`a=7,b=2`) and `info locals` (`prod=14,sum=9`) |
+| G24 | Capstone: a realistic session start-to-finish combining all of the above |
+
+**Acceptance.**
+- **Hardware (`hw-test-gdb`):** `make hw-test-gdb HW_TEST_NVM_CONFIRM=YES` runs G18–G24 green on AVR128DA28.
+- **Gate:** `make` 0 warnings; `make test` all suites pass (the new cases stay out of `make test`); `python3 tools/lint_project.py` 0 errors / 0 warnings; no `<placeholder>` text remains.
 
 ## 9. Risks & Open Questions
 

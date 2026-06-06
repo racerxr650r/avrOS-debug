@@ -512,7 +512,14 @@ static int sw_bp_patch_flash(RspContext *ctx, uint32_t byte_addr,
         }
     }
 
-    return sw_bp_restore_cpu(updi_fd, gpr, sreg, sp, pc);
+    if (sw_bp_restore_cpu(updi_fd, gpr, sreg, sp, pc) < 0) return -1;
+
+    /* The restore above re-wrote OCD.PC after the NVMPROG system-reset.
+     * A fresh OCD.PC write makes the silicon skip the instruction at PC on
+     * the next step/run; mark the PC dirty so the next resume executes that
+     * instruction via injection (consume_pc_skip) rather than skipping it. */
+    ctx->pc_dirty = true;
+    return 0;
 }
 
 /* HLR-056: data-address watchpoints over UPDI are not implemented in
@@ -847,6 +854,51 @@ static int continue_step_over_leading_cof(RspContext *ctx)
     return 0;
 }
 
+/* When a SW-breakpoint flash patch (Z0/z0) has just re-written OCD.PC after
+ * its NVMPROG round-trip, the silicon will skip the instruction at PC on the
+ * next step/run (ctx->pc_dirty; see RspContext).  Execute that one
+ * instruction here via instruction injection — which feeds the opcode to the
+ * core directly and is immune to the fresh-PC-write skip — so the resume
+ * does not silently lose it.  Direct 32-bit CALL/JMP at PC is left to the
+ * caller's change-of-flow emulation (it rewrites OCD.PC to the target
+ * anyway, so the skip is moot).  Returns 1 if an instruction was injected
+ * and executed, 0 if nothing was done (not dirty, or a CoF left for the
+ * caller), -1 on UPDI error.  Always clears ctx->pc_dirty.                */
+static int consume_pc_skip(RspContext *ctx)
+{
+    if (!ctx->pc_dirty) return 0;
+    ctx->pc_dirty = false;
+
+    int updi_fd = ctx->updi_fd;
+    uint32_t pc = 0;
+    if (updi_ocd_read_pc(updi_fd, &pc) < 0) return -1;
+
+    uint8_t op[4] = {0};
+    if (updi_mem_read(updi_fd, pc | UPDI_FLASH_BASE, op, 4) < 0) return -1;
+    uint16_t w0 = (uint16_t)op[0] | ((uint16_t)op[1] << 8);
+
+    /* Leave a direct 32-bit CALL/JMP to the CoF emulator. */
+    if ((w0 & 0xFE0Eu) == 0x940Eu || (w0 & 0xFE0Eu) == 0x940Cu)
+        return 0;
+
+    /* If a BREAK is currently patched at PC (an active SW breakpoint we are
+     * resuming over), inject the saved original opcode word instead. */
+    uint16_t exec_w0 = w0;
+    if (w0 == ((uint16_t)SW_BP_BREAK_BYTES[0]
+               | ((uint16_t)SW_BP_BREAK_BYTES[1] << 8))) {
+        for (int i = 0; i < RSP_MAX_SW_BREAKPOINTS; i++) {
+            if (ctx->sw_bp[i].in_use && ctx->sw_bp[i].addr == pc) {
+                exec_w0 = (uint16_t)ctx->sw_bp[i].orig[0]
+                        | ((uint16_t)ctx->sw_bp[i].orig[1] << 8);
+                break;
+            }
+        }
+    }
+
+    if (updi_ocd_step_inject_word0(updi_fd, exec_w0) < 0) return -1;
+    return 1;
+}
+
 static int dh_continue(int fd, const char *pkt, void *vctx)
 {
     (void)pkt;
@@ -855,6 +907,10 @@ static int dh_continue(int fd, const char *pkt, void *vctx)
     /* HLR-062: clear the previous-halt cause hint so a stale tag
      * never bleeds across resumes.                                  */
     ctx->last_stop_cause = SC_NONE;
+    /* If a prior SW-BP flash patch left OCD.PC freshly written, execute the
+     * instruction at PC via injection so the upcoming free-run does not skip
+     * it (the silicon's fresh-PC-write one-instruction skip).            */
+    if (consume_pc_skip(ctx) < 0) return reply_err(fd, "E01");
     /* HLR-062 (issue #40): emulate a direct 32-bit CALL/JMP parked at
      * the resume PC so the OCD "first change-of-flow after RUN" quirk
      * does not skip breakpoints inside the callee.                   */
@@ -945,6 +1001,25 @@ static int dh_step(int fd, const char *pkt, void *vctx)
      * hint with SC_STEP so classify_stop_cause() returns it when
      * neither shadow matches.                                       */
     ctx->last_stop_cause = SC_NONE;
+
+    /* If a prior SW-BP flash patch left OCD.PC freshly written, the single
+     * step must execute the instruction at PC via injection (immune to the
+     * fresh-PC-write skip).  consume_pc_skip() does exactly one instruction
+     * when it returns 1 — that IS this step, so report the stop and return.
+     * A direct 32-bit CALL/JMP returns 0 and falls through to the normal
+     * change-of-flow step path below.                                     */
+    {
+        int cs = consume_pc_skip(ctx);
+        if (cs < 0) return reply_err(fd, "E01");
+        if (cs == 1) {
+            fsm_invalidate(ctx->fsm);
+            if (ctx->fsm) {
+                (void)fsm_build_thread_list(ctx->fsm, ctx->idx, ctx->updi_fd);
+            }
+            ctx->last_stop_cause = classify_stop_cause(ctx, SC_STEP);
+            return dh_halt_reason(fd, "?", vctx);
+        }
+    }
 
     /* Detect if current instruction is 32-bit (AVR UPDI hardware stepper errata workaround) */
     uint32_t pc_byte = 0;

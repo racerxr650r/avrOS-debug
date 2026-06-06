@@ -1185,6 +1185,20 @@ fail:
     return -1;
 }
 
+int updi_ocd_step_inject_word0(int fd, uint16_t word0)
+{
+    /* Inject the first opcode word and single-step WITHOUT PCHOLD so the
+     * core executes the injected instruction and advances PC normally
+     * (guesswork.md: "if we inject the first word only, the second word is
+     * fetched from flash, and PC increases by two"; a single-word op
+     * advances PC by one).  No PC write here, so the fresh-PC-write skip
+     * does not apply.  The injected-instruction registers are write-only
+     * and self-clear once executed.                                       */
+    if (updi_sts8(fd, OCD_INSN0,      (uint8_t)( word0       & 0xFFu)) < 0) return -1;
+    if (updi_sts8(fd, OCD_INSN0 + 1u, (uint8_t)((word0 >> 8) & 0xFFu)) < 0) return -1;
+    return updi_step(fd);
+}
+
 int updi_ocd_read_sp(int fd, uint16_t *val)
 {
     uint8_t lo = 0, hi = 0;

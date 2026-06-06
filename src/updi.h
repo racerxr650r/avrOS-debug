@@ -189,6 +189,20 @@ int  updi_ocd_emulate_cof_32bit(int fd,
 int  updi_ocd_poll_halted(int fd, int timeout_ms);
 int  updi_ocd_read_halt_status(int fd, uint8_t *st0, uint8_t *st1);
 
+/* Execute one instruction at the current PC by *injecting* its first
+ * opcode word into OCD_INSN0 and single-stepping.  Per
+ * doc/reference/guesswork.md, writing an opcode into OCD_INSN0 makes the
+ * core execute the injected word instead of fetching from flash; for a
+ * two-word instruction the second word is still fetched from flash and PC
+ * advances by two, for a single-word instruction PC advances by one.  This
+ * is the canonical "step over a software BREAK / freshly-written PC"
+ * primitive: it reliably executes the real instruction regardless of (a) a
+ * `BREAK` opcode patched into flash at PC, or (b) the one-instruction skip
+ * the silicon performs on the first step/run after a fresh OCD.PC write.
+ * `word0` is the original first opcode word (little-endian value).  CPU
+ * must be halted on entry and remains halted on return.                 */
+int  updi_ocd_step_inject_word0(int fd, uint16_t word0);
+
 /* OCD register-file access (CPU must be halted). */
 int  updi_ocd_read_gpr (int fd, uint8_t n, uint8_t *val);
 int  updi_ocd_write_gpr(int fd, uint8_t n, uint8_t val);

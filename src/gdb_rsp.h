@@ -100,6 +100,17 @@ typedef struct {
      * as a plain int here to avoid leaking the private enum).  Reset
      * to 0 (SC_NONE) at the start of every fresh resume.            */
     int                       last_stop_cause;
+    /* Set whenever a software-breakpoint flash patch (Z0/z0) has just
+     * re-restored the OCD program counter via updi_ocd_write_pc() after
+     * the NVMPROG system-reset round-trip.  A fresh OCD.PC write makes the
+     * silicon skip the instruction at PC on the very next step/run (see
+     * doc/reference/guesswork.md "OCD.PC and PC").  When this flag is set,
+     * the next resume (dh_continue/dh_step) executes the instruction at PC
+     * via instruction injection instead of a plain run/step, which is
+     * immune to the skip; the flag is then cleared.  Without this, the
+     * instruction the CPU was halted on (e.g. an argument-setup `ldi`) is
+     * silently skipped on the next continue, corrupting execution.       */
+    bool                      pc_dirty;
     /* HLR-063: memory-map advertisement.  Sizes copied verbatim out
      * of the loaded ELF's program headers (`elf_ctx.flash_size` /
      * `.sram_base` / `.sram_size`) at server startup and used by the

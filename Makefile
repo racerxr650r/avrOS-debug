@@ -190,6 +190,15 @@ NOT_AVR_ELF    := $(FIXBINDIR)/not_avr.elf
 GDB_LOCALS_SRC := $(FIXTUREDIR)/gdb_locals.c
 GDB_LOCALS_ELF := $(FIXBINDIR)/gdb_locals.elf
 
+# Phase 14 interactive debug-session fixture (Group-G G18..G24, HLR-070) —
+# also built at -O0 (NOT the generic -Os pattern rule) so the explicit
+# main->top->mid->leaf call chain keeps deterministic frames, per-frame
+# locals/params, and trivial frame-base DWARF.  The acceptance harness
+# drives a full interactive session against this fixture and checks exact
+# first-hit values, so the optimiser must not elide or reorder anything.
+GDB_DBG_SESSION_SRC := $(FIXTUREDIR)/gdb_debug_session.c
+GDB_DBG_SESSION_ELF := $(FIXBINDIR)/gdb_debug_session.elf
+
 # ── Per-test configuration ─────────────────────────────────────────────────────
 # Each entry: TEST_SRCS_<name>, TEST_WRAP_<name>, TEST_EXTRA_LDFLAGS_<name>
 #
@@ -237,6 +246,7 @@ TEST_WRAP_test_rsp  := updi_mem_read updi_mem_write updi_halt updi_run updi_step
                        updi_ocd_read_sp updi_ocd_write_sp \
 					   updi_ocd_read_pc updi_ocd_write_pc \
 					   updi_ocd_stabilize_pc_after_write \
+					   updi_ocd_step_inject_word0 \
                        updi_ocd_emulate_cof_32bit \
                        updi_ocd_set_hw_bp updi_ocd_clear_hw_bp \
                        fsm_build_thread_list \
@@ -344,6 +354,13 @@ $(GDB_LOCALS_ELF): $(GDB_LOCALS_SRC)
 	$(Q)$(AVR_CC) -mmcu=$(AVR_MCU) $(DFP_FLAGS) -O0 -g -o $@ $<
 	@echo "  AVR-CC  $<  (-O0, locals fixture)"
 
+# Phase 14 debug-session fixture: -O0 so the call chain and per-frame
+# locals/params stay deterministic.  Explicit recipe overrides the -Os pattern.
+$(GDB_DBG_SESSION_ELF): $(GDB_DBG_SESSION_SRC)
+	@mkdir -p $(FIXBINDIR)
+	$(Q)$(AVR_CC) -mmcu=$(AVR_MCU) $(DFP_FLAGS) -O0 -g -o $@ $<
+	@echo "  AVR-CC  $<  (-O0, debug-session fixture)"
+
 # ── Generic rule: build one test binary ──────────────────────────────────────
 # $(1) = test name (e.g. test_elf)
 define TEST_template
@@ -385,7 +402,8 @@ test: fixtures $(addprefix $(TESTBINDIR)/,$(TEST_NAMES))
 
 # ── fixtures target ───────────────────────────────────────────────────────────
 .PHONY: fixtures
-fixtures: $(FIXTURE_ELFS) $(NOT_AVR_ELF) $(WRONG_FAMILY_ELF) $(GDB_LOCALS_ELF)
+fixtures: $(FIXTURE_ELFS) $(NOT_AVR_ELF) $(WRONG_FAMILY_ELF) $(GDB_LOCALS_ELF) \
+          $(GDB_DBG_SESSION_ELF)
 
 # ── test-ci target ────────────────────────────────────────────────────────────
 # Like 'test' but writes each suite's output to build/test-results/<name>.txt
@@ -562,7 +580,8 @@ hw-test-rsp: $(HW_TEST_BIN) all
 HW_GDB_ELF ?= $(FIXBINDIR)/gdb_target.elf
 HW_GDB_G10_ELF ?= tests/hw/fixtures/avrOS_example_main.elf
 HW_GDB_G17_ELF ?= $(GDB_LOCALS_ELF)
-hw-test-gdb: $(FIXBINDIR)/gdb_target.elf $(GDB_LOCALS_ELF) all
+HW_GDB_DBG_ELF ?= $(GDB_DBG_SESSION_ELF)
+hw-test-gdb: $(FIXBINDIR)/gdb_target.elf $(GDB_LOCALS_ELF) $(GDB_DBG_SESSION_ELF) all
 	@if [ "$(HW_TEST_NVM_CONFIRM)" != "YES" ]; then \
 	    echo "hw-test-gdb: refused — set HW_TEST_NVM_CONFIRM=YES to confirm"; \
 	    echo "             (this reflashes the target via `(gdb) load`)"; \
@@ -579,6 +598,7 @@ hw-test-gdb: $(FIXBINDIR)/gdb_target.elf $(GDB_LOCALS_ELF) all
 	        --elf       '$(HW_GDB_ELF)' \
 	        --g10-elf   '$(HW_GDB_G10_ELF)' \
 	        --g17-elf   '$(HW_GDB_G17_ELF)' \
+	        --dbg-elf   '$(HW_GDB_DBG_ELF)' \
 	        --avros-bin '$(BUILDDIR)/$(TARGET)'
 
 # Run Groups A + B + C + D in one go. NVM still requires explicit confirm.
