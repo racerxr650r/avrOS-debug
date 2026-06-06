@@ -1598,6 +1598,14 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="SDD" ref="5.1"/>
         </traces>
       </hlr>
+
+      <hlr id="HLR-075" name="DAP Wire Transport (Content-Length JSON-RPC)">
+        <text><![CDATA[The DAP front-end shall exchange messages with the client using the Debug Adapter Protocol wire format: each message is a JSON object framed by a `Content-Length: <n>\r\n\r\n` header block followed by exactly `n` bytes of UTF-8 JSON body. On receive, the server shall consume the header block (matching the `Content-Length` field case-insensitively), then read exactly `n` body bytes — never over-reading into the following message — and shall reject a message whose advertised length is non-negative-overflowing or exceeds the receive buffer (`DAP_MSG_MAX`). On send, it shall prefix the body with the same header framing. JSON shall be handled by a self-contained recursive-descent tokenizer (no third-party JSON library is vendored — chosen so the parser is in-tree, in the project's C99 style, and directly unit-testable) exposing object-member lookup, string extraction with JSON-escape decoding, numeric extraction, and a string escaper for emission. The transport (framing + codec) shall be independent of the target and therefore unit-testable over a pipe/socketpair without hardware.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+          <trace target="SDD" ref="5.1"/>
+        </traces>
+      </hlr>
     </section>
 
     <section number="11" title="CI-Grade Loader and Link Diagnostics">
@@ -2858,6 +2866,38 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
           <trace target="HLR" ref="HLR-056" name="Data Access Watchpoints"/>
           <trace target="HLR" ref="HLR-058" name="vRun / vAttach / vKill"/>
           <trace target="HLR" ref="HLR-059" name="qC / qOffsets / T / R Replies"/>
+        </traces>
+      </llr>
+    </function>
+
+    <function number="10" title="src/dap.c — Debug Adapter Protocol Front-End" name="dap" source="src/dap.c">
+      <intro><![CDATA[Requirements for the DAP front-end (`src/dap.c`), a protocol front-end over the shared debug core parallel to `src/gdb_rsp.c`. Phase 16 implements the wire transport: a self-contained JSON codec and the Content-Length message framing. The accept/dispatch loop and the lifecycle/request handlers are added across Phases 16–19.]]></intro>
+
+      <llr id="LLR-DAP-01">
+        <text><![CDATA[`dj_parse()` shall tokenise a JSON text into a caller-supplied flat, pre-order array of `dj_tok_t` via recursive descent, returning the token count on success or -1 on malformed input or token-array overflow. Each token records its `type` (OBJECT/ARRAY/STRING/NUMBER/TRUE/FALSE/NULL), the source byte range `[start, end)` (for STRING, the content between the quotes), the `size` (OBJECT member count / ARRAY element count), and `next` (the index of the token following its entire subtree). The accessors shall include: `dj_member()` returning the value-token index for an object member by key (or -1); `dj_streq()` testing a STRING token against a C string; `dj_strcpy()` copying a STRING token's content into a bounded buffer while decoding the JSON escapes `\" \\ \/ \b \f \n \r \t` and `\uXXXX` (code points < 0x80 as the byte, otherwise `?`); and `dj_long()` parsing a NUMBER token as a `long`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-075" name="DAP Wire Transport (Content-Length JSON-RPC)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-DAP-02">
+        <text><![CDATA[`dj_escape()` shall append a C string to a caller buffer as a JSON-escaped string body (without surrounding quotes), always NUL-terminating and never writing past `cap`. It shall emit the short escapes for `"`, `\\`, newline, carriage-return, tab, backspace, and form-feed, and shall emit any other control byte (< 0x20) as `\uXXXX`. It shall stop appending rather than overflow when the buffer would be exceeded.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-075" name="DAP Wire Transport (Content-Length JSON-RPC)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-DAP-03">
+        <text><![CDATA[`dap_read_message()` shall read one DAP message off a file descriptor: it shall consume CRLF-terminated header lines until a blank line, parsing the `Content-Length:` value (case-insensitive header name), then read exactly that many body bytes into the caller buffer and NUL-terminate it, setting `*out_len`. It shall read the body with exact-length reads so it never consumes bytes belonging to the next message. It shall return 1 when a message was read, 0 on EOF / peer close before any data, and -1 on read error, a missing/negative `Content-Length`, or a length that does not fit the caller buffer (`>= cap`). It shall retry `read()` on `EINTR`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-075" name="DAP Wire Transport (Content-Length JSON-RPC)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-DAP-04">
+        <text><![CDATA[`dap_write_message()` shall write one DAP message to a file descriptor as `Content-Length: <len>\r\n\r\n` followed by the `len` body bytes, using length-complete writes that retry on `EINTR`. It shall return 0 on success and -1 on write error.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-075" name="DAP Wire Transport (Content-Length JSON-RPC)"/>
         </traces>
       </llr>
     </function>
@@ -4314,6 +4354,53 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="G24_capstone_full_interactive_session">
         <purpose><![CDATA[Phase-14 interactive debug-session coverage (HLR-070). One capstone case driving a realistic session start to finish: break at `top` (confirm `seed = 7` and a `bt` reaching `main`), set a conditional `break leaf if b == 3`, continue to `leaf(7, 3)` (confirm a full `leaf -> mid -> top -> main` backtrace and `a=7, b=3`), read a global (`g_marker = 49374`), and `finish` out of `leaf` reporting the return value `49405`. Combines breakpoints, conditions, multi-frame backtrace, global reads, and finish in a single end-to-end transcript.]]></purpose>
         <traces><trace target="HLR" ref="HLR-070"/></traces>
+      </test>
+    </file>
+
+    <!-- ============================================================ -->
+    <!-- src/dap.c DAP wire-transport tests (Phase 16)                -->
+    <!-- ============================================================ -->
+    <file path="tests/test_dap.c" role="unit" count="8">
+      <header><![CDATA[Unit tests for the DAP wire transport (HLR-075): the JSON codec (`dj_*` recursive-descent tokenizer, member/string/number accessors, escape decode, and the emission escaper) and the Content-Length message framing (`dap_read_message` / `dap_write_message`). Both are target-independent; framing is exercised over an anonymous pipe.]]></header>
+
+      <test name="dj_parse_extracts_request_fields">
+        <purpose><![CDATA[Tokenise a representative DAP `initialize` request and verify the accessors: the root is an OBJECT; `command` is the STRING `initialize`; `seq` is the NUMBER 3; `arguments` is a nested OBJECT whose `clientID` copies to `vscode` and whose `linesStartAt1` is the TRUE token; a missing member returns -1.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-01"/></traces>
+      </test>
+
+      <test name="dj_parse_handles_arrays_and_nesting">
+        <purpose><![CDATA[Parse `{"a":[1,2,3],"b":{"c":"x"}}` and verify `a` is an ARRAY of size 3, `b` is an OBJECT, and `b.c` copies to `x` — confirming subtree skipping and nested member lookup.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-01"/></traces>
+      </test>
+
+      <test name="dj_strcpy_decodes_escapes">
+        <purpose><![CDATA[Copy a STRING value containing `\\`, `\"`, and `\n` escapes and verify the decoded bytes are the literal backslash, double-quote, and newline.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-01"/></traces>
+      </test>
+
+      <test name="dj_escape_quotes_backslash_and_controls">
+        <purpose><![CDATA[Escape a string containing `"`, `\\`, and a newline and verify the output uses the short JSON escapes (`\"`, `\\`, `\n`).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-02"/></traces>
+      </test>
+
+      <test name="dj_parse_rejects_malformed">
+        <purpose><![CDATA[Verify `dj_parse()` returns -1 for a member with no value (`{"x":}`), a truncated object (`{"x"`), and an unterminated array (`[1,2`).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-01"/></traces>
+      </test>
+
+      <test name="dj_parse_respects_token_cap">
+        <purpose><![CDATA[Verify `dj_parse()` returns -1 (rather than overrunning) when the token array is too small for the input.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-01"/></traces>
+      </test>
+
+      <test name="dap_framing_round_trip_over_pipe">
+        <purpose><![CDATA[Write two framed messages to a pipe with `dap_write_message()` and read them back with `dap_read_message()`; verify each body and length round-trips exactly with no over-read into the second message, and that closing the write end then yields EOF (return 0).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-03"/><trace target="LLR" ref="LLR-DAP-04"/></traces>
+      </test>
+
+      <test name="dap_read_rejects_oversize_body">
+        <purpose><![CDATA[Feed a header advertising a `Content-Length` larger than the reader's buffer and verify `dap_read_message()` returns -1 rather than overflowing.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-03"/></traces>
       </test>
     </file>
 

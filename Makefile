@@ -214,6 +214,11 @@ TEST_SRCS_test_elf  := $(TESTDIR)/test_elf.c $(SRCDIR)/elf_parser.c
 TEST_WRAP_test_elf  :=
 TEST_EXTRA_LDFLAGS_test_elf :=
 
+# test_dap  (DAP transport: JSON codec + Content-Length framing)
+TEST_SRCS_test_dap  := $(TESTDIR)/test_dap.c $(SRCDIR)/dap.c
+TEST_WRAP_test_dap  :=
+TEST_EXTRA_LDFLAGS_test_dap :=
+
 # test_updi
 TEST_SRCS_test_updi  := $(TESTDIR)/test_updi.c $(SRCDIR)/updi.c
 TEST_WRAP_test_updi  := select
@@ -306,7 +311,7 @@ TEST_WRAP_test_device  := select updi_open updi_close \
 TEST_EXTRA_LDFLAGS_test_device := $(LUTIL) -lpthread
 
 # Master list
-TEST_NAMES := test_elf test_updi test_fsm test_monitor test_rsp test_main test_integration test_install test_device
+TEST_NAMES := test_elf test_updi test_fsm test_monitor test_rsp test_main test_integration test_install test_device test_dap
 
 # Build a --wrap flag string from a space-separated list of symbols
 wrap_flags = $(foreach sym,$(1),-Wl,--wrap,$(sym))

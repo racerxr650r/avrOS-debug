@@ -361,6 +361,21 @@ Role: **hardware**. **1 test(s).**
 | 7 | <a id="G23_per_frame_info_args_and_locals"></a>`G23_per_frame_info_args_and_locals` | — | Phase-14 interactive debug-session coverage (HLR-070). Stopped at `leaf(7, 2)`, `info args` must show `a = 7` and `b = 2`; after two `next` steps execute the local assignments, `info locals` and `print` must show `prod = 14` and `sum = 9`. Verifies per-frame argument and local reads return the exact fixture constants once the locals are live, complementing G17's single-type sweep with the call-chain fixture. |
 | 8 | <a id="G24_capstone_full_interactive_session"></a>`G24_capstone_full_interactive_session` | — | Phase-14 interactive debug-session coverage (HLR-070). One capstone case driving a realistic session start to finish: break at `top` (confirm `seed = 7` and a `bt` reaching `main`), set a conditional `break leaf if b == 3`, continue to `leaf(7, 3)` (confirm a full `leaf -> mid -> top -> main` backtrace and `a=7, b=3`), read a global (`g_marker = 49374`), and `finish` out of `leaf` reporting the return value `49405`. Combines breakpoints, conditions, multi-frame backtrace, global reads, and finish in a single end-to-end transcript. |
 
+### 3.12. [tests/test_dap.c](../tests/test_dap.c)
+
+Role: **unit**. **8 test(s).**
+
+| # | Test | Verifies | Purpose |
+| - | ---- | -------- | ------- |
+| 1 | <a id="dj_parse_extracts_request_fields"></a>`dj_parse_extracts_request_fields` | `LLR-DAP-01` | Tokenise a representative DAP `initialize` request and verify the accessors: the root is an OBJECT; `command` is the STRING `initialize`; `seq` is the NUMBER 3; `arguments` is a nested OBJECT whose `clientID` copies to `vscode` and whose `linesStartAt1` is the TRUE token; a missing member returns -1. |
+| 2 | <a id="dj_parse_handles_arrays_and_nesting"></a>`dj_parse_handles_arrays_and_nesting` | `LLR-DAP-01` | Parse `{"a":[1,2,3],"b":{"c":"x"}}` and verify `a` is an ARRAY of size 3, `b` is an OBJECT, and `b.c` copies to `x` — confirming subtree skipping and nested member lookup. |
+| 3 | <a id="dj_strcpy_decodes_escapes"></a>`dj_strcpy_decodes_escapes` | `LLR-DAP-01` | Copy a STRING value containing `\\`, `\"`, and `\n` escapes and verify the decoded bytes are the literal backslash, double-quote, and newline. |
+| 4 | <a id="dj_escape_quotes_backslash_and_controls"></a>`dj_escape_quotes_backslash_and_controls` | `LLR-DAP-02` | Escape a string containing `"`, `\\`, and a newline and verify the output uses the short JSON escapes (`\"`, `\\`, `\n`). |
+| 5 | <a id="dj_parse_rejects_malformed"></a>`dj_parse_rejects_malformed` | `LLR-DAP-01` | Verify `dj_parse()` returns -1 for a member with no value (`{"x":}`), a truncated object (`{"x"`), and an unterminated array (`[1,2`). |
+| 6 | <a id="dj_parse_respects_token_cap"></a>`dj_parse_respects_token_cap` | `LLR-DAP-01` | Verify `dj_parse()` returns -1 (rather than overrunning) when the token array is too small for the input. |
+| 7 | <a id="dap_framing_round_trip_over_pipe"></a>`dap_framing_round_trip_over_pipe` | `LLR-DAP-03`, `LLR-DAP-04` | Write two framed messages to a pipe with `dap_write_message()` and read them back with `dap_read_message()`; verify each body and length round-trips exactly with no over-read into the second message, and that closing the write end then yields EOF (return 0). |
+| 8 | <a id="dap_read_rejects_oversize_body"></a>`dap_read_rejects_oversize_body` | `LLR-DAP-03` | Feed a header advertising a `Content-Length` larger than the reader's buffer and verify `dap_read_message()` returns -1 rather than overflowing. |
+
 ## 4. LLR Coverage Matrix
 
 Every LLR in [LLRs.md](LLRs.md) and the test(s) that verify it.
@@ -515,3 +530,7 @@ verified by code review — see
 | `LLR-HWTEST-06` | `hwtest` | `HLR-045` | `B0_sram_single_byte_round_trip` |
 | `LLR-HWTEST-07` | `hwtest` | `HLR-045`, `HLR-049`, `HLR-050`, `HLR-051`, `HLR-052` | `F1_autobaud_picks_reliable_rung`, `F2_fuse_pretty_print_round_trip`, `F3_prog_mode_end_to_end_with_verify` |
 | `LLR-HWTEST-08` | `hwtest` | `HLR-053`, `HLR-054`, `HLR-055`, `HLR-056`, `HLR-058`, `HLR-059` | `D4_rsp_qC_current_thread`, `D5_rsp_qOffsets_section_bases`, `D6_rsp_monitor_info_verb`, `D7_rsp_Z2_z2_replies_empty_packet_unsupported`, `D8_rsp_vRun_reload_returns_Tstop`, `D9_rsp_vFlashErase_vFlashDone_smoke`, `D10_rsp_Z0_z0_sw_bp_flash_break_round_trip` |
+| `LLR-DAP-01` | `dap` | `HLR-075` | `dj_parse_extracts_request_fields`, `dj_parse_handles_arrays_and_nesting`, `dj_strcpy_decodes_escapes`, `dj_parse_rejects_malformed`, `dj_parse_respects_token_cap` |
+| `LLR-DAP-02` | `dap` | `HLR-075` | `dj_escape_quotes_backslash_and_controls` |
+| `LLR-DAP-03` | `dap` | `HLR-075` | `dap_framing_round_trip_over_pipe`, `dap_read_rejects_oversize_body` |
+| `LLR-DAP-04` | `dap` | `HLR-075` | `dap_framing_round_trip_over_pipe` |
