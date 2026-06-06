@@ -76,6 +76,7 @@ static int      mock_ocd_gpr_writes;
 static int      mock_ocd_sreg_writes;
 static int      mock_ocd_sp_writes;
 static int      mock_ocd_pc_writes;
+static int      mock_inject_step_calls;     /* updi_ocd_step_inject_word0 */
 static int      mock_ocd_gpr_reads_active;  /* active-thread g via OCD */
 
 /* OCD halt-status that updi_ocd_read_halt_status() returns. */
@@ -211,6 +212,16 @@ int __wrap_updi_ocd_stabilize_pc_after_write(int fd)
 {
     (void)fd;
     ++mock_pc_stabilize_calls;
+    return 0;
+}
+/* Injection-step over the instruction at PC (see consume_pc_skip): behaves
+ * like a single step — advance the mock PC and log a step event. */
+int __wrap_updi_ocd_step_inject_word0(int fd, uint16_t word0)
+{
+    (void)fd; (void)word0;
+    ++mock_inject_step_calls;
+    mock_ocd_pc += mock_step_pc_delta;
+    log_event(EV_STEP);
     return 0;
 }
 int __wrap_updi_ocd_emulate_cof_32bit(int fd, uint32_t return_pc,
@@ -471,6 +482,7 @@ static void reset_mocks(void)
     memset(mock_ocd_gpr, 0, sizeof mock_ocd_gpr);
     mock_ocd_sreg = 0; mock_ocd_sp = 0; mock_ocd_pc = 0;
     mock_ocd_gpr_writes = mock_ocd_sreg_writes = mock_ocd_sp_writes = mock_ocd_pc_writes = 0;
+    mock_inject_step_calls = 0;
     mock_ocd_gpr_reads_active = 0;
     mock_ocd_status0 = mock_ocd_status1 = 0;
     mock_hw_bp_silicon[0] = mock_hw_bp_silicon[1] = 0xFFFFFFFFu;
@@ -915,6 +927,57 @@ static void z0_in_sw_mode_stabilizes_pc_after_restore(void)
 
     rsp_dispatch(sock_pair[1], "z0,200,2", &h);
     TEST_ASSERT_EQUAL(stabilize_before_remove + 1, mock_pc_stabilize_calls);
+}
+
+/* A SW-breakpoint flash patch re-writes OCD.PC after its NVMPROG reset,
+ * which makes the silicon skip the instruction at PC on the next resume.
+ * `continue` must therefore execute that instruction via injection
+ * (updi_ocd_step_inject_word0) BEFORE the free-run, then clear the dirty
+ * flag — otherwise the instruction the CPU was halted on is silently lost.
+ * Regression for the "arguments read as 0 after a breakpoint" hardware bug. */
+static void continue_after_sw_bp_install_injects_leading_instruction(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    mock_ocd_poll_default = 0;                 /* halt on first poll */
+    mock_read_canned_len = 4;                  /* opcode at PC: a non-CoF ldi */
+    mock_read_canned[0] = 0x87; mock_read_canned[1] = 0xE0;  /* 0xE087 */
+    mock_read_canned[2] = 0x00; mock_read_canned[3] = 0x00;
+
+    rsp_dispatch(sock_pair[1], "Z0,200,2", &h);
+    char d[128]; drain(sock_pair[0], d, sizeof d);
+    TEST_ASSERT_TRUE(ctx.pc_dirty);            /* patch marked PC dirty */
+
+    mock_inject_step_calls = 0;
+    rsp_dispatch(sock_pair[1], "c", &h);
+    drain(sock_pair[0], d, sizeof d);
+
+    TEST_ASSERT_EQUAL(1, mock_inject_step_calls);  /* leading insn injected */
+    TEST_ASSERT_EQUAL(1, mock_run_calls);          /* then free-run */
+    TEST_ASSERT_FALSE(ctx.pc_dirty);               /* flag consumed */
+    TEST_ASSERT_TRUE(event_index(EV_STEP) < event_index(EV_RUN));
+}
+
+/* The same skip-compensation must apply to a single `s` step: the step over
+ * a freshly-restored PC executes the instruction via injection (not a plain
+ * updi_step, which the silicon would turn into a one-instruction skip). */
+static void step_after_sw_bp_install_injects_leading_instruction(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    mock_read_canned_len = 4;
+    mock_read_canned[0] = 0x87; mock_read_canned[1] = 0xE0;  /* non-CoF ldi */
+    mock_read_canned[2] = 0x00; mock_read_canned[3] = 0x00;
+
+    rsp_dispatch(sock_pair[1], "Z0,200,2", &h);
+    char d[128]; drain(sock_pair[0], d, sizeof d);
+    TEST_ASSERT_TRUE(ctx.pc_dirty);
+
+    mock_inject_step_calls = 0; mock_step_calls = 0;
+    rsp_dispatch(sock_pair[1], "s", &h);
+    drain(sock_pair[0], d, sizeof d);
+
+    TEST_ASSERT_EQUAL(1, mock_inject_step_calls);  /* step done via injection */
+    TEST_ASSERT_EQUAL(0, mock_step_calls);         /* not a plain updi_step  */
+    TEST_ASSERT_FALSE(ctx.pc_dirty);
 }
 
 /* ── LLR-RSP-11: continue ───────────────────────────────────────────── */
@@ -2161,6 +2224,8 @@ int main(void)
     RUN_TEST(Z0_in_sw_mode_snapshots_and_restores_cpu_state);
     RUN_TEST(Z0_in_hw_only_mode_falls_back_to_HW_BP_path);
     RUN_TEST(Z0_in_sw_mode_idempotent_on_same_address);
+    RUN_TEST(continue_after_sw_bp_install_injects_leading_instruction);
+    RUN_TEST(step_after_sw_bp_install_injects_leading_instruction);
     RUN_TEST(vFlashDone_also_clears_sw_bp_shadow);
     /* Phase 11 — HLR-060/061 multiprocess thread-id parsing. */
     RUN_TEST(qfThreadInfo_without_fsm_context_replies_l);

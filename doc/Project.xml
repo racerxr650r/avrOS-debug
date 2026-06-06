@@ -1546,6 +1546,14 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="SDD" ref="4.2.1"/>
         </traces>
       </hlr>
+
+      <hlr id="HLR-070" name="Interactive Debug-Session Acceptance Suite">
+        <text><![CDATA[The on-target Group-G GDB acceptance harness (`tests/hw/gdb_acceptance.py`, driven by `make hw-test-gdb`) shall include a suite of cases that emulate a complete *interactive* debug session against live AVR-Dx silicon — exercising the combinations a developer drives by hand in an IDE (VS Code Cortex-Debug / `cppdbg`) rather than the isolated protocol primitives covered by the earlier Group-G cases. The suite shall run against a dedicated deterministic bare-metal fixture (`tests/fixtures/gdb_debug_session.c`) built at `-O0` with an explicit four-deep call chain `main -> top -> mid -> leaf`, `noinline` functions, scalar / struct / array globals plus a constant marker, and per-frame parameters and locals whose first-hit values are fixed constants; the fixture's known first-hit values are `leaf(7, 2)` returning `49397`, `leaf(7, 3)` returning `49405`, `g_marker = 49374`, `g_cfg = { base = 100, gain = -7 }`, and `g_arr = { 10, 20, 30, 40 }`. The suite shall verify: (a) a multi-frame backtrace that reaches `main` in correct frame order, plus frame selection (`frame N`, `up`, `down`) with per-frame `info args`; (b) source-level `step` (into a call), `next` (over a call), and `finish` (out of a frame) reporting the correct returned value; (c) multiple simultaneous breakpoints hit in call order (`top` then `mid` then `leaf`); (d) a conditional breakpoint (`break leaf if b == 3`) that skips the non-matching `leaf(7, 2)` call and stops only at `leaf(7, 3)`; (e) global reads of a scalar, a struct, and an array, including specific struct fields and array elements; (f) per-frame `info locals` and `info args` reading back the exact constants the fixture assigns; and (g) one capstone case that drives a realistic session start to finish. The fixture shall be flashed via the server's `--load` path and selected through a new `--dbg-elf` / `HW_GDB_DBG_ELF` knob; breakpoints shall be set by symbol (never by line number) so the suite is robust to edits in the fixture. The suite shall remain manual-only and shall never be wired into `make test`.]]></text>
+        <traces>
+          <trace target="SDD" ref="5.3.1"/>
+          <trace target="SDD" ref="4.1"/>
+        </traces>
+      </hlr>
     </section>
 
     <section number="11" title="CI-Grade Loader and Link Diagnostics">
@@ -2100,6 +2108,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
           <trace target="HLR" ref="HLR-008" name="Target Memory Write"/>
         </traces>
       </llr>
+
+      <llr id="LLR-UPDI-34">
+        <text><![CDATA[`updi_ocd_step_inject_word0(fd, word0)` shall execute exactly one instruction at the current program counter by *injecting* its first opcode word and single-stepping, rather than letting the core fetch from Flash. It shall write the low and high bytes of `word0` to `OCD_INSN0` / `OCD_INSN0+1` and then call `updi_step()` WITHOUT setting `OCD_CTRL0.PCHOLD`, so the core executes the injected instruction and advances the PC normally (per `doc/reference/guesswork.md`: a single-word instruction advances PC by one; for a two-word instruction only the first word is injected and the second word is fetched from Flash, advancing PC by two). The CPU must be halted on entry and remains halted on return; the function returns 0 on success or −1 on any UPDI error. This is the canonical "step over a software `BREAK` / freshly-written PC" primitive: because the opcode is fed to the core directly, it reliably executes the real instruction regardless of (a) a `BREAK` opcode patched into Flash at PC, or (b) the one-instruction skip the silicon performs on the first step/run after a fresh `OCD.PC` write (the inverse hazard documented for `updi_ocd_write_pc()`). It is consumed by the RSP resume path (LLR-RSP-50).]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-054" name="True Software Breakpoints via Flash BREAK Opcode"/>
+        </traces>
+      </llr>
     </function>
 
     <function number="4" title="src/gdb_rsp.c — GDB Remote Serial Protocol Server" name="rsp" source="src/gdb_rsp.c">
@@ -2407,6 +2422,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <text><![CDATA[`dh_read_mem()` shall, immediately after parsing and length-validating the `m<addr>,<len>` packet (and before the GDB↔UPDI bit-23 address translation), call a new file-private helper `static bool mm_range_in_advertised_region(const RspContext *ctx, uint32_t addr, uint32_t len)` and, when the helper returns `false`, return `reply_err(fd, "E14")` instead of invoking `updi_mem_read()`. The helper shall return `false` for `len == 0` or when the 32-bit sum `addr + len` wraps; it shall return `true` when both `ctx->flash_size == 0` and `ctx->sram_size == 0` (no memory map advertised — permissive fallback for HLR-063's no-ELF case); otherwise it shall return `true` iff the half-open range `[addr, addr+len)` lies entirely within one of these seven regions (using the same constants HLR-063's advertisement emits): `[0, ctx->flash_size)` when `flash_size != 0`; `[ctx->sram_base, ctx->sram_base + ctx->sram_size)` when `sram_size != 0`; `[ELF_VMA_EEPROM, ELF_VMA_EEPROM + UPDI_EEPROM_SIZE)`; `[ELF_VMA_FUSES, ELF_VMA_FUSES + UPDI_FUSES_SIZE)`; `[ELF_VMA_LOCK, ELF_VMA_LOCK + UPDI_LOCK_SIZE)`; `[ELF_VMA_SIGROW, ELF_VMA_SIGROW + UPDI_SIGROW_SIZE)`; `[ELF_VMA_USERROW, ELF_VMA_USERROW + UPDI_USERROW_SIZE)`. The helper shall be defined immediately above `dh_read_mem()` in `src/gdb_rsp.c` and shall be `static` (file scope) so it is exclusively callable from the `m`-read path. The check shall NOT be wired into `dh_write_mem()` for this requirement — symmetric write enforcement is deferred. UPDI shall not be touched on a bounds rejection (`mock_read_count` MUST remain 0 in the negative unit test).]]></text>
         <traces>
           <trace target="HLR" ref="HLR-067" name="Memory-Map Honesty for `m`-Reads"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-50">
+        <text><![CDATA[Installing or removing a software breakpoint via `sw_bp_patch_flash()` enters NVMPROG, which issues a system-reset pulse; the original PC is therefore re-written with `updi_ocd_write_pc()` during `sw_bp_restore_cpu()`. A fresh `OCD.PC` write makes the silicon skip the instruction at PC on the very next step/run, so after such a restore `sw_bp_patch_flash()` shall set `RspContext.pc_dirty = true`. On the next resume, both `dh_continue()` and `dh_step()` shall call a file-private helper `static int consume_pc_skip(RspContext *ctx)` before resuming. The helper shall: return 0 immediately when `pc_dirty` is false; otherwise clear `pc_dirty`, read the live PC and its 4 opcode bytes, and — when the first opcode word is a direct 32-bit `CALL`/`JMP` (`(w0 & 0xFE0E) == 0x940E` or `0x940C`) — return 0 to leave change-of-flow handling to the existing `continue_step_over_leading_cof()` / `dh_step()` emulation (which rewrites `OCD.PC` to the target anyway, so the skip is moot); for any other instruction it shall execute it exactly once via `updi_ocd_step_inject_word0()` (LLR-UPDI-34) — substituting the saved original opcode from the `sw_bp[]` shadow when a `BREAK` is currently patched at PC — and return 1. `dh_continue()` shall call the helper before `continue_step_over_leading_cof()` and `updi_run()`; `dh_step()` shall, when the helper returns 1, treat that injected execution as the single step (rebuild the FSM list, classify the stop cause as `SC_STEP`, and emit the stop reply) without a further `updi_step()`. This prevents the instruction the CPU was halted on (e.g. an argument-setup `ldi` at a breakpoint) from being silently skipped on the next continue/step, which otherwise corrupts downstream execution (observed on hardware as function arguments read as 0).]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-054" name="True Software Breakpoints via Flash BREAK Opcode"/>
         </traces>
       </llr>
     </function>
@@ -3195,7 +3217,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/gdb_rsp.c unit tests                                     -->
     <!-- ============================================================ -->
-    <file path="tests/test_rsp.c" role="unit" count="87">
+    <file path="tests/test_rsp.c" role="unit" count="89">
       <header><![CDATA[Unit tests for `src/gdb_rsp.c`: socket configuration, RSP packet framing, register and memory handlers, hardware-breakpoint comparator management, OCD-based execution control, async Ctrl-C interrupt, detach cleanup, session lifecycle packets, and monitor relay. Uses a `socketpair()` as a drop-in socket substitute and replaces every `updi_*`, `fsm_*`, and `monitor_dispatch` call site with `ld --wrap` mocks so all tests run without real silicon.]]></header>
 
       <test name="rsp_listen_sets_so_reuseaddr_before_bind">
@@ -3523,6 +3545,16 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="Z0_in_sw_mode_idempotent_on_same_address">
         <purpose><![CDATA[Dispatch `Z0,900,2` twice and verify `mock_flash_patch_count == 1` — the second install on a shadowed address shall reply `OK` without re-patching FLASH.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-36"/></traces>
+      </test>
+
+      <test name="continue_after_sw_bp_install_injects_leading_instruction">
+        <purpose><![CDATA[Regression for the SW-breakpoint resume skip (LLR-RSP-50 / LLR-UPDI-34). Prime the opcode at PC as a non-CoF `ldi` (`0xE087`) and dispatch `Z0,200,2`; assert `ctx.pc_dirty` is set by the patch. Then dispatch `c` and assert the resume executed the leading instruction via injection (`mock_inject_step_calls == 1`) BEFORE the free-run (`mock_run_calls == 1`, `EV_STEP` precedes `EV_RUN`) and that `ctx.pc_dirty` was consumed (cleared). Without the fix the silicon's fresh-PC-write skip drops the instruction the CPU was halted on, which surfaced on hardware as function arguments read as 0 after a breakpoint.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-50"/><trace target="LLR" ref="LLR-UPDI-34"/></traces>
+      </test>
+
+      <test name="step_after_sw_bp_install_injects_leading_instruction">
+        <purpose><![CDATA[Companion to the continue case (LLR-RSP-50 / LLR-UPDI-34) for single-step. After a `Z0,200,2` install marks `ctx.pc_dirty`, dispatch `s` and assert the step over the freshly-restored PC was performed by injection (`mock_inject_step_calls == 1`) and NOT by a plain `updi_step()` (`mock_step_calls == 0`), and that `ctx.pc_dirty` was cleared.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-50"/><trace target="LLR" ref="LLR-UPDI-34"/></traces>
       </test>
 
       <test name="vFlashDone_also_clears_sw_bp_shadow">
@@ -4145,11 +4177,46 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- On-target GDB acceptance harness (Group G; manual; not in CI)-->
     <!-- ============================================================ -->
     <file path="tests/hw/gdb_acceptance.py" role="hardware" count="1">
-      <header><![CDATA[On-target GDB acceptance harness (Group-G tests) that drives a real `avr-gdb` against a live AVR-Dx through `avrOSdb` over UPDI, scripting `-batch` command sequences and applying per-test verdict functions to the transcript. Manual-only: never invoked by `make test`. Driven by `make hw-test-gdb`. Only the test that regression-guards the ST_PTR_LONG SRAM-read fix is traced here; the remaining Group-G cases are not yet individually tracked.]]></header>
+      <header><![CDATA[On-target GDB acceptance harness (Group-G tests) that drives a real `avr-gdb` against a live AVR-Dx through `avrOSdb` over UPDI, scripting `-batch` command sequences and applying per-test verdict functions to the transcript. Manual-only: never invoked by `make test`. Driven by `make hw-test-gdb`. The ST_PTR_LONG SRAM-read regression guard (G17) and the Phase-14 interactive debug-session suite (G18–G24, HLR-070) are individually tracked here; the remaining early Group-G protocol-primitive cases (G1–G16) are not yet individually tracked.]]></header>
 
       <test name="G17_local_variable_values_and_backtrace">
         <purpose><![CDATA[Regression guard for the always-24-bit `ST_PTR_LONG` pointer-set (LLR-UPDI-33). Break inside `locals_probe()` in the `-O0` `gdb_locals` fixture where one local of each representative C type is assigned and still live, then `print` each local and run `bt`. Every local must read back the exact constant the fixture assigned and the backtrace must reach `main`. Both surfaces read SRAM off the stack and both were corrupted by the stale-high-byte bug — a Flash read by GDB left the UPDI pointer high byte at `0x80`, so the following 16-bit-pointer SRAM read was misdirected into mapped Flash and returned erased `0xFF`, yielding `0xFF`/garbage locals and a bogus `0x1fffe` return-address frame. With the 24-bit fix every local reads its known value and `bt` is clean.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-33"/></traces>
+      </test>
+
+      <test name="G18_multiframe_backtrace_and_frame_selection">
+        <purpose><![CDATA[Phase-14 interactive debug-session coverage (HLR-070). Break at `leaf` in the `-O0` `gdb_debug_session` fixture and stop in `leaf(7, 2)`, then `bt` must unwind the full `leaf -> mid -> top -> main` chain in frame order and reach `main`. Frame selection (`frame 1`, `frame 2`, `up`, `down`) followed by `info args` must report each frame's own parameter (`mid`'s `n = 7`, `top`'s `seed = 7`), proving avrOSdb's per-frame SP/unwind and SRAM-read plumbing is correct across a multi-frame stack, not just at the innermost frame.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-070"/></traces>
+      </test>
+
+      <test name="G19_step_into_next_over_finish_return_value">
+        <purpose><![CDATA[Phase-14 interactive debug-session coverage (HLR-070). From a breakpoint at `top`, `step` must descend into `mid` (verified by a `bt` showing `#0 mid` / `#1 top`); `next` must step over the `leaf(7, 2)` call without descending; a further `step` must descend into `leaf(7, 3)`; and `finish` must run out of that frame and report the exact returned value (`Value returned is ... = 49405`). Exercises source-level step/next/finish across frames and the function-return-value read, which together require correct change-of-flow emulation, step-comparator use, and stack unwinding on live silicon.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-070"/></traces>
+      </test>
+
+      <test name="G20_multiple_breakpoints_hit_in_call_order">
+        <purpose><![CDATA[Phase-14 interactive debug-session coverage (HLR-070). Set three simultaneous breakpoints (`top`, `mid`, `leaf`), confirm `info breakpoints` lists all three, then `continue` three times. The hit banners must appear in call order — `top`, then `mid`, then `leaf` — proving multiple breakpoints coexist and fire in the order the call chain reaches them.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-070"/></traces>
+      </test>
+
+      <test name="G21_conditional_breakpoint_honoured">
+        <purpose><![CDATA[Phase-14 interactive debug-session coverage (HLR-070). A conditional breakpoint `break leaf if b == 3` must skip the first call `leaf(7, 2)` (condition false) and stop only at `leaf(7, 3)`; the hit banner must show `leaf (a=7, b=3)` and must never show `leaf (a=7, b=2)`. Verifies GDB-side condition evaluation drives repeated host-side resume/inspect cycles correctly against live silicon.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-070"/></traces>
+      </test>
+
+      <test name="G22_global_scalar_struct_array_reads">
+        <purpose><![CDATA[Phase-14 interactive debug-session coverage (HLR-070). Stopped in `leaf`, read globals from the data space: a scalar (`g_marker = 49374`, also `print/x` as `0xc0de`), a struct (`g_cfg = { base = 100, gain = -7 }` and its individual fields), and an array (`g_arr = { 10, 20, 30, 40 }` and the element `g_arr[2] = 30`). Each must read back its exact initialised value, exercising the SRAM/data-space read path for aggregate and indexed expressions.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-070"/></traces>
+      </test>
+
+      <test name="G23_per_frame_info_args_and_locals">
+        <purpose><![CDATA[Phase-14 interactive debug-session coverage (HLR-070). Stopped at `leaf(7, 2)`, `info args` must show `a = 7` and `b = 2`; after two `next` steps execute the local assignments, `info locals` and `print` must show `prod = 14` and `sum = 9`. Verifies per-frame argument and local reads return the exact fixture constants once the locals are live, complementing G17's single-type sweep with the call-chain fixture.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-070"/></traces>
+      </test>
+
+      <test name="G24_capstone_full_interactive_session">
+        <purpose><![CDATA[Phase-14 interactive debug-session coverage (HLR-070). One capstone case driving a realistic session start to finish: break at `top` (confirm `seed = 7` and a `bt` reaching `main`), set a conditional `break leaf if b == 3`, continue to `leaf(7, 3)` (confirm a full `leaf -> mid -> top -> main` backtrace and `a=7, b=3`), read a global (`g_marker = 49374`), and `finish` out of `leaf` reporting the return value `49405`. Combines breakpoints, conditions, multi-frame backtrace, global reads, and finish in a single end-to-end transcript.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-070"/></traces>
       </test>
     </file>
 
