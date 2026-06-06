@@ -33,6 +33,7 @@
 | [12](#phase-12--demote-fsm-threading-to-introspection--breakpoint-regression-net) | Demote FSM-as-GDB-threads to `monitor avros tasks` introspection + breakpoint regression net | ✅ Complete (PR [#43](https://github.com/racerxr650r/avrOS-debug/pull/43)) |
 | [13](#phase-13--hw-comparator-arbiter-with-a-reserved-single-step-slot) | HW-comparator arbiter: 1 user HW BP + 1 reserved single-step slot (SW BPs unlimited) | ✅ Complete (PR [#46](https://github.com/racerxr650r/avrOS-debug/pull/46)) |
 | [14](#phase-14--full-debug-session-hw-test-coverage) | Full interactive debug-session `hw-test` coverage (G18–G24): breakpoints, stepping, frames, locals/globals | ✅ Complete (PR [#49](https://github.com/racerxr650r/avrOS-debug/pull/49)) |
+| [15](#phase-15--dap-readiness-ocd-reference-appendix-elfutilsdwarf-integration--dual-protocol-architecture-prep) | DAP-readiness: User-Manual OCD reference appendix + `libelf`/`libdw` (elfutils/DWARF) integration in `elf_parser.c` + protocol-agnostic debug-core seam for a future parallel DAP server | 🔲 In progress (issue [#50](https://github.com/racerxr650r/avrOS-debug/issues/50)) |
 
 ## 0. Required Tools for Development
 
@@ -990,6 +991,42 @@ This is not a fixable detail — it is a **model mismatch**. avrOS is a cooperat
 **Acceptance.**
 - **Hardware (`hw-test-gdb`):** `make hw-test-gdb HW_TEST_NVM_CONFIRM=YES` runs G18–G24 green on AVR128DA28.
 - **Gate:** `make` 0 warnings; `make test` all suites pass (the new cases stay out of `make test`); `python3 tools/lint_project.py` 0 errors / 0 warnings; no `<placeholder>` text remains.
+
+### Phase 15 — DAP-Readiness: OCD Reference Appendix, elfutils/DWARF Integration & Dual-Protocol Architecture Prep
+
+> **Status: 🔲 In progress — issue [#50](https://github.com/racerxr650r/avrOS-debug/issues/50), branch `50-phase-15-dap-readiness`.** Landed so far: this SDP plan; **User Manual Appendix B — "AVR-Dx UPDI On-Chip Debug (OCD) Reference"** (the full ASI + memory-mapped OCD register maps for OCD v1 and the v0 differences, plus per-feature implementation recipes and the reverse-engineered quirks, synthesized from `doc/reference/guesswork.md` and the `src/updi.h` definitions); the **dual-protocol architecture review** (`doc/reference/dual-protocol-architecture.md`) that scopes the debug-core seam; and the **elfutils refactor** — `src/elf_parser.c` is now a thin adapter over **libelf** (GElf API) + **libdw**, the bundled `src/elf.h` shim is deleted, and elfutils is a hard build/runtime dependency (auto-linked `-ldw -lelf`, no feature detection; `make prereqs` installs `libdw-dev`/`libelf-dev`). New DWARF source-line accessors (`elf_addr_to_line`/`elf_line_to_addr`/`elf_dwarf_available`) are the DAP groundwork. Spec reconciled via **tracer** (HLR-033/034 revised; **HLR-071** ELF/DWARF-via-elfutils + **HLR-072** DWARF source-lookup added; LLR-ELF-01/02/03/06/07/08/09 rewritten; **LLR-ELF-10..13** added; the elf.h-shim LLR repurposed; STP updated; all docs re-rendered, `lint_project` 0/0). `make`: 0 warnings; `make test`: 9/9 suites pass. Remaining: the protocol-agnostic debug-core extraction and the **tracer** reconciliation of HLR-031 / "Editor-Agnostic Core" for the in-server DAP front-end. Acceptance gate is met per item as each is merged.
+
+**Motivation.** PVD §9 names **Native DAP Translation** as a roadmap theme: a Debug Adapter Protocol server running *in parallel* to the GDB RSP server, so editors that speak DAP natively (Zed, VS Code) can drive `avrOSdb` directly without `avr-gdb` in the loop. Two things stand between today's RSP-only server and that goal. First, the OCD knowledge that makes all of this possible — the reverse-engineered AVR-Dx OCD register map and its quirks — lives only in `doc/reference/guesswork.md` (a lab notebook) and in `src/updi.h` comments; it has never been written up as durable, user-facing reference documentation. Second, the architecture assumes RSP is the only client protocol: `gdb_rsp.c` owns the `RspContext`, the breakpoint arbiter, the stop-cause classifier, and the only path to UPDI/OCD execution control, and (crucially) it delegates **all** source-level mapping — line tables, variable/type resolution, stack unwinding — to `avr-gdb`'s DWARF reader. A native DAP server has no `avr-gdb` to delegate to; it must read DWARF itself. Phase 15 lands the three prerequisites — the documentation, the DWARF capability, and the protocol-agnostic core seam — without yet writing a line of DAP.
+
+**This phase is preparation, not the DAP server.** The DAP listener, the JSON-RPC framing, and the DAP request handlers are explicitly a *later* phase. Phase 15's success is measured by: (a) the OCD reference being complete and accurate, (b) elfutils/DWARF being wired in and exposing line/variable info behind a stable API with the existing symbol/segment API unchanged, and (c) a documented, reviewed seam between a protocol-agnostic debug core and the RSP framing layer (with the spec reconciled to permit an in-server DAP front-end).
+
+**Architectural constraint.** The Layered Architecture rule still holds: UPDI-layer helpers never choose policy (slots, protocols, packet shapes). The new seam *reinforces* it — the debug core is the policy/state owner (execution control, register/memory model, breakpoint arbiter, ELF/DWARF), and RSP becomes one of two thin protocol front-ends over that core. No behaviour change to the running RSP server is in scope for this phase; the extraction is structural.
+
+**Scope summary.**
+
+| # | Area | Deliverable | File(s) |
+| - | ---- | ----------- | ------- |
+| 1 | OCD reference appendix | New `doc/UserManual.md` appendix: ASI register map, memory-mapped OCD register map (v1 + v0 deltas), and per-feature implementation recipes (halt/resume, single-step, SW/HW breakpoints, register & PC access via instruction injection) with every reverse-engineered quirk called out (PC = `OCD.PC`−1; slow-UPDI-clock "slippery-stepping"; fresh-PC-write one-instruction skip; two-word injection PC arithmetic; halt-on-change-of-flow; external break; no data-watchpoint hardware) | `doc/UserManual.md` |
+| 2 | elfutils / DWARF | Make `src/elf_parser.c` a **thin adapter** over `libelf` (GElf API) + `libdw`; delete the bundled `src/elf.h` shim; add DWARF-backed `addr↔file:line` accessors; keep the `ElfContext` flash/sram/`device_name` API + `elf_*` functions compatible for `fsm_mapper`/`main`/RSP. elfutils is a hard dependency (auto-linked, no detection) | `src/elf_parser.c/.h`, `Makefile` |
+| 3 | Debug-core seam | Identify and (where low-risk) extract the protocol-agnostic core: execution control + register/memory access + HW-comparator arbiter + stop-cause model + ELF/DWARF, separated from RSP packet parse/format. Documented in the architecture review; first structural steps taken behind the existing RSP behaviour | `doc/reference/dual-protocol-architecture.md`, `src/gdb_rsp.c` (seam only) |
+| 4 | Spec reconciliation | Via **tracer**: revise HLR-031 / the "Editor-Agnostic Core" SDD goal so an *in-server* DAP front-end is permitted (it was previously forbidden), and author the new HLRs/LLRs for the DWARF capability and the documentation requirement. Render + lint 0/0 | `doc/Project.xml` |
+| 5 | Tests | Unit coverage for the new DWARF accessors (over an existing `-g` AVR fixture) and a guard that the legacy symbol/segment API is unchanged | `tests/test_elf.c`, `Makefile` `--wrap` notes |
+
+**Plan.**
+
+1. **Document first (no code risk).** Write Appendix B from `guesswork.md` + `updi.h`, and the dual-protocol architecture review. These capture the knowledge the rest of the phase depends on and are independently mergeable.
+2. **elfutils refactor.** Reimplement `elf_parser` over `libelf` (GElf) + `libdw`; delete the `src/elf.h` shim (system `<elf.h>` is supplied by elfutils); link `-ldw -lelf` unconditionally. Add `--wrap`-free unit tests over a `-g` fixture. macOS obtains elfutils via `brew install elfutils` (HLR-033).
+3. **Debug-core seam.** Per the review, name the core API surface RSP already calls through, and make the low-risk separations (e.g. a `debug_core` header collecting the execution-control/register/memory/arbiter entry points) so a future DAP front-end has a single, documented include. Defer any risky behaviour-affecting moves.
+4. **Spec reconciliation (tracer).** Reconcile HLR-031 / the Editor-Agnostic goal and author the new requirements; render and lint.
+
+**Acceptance.**
+- **Docs:** Appendix B complete and accurate against `src/updi.h`; architecture review committed; no `<placeholder>` text.
+- **Build/test:** `make` 0 warnings under `-Wall -Wextra -Wpedantic`; `make test` all suites pass (including new DWARF unit tests); the legacy `ElfContext` symbol/segment API is unchanged.
+- **Spec:** new HLRs/LLRs authored and rendered; `python3 tools/lint_project.py` 0 errors / 0 warnings.
+
+**Open questions.**
+- **macOS + elfutils (HLR-033).** `libelf`/`libdw` are GNU/Linux-centric. Resolution (decided): elfutils is a **required** dependency on all platforms — there is no symbol-only fallback and no bundled shim. macOS obtains it via `brew install elfutils`; the Makefile auto-links `-ldw -lelf` with no feature detection.
+- **Depth of the core extraction.** The seam definition and the lowest-risk structural moves are in scope; a wholesale `gdb_rsp.c` split is deferred to the DAP-server phase to avoid destabilising the verified RSP path.
 
 ## 9. Risks & Open Questions
 

@@ -892,3 +892,286 @@ This setup provides headers for all AVR-DA I/O pins, 5V power, and 3.3V power so
    ```
 
    Connect with `tio cli` or `tio log`.
+
+---
+
+## 10. Appendix B: AVR-Dx UPDI On-Chip Debug (OCD) Reference
+
+This appendix documents the AVR-Dx On-Chip Debugger (OCD) as `avrOSdb`
+actually drives it — the register maps, the operational sequences behind each
+debug feature, and the silicon quirks that shape the implementation.
+
+> [!IMPORTANT]
+> Microchip does **not** publish the OCD register map for modern AVR-Dx
+> parts. Everything below was reverse-engineered against real silicon
+> (primarily an AVR128DB48 and AVR128DA28) and cross-checked against the
+> open-source AVR debugger ecosystem (Bloom, `pyavrdebug`, `avr-absurd`).
+> The lab notebook is [`doc/reference/guesswork.md`](reference/guesswork.md);
+> the canonical constants `avrOSdb` compiles against live in `src/updi.h`.
+> Names are unofficial. Treat this as field-proven, not authoritative.
+
+### B.1 Two addressing domains
+
+UPDI debugging spans two distinct register spaces, reached by different UPDI
+instructions:
+
+1. **The Application Status Interface (ASI)** — out-of-band link-layer
+   registers inside the UPDI peripheral itself. Accessed with the UPDI
+   control/status instructions `LDCS` (load) and `STCS` (store), indexed by a
+   small *CS* address. These control the link, the OCD key, and the master
+   halt/resume state of the CPU.
+2. **The memory-mapped OCD peripheral** — a register block based at data-space
+   address **`0x0F80`**. Accessed with ordinary UPDI `LDS`/`STS` (and the
+   pointer/repeat variants) once the CPU is halted. These hold the breakpoint
+   address comparators, the control/status bits, the instruction-injection
+   registers, and — uniquely useful on AVR-Dx — the live **PC, SP, SREG, and
+   the entire r0–r31 register file**, all directly readable.
+
+A key consequence of (2): on AVR-Dx you do **not** need the `RCALL`/stack
+gymnastics that the generic community guides describe for reading the program
+counter or working registers. They are memory-mapped; a halted-CPU `LDS` reads
+them directly. Instruction injection is reserved for one specific job —
+stepping over a software breakpoint without two flash writes (§B.9).
+
+### B.2 ASI register map (OCD-relevant)
+
+Accessed with `LDCS`/`STCS` at the CS index shown.
+
+| CS idx | Name | Bit(s) | Mask | Purpose |
+| ------ | ---- | ------ | ---- | ------- |
+| `0x03` | `ASI_CTRLB` | `CCDETDIS` (3) | `0x08` | Disable collision/contention detection (set during link bring-up on resistor-OR wirings). |
+| `0x04` | `ASI_OCD_CTRLA` | `STOP` (0) | `0x01` | Write 1 to **halt** the CPU. |
+| | | `RUN` (1) | `0x02` | Write 1 to **resume** the CPU. |
+| | | `SOR_DIS` (7) | `0x80` | Stop-on-reset disable. |
+| `0x05` | `ASI_OCD_STATUS` | `STOPPED` (0) | `0x01` | Read-only: 1 = CPU is halted and the OCD memory window is live. |
+| | | `OCDMV` (4) | `0x10` | Read-only: OCD message-channel byte valid. |
+| `0x08` | `ASI_RESET_REQ` | `RSTREQ` | — | Write `0x59` to assert system reset; write `0x00` to release. |
+| `0x0B` | `ASI_SYS_STATUS` | — | — | Read-only link/system status (reset held, in-sleep, NVMPROG busy …). |
+| `0x0D` | `ASI_OCD_MESSAGE` | — | — | 8-bit host↔target message channel (valid when `OCDMV` is set). |
+
+> The halt/resume bits live in the **ASI** space, not the memory-mapped OCD
+> block, precisely so the host can stop the core regardless of where the PC is
+> — including before the application has run at all.
+
+### B.3 Memory-mapped OCD register map (OCD v1, base `0x0F80`)
+
+Accessed with `LDS`/`STS`. Both byte and word access are allowed. Offsets are
+relative to `0x0F80`. This is the AVR-Dx/AVR-Ex ("OCD v1") layout; see §B.4 for
+the tinyAVR-0/1 ("OCD v0") differences.
+
+| Offset | Name | Width | Description |
+| ------ | ---- | ----- | ----------- |
+| `0x00` | `OCD_BP0A` | 3 B | Breakpoint 0 **byte** address (17-bit code-space address; LSb always 0). |
+| `0x04` | `OCD_BP1A` | 3 B | Breakpoint 1 byte address. |
+| `0x08` | `OCD_CTRL0` | 1 B | `PCHOLD` (b0, `0x01`) hold PC during injection · `HWBP` (b1, `0x02`) global HW-breakpoint enable · `STEP` (b2, `0x04`) arm single-step. |
+| `0x09` | `OCD_CTRL1` | 1 B | `BP0` (b0, `0x01`) / `BP1` (b1, `0x02`) per-comparator enables · `EXTBRK` (b4, `0x10`) halt on EXTBRK pin · `SWBP` (b5, `0x20`) halt on `BREAK` opcode (read-only, always set) · `JMP` (b6, `0x40`) halt after change-of-flow · `INT` (b7, `0x80`) halt on interrupt vector. |
+| `0x0C` | `OCD_STATUS0` | 1 B | Halt cause (RO): `STOPPED` (b2, `0x04`) · `EXT` (b6, `0x40`) external/ASI halt · `RESET` (b7, `0x80`) halt-on-reset. |
+| `0x0D` | `OCD_STATUS1` | 1 B | Halt cause (RO): `BP0_STEP` (b0, `0x01`, shared by BP0 **and** stepping) · `BP1` (b1, `0x02`) · `EXTBRK` (b4, `0x10`) · `SWBP` (b5, `0x20`). |
+| `0x10` | `OCD_INSN0` | 2 B | Injected instruction, word 0 (write-only; auto-clears after execution). |
+| `0x12` | `OCD_INSN1` | 2 B | Injected instruction, word 1 (second word of a 2-word opcode; optional). |
+| `0x14` | `OCD_PC` | 2 B | Program counter, **word** address — but reads back as **PC+1** (see §B.8). |
+| `0x18` | `OCD_SP` | 2 B | Stack pointer. |
+| `0x1C` | `OCD_SREG` | 1 B | Status register (`I T H S V N Z C`). |
+| `0x20`–`0x3F` | `OCD_REGFILE` | 32 B | The working register file, r0 (`0x20`) … r31/ZH (`0x3F`). |
+
+`avrOSdb` reads the GDB `g`-packet register block (r0–r31, SREG, SP, PC)
+straight out of `0x20`–`0x1F`/`0x1C`/`0x18`/`0x14` with halted-CPU `LDS`
+bursts — no instruction injection — and writes them back with `STS`.
+
+### B.4 OCD v0 differences (tinyAVR 0/1-series)
+
+Parts that report **OCD version 0** in their SIB use a slightly different map.
+`avrOSdb` targets AVR-Dx (v1); the deltas are recorded here for completeness
+and future family coverage:
+
+- **Breakpoint enables move into the address registers:** `BP0EN` is
+  `OCD_BP0A` bit 0, `BP1EN` is `OCD_BP1A` bit 0 (not `OCD_CTRL1[0:1]`).
+- **`OCD_CTRL0` bit 0 is `INJECT`** (rather than `PCHOLD`).
+- **`OCD_PC` is a *byte* address**, not a word address.
+- **Stepping over a `BREAK` is not supported** the way v1 supports it, and
+  moving the PC onto a `BREAK` opcode mis-counts the "empty" step cycle —
+  inject a `NOP` instead of a bare step to work around both (§B.9).
+
+### B.5 Activating the OCD peripheral
+
+The OCD block at `0x0F80` is dark until the debugger is unlocked, which must
+happen out of reset before the application runs:
+
+1. Send the UPDI `KEY` instruction with the 8-byte OCD key string
+   **`"OCD     "`** (`0x4F 0x43 0x44 0x20 0x20 0x20 0x20 0x20`).
+2. Bring the part through the reset sequence so the key takes effect.
+3. The OCD memory window and `ASI_OCD_*` registers are now live; confirm by
+   reading `ASI_OCD_STATUS` and halting (§B.6).
+
+### B.6 Halt and resume (`?`, Ctrl-C, `c`, `vCont;c`)
+
+Halt and resume go through the **ASI** space so they work from any CPU state:
+
+- **Halt:** `STCS ASI_OCD_CTRLA = STOP (0x01)`, then poll
+  `LDCS ASI_OCD_STATUS` until `STOPPED (0x01)` is set. The CPU is now stopped
+  and the memory-mapped OCD window is readable.
+- **Resume:** `STCS ASI_OCD_CTRLA = RUN (0x02)`. The core resumes instruction
+  fetch.
+- **Stop reason:** once `STOPPED` is seen, read `OCD_STATUS0`/`OCD_STATUS1` to
+  decide *why* it stopped (HW breakpoint, `BREAK`, step complete, external,
+  reset) before reporting the SIGTRAP/SIGINT to GDB (§B.14).
+
+### B.7 Single-stepping (`s`, `vCont;s`)
+
+Arm the step and resume: set `OCD_CTRL0 = STEP (0x04)` while halted, then
+resume. The CPU executes one opcode (1- or 2-word) and halts again with the
+step bit reflected in `OCD_STATUS1[0]`.
+
+> [!WARNING]
+> **The "slippery-stepping" clock quirk.** Single-stepping appears to skip or
+> double-step instructions if the UPDI clock is too slow relative to the CPU.
+> The symptom was originally (and wrongly) blamed on `STS`/two-word
+> instructions; the real cause is the **UPDI clock losing the race with a fast
+> CPU** (e.g. after firmware sets `CLKCTRL` to 24 MHz while UPDI runs at its
+> 4 MHz default). The fix is to raise the UPDI clock: set
+> `ASI_CTRLA.UPDICLKSEL` to the 32 MHz selection, after which single-stepping
+> is exact. If you see stepping that "sometimes advances two instructions,"
+> suspect the UPDI clock, not the opcode.
+
+### B.8 Reading and writing PC, SP, SREG, and registers (`g`, `G`, `p`, `P`)
+
+On AVR-Dx these are all memory-mapped (§B.3), so reads/writes are plain
+halted-CPU `LDS`/`STS`. Two PC quirks must be handled:
+
+- **`OCD_PC` reads back as PC+1 (word address).** If `OCD_PC` is `0x70`, the
+  *actual* PC is `0x6F`, and the instruction at `0x6F` has **not yet** executed.
+  On a fresh halt-at-reset, `OCD_PC` reads `0x0001`. `avrOSdb` subtracts one
+  when reporting the PC to GDB and adds one when writing it.
+- **Writing the PC needs the same −1, and the next step is "empty."** After you
+  store a new `OCD_PC` and resume/step, the instruction the PC now points at is
+  **not** executed on that first cycle — the core consumes one "empty" cycle
+  while the PC settles (an artifact of the fetch/execute pipeline). Set the PC
+  to *target* and account for this skip, or you will silently drop the
+  instruction at the destination. This is the same fresh-PC-write
+  one-instruction skip that Phase 14 fixed for the software-breakpoint resume
+  path (`pc_dirty` + resume-time instruction injection).
+
+### B.9 Instruction injection (software-breakpoint step-over)
+
+The OCD can be made to execute an opcode the host supplies instead of the one
+in flash: write the opcode word to `OCD_INSN0` (`0x10`) and step. Writing the
+opcode alone is enough — you need **not** set any "inject" bit on v1; the core
+ignores the flash instruction at the PC and runs the injected one on the next
+cycle. PC behaviour:
+
+- With `OCD_CTRL0.PCHOLD` **clear** (the normal case): PC advances by one word
+  unless the injected instruction itself changes flow.
+- With `PCHOLD` **set**: PC stays put unless the injected instruction is an
+  absolute/indirect branch.
+
+For **two-word** instructions (`LDS`, `STS`, `CALL`, `JMP`):
+
+- Inject **both** words (`OCD_INSN0` + `OCD_INSN1`): the CPU runs the injected
+  pair regardless of flash and PC advances by **one**.
+- Inject **only word 0**: the second word is fetched from flash and PC advances
+  by **two**.
+
+Why this matters: when GDB continues off a software breakpoint, the flash
+ordinarily has to be reprogrammed twice (restore the original opcode, step,
+re-plant `BREAK`) — two erase/write cycles every time a breakpoint is hit, on
+parts rated for as few as 1k cycles. Injecting the **original first word**
+lets the core step over the breakpoint without restoring flash, so `BREAK`
+stays planted and only the inevitable plant/remove cycles cost flash wear.
+
+### B.10 Software breakpoints (`Z0`/`z0`) — the `BREAK` opcode
+
+Software breakpoints are unlimited and are `avrOSdb`'s default
+(`bp-mode sw`):
+
+- **Insert:** read and save the original 16-bit opcode at the target flash
+  word, then overwrite it with the AVR `BREAK` opcode **`0x9598`** via the NVM
+  controller. When the CPU fetches `0x9598` it halts and sets
+  `OCD_STATUS1.SWBP`.
+- **Remove:** rewrite the saved original opcode.
+- **Step over** without two flash writes: see §B.9.
+
+> [!NOTE]
+> Every flash patch enters NVMPROG, whose mandatory reset pulse resets the
+> AVR-Dx peripherals (including any avrOS tick timer). This is a UPDI/NVMPROG
+> constraint, not an `avrOSdb` defect — it is why some tick-driven firmware
+> cannot re-enter its dispatch loop after a software-breakpoint plant (see the
+> Phase 14 notes in `doc/SDP.md`).
+
+### B.11 Hardware breakpoints (`Z1`/`z1`) — the PC comparators
+
+Two program-counter comparators exist, `OCD_BP0A` and `OCD_BP1A`. A comparator
+fires when the PC matches; enabling one requires **both** its per-comparator
+enable in `OCD_CTRL1` (`BP0`/`BP1`) **and** the global `OCD_CTRL0.HWBP` bit.
+
+`avrOSdb` reserves these via a single arbiter (Phase 13):
+
+- **Comparator 0** is the sole *user* hardware-breakpoint slot — a second
+  `Z1` request returns `E08`.
+- **Comparator 1** is permanently reserved for the 32-bit `LDS`/`STS`
+  single-step-over workaround, so stepping is always possible regardless of any
+  user breakpoint.
+
+Write the 17-bit byte address into the comparator (LSb is always 0), set the
+enable bits, and resume. On halt, `OCD_STATUS1[0]`/`[1]` indicate which
+comparator matched.
+
+### B.12 Halt-on-change-of-flow, halt-on-interrupt, external break
+
+Three more halt sources live in `OCD_CTRL1`:
+
+- **`JMP` (`0x40`) — halt after change of flow.** The "change-of-flow"
+  breakpoint mentioned in early datasheets: the CPU halts immediately after any
+  instruction that moves the PC — `cpse`, the `sbic/sbis/sbrc/sbrs` skips, the
+  `br__` conditional branches, `[r|i]jmp`, `[r|i]call`, and `ret`/`reti`.
+- **`INT` (`0x80`) — halt on interrupt.** The core stops on the interrupt
+  vector entry.
+- **`EXTBRK` (`0x10`) — external break.** Halts the core while the EXTBRK input
+  pin is high — a mechanism to stop several MCUs together. The pin is `PA6` on
+  the DB family (undocumented, may differ per family and may be remappable via
+  an undocumented PORTMUX bit).
+
+### B.13 Data watchpoints — not available in silicon
+
+The AVR-Dx OCD over UPDI exposes **no data-address comparator hardware**.
+`avrOSdb` therefore replies the empty RSP packet to `Z2`/`Z3`/`Z4`
+(read/write/access watchpoints), the documented "unsupported" signal, and GDB
+falls back to software watchpoints (single-step + memory poll) — so
+`watch <expr>` still works, just without hardware acceleration. The FF-bomb
+experiment found writable bits only at the breakpoint, control, status,
+instruction-injection, PC/SP/SREG, and register-file locations — nothing that
+behaves like a data comparator. Independently confirmed by Bloom
+(`hardwareBreakpoints=1`, no data-watchpoint method), `avr-absurd`, and
+`pyavrdebug` (which also replies empty to Z2/Z3/Z4 even over EDBG).
+
+### B.14 Stop-cause classification
+
+After any halt, `avrOSdb` reads `OCD_STATUS0`/`OCD_STATUS1` to map the silicon
+cause onto a GDB stop reply:
+
+| Bit | Register | Meaning | Reported as |
+| --- | -------- | ------- | ----------- |
+| `RESET` (`0x80`) | `OCD_STATUS0` | Halted out of reset | initial stop |
+| `EXT` (`0x40`) | `OCD_STATUS0` | Host/ASI-initiated halt (Ctrl-C) | `S02` (SIGINT) |
+| `SWBP` (`0x20`) | `OCD_STATUS1` | `BREAK` opcode executed | `S05` + `swbreak` |
+| `BP1` (`0x02`) | `OCD_STATUS1` | HW comparator 1 (reserved step slot) | step complete |
+| `BP0_STEP` (`0x01`) | `OCD_STATUS1` | HW comparator 0 **or** single-step | `S05` + `hwbreak` / step |
+| `EXTBRK` (`0x10`) | `OCD_STATUS1` | External-break pin | `S05` |
+
+Note `BP0_STEP` is shared between hardware comparator 0 and step completion;
+the arbiter (§B.11) disambiguates using whether a step was armed and which slot
+holds a user breakpoint.
+
+### B.15 Further reading
+
+- [`doc/reference/guesswork.md`](reference/guesswork.md) — the reverse-engineering
+  lab notebook, including the FF-bomb register-mapping method and the full v0/v1
+  bitfield tables this appendix summarizes.
+- [`doc/reference/OCD.md`](reference/OCD.md) — community-consensus OCD notes and
+  the cross-tool register survey.
+- `src/updi.h` / `src/updi.c` — the canonical constants and the UPDI/OCD driver
+  that implements every sequence above.
+- The open-source AVR debuggers that corroborate the silicon limits:
+  [Bloom](https://bloom.oscillate.io/),
+  [`mraardvark/pyavrdebug`](https://github.com/mraardvark/pyavrdebug),
+  and the SpenceKonde AVR-Dx/UPDI notes at
+  <https://github.com/SpenceKonde>.

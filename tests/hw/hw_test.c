@@ -43,7 +43,7 @@
 #include <unistd.h>
 
 #include "updi.h"
-#include "elf.h"
+#include <elf.h>
 
 #define DEF_PORT            "/dev/ttyAMA2"
 #define DEF_FLASH_PAGE      0x7E00u   /* last page of 32 KiB AVR128DA28 */

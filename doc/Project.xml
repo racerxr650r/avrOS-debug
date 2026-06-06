@@ -645,51 +645,64 @@ Total static BSS in `src/gdb_rsp.c`: approximately 4.2 KiB.
       </module>
 
       <module path="src/elf_parser.c">
-        <purpose><![CDATA[parses the AVR ELF binary to extract the FLASH addresses and sizes of the avrOS system tables and to produce the `AvrOsSymbolIndex` consumed by the FSM mapper.]]></purpose>
-        <responsibility>Open and validate the ELF file header and target architecture.</responsibility>
-        <responsibility>Locate the symbol table section and iterate over symbol entries.</responsibility>
-        <responsibility>Apply the Harvard architecture offset to convert ELF virtual addresses to physical FLASH word addresses.</responsibility>
+        <purpose><![CDATA[A thin adapter over **elfutils** (libelf for ELF, libdw for DWARF) that holds the AVR-Dx/avrOS domain knowledge: it validates the AVR ELF binary, extracts the FLASH addresses and sizes of the avrOS system tables to produce the `AvrOsSymbolIndex` consumed by the FSM mapper, and exposes DWARF source-line lookup for the future native DAP front-end. All raw ELF/DWARF format decoding is delegated to elfutils so format changes are absorbed by the library, not hand-rolled byte parsing.]]></purpose>
+        <responsibility>Open and validate the ELF file (ELF32, `EM_AVR`) via libelf, retaining the `Elf*` handle for the context lifetime.</responsibility>
+        <responsibility>Iterate the symbol table through the libelf GElf API (no application-side heap copies of `.symtab`/`.strtab`).</responsibility>
+        <responsibility>Apply the Harvard architecture offset to convert ELF virtual addresses to physical FLASH word addresses, and the mapped-flash VMA→LMA translation.</responsibility>
         <responsibility><![CDATA[Populate an `AvrOsSymbolIndex` with the FLASH address, SRAM status address, and entry count for each detected avrOS table.]]></responsibility>
         <responsibility>Provide ELF program-header metadata to the RSP layer for memory-map query responses.</responsibility>
+        <responsibility><![CDATA[Open a libdw `Dwarf*` handle when the ELF carries debug info and expose source-line lookup (`elf_addr_to_line`, `elf_line_to_addr`) as groundwork for the native DAP front-end.]]></responsibility>
         <interfaces>
           <interface title="Public C API (src/elf_parser.h)"><![CDATA[All functions exported from `src/elf_parser.c` and declared in `src/elf_parser.h`:
 
 ```c
-/* Lifecycle */
+/* Lifecycle (libelf/libdw handles opened here, released in elf_close) */
 int  elf_open (const char *path, ElfContext *ctx);
-    /* Validates magic/arch, loads .symtab and .strtab into ctx. */
-    /* Returns: 0 on success; -1 on I/O error, bad magic, or malloc failure. */
+    /* Validates ELF32/EM_AVR via libelf; captures PT_LOAD bands + deviceinfo; */
+    /* opens a libdw handle when debug info is present. */
+    /* Returns: 0 on success; -1 on I/O error or validation failure. */
 void elf_close(ElfContext *ctx);
-    /* Frees ctx->symtab and ctx->strtab; closes ctx->fd. */
+    /* dwarf_end(), elf_end(), then close(ctx->fd); NULLs the handles. */
 
 /* Symbol resolution */
 int      elf_find_avros_tables(ElfContext *ctx, AvrOsSymbolIndex *idx);
     /* Returns: 0 (partial or full success); -1 on internal ELF read error. */
 uint32_t elf_flash_addr(const ElfContext *ctx, uint32_t vma);
     /* Applies: physical_word_addr = (vma - ctx->flash_base) / 2 */
+uint32_t elf_phys_flash_byte_addr(const ElfContext *ctx, uint32_t vma);
+    /* Mapped-flash VMA -> physical FLASH byte (LMA) via PT_LOAD p_paddr. */
+
+/* DWARF source-level lookup (libdw); groundwork for the native DAP front-end */
+int elf_dwarf_available(void);
+    /* 1 — elfutils is a required dependency; libdw is always linked. */
+int elf_addr_to_line(const ElfContext *ctx, uint32_t byte_addr,
+                     char *file, size_t file_cap, int *line);
+int elf_line_to_addr(const ElfContext *ctx, const char *file, int line,
+                     uint32_t *byte_addr);
+    /* Both return 0 on success, -1 when the ELF carries no DWARF or no match. */
 ```
 
-The `ElfContext` and `AvrOsSymbolIndex` struct definitions are also declared in `src/elf_parser.h`.  Callers must zero-initialise `AvrOsSymbolIndex` before passing it to `elf_find_avros_tables()`.]]></interface>
+The `ElfContext` and `AvrOsSymbolIndex` struct definitions are also declared in `src/elf_parser.h`.  The libelf `Elf*` and libdw `Dwarf*` handles are held in `ElfContext` as opaque `void*` so consumers need no elfutils headers.  Callers must zero-initialise `AvrOsSymbolIndex` before passing it to `elf_find_avros_tables()`.]]></interface>
         </interfaces>
         <data_structures><![CDATA[**`ElfContext`** — All ELF parsing state maintained between `elf_open()` and `elf_close()`.
 
 | Field | Type | Description |
 | ----- | ---- | ----------- |
-| `fd`          | `int`         | Open file descriptor for the ELF binary (kept open for lazy section reads). |
-| `ehdr`        | `Elf32_Ehdr`  | Cached ELF32 file header (magic, machine, entry point, section count). |
-| `symtab`      | `Elf32_Sym *` | Heap-allocated copy of the `.symtab` section contents. |
-| `sym_count`   | `size_t`      | Number of `Elf32_Sym` entries in `symtab`. |
-| `strtab`      | `char *`      | Heap-allocated copy of the `.strtab` string table used for symbol names. |
-| `strtab_size` | `size_t`      | Byte size of the `strtab` buffer. |
+| `fd`          | `int`         | Open file descriptor for the ELF binary (held for the libelf/libdw lifetime). |
+| `elf`         | `void *`      | Opaque libelf `Elf*` handle (the parsed ELF; owns symbol/section data). |
+| `dwarf`       | `void *`      | Opaque libdw `Dwarf*` handle, or NULL when the ELF carries no debug info. |
+| `ehdr`        | `Elf32_Ehdr`  | Cached ELF32 file header (via `elf32_getehdr`); consumers walk program headers from `fd`. |
 | `flash_base`  | `uint32_t`    | ELF VMA of the first `PT_LOAD` segment (FLASH); used as Harvard offset base. |
 | `flash_size`  | `uint32_t`    | Byte size of the FLASH load segment. |
 | `sram_base`   | `uint32_t`    | ELF VMA of the SRAM segment. |
 | `sram_size`   | `uint32_t`    | Byte size of the SRAM segment. |
+| `loads[]` / `load_count` | `ElfLoadSegment[]` / `unsigned` | Captured `PT_LOAD` vaddr/paddr/memsz for the mapped-flash VMA→LMA translation. |
+| `device_name` | `char[16]`    | Lowercase Microchip part name from the deviceinfo note, or empty string. |
 
 Harvard address conversion formula applied by `elf_flash_addr()`:
 `physical_word_addr = (vma − flash_base) / 2`
 
-Both `.symtab` and `.strtab` are loaded fully into heap memory at `elf_open()` time and freed by `elf_close()`, so no file seeks are required during symbol lookup.]]></data_structures>
+The symbol and string tables are **not** copied into application heap buffers — libelf owns that data and `elf_find_avros_tables()` reads it through the GElf API (`elf_getdata` / `gelf_getsym` / `elf_strptr`) on demand.]]></data_structures>
         <functions>
           <function signature="int elf_open(const char *path, ElfContext *ctx)"
                     summary="Open and parse the ELF file; populate ctx; return 0 or -1."/>
@@ -701,25 +714,33 @@ Both `.symtab` and `.strtab` are loaded fully into heap memory at `elf_open()` t
             <post>All fields of `idx` that correspond to symbols found in the ELF are populated. Fields for missing symbols retain their zero-initialised values.</post>
             <returns>0 if at least the FSM table symbols were found and resolved; 0 with `idx` partially populated if only some symbols were found; -1 only on an internal ELF read error.</returns>
             <logic>
-              <step>Iterate over all `sym_count` entries in `ctx->symtab`; skip entries with `st_name == 0` or `st_shndx == SHN_UNDEF`.</step>
-              <step><![CDATA[Look up each symbol's name in `ctx->strtab` at offset `sym->st_name` and compare against the avrOS sentinel names (see algorithm section for the full symbol name table).]]></step>
-              <step><![CDATA[For `_start` symbols (FLASH-resident table boundaries), call `elf_flash_addr()` to convert the VMA to a physical word address and store in the corresponding `idx` field.]]></step>
+              <step><![CDATA[Locate the first `SHT_SYMTAB` section via `elf_nextscn`/`gelf_getshdr` and obtain its `Elf_Data` via `elf_getdata`.]]></step>
+              <step><![CDATA[Iterate the symbols with `gelf_getsym`; skip entries with `st_name == 0` or `st_shndx == SHN_UNDEF`; resolve each name with `elf_strptr(elf, sh.sh_link, st_name)` and compare against the avrOS sentinel names (see algorithm section).]]></step>
+              <step><![CDATA[For `_start` symbols (FLASH-resident table boundaries), call `elf_phys_flash_byte_addr()` to translate the mapped-flash VMA to its physical FLASH byte (LMA) and store in the corresponding `idx` field; record the window's LMA-VMA delta in `flash_lma_off`.]]></step>
               <step><![CDATA[For `__stop_<NAME>` symbols, subtract the paired `__start_<NAME>` VMA and divide by the per-entry struct size to compute the entry count (e.g., `fsm_table_count`).]]></step>
               <step><![CDATA[For the `currStateMachine` symbol (SRAM-resident variable), store its VMA directly without the Harvard offset.]]></step>
             </logic>
           </function>
           <function signature="uint32_t elf_flash_addr(const ElfContext *ctx, uint32_t vma)"
                     summary="Convert an ELF virtual memory address to a physical FLASH word address."/>
+          <function signature="uint32_t elf_phys_flash_byte_addr(const ElfContext *ctx, uint32_t vma)"
+                    summary="Translate a mapped-flash data-space VMA to its physical FLASH byte (LMA) via the captured PT_LOAD p_paddr basis; returns vma unchanged when no segment matches."/>
+          <function signature="int elf_dwarf_available(void)"
+                    summary="Return 1 — libdw is always linked (elfutils is required)."/>
+          <function signature="int elf_addr_to_line(const ElfContext *ctx, uint32_t byte_addr, char *file, size_t file_cap, int *line)"
+                    summary="Map a code byte address to source file:line via libdw (dwarf_addrdie + dwarf_getsrc_die); 0 on success, -1 when no DWARF or no line-table entry."/>
+          <function signature="int elf_line_to_addr(const ElfContext *ctx, const char *file, int line, uint32_t *byte_addr)"
+                    summary="Resolve file:line (basename match) to the first code byte address via libdw line tables; 0 on success, -1 when no DWARF or no match."/>
         </functions>
-        <algorithm><![CDATA[`elf_open()` validates and loads the ELF as follows:
+        <algorithm><![CDATA[`elf_open()` validates and loads the ELF via libelf as follows:
 
-1.  Read the first 4 bytes; verify the ELF magic (`0x7F 'E' 'L' 'F'`). Verify `e_ident[EI_CLASS] == ELFCLASS32`.
-2.  Verify `e_machine == EM_AVR` (0x0053); reject non-AVR ELF files with a warning.
-3.  Scan `e_phnum` program headers at offset `e_phoff`; for each `PT_LOAD` segment, record the segment VMA (`p_vaddr`) and size (`p_filesz`) to populate `flash_base` / `flash_size` (first LOAD segment) and `sram_base` / `sram_size` (second LOAD segment).
-4.  Scan `e_shnum` section headers at offset `e_shoff`; find the section with `sh_type == SHT_SYMTAB`. Read its `sh_size / sizeof(Elf32_Sym)` entries into a heap buffer.
-5.  Load the associated string table section (index given by `sh_link` on the `.symtab` section header) into a second heap buffer.
+1.  Call `elf_version(EV_CURRENT)`, then `elf_begin(fd, ELF_C_READ, NULL)`; verify `elf_kind() == ELF_K_ELF` and `gelf_getclass() == ELFCLASS32`.
+2.  Obtain the header via `elf32_getehdr()`; verify `e_machine == EM_AVR` (0x0053) and cache the header in `ctx->ehdr`. Reject non-AVR ELF files with a warning.
+3.  Walk the program headers via `elf_getphdrnum()`/`gelf_getphdr()`; for each `PT_LOAD` segment record the VMA (`p_vaddr`), size, and `p_paddr` into `ctx->loads[]`, and set `flash_base`/`flash_size` (first LOAD) and `sram_base`/`sram_size` (second LOAD).
+4.  Scan `SHT_NOTE` sections via libelf (`elf_getdata`) for the deviceinfo part name (LLR-ELF-09).
+5.  Open a DWARF handle with `dwarf_begin_elf(elf, DWARF_C_READ, NULL)`; a NULL result (no debug info) is non-fatal.
 
-`elf_find_avros_tables()` scans the loaded symbol array for the following names:
+The libelf `Elf*` retains the symbol and string tables, so no application-side heap copy is made. `elf_find_avros_tables()` reads the first `SHT_SYMTAB` through the GElf API and matches the following names:
 
 | Symbol name             | `AvrOsSymbolIndex` field | Address space     | Per-entry stride |
 | ----------------------- | ------------------------ | ----------------- | ---------------- |
@@ -733,27 +754,20 @@ Both `.symtab` and `.strtab` are loaded fully into heap memory at `elf_open()` t
 
 The boundary symbols `__start_<NAME>` and `__stop_<NAME>` are emitted by the avrOS application's custom linker script (`avrOS.x`) and bracket the input section that holds the corresponding registration table. Entry counts (e.g., `fsm_table_count`) are derived by computing `(__stop − __start) / sizeof(per_entry_descriptor)`, where the descriptor sizes match the 1-byte-packed AVR layout shown above.
 
-**Heap memory budget for `elf_open()`:**
+**Memory:** the symbol and string tables are owned by libelf (typically `mmap`'d from the file), not copied into application heap, so `elf_open()` performs no large allocations of its own. The libelf `Elf*`, libdw `Dwarf*`, and the fd are released by `elf_close()`.
 
-| Buffer | Formula | Typical size (1000-symbol AVR ELF) |
-| ------ | ------- | ---------------------------------- |
-| `ctx->symtab` | `sym_count x sizeof(Elf32_Sym)` = `sym_count x 16` B | ~16 KiB |
-| `ctx->strtab` | `.strtab` section `sh_size` | ~8 KiB |
-| Total | | ~24 KiB per session |
+**Parse complexity:** libelf parses the container; `elf_find_avros_tables()` performs a single O(sym_count) linear scan of the first `SHT_SYMTAB` with 8 string comparisons per symbol entry.
 
-Both buffers are freed by `elf_close()`. Peak heap usage occurs between `elf_open()` and the first `elf_close()`.
-
-**Parse complexity:** `elf_open()` performs O(e_phnum + e_shnum) file seeks plus two sequential block reads. `elf_find_avros_tables()` performs a single O(sym_count) linear scan with 8 string comparisons per symbol entry.
-
-**Test approach for `src/elf_parser.c`:** Unit-testable using pre-built AVR ELF fixtures. Test cases cover: magic validation rejection, `EM_AVR` check, correct `flash_base` / `sram_base` extraction, all 7 avrOS sentinel symbols found with correct address conversions, partial symbol set (graceful degradation), `malloc` failure via injection shim, and `elf_close()` resource-free correctness.]]></algorithm>
+**Test approach for `src/elf_parser.c`:** Unit-testable using pre-built AVR ELF fixtures (compiled with `-g` so DWARF is present). Test cases cover: magic/class validation rejection, `EM_AVR` check, correct `flash_base` / `sram_base` extraction, all 7 avrOS sentinel symbols found with correct address conversions, FLASH-table LMA translation vs. raw SRAM VMA, partial symbol set (graceful degradation), deviceinfo name extraction (present and absent), DWARF source-line round-trip, and `elf_close()` resource-release correctness. The former `malloc`-injection test is retired — libelf owns the allocations now.]]></algorithm>
         <dependencies>
           <dep>Standard C file I/O.</dep>
-          <dep><![CDATA[ELF header definitions from `<elf.h>` (Linux) or a bundled `elf.h` for macOS portability.]]></dep>
+          <dep><![CDATA[**elfutils** (required): libelf (GElf API) for ELF parsing and libdw for DWARF. ELF32 type definitions come from the system `<elf.h>` that elfutils requires. There is no bundled ELF shim.]]></dep>
         </dependencies>
         <error_handling>
-          <case name="Non-ELF or wrong architecture magic">Log a warning message and return -1.</case>
+          <case name="Non-ELF, wrong class, or wrong architecture">Log a warning message and return -1.</case>
           <case name="Missing avrOS symbols"><![CDATA[Log an informational message and return 0 with an empty `AvrOsSymbolIndex`; the server continues in bare-metal stub mode.]]></case>
-          <case name="Memory allocation failure"><![CDATA[Return -1; the caller falls back to bare-metal stub mode.]]></case>
+          <case name="libelf elf_begin() failure"><![CDATA[Log `elf_errmsg()`, close the fd, and return -1; the caller falls back to bare-metal stub mode.]]></case>
+          <case name="No DWARF debug info"><![CDATA[`dwarf_begin_elf()` returns NULL; `ctx->dwarf` stays NULL and the source-line accessors return -1. Non-fatal.]]></case>
         </error_handling>
       </module>
 
@@ -1041,8 +1055,8 @@ typedef struct {
 | C standard | C99 | `--std=c99`; no GNU extensions required. |
 | GCC | 4.8 | Or Clang ≥ 3.4. |
 | POSIX API | POSIX.1-2008 | `-D_POSIX_C_SOURCE=200809L` |
-| ELF headers | `<elf.h>` | Provided by `glibc-headers` on Linux; bundled `elf.h` on macOS. |
-| libc | any POSIX libc | No additional shared libraries required. |
+| elfutils | libelf + libdw | **Required.** ELF parsing (libelf/GElf) and DWARF (libdw). `libdw-dev`/`libelf-dev` (Debian) or `elfutils-devel` (Fedora); `brew install elfutils` on macOS. Supplies the system `<elf.h>`. |
+| libc | any POSIX libc | Plus the elfutils shared libraries (libelf, libdw) and libdw's compression backends (libz/libzstd/liblzma/libbz2). |
 
 **Recommended compile flags:**
 
@@ -1059,7 +1073,7 @@ Debug builds add `-fsanitize=address,undefined` for runtime error detection.
 | Platform | Status | Notes |
 | -------- | ------ | ----- |
 | Linux (x86-64, ARM64) | Primary target | Tested on Ubuntu 22.04 and Raspberry Pi OS. |
-| macOS (Intel, Apple Silicon) | Secondary target | Requires bundled `elf.h`; uses `/dev/cu.usbserial-*` device paths. |
+| macOS (Intel, Apple Silicon) | Secondary target | Requires `brew install elfutils` (libelf/libdw); uses `/dev/cu.usbserial-*` device paths. |
 | Windows (native) | Out of scope | See `doc/PVD.md §7.2`; WSL2 may work but is not supported. |
 
 **Build targets (Makefile):**
@@ -1442,14 +1456,14 @@ Errors are propagated upward through the module stack without retrying:
       <intro><![CDATA[Requirements in this section govern the host platforms the server must support and the constraints on its runtime dependencies.]]></intro>
 
       <hlr id="HLR-033" name="Native Linux and macOS Build">
-        <text><![CDATA[The application shall compile and execute natively on Linux (x86-64 and ARM) and macOS (x86-64 and Apple Silicon) using a C99-conforming toolchain. The build shall not require any platform-specific preprocessor workarounds beyond what the C99 standard and POSIX.1-2008 provide.]]></text>
+        <text><![CDATA[The application shall compile and execute natively on Linux (x86-64 and ARM) and macOS (x86-64 and Apple Silicon) using a C99-conforming toolchain plus the **elfutils** development libraries (libelf and libdw), which are a required dependency (`src/elf_parser.c` is a thin adapter over them). On Linux these come from `libelf-dev`/`libdw-dev` (or `elfutils-devel`); on macOS from `brew install elfutils`. The build shall not require any platform-specific preprocessor workarounds beyond what the C99 standard, POSIX.1-2008, and the elfutils headers provide; in particular, no bundled ELF type shim is used (elfutils supplies the system `<elf.h>`).]]></text>
         <traces>
           <trace target="SDD" ref="2.2"/>
         </traces>
       </hlr>
 
       <hlr id="HLR-034" name="Lean Host Runtime Dependencies">
-        <text><![CDATA[The application runtime shall depend only on the host C standard library and POSIX serial and socket APIs. No Java runtime, Python interpreter, Electron-based framework, or other heavyweight dependency shall be required to launch or operate the server.]]></text>
+        <text><![CDATA[The application runtime shall depend only on the host C standard library, POSIX serial and socket APIs, and the **elfutils** shared libraries (libelf and libdw, together with the compression backends libdw links to read compressed `.debug` sections: libz, libzstd, liblzma, libbz2). No Java runtime, Python interpreter, Electron-based framework, or other heavyweight dependency shall be required to launch or operate the server.]]></text>
         <traces>
           <trace target="SDD" ref="2.2"/>
         </traces>
@@ -1465,7 +1479,7 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-040" name="Bounded Heap Allocation">
-        <text><![CDATA[The server shall not allocate heap memory on any hot path (packet processing, UPDI reads, FSM enumeration, monitor commands). Heap allocation via `malloc` shall be used exclusively inside `elf_open()` to load the ELF symbol and string table sections; this allocation shall be bounded by the size of the ELF binary and shall occur at most once per GDB session. All heap memory shall be freed by `elf_close()` at session end or on error.]]></text>
+        <text><![CDATA[The server shall not allocate heap memory on any hot path (packet processing, UPDI reads, FSM enumeration, monitor commands). The application itself shall perform no `malloc` of the ELF symbol/string tables; ELF/DWARF parsing memory is owned internally by the elfutils handles (the libelf `Elf*` and libdw `Dwarf*` opened in `elf_open()`), is bounded by the size of the ELF binary, and is allocated at most once per GDB session. All such resources shall be released by `elf_close()` (via `dwarf_end()` / `elf_end()` and `close(fd)`) at session end or on error.]]></text>
         <traces>
           <trace target="SDD" ref="2.2"/>
           <trace target="SDD" ref="9"/>
@@ -1552,6 +1566,21 @@ Errors are propagated upward through the module stack without retrying:
         <traces>
           <trace target="SDD" ref="5.3.1"/>
           <trace target="SDD" ref="4.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-071" name="ELF and DWARF Parsing via elfutils">
+        <text><![CDATA[ELF and DWARF parsing shall be delegated to the **elfutils** libraries — libelf (accessed through the class-independent GElf API) for the ELF container and libdw for DWARF — rather than hand-decoded from raw byte layouts. `src/elf_parser.c` shall be a thin adapter that holds only the AVR-Dx/avrOS domain logic (avrOS system-table symbol discovery, the mapped-flash VMA→LMA translation, word-vs-byte flash addressing, and the Microchip deviceinfo note) on top of those libraries, so that ELF/DWARF format changes are absorbed by elfutils. The bundled ELF type shim (`src/elf.h`) is removed; ELF type definitions come from the system `<elf.h>` that elfutils provides. The module's public C API (`elf_open`, `elf_close`, `elf_find_avros_tables`, `elf_has_fsm_symbols`, `elf_flash_addr`, `elf_phys_flash_byte_addr`) and the `ElfContext` / `AvrOsSymbolIndex` contract consumed by `fsm_mapper` and `main` shall be preserved, with the libelf `Elf*` and libdw `Dwarf*` handles held as opaque `void*` so consumers need no elfutils headers.]]></text>
+        <traces>
+          <trace target="SDD" ref="6.1"/>
+          <trace target="SDD" ref="6.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-072" name="DWARF Source-Level Lookup (DAP Groundwork)">
+        <text><![CDATA[The ELF module shall expose DWARF-backed source-level lookup so a future native Debug Adapter Protocol (DAP) front-end can map between machine addresses and source locations without delegating to `avr-gdb` (the GDB-RSP path does not use it). It shall provide: `elf_dwarf_available()` (returns 1, since elfutils is a required dependency); `elf_addr_to_line()` mapping a code byte address to its source file and 1-based line via libdw; and `elf_line_to_addr()` resolving a `file:line` (matched by basename) to the first code byte address. The accessors shall be safe to call when the ELF carries no debug info — returning -1 and leaving outputs untouched — and shall never abort the session. This requirement lands the source-mapping capability only; the DAP listener and request handlers are a later phase.]]></text>
+        <traces>
+          <trace target="SDD" ref="6.3.1"/>
         </traces>
       </hlr>
     </section>
@@ -2433,33 +2462,36 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
     </function>
 
-    <function number="5" title="src/elf_parser.c — ELF Binary Parser" name="elf" source="src/elf_parser.c">
-      <intro><![CDATA[Requirements for `elf_open()`, `elf_close()`, `elf_find_avros_tables()`, and `elf_flash_addr()`.]]></intro>
+    <function number="5" title="src/elf_parser.c — ELF/DWARF Adapter (elfutils)" name="elf" source="src/elf_parser.c">
+      <intro><![CDATA[Requirements for the thin elfutils adapter `src/elf_parser.c`: `elf_open()`, `elf_close()`, `elf_find_avros_tables()`, `elf_flash_addr()`, `elf_phys_flash_byte_addr()`, and the DWARF source-line accessors (`elf_dwarf_available()`, `elf_addr_to_line()`, `elf_line_to_addr()`). ELF parsing is delegated to libelf (GElf API); DWARF to libdw.]]></intro>
 
       <llr id="LLR-ELF-01">
-        <text><![CDATA[`elf_open()` shall read the first 16 bytes of the ELF binary and verify: the 4-byte magic sequence (0x7F `'E'` `'L'` `'F'`), `EI_CLASS == ELFCLASS32`, and `e_machine == EM_AVR` (0x0053). Any validation failure shall cause `elf_open()` to log a warning and return -1 without any heap allocation.]]></text>
+        <text><![CDATA[`elf_open()` shall open the file via libelf — `elf_version(EV_CURRENT)` then `elf_begin(fd, ELF_C_READ, NULL)` — and validate it through libelf: `elf_kind() == ELF_K_ELF`, `gelf_getclass() == ELFCLASS32`, and (via the cached header, LLR-ELF-10) `e_machine == EM_AVR` (0x0053). Any validation failure shall cause `elf_open()` to log a warning (including `elf_errmsg()` where applicable), release the libelf handle and fd, and return -1.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-021" name="ELF Binary Parsing"/>
+          <trace target="HLR" ref="HLR-071" name="ELF and DWARF Parsing via elfutils"/>
         </traces>
       </llr>
 
       <llr id="LLR-ELF-02">
-        <text><![CDATA[`elf_open()` shall locate the `.symtab` section (type `SHT_SYMTAB`) and its associated string table section (index given by `sh_link`), and load both into heap-allocated buffers stored in `ctx->symtab` and `ctx->strtab`. `ctx->sym_count` and `ctx->strtab_size` shall be set accordingly. On any `malloc` failure, `elf_open()` shall free all partial allocations and return -1.]]></text>
+        <text><![CDATA[`elf_open()` shall retain the libelf `Elf*` handle in `ctx->elf` for the lifetime of the context and shall access the symbol and string tables through that handle (the GElf API) on demand — it shall NOT copy `.symtab`/`.strtab` into application-owned heap buffers. The `ElfContext` shall therefore expose no `symtab`/`strtab`/`sym_count`/`strtab_size` fields; all symbol enumeration is performed by `elf_find_avros_tables()` (LLR-ELF-03) directly over libelf data.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-021" name="ELF Binary Parsing"/>
           <trace target="HLR" ref="HLR-040" name="Bounded Heap Allocation"/>
+          <trace target="HLR" ref="HLR-071" name="ELF and DWARF Parsing via elfutils"/>
         </traces>
       </llr>
 
       <llr id="LLR-ELF-03">
-        <text><![CDATA[`elf_find_avros_tables()` shall perform a single O(sym_count) linear scan of `ctx->symtab`, compare each symbol name against the 8 avrOS sentinel names defined in SDD §6.3.3, and populate the corresponding fields of `AvrOsSymbolIndex` for each match. The function shall return 0 (success, even if partial) or -1 only on an internal ELF read error.]]></text>
+        <text><![CDATA[`elf_find_avros_tables()` shall locate the first `SHT_SYMTAB` section through libelf (`elf_nextscn`/`gelf_getshdr`), obtain its `Elf_Data` (`elf_getdata`), and perform a single O(sym_count) scan with `gelf_getsym`, resolving each name via `elf_strptr(elf, sh.sh_link, st_name)` and comparing against the 8 avrOS sentinel names defined in SDD §6.3.3 to populate the corresponding fields of `AvrOsSymbolIndex` for each match. The function shall return 0 (success, even if partial) or -1 only on an internal ELF read error.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-021" name="ELF Binary Parsing"/>
+          <trace target="HLR" ref="HLR-071" name="ELF and DWARF Parsing via elfutils"/>
         </traces>
       </llr>
 
       <llr id="LLR-ELF-04">
-        <text><![CDATA[`elf_flash_addr()` shall convert an ELF virtual memory address to a physical FLASH word address using the formula: `physical_word_addr = (vma - ctx->flash_base) / 2`. All FLASH-resident avrOS symbol addresses stored in `AvrOsSymbolIndex` shall be computed via this function.]]></text>
+        <text><![CDATA[`elf_flash_addr()` shall convert an ELF virtual memory address to a physical FLASH word address using the formula `physical_word_addr = (vma - ctx->flash_base) / 2`. The FLASH-resident avrOS table addresses stored in `AvrOsSymbolIndex` shall be translated to their physical FLASH byte address (LMA) via `elf_phys_flash_byte_addr()` (the mapped-flash-window translation, LLR-ELF-08), while the SRAM-resident `currStateMachine` address shall be stored as a raw VMA.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-022" name="Harvard Architecture Address Mapping"/>
         </traces>
@@ -2473,21 +2505,22 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-ELF-06">
-        <text><![CDATA[`elf_close()` shall free `ctx->symtab`, free `ctx->strtab`, and close `ctx->fd`. After returning, `ctx->symtab` and `ctx->strtab` shall be set to NULL and `ctx->fd` to -1. `elf_close()` shall be safe to call on a partially initialised `ElfContext` (e.g., after a failed `elf_open()`).]]></text>
+        <text><![CDATA[`elf_close()` shall release the elfutils handles in order — `dwarf_end(ctx->dwarf)` (if non-NULL), then `elf_end(ctx->elf)` — and close `ctx->fd`. After returning, `ctx->dwarf` and `ctx->elf` shall be NULL and `ctx->fd` shall be -1. `elf_close()` shall be safe to call on a zero-initialised or partially initialised `ElfContext` (e.g., after a failed `elf_open()`).]]></text>
         <traces>
           <trace target="HLR" ref="HLR-040" name="Bounded Heap Allocation"/>
         </traces>
       </llr>
 
       <llr id="LLR-ELF-07">
-        <text><![CDATA[`src/elf_parser.c` shall obtain ELF32 type definitions via a platform-conditional include: on Linux (`#ifdef __linux__`) it shall use the system header `<elf.h>`; on all other platforms it shall include the bundled portability shim `src/elf.h`. The shim shall define at minimum: `Elf32_Half`, `Elf32_Word`, `Elf32_Off`, `Elf32_Addr`, `Elf32_Ehdr`, `Elf32_Phdr`, `Elf32_Shdr`, `Elf32_Sym`, the `ELFMAG`/`SELFMAG` magic constants, `EI_CLASS`, `ELFCLASS32`, `EM_AVR` (0x0053), `PT_LOAD`, `SHT_SYMTAB`, `SHT_STRTAB`, `SHN_UNDEF`, and the `ELF32_ST_BIND`/`ELF32_ST_TYPE` accessor macros.]]></text>
+        <text><![CDATA[`src/elf_parser.c` shall delegate all ELF and DWARF format parsing to elfutils — libelf via the class-independent GElf API for the ELF container, and libdw for DWARF — and shall not hand-decode ELF byte layouts. elfutils is a required build and runtime dependency; the bundled ELF type shim formerly at `src/elf.h` is removed, and ELF32 type definitions (`Elf32_Ehdr`, `Elf32_Phdr`, `EM_AVR`, `PT_LOAD`, etc.) used by this module and its consumers come from the system `<elf.h>` that elfutils requires. The build shall link `-ldw -lelf` unconditionally (no compile-time feature detection).]]></text>
         <traces>
           <trace target="HLR" ref="HLR-033" name="Native Linux and macOS Build"/>
+          <trace target="HLR" ref="HLR-071" name="ELF and DWARF Parsing via elfutils"/>
         </traces>
       </llr>
 
       <llr id="LLR-ELF-08">
-        <text><![CDATA[`elf_open()` shall iterate over all ELF program headers and identify `PT_LOAD` segments. The first `PT_LOAD` segment encountered shall be treated as the FLASH load segment: its `p_vaddr` and `p_filesz` shall be stored in `ctx->flash_base` and `ctx->flash_size` respectively. The second `PT_LOAD` segment shall be treated as the SRAM load segment: its `p_vaddr` and `p_memsz` shall be stored in `ctx->sram_base` and `ctx->sram_size` respectively. If fewer than two `PT_LOAD` segments are present the absent values shall remain zero. These fields are the sole inputs to `elf_flash_addr()`.]]></text>
+        <text><![CDATA[`elf_open()` shall walk the ELF program headers via libelf (`elf_getphdrnum()` / `gelf_getphdr()`) and identify `PT_LOAD` segments. The first `PT_LOAD` segment shall be treated as the FLASH load segment: its `p_vaddr` and `p_filesz` shall be stored in `ctx->flash_base` and `ctx->flash_size`. The second `PT_LOAD` shall be the SRAM segment: its `p_vaddr` and `p_filesz` shall be stored in `ctx->sram_base` and `ctx->sram_size`. Each `PT_LOAD`'s `p_vaddr`/`p_paddr`/`p_memsz` shall also be recorded in `ctx->loads[]` (up to `ELF_MAX_PT_LOAD`) for the mapped-flash VMA→LMA translation performed by `elf_phys_flash_byte_addr()`. If fewer than two `PT_LOAD` segments are present the absent values shall remain zero.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-021" name="ELF Binary Parsing"/>
           <trace target="HLR" ref="HLR-022" name="Harvard Architecture Address Mapping"/>
@@ -2495,10 +2528,39 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-ELF-09">
-        <text><![CDATA[`elf_open()` shall best-effort extract the lowercase Microchip part-name string from the `.note.gnu.avr.deviceinfo` ELF note emitted by avr-gcc + Microchip device packs (binutils ≥ 2.27). The parser shall walk every section of type `SHT_NOTE`, validate the standard ELF note prologue (`namesz = 4`, `type = 1`, `name = "AVR\0"`), then scan the descriptor bytes for the first NUL-terminated ASCII run starting with `"avr"` followed immediately by an ASCII digit. Up to `ELF_DEVICE_NAME_MAX - 1` (15) bytes shall be copied into the new `ElfContext.device_name` field and NUL-terminated. The note-format heuristic — scanning for `"avr<digit>…"` rather than decoding the descriptor's full struct — is intentional, so the parser survives binutils version drift in the descriptor layout. When the note is absent, malformed, or contains no recognised part-name, `device_name` shall remain the empty string the entry path cleared (`ctx->device_name[0] = '\0'`), which `app_main()` (LLR-MAIN-13) treats as "ELF carries no device identification" and which `updi_family_from_partname()` (LLR-UPDI-28) maps to `NULL`. This LLR shall not cause `elf_open()` to fail on any input that already passes the ELF32/EM_AVR validation in LLR-ELF-01.]]></text>
+        <text><![CDATA[`elf_open()` shall best-effort extract the lowercase Microchip part-name string from the `.note.gnu.avr.deviceinfo` ELF note emitted by avr-gcc + Microchip device packs. The parser shall walk every `SHT_NOTE` section via libelf (`elf_nextscn` / `gelf_getshdr` / `elf_getdata`) and scan the note section data for the first NUL-terminated ASCII run starting with `"avr"` followed immediately by an ASCII digit. Up to `ELF_DEVICE_NAME_MAX - 1` (15) bytes shall be copied into the `ElfContext.device_name` field and NUL-terminated. The note-format heuristic — scanning for `"avr<digit>…"` rather than decoding the descriptor's full struct — is intentional, so the parser survives binutils version drift in the descriptor layout. When the note is absent, malformed, or contains no recognised part-name, `device_name` shall remain the empty string the entry path cleared (`ctx->device_name[0] = '\0'`), which `app_main()` (LLR-MAIN-13) treats as "ELF carries no device identification" and which `updi_family_from_partname()` (LLR-UPDI-28) maps to `NULL`. This LLR shall not cause `elf_open()` to fail on any input that already passes the ELF32/EM_AVR validation in LLR-ELF-01.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-021" name="ELF Binary Parsing"/>
           <trace target="HLR" ref="HLR-048" name="Multi-Family Runtime Device Dispatch"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-ELF-10">
+        <text><![CDATA[`elf_open()` shall cache the ELF header via libelf's `elf32_getehdr()` into `ctx->ehdr` (an `Elf32_Ehdr`) so consumers that walk program headers directly from `ctx->fd` — notably `main.c`'s flash-load and verify paths — retain access to `e_phnum` / `e_phoff` / `e_entry`. A NULL return from `elf32_getehdr()` shall be treated as a validation failure (LLR-ELF-01).]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-021" name="ELF Binary Parsing"/>
+          <trace target="HLR" ref="HLR-071" name="ELF and DWARF Parsing via elfutils"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-ELF-11">
+        <text><![CDATA[`elf_open()` shall open a libdw handle with `dwarf_begin_elf(ctx->elf, DWARF_C_READ, NULL)` and store it in `ctx->dwarf`; the handle shares the libelf `Elf*`, so `elf_close()` releases it with `dwarf_end()` before `elf_end()` (LLR-ELF-06). A NULL result (the ELF carries no `.debug_*` sections) shall be non-fatal — `ctx->dwarf` stays NULL and `elf_open()` still returns 0. `elf_dwarf_available()` shall return 1 (libdw is always linked, since elfutils is a required dependency).]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-072" name="DWARF Source-Level Lookup (DAP Groundwork)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-ELF-12">
+        <text><![CDATA[`elf_addr_to_line()` shall map a code-space byte address to its source `file:line` using libdw: `dwarf_addrdie()` to find the compilation-unit DIE containing the address, then `dwarf_getsrc_die()` and `dwarf_lineno()`/`dwarf_linesrc()`. On success it shall return 0, store the 1-based line in `*line` (when non-NULL), and copy the NUL-terminated source path (truncated to `file_cap`) into `file` (when non-NULL). It shall return -1 — leaving the outputs untouched and never aborting — when `ctx->dwarf` is NULL or the address has no line-table entry.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-072" name="DWARF Source-Level Lookup (DAP Groundwork)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-ELF-13">
+        <text><![CDATA[`elf_line_to_addr()` shall resolve a `file:line` to the first matching code-space byte address using libdw: iterate compilation units with `dwarf_nextcu()`/`dwarf_offdie()`, enumerate each CU's line table with `dwarf_getsrclines()`/`dwarf_onesrcline()`, match on `dwarf_lineno()` and on the requested file by basename (`dwarf_linesrc()`), and return the address from `dwarf_lineaddr()`. On success it shall return 0 and store the address in `*byte_addr`; it shall return -1 when `ctx->dwarf` is NULL or no matching row exists.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-072" name="DWARF Source-Level Lookup (DAP Groundwork)"/>
         </traces>
       </llr>
     </function>
@@ -3677,12 +3739,12 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/elf_parser.c unit tests                                  -->
     <!-- ============================================================ -->
-    <file path="tests/test_elf.c" role="unit" count="16">
-      <header><![CDATA[Unit tests for `src/elf_parser.c`: ELF validation, symbol table loading, avrOS sentinel symbol discovery, Harvard address conversion, fail-safe degradation, and context cleanup. Fixture ELF binaries are generated by a helper script in `tests/fixtures/`.]]></header>
+    <file path="tests/test_elf.c" role="unit" count="15">
+      <header><![CDATA[Unit tests for the elfutils-based `src/elf_parser.c`: ELF validation, avrOS sentinel symbol discovery, Harvard / mapped-flash address conversion, fail-safe degradation, deviceinfo note extraction, DWARF source-line round-trip, and handle release. Fixture ELF binaries (compiled with `-g`) are generated under `tests/fixtures/`. The former heap symtab/strtab and malloc-injection tests are retired — libelf owns that memory now.]]></header>
 
       <test name="elf_open_accepts_valid_avr_elf32_binary">
-        <purpose><![CDATA[Call `elf_open()` with a well-formed AVR ELF32 fixture file and verify the return value is non-negative and `ctx.sym_count > 0`.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-ELF-01"/></traces>
+        <purpose><![CDATA[Call `elf_open()` with a well-formed AVR ELF32 fixture file and verify the return value is 0, `ctx.elf` is non-NULL, and `ctx.fd` is open.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-01"/><trace target="LLR" ref="LLR-ELF-02"/></traces>
       </test>
 
       <test name="elf_open_returns_minus1_on_invalid_elf_magic">
@@ -3692,22 +3754,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
 
       <test name="elf_open_returns_minus1_on_wrong_machine_type">
         <purpose><![CDATA[Call `elf_open()` with a valid ELF32 file that has `e_machine != EM_AVR` and verify the return value is -1.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-ELF-01"/></traces>
-      </test>
-
-      <test name="elf_open_loads_symtab_and_strtab_into_heap_buffers">
-        <purpose><![CDATA[After a successful `elf_open()`, verify that `ctx.symtab` and `ctx.strtab` are non-NULL heap pointers, and that `ctx.sym_count` and `ctx.strtab_size` reflect the actual section sizes.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-ELF-02"/></traces>
-      </test>
-
-      <test name="elf_open_frees_partial_allocs_and_returns_minus1_on_malloc_failure">
-        <purpose><![CDATA[Inject a mock `malloc()` that fails on the second allocation, call `elf_open()`, and verify the return value is -1 and no heap memory remains allocated.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-ELF-02"/></traces>
-      </test>
-
-      <test name="elf_find_avros_tables_performs_single_linear_scan">
-        <purpose><![CDATA[Instrument `elf_find_avros_tables()` with a mock symbol table and verify that each symbol entry is examined at most once regardless of how many avrOS sentinels are present.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-ELF-03"/></traces>
+        <traces><trace target="LLR" ref="LLR-ELF-01"/><trace target="LLR" ref="LLR-ELF-10"/></traces>
       </test>
 
       <test name="elf_find_avros_tables_populates_all_7_avros_sentinel_fields">
@@ -3720,13 +3767,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces><trace target="LLR" ref="LLR-ELF-04"/></traces>
       </test>
 
-      <test name="elf_flash_addr_all_avros_symbol_addresses_use_word_formula">
-        <purpose><![CDATA[After `elf_find_avros_tables()`, verify that every FLASH-resident address stored in `AvrOsSymbolIndex` was computed via `elf_flash_addr()`, not as a raw VMA.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-ELF-04"/></traces>
+      <test name="elf_find_avros_tables_translates_flash_but_not_sram">
+        <purpose><![CDATA[After `elf_find_avros_tables()` on the full fixture, verify the FLASH-resident table addresses (`fsm_table_addr`, `queue_table_addr`, `event_table_addr`) are physical FLASH byte LMAs below the 0x800000 data band (i.e. mapped-flash-translated), while the SRAM-resident `current_fsm_addr` is a raw VMA at or above 0x800000.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-04"/><trace target="LLR" ref="LLR-ELF-08"/></traces>
       </test>
 
       <test name="elf_find_avros_tables_returns_0_on_partial_symbol_match">
-        <purpose><![CDATA[Call `elf_find_avros_tables()` with a fixture ELF containing only 4 of the 8 avrOS sentinels and verify the return value is 0 (not -1).]]></purpose>
+        <purpose><![CDATA[Call `elf_find_avros_tables()` with a fixture ELF containing only some of the avrOS sentinels and verify the return value is 0 (not -1).]]></purpose>
         <traces><trace target="LLR" ref="LLR-ELF-05"/></traces>
       </test>
 
@@ -3735,29 +3782,39 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces><trace target="LLR" ref="LLR-ELF-05"/></traces>
       </test>
 
-      <test name="elf_close_frees_symtab_strtab_and_closes_fd">
-        <purpose><![CDATA[After a successful `elf_open()`, call `elf_close()` and verify that the file descriptor is closed and no memory is leaked (checked via Valgrind or AddressSanitizer).]]></purpose>
+      <test name="elf_has_fsm_symbols_requires_non_zero_table_address_and_count">
+        <purpose><![CDATA[Verify `elf_has_fsm_symbols()` returns 0 for a zero-initialised `AvrOsSymbolIndex` and 1 once both `fsm_table_addr` and `fsm_table_count` are non-zero.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-05"/></traces>
+      </test>
+
+      <test name="elf_close_releases_handles_and_closes_fd">
+        <purpose><![CDATA[After a successful `elf_open()`, call `elf_close()` and verify `ctx.elf` and `ctx.dwarf` are NULL, `ctx.fd` is -1, and the OS file descriptor is actually closed (`fcntl(saved_fd, F_GETFD)` fails with `EBADF`).]]></purpose>
         <traces><trace target="LLR" ref="LLR-ELF-06"/></traces>
       </test>
 
       <test name="elf_close_safe_on_partially_initialised_context">
-        <purpose><![CDATA[Construct an `ElfContext` with `symtab = NULL`, `strtab` allocated, and `fd = -1`, call `elf_close()`, and verify no crash or double-free occurs.]]></purpose>
+        <purpose><![CDATA[Call `elf_close()` on a zero-initialised `ElfContext` (NULL handles, `fd = -1`) and verify no crash or double-free occurs and the handles/fd remain cleared.]]></purpose>
         <traces><trace target="LLR" ref="LLR-ELF-06"/></traces>
       </test>
 
       <test name="elf_open_sets_flash_base_and_sram_base_from_pt_load_segments">
-        <purpose><![CDATA[After a successful `elf_open()` on the full fixture, verify that `ctx.flash_base` equals the VMA of the first `PT_LOAD` segment (0x00000000 for the fixture) and `ctx.sram_base` equals the VMA of the second `PT_LOAD` segment (0x00804000 for the AVR128DA28 fixture).]]></purpose>
+        <purpose><![CDATA[After a successful `elf_open()` on the full fixture, verify `ctx.sram_base` equals the VMA of the second `PT_LOAD` segment (0x00804000 for the AVR128DA28 fixture) and `ctx.flash_size` is non-zero.]]></purpose>
         <traces><trace target="LLR" ref="LLR-ELF-08"/></traces>
       </test>
 
       <test name="elf_open_extracts_device_name_from_deviceinfo_note">
-        <purpose><![CDATA[After `elf_open()` on every AVR fixture (all built for AVR128DA28), verify `ctx.device_name` equals `"avr128da28"` — the lowercase part-name string extracted from the `.note.gnu.avr.deviceinfo` ELF note descriptor.]]></purpose>
+        <purpose><![CDATA[After `elf_open()` on every AVR fixture (all built for AVR128DA28), verify `ctx.device_name` equals `"avr128da28"` — the lowercase part-name string extracted from the `.note.gnu.avr.deviceinfo` ELF note via libelf section data.]]></purpose>
         <traces><trace target="LLR" ref="LLR-ELF-09"/></traces>
       </test>
 
       <test name="elf_open_leaves_device_name_empty_when_note_absent">
-        <purpose><![CDATA[Copy the full fixture to a temp path and zero every `"avr<digit>"` ASCII triplet in the file so the deviceinfo heuristic finds nothing, then `elf_open()` the rewritten ELF and verify `elf_open()` still returns 0 and that `ctx.device_name` is the empty string. This proves the parser's note-extraction step is non-fatal on inputs that lack the note.]]></purpose>
+        <purpose><![CDATA[Copy the full fixture to a temp path and zero every `"avr<digit>"` ASCII triplet so the deviceinfo heuristic finds nothing, then `elf_open()` the rewritten ELF and verify it still returns 0 and `ctx.device_name` is the empty string. Proves the note-extraction step is non-fatal on inputs that lack the note.]]></purpose>
         <traces><trace target="LLR" ref="LLR-ELF-09"/></traces>
+      </test>
+
+      <test name="elf_dwarf_accessors_round_trip">
+        <purpose><![CDATA[On a `-g` fixture, verify `elf_dwarf_available()` returns 1; map the entry-point code address to a source `file:line` via `elf_addr_to_line()` (when it resolves, assert line > 0 and a non-empty file, and that `elf_line_to_addr()` returns a real address for that `file:line`); and verify `elf_addr_to_line()` on an address far outside any CU returns -1 without crashing.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-11"/><trace target="LLR" ref="LLR-ELF-12"/><trace target="LLR" ref="LLR-ELF-13"/></traces>
       </test>
     </file>
 
@@ -3931,8 +3988,8 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         </traces>
       </test>
 
-      <test name="runtime_links_only_libc_no_heavyweight_deps">
-        <purpose><![CDATA[Run `ldd avrOSdb` on the linked binary and verify that the only shared-library dependency is `libc.so`. Assert that no Java runtime, Python interpreter, Electron libraries, or other non-POSIX dependencies appear.]]></purpose>
+      <test name="runtime_links_only_libc_and_elfutils">
+        <purpose><![CDATA[Run `ldd avrOSdb` on the linked binary and verify the only shared-library dependencies are libc, the loader/vDSO, libutil, and the required elfutils stack (libdw, libelf) plus libdw's compression backends (libz, libzstd, liblzma, libbz2). Assert that no Java runtime, Python interpreter, Electron libraries, or other heavyweight dependency appears.]]></purpose>
         <traces><trace target="HLR" ref="HLR-034"/></traces>
       </test>
     </file>
