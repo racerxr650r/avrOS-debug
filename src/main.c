@@ -20,6 +20,7 @@
 #include "elf_parser.h"
 #include "updi.h"
 #include "fsm_mapper.h"
+#include "dap.h"
 #include "gdb_rsp.h"
 
 #include <netinet/in.h>
@@ -49,6 +50,9 @@ typedef struct {
                                   *  autodetect and use the named family  */
     bool        no_introspect;  /* --no-introspect: disable avrOS FSM introspection */
     bool        reset_cpu;       /* --reset: pulse UPDI system reset and exit    */
+    bool        dap_mode;        /* --dap: serve DAP instead of RSP (default).
+                                  *  --rsp selects RSP explicitly; the two are
+                                  *  mutually exclusive (Phase 16).            */
     /* fds owned by main; -1 = closed/unset */
     int         listen_fd;
     int         gdb_fd;
@@ -78,7 +82,7 @@ static volatile sig_atomic_t g_shutdown_signal = 0;
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "usage: %s [--port <port>] [--baud <baud>] [--erase] [--load] "
+        "usage: %s [--rsp | --dap] [--port <port>] [--baud <baud>] [--erase] [--load] "
         "[--no-verify] [--allow-lock-updi] [--force-device=<family>] [--log-rsp] "
         "<serial-device> <elf-file>\n"
         "       %s --prog [--baud <baud>] [--erase] [--no-verify] "
@@ -119,7 +123,12 @@ static void usage(const char *prog)
         "  --no-introspect    Disable avrOS FSM introspection (the `monitor\n"
         "                     avros` task/state view). The GDB thread model is\n"
         "                     unaffected: the live CPU is always the sole GDB\n"
-        "                     thread.\n",
+        "                     thread.\n"
+        "  --rsp              Serve the GDB Remote Serial Protocol front-end\n"
+        "                     (the default). Mutually exclusive with --dap.\n"
+        "  --dap              Serve the Debug Adapter Protocol front-end for\n"
+        "                     DAP-native editors (VS Code). Mutually exclusive\n"
+        "                     with --rsp.\n",
         prog, prog, prog, prog);
 }
 
@@ -404,10 +413,15 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
     cfg->log_rsp       = false;
     cfg->no_introspect = false;
     cfg->reset_cpu      = false;
+    cfg->dap_mode       = false;   /* default: RSP front-end */
     cfg->listen_fd     = -1;
     cfg->gdb_fd        = -1;
     cfg->updi_fd       = -1;
 
+    /* Phase 16: track explicit --rsp / --dap so the two can be rejected when
+     * both are given.  cfg->dap_mode alone can't distinguish "default RSP"
+     * from "--rsp given". */
+    bool saw_rsp = false, saw_dap = false;
     int positional = 0;
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -448,6 +462,12 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
             cfg->no_introspect = true;
         } else if (strcmp(a, "--reset") == 0) {
             cfg->reset_cpu = true;
+        } else if (strcmp(a, "--rsp") == 0) {
+            cfg->dap_mode = false;
+            saw_rsp = true;
+        } else if (strcmp(a, "--dap") == 0) {
+            cfg->dap_mode = true;
+            saw_dap = true;
         } else if (a[0] == '-' && a[1] != '\0') {
             fprintf(stderr, "%s: unrecognised option '%s'\n", argv[0], a);
             usage(argv[0]);
@@ -463,6 +483,15 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
             usage(argv[0]);
             exit(1);
         }
+    }
+
+    /* Phase 16: --rsp and --dap are mutually exclusive. */
+    if (saw_rsp && saw_dap) {
+        fprintf(stderr,
+                "%s: error: --rsp and --dap are mutually exclusive\n",
+                argv[0]);
+        usage(argv[0]);
+        exit(1);
     }
 
     /* LLR-MAIN-08: --device and --load are mutually exclusive. */
@@ -1512,7 +1541,13 @@ int MAIN_NAME(int argc, char *argv[])
     rsp_default_handlers(&handlers, &rctx);
 
     rsp_set_logging(cfg.log_rsp);
-    event_loop(&cfg, &handlers);
+    /* Phase 16: dispatch to the selected protocol front-end. Both serve over
+     * the same TCP listener + debug core; --rsp is the default. */
+    if (cfg.dap_mode)
+        dap_serve(cfg.listen_fd, cfg.updi_fd, &elf_ctx, &idx,
+                  enable_introspect ? &fsm_ctx : NULL, &g_quit, cfg.log_rsp);
+    else
+        event_loop(&cfg, &handlers);
 
     /* HLR-065 / LLR-MAIN-22: announce shutdown reason just before
      * teardown frees the listener and silicon resources.              */

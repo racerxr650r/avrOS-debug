@@ -145,7 +145,8 @@ SRCS     := $(SRCDIR)/main.c \
              $(SRCDIR)/elf_parser.c \
              $(SRCDIR)/fsm_mapper.c \
              $(SRCDIR)/monitor.c \
-             $(SRCDIR)/gdb_rsp.c
+             $(SRCDIR)/gdb_rsp.c \
+             $(SRCDIR)/dap.c
 OBJS     := $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(SRCS))
 
 # ── Unity ──────────────────────────────────────────────────────────────────────
@@ -262,7 +263,7 @@ TEST_EXTRA_LDFLAGS_test_rsp :=
 
 # test_main — test_main.c #includes src/main.c so it can reach the
 # static parse_args() / event_loop() / load_flash_segments() helpers.
-TEST_SRCS_test_main := $(TESTDIR)/test_main.c
+TEST_SRCS_test_main := $(TESTDIR)/test_main.c $(SRCDIR)/dap.c
 TEST_WRAP_test_main  := updi_open updi_close updi_console_poll \
                         updi_select_device updi_get_device \
                         updi_nvm_write_flash updi_nvm_flash_patch \
@@ -293,7 +294,7 @@ TEST_EXTRA_LDFLAGS_test_install :=
 # updi.c is linked in real so updi_read_device_info exercises the PTY
 # harness; updi_open / updi_close are wrapped to substitute a pre-opened
 # PTY slave fd.
-TEST_SRCS_test_device := $(TESTDIR)/test_device.c $(SRCDIR)/updi.c
+TEST_SRCS_test_device := $(TESTDIR)/test_device.c $(SRCDIR)/updi.c $(SRCDIR)/dap.c
 TEST_WRAP_test_device  := select updi_open updi_close \
                           updi_nvm_write_flash updi_console_poll \
                           updi_probe_baud updi_nvm_read \

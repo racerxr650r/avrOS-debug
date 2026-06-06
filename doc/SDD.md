@@ -88,7 +88,7 @@ Phase 10 work shall continue to honour the layered architecture (§2.1) and the 
 ## 2. System Overview
 
 ### 2.1 System Architecture
-`avrOSdb` is a single-process C99 application. Responsibilities are divided into six source modules arranged in four protocol layers; each layer depends only on the layers below it, and no upward calls are permitted. This layering is a hard design rule — see §2.2 "Layered Architecture" — and is enforced by review and by the `.h` dependency graph (the lower layers' headers must not `#include` any header from a higher layer).
+`avrOSdb` is a single-process C99 application. Responsibilities are divided into seven source modules arranged in four protocol layers; each layer depends only on the layers below it, and no upward calls are permitted. The protocol layer hosts two interchangeable client-facing front-ends over a shared protocol-agnostic debug core (HLR-073, `src/debug_core.h`): the GDB-RSP server (`src/gdb_rsp.c`) and the DAP server (`src/dap.c`), selected at startup by `--rsp` (default) / `--dap`. This layering is a hard design rule — see §2.2 "Layered Architecture" — and is enforced by review and by the `.h` dependency graph (the lower layers' headers must not `#include` any header from a higher layer).
 
 **Layer stack (top to bottom):**
 

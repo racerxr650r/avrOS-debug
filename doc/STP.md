@@ -297,16 +297,18 @@ Role: **integration**. **8 test(s).**
 
 ### 3.9. [tests/test_device.c](../tests/test_device.c)
 
-Role: **unit**. **6 test(s).**
+Role: **unit**. **8 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
 | 1 | <a id="parse_args_accepts_device_flag_without_elf_operand"></a>`parse_args_accepts_device_flag_without_elf_operand` | `LLR-MAIN-08` | Invoke `parse_args()` with `argv = {"avrOSdb", "--device", "/dev/ttyUSB0"}` and assert `cfg.device_info == true`, `cfg.serial_device == "/dev/ttyUSB0"`, `cfg.elf_path == NULL`, and `parse_args()` returns without exiting. |
 | 2 | <a id="parse_args_rejects_device_combined_with_load"></a>`parse_args_rejects_device_combined_with_load` | `LLR-MAIN-08` | Fork a subprocess that calls `parse_args()` with `--device --load /dev/ttyUSB0 fw.elf`; assert the child exits with status 1 and that captured stderr contains `"--device is mutually exclusive with --load"`. |
-| 3 | <a id="updi_read_device_info_returns_sigrow_and_asi_bytes"></a>`updi_read_device_info_returns_sigrow_and_asi_bytes` | `LLR-UPDI-13` | Open a PTY pair; in a helper thread script the slave end to echo half-duplex bytes and respond to a SIGROW DEVICEID read at `0x1100`-`0x1102` with canned signature `0x1E 0x97 0x0A`, a SYSCFG.REVID read at `0x0F01` returning `0xA6`, a SIGROW.SERNUM read at `0x1110`-`0x111F` returning a canned 16-byte serial number, and to LDCS reads of SYS_STATUS / KEY_STATUS / STATUSB. Call `updi_read_device_info()` and assert all struct fields match the canned values and that the function returns 0 with `info.fail_op == NULL`. |
-| 4 | <a id="updi_read_device_info_reports_failed_step_on_nak"></a>`updi_read_device_info_reports_failed_step_on_nak` | `LLR-UPDI-13` | Drive the PTY harness to return an unexpected byte in place of the SIGROW response. Assert `updi_read_device_info()` returns -1, `info.fail_op` equals the string `"sigrow"`, and `info.fail_errno` is negative. |
-| 5 | <a id="run_device_mode_prints_report_to_stdout"></a>`run_device_mode_prints_report_to_stdout` | `LLR-MAIN-09` | Capture `stdout` from `run_device_mode()` driven by the PTY harness with signature `0x1E 0x97 0x0A`. Assert the captured output contains the literal lines `Serial device:`, `Baud rate:`, `Signature:`, `Family:`, `Revision:`, `Serial:`, and `UPDI status:` (case-sensitive prefix match). |
-| 6 | <a id="device_mode_does_not_call_rsp_listen"></a>`device_mode_does_not_call_rsp_listen` | `LLR-MAIN-09` | Link the test binary with a stub `rsp_listen()` that flags a global. Invoke `run_device_mode()` to completion and assert the flag remains clear, proving the diagnostic path bypasses GDB listener startup. |
+| 3 | <a id="parse_args_mode_defaults_to_rsp_and_honours_dap_rsp"></a>`parse_args_mode_defaults_to_rsp_and_honours_dap_rsp` | `LLR-MAIN-24` | Invoke `parse_args()` three ways and assert `cfg.dap_mode`: with no mode flag it is `false` (default RSP); with `--dap` it is `true`; with `--rsp` it is `false`. |
+| 4 | <a id="parse_args_rejects_rsp_combined_with_dap"></a>`parse_args_rejects_rsp_combined_with_dap` | `LLR-MAIN-24` | Fork a subprocess that calls `parse_args()` with `--rsp --dap /dev/ttyUSB0 fw.elf`; assert the child exits with status 1 and that captured stderr contains `"--rsp and --dap are mutually exclusive"`. |
+| 5 | <a id="updi_read_device_info_returns_sigrow_and_asi_bytes"></a>`updi_read_device_info_returns_sigrow_and_asi_bytes` | `LLR-UPDI-13` | Open a PTY pair; in a helper thread script the slave end to echo half-duplex bytes and respond to a SIGROW DEVICEID read at `0x1100`-`0x1102` with canned signature `0x1E 0x97 0x0A`, a SYSCFG.REVID read at `0x0F01` returning `0xA6`, a SIGROW.SERNUM read at `0x1110`-`0x111F` returning a canned 16-byte serial number, and to LDCS reads of SYS_STATUS / KEY_STATUS / STATUSB. Call `updi_read_device_info()` and assert all struct fields match the canned values and that the function returns 0 with `info.fail_op == NULL`. |
+| 6 | <a id="updi_read_device_info_reports_failed_step_on_nak"></a>`updi_read_device_info_reports_failed_step_on_nak` | `LLR-UPDI-13` | Drive the PTY harness to return an unexpected byte in place of the SIGROW response. Assert `updi_read_device_info()` returns -1, `info.fail_op` equals the string `"sigrow"`, and `info.fail_errno` is negative. |
+| 7 | <a id="run_device_mode_prints_report_to_stdout"></a>`run_device_mode_prints_report_to_stdout` | `LLR-MAIN-09` | Capture `stdout` from `run_device_mode()` driven by the PTY harness with signature `0x1E 0x97 0x0A`. Assert the captured output contains the literal lines `Serial device:`, `Baud rate:`, `Signature:`, `Family:`, `Revision:`, `Serial:`, and `UPDI status:` (case-sensitive prefix match). |
+| 8 | <a id="device_mode_does_not_call_rsp_listen"></a>`device_mode_does_not_call_rsp_listen` | `LLR-MAIN-09` | Link the test binary with a stub `rsp_listen()` that flags a global. Invoke `run_device_mode()` to completion and assert the flag remains clear, proving the diagnostic path bypasses GDB listener startup. |
 
 ### 3.10. [tests/hw/hw_test.c](../tests/hw/hw_test.c)
 
@@ -387,6 +389,7 @@ verified by code review — see
 | `LLR-MAIN-17` | `main` | `HLR-050`, `HLR-051`, `HLR-052` | `parse_args_no_autobaud_sets_flag` |
 | `LLR-MAIN-21` | `main` | `HLR-055` | `parse_args_allow_erase_sets_flag`, `parse_args_allow_erase_defaults_false` |
 | `LLR-MAIN-23` | `main` | `HLR-068` | `test_parse_args_log_rsp_sets_flag` |
+| `LLR-MAIN-24` | `main` | `HLR-074` | `parse_args_mode_defaults_to_rsp_and_honours_dap_rsp`, `parse_args_rejects_rsp_combined_with_dap` |
 | `LLR-MAIN-22` | `main` | `HLR-065` | `test_sig_handler_records_signo_in_g_shutdown_signal`, `test_event_loop_clears_disconnect_reason_after_drain` |
 | `LLR-UPDI-01` | `updi` | `HLR-006` | `updi_open_sets_8e2_raw_half_duplex_via_termios`, `updi_open_returns_minus1_on_device_open_failure` |
 | `LLR-UPDI-02` | `updi` | `HLR-006`, `HLR-036` | `updi_open_asserts_wake_byte_then_stcs_ctrlb`, `updi_open_restores_session_baud_after_break` |
