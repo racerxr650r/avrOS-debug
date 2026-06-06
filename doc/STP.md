@@ -381,6 +381,17 @@ Role: **unit**. **13 test(s).**
 | 12 | <a id="dap_unknown_request_returns_error"></a>`dap_unknown_request_returns_error` | `LLR-DAP-06`, `LLR-DAP-07` | Dispatch an unimplemented command and verify the adapter replies with a `success:false` response echoing the command and carrying a `message`, rather than leaving the client waiting. |
 | 13 | <a id="dap_serve_runs_handshake_to_disconnect"></a>`dap_serve_runs_handshake_to_disconnect` | `LLR-DAP-05` | Drive `dap_serve()` end-to-end without hardware: a stubbed `rsp_accept()` hands it a pre-connected socketpair end whose request stream is pre-loaded with `initialize` then `disconnect`. Verify the accept/select/read/dispatch loop processes both (emitting the initialize response, the `initialized` event, and the disconnect response) and returns 0 when the client disconnects. |
 
+### 3.13. [tests/hw/dap_acceptance.lua](../tests/hw/dap_acceptance.lua)
+
+Role: **hardware**. **4 test(s).**
+
+| # | Test | Verifies | Purpose |
+| - | ---- | -------- | ------- |
+| 1 | <a id="DAP1_initialize_handshake"></a>`DAP1_initialize_handshake` | — | nvim-dap attaches to the `avrOSdb --dap` server; verify the `initialize` request completes (capabilities received) and the adapter emits the `initialized` event, i.e. the session becomes active on live silicon. |
+| 2 | <a id="DAP2_configuration_done_stopped_entry"></a>`DAP2_configuration_done_stopped_entry` | — | After the configuration phase, verify the adapter emits a `stopped` event with reason `entry`, reaching the stopped-at-entry state on the target. |
+| 3 | <a id="DAP3_threads_single_cpu"></a>`DAP3_threads_single_cpu` | — | Issue a `threads` request and verify the adapter reports exactly one live CPU thread. |
+| 4 | <a id="DAP4_disconnect_clean"></a>`DAP4_disconnect_clean` | — | Issue a `disconnect` request and verify the adapter responds successfully and the session tears down cleanly (the target is resumed). |
+
 ## 4. LLR Coverage Matrix
 
 Every LLR in [LLRs.md](LLRs.md) and the test(s) that verify it.

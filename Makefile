@@ -23,6 +23,8 @@
 #                (reflashes the target); requires HW_TEST_NVM_CONFIRM=YES
 #                and a working `avr-gdb` on PATH.
 #   hw-test-all  Run all hw-test groups (needs both opt-ins above)
+#   hw-test-dap  Drive the DAP server with headless Neovim + nvim-dap over TCP
+#                (attach handshake; non-destructive; needs `nvim`).
 #   clean        Remove all build artefacts
 #   check-tools  Verify all required host tools are present on PATH
 #   install      Install binary + man page under $(PREFIX) [default: /usr/local]
@@ -558,7 +560,7 @@ $(HW_TEST_BIN): $(HW_TEST_SRC) $(BUILDDIR)/updi.o
 	$(Q)$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $^ $(LUTIL)
 	@echo "  LD  $@"
 
-.PHONY: hw-test hw-test-nvm hw-test-rsp hw-test-gdb hw-test-all
+.PHONY: hw-test hw-test-nvm hw-test-rsp hw-test-gdb hw-test-all hw-test-dap
 hw-test: $(HW_TEST_BIN)
 	$(Q)$(HW_ENV) $(HW_TEST_BIN)
 
@@ -625,6 +627,21 @@ hw-test-all: $(HW_TEST_BIN) $(FIXBINDIR)/all_nvm.elf all
 	fi
 	$(Q)$(HW_ENV) HW_TEST_NVM_ELF='$(if $(HW_TEST_NVM_ELF),$(HW_TEST_NVM_ELF),$(FIXBINDIR)/all_nvm.elf)' \
 	    $(HW_TEST_BIN) --with-nvm --with-rsp
+
+# DAP acceptance harness (Phase 16+). Spawns `avrOSdb --dap` and drives it with
+# the real nvim-dap client (headless Neovim) over TCP, asserting the connection
+# lifecycle. Non-destructive (attach only — does not reflash). Requires `nvim`
+# (and network on first run to fetch nvim-dap into tests/hw/.nvim-dap).
+HW_DAP_PORT ?= 1234
+HW_DAP_ELF  ?= $(FIXBINDIR)/gdb_target.elf
+hw-test-dap: $(FIXBINDIR)/gdb_target.elf all
+	@if ! command -v nvim >/dev/null 2>&1; then \
+	    echo "hw-test-dap: required tool not found: nvim" >&2; \
+	    exit 1; \
+	fi
+	$(Q)AVROSDB_BIN='$(BUILDDIR)/$(TARGET)' HW_PORT='$(HW_PORT)' \
+	    DAP_PORT='$(HW_DAP_PORT)' DAP_ELF='$(HW_DAP_ELF)' \
+	    nvim --headless -u tests/hw/dap_init.lua -l tests/hw/dap_acceptance.lua
 
 # ── check-tools target ────────────────────────────────────────────────────────
 # LLR-INST-01: verify every required host tool is on PATH.
@@ -724,7 +741,7 @@ prereqs:
 	sudo apt-get install -y --no-install-recommends \
 	    make gcc binutils gcc-avr binutils-avr avr-libc wget unzip \
 	    dpkg-dev rpm ruby man-db groff \
-	    libdw-dev libelf-dev
+	    libdw-dev libelf-dev neovim git
 	@echo "── Installing AVR-Dx DFP $(DFP_VER) ──────────────────────────"
 	wget -q -O /tmp/$(DFP_PACK) $(DFP_URL)
 	unzip -q -o /tmp/$(DFP_PACK) -d /tmp/Atmel.AVR-Dx_DFP.$(DFP_VER)

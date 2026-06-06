@@ -4458,5 +4458,32 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </test>
     </file>
 
+    <!-- ============================================================ -->
+    <!-- src DAP on-target acceptance harness (Neovim + nvim-dap)     -->
+    <!-- ============================================================ -->
+    <file path="tests/hw/dap_acceptance.lua" role="hardware" count="4">
+      <header><![CDATA[On-target DAP acceptance harness (the DAP analogue of the Group-G GDB harness): spawns a fresh `avrOSdb --dap` against live AVR-Dx silicon and drives it with the real nvim-dap client (headless Neovim) over TCP, applying per-case verdicts to the connection lifecycle. Manual-only (`make hw-test-dap`); never invoked by `make test`. Phase 16 covers the handshake (DAP1–DAP4); execution control, breakpoints, and variables grow this suite in Phases 17–19.]]></header>
+
+      <test name="DAP1_initialize_handshake">
+        <purpose><![CDATA[nvim-dap attaches to the `avrOSdb --dap` server; verify the `initialize` request completes (capabilities received) and the adapter emits the `initialized` event, i.e. the session becomes active on live silicon.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-076"/></traces>
+      </test>
+
+      <test name="DAP2_configuration_done_stopped_entry">
+        <purpose><![CDATA[After the configuration phase, verify the adapter emits a `stopped` event with reason `entry`, reaching the stopped-at-entry state on the target.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-076"/></traces>
+      </test>
+
+      <test name="DAP3_threads_single_cpu">
+        <purpose><![CDATA[Issue a `threads` request and verify the adapter reports exactly one live CPU thread.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-076"/></traces>
+      </test>
+
+      <test name="DAP4_disconnect_clean">
+        <purpose><![CDATA[Issue a `disconnect` request and verify the adapter responds successfully and the session tears down cleanly (the target is resumed).]]></purpose>
+        <traces><trace target="HLR" ref="HLR-076"/></traces>
+      </test>
+    </file>
+
   </tests>
 </project>
