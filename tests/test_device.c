@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pty.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -373,6 +374,10 @@ static void parse_args_rejects_device_combined_with_load(void)
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[0]);
         close(pipefd[1]);
+        /* Defensive: never let a write to a (prematurely) closed read end
+         * abort the child via SIGPIPE — exit() must run so the parent sees a
+         * clean WIFEXITED status.  fprintf() then merely returns EPIPE. */
+        signal(SIGPIPE, SIG_IGN);
         char *argv[] = { (char*)"avrOSdb",
                          (char*)"--device", (char*)"--load",
                          (char*)"/dev/ttyUSB0", (char*)"fw.elf" };
@@ -382,10 +387,23 @@ static void parse_args_rejects_device_combined_with_load(void)
     }
     close(pipefd[1]);
 
-    char buf[512];
-    ssize_t n = read(pipefd[0], buf, sizeof(buf) - 1);
-    if (n < 0) n = 0;
-    buf[n] = '\0';
+    /* Drain the pipe to EOF.  parse_args() prints the mutual-exclusion
+     * diagnostic AND the full usage() text to stderr (unbuffered, so several
+     * write()s); reading only the first chunk and closing the read end would
+     * SIGPIPE the child mid-usage().  Read until the child closes its end. */
+    char buf[2048];
+    size_t total = 0;
+    for (;;) {
+        ssize_t n = read(pipefd[0], buf + total, (sizeof buf - 1) - total);
+        if (n <= 0) break;
+        total += (size_t)n;
+        if (total >= sizeof buf - 1) {
+            char sink[256];
+            while (read(pipefd[0], sink, sizeof sink) > 0) { }
+            break;
+        }
+    }
+    buf[total] = '\0';
     close(pipefd[0]);
 
     int status = 0;
