@@ -168,8 +168,8 @@ Requirements in this section govern the custom `monitor avros` commands that exp
 
 Requirements in this section govern the host platforms the server must support and the constraints on its runtime dependencies.
 
-*   <a id="HLR-033"></a>**HLR-033: Native Linux and macOS Build.**
-    The application shall compile and execute natively on Linux (x86-64 and ARM) and macOS (x86-64 and Apple Silicon) using a C99-conforming toolchain plus the **elfutils** development libraries (libelf and libdw), which are a required dependency (`src/elf_parser.c` is a thin adapter over them). On Linux these come from `libelf-dev`/`libdw-dev` (or `elfutils-devel`); on macOS from `brew install elfutils`. The build shall not require any platform-specific preprocessor workarounds beyond what the C99 standard, POSIX.1-2008, and the elfutils headers provide; in particular, no bundled ELF type shim is used (elfutils supplies the system `<elf.h>`).
+*   <a id="HLR-033"></a>**HLR-033: Native Linux Build.**
+    The application shall compile and execute natively on Linux (x86-64 and ARM/ARM64) using a C99-conforming toolchain plus the **elfutils** development libraries (libelf and libdw), which are a required dependency (`src/elf_parser.c` is a thin adapter over them); these come from `libelf-dev`/`libdw-dev` (Debian/Ubuntu) or `elfutils-devel` (Fedora). Linux is the sole supported platform; other platforms are out of scope (see `doc/PVD.md §7.2`). The build shall not require any platform-specific preprocessor workarounds beyond what the C99 standard, POSIX.1-2008, and the elfutils headers provide; in particular, no bundled ELF type shim is used (elfutils supplies the system `<elf.h>`).
     *Trace:* [SDD Section 2.2](SDD.md).
 
 *   <a id="HLR-034"></a>**HLR-034: Lean Host Runtime Dependencies.**
@@ -197,7 +197,7 @@ Requirements in this section govern the Makefile installation targets and the us
     *Trace:* [SDD Section 2.2](SDD.md).
 
 *   <a id="HLR-043"></a>**HLR-043: Distribution Package Bundle.**
-    The Makefile shall provide a `bundle` target that produces native distribution packages for three target platforms: a Debian binary package (`dist/avrOSdb_$(VERSION)_amd64.deb`) for Debian/Ubuntu Linux, an RPM binary package (`dist/avrOSdb-$(VERSION)-1.x86_64.rpm`) for Red Hat/Fedora Linux, and a Homebrew formula (`dist/avrOSdb.rb`) for macOS. Each package shall include the `avrOSdb` binary and the man page. All output artefacts shall be written under the `dist/` directory. A `VERSION` variable (defaulting to the value extracted from `git describe`) shall parameterise every package version string.
+    The Makefile shall provide a `bundle` target that produces native distribution packages for three target platforms: a Debian binary package (`dist/avrOSdb_$(VERSION)_amd64.deb`) for Debian/Ubuntu Linux, an RPM binary package (`dist/avrOSdb-$(VERSION)-1.x86_64.rpm`) for Red Hat/Fedora Linux, and a Homebrew formula (`dist/avrOSdb.rb`). Each package shall include the `avrOSdb` binary and the man page. All output artefacts shall be written under the `dist/` directory. A `VERSION` variable (defaulting to the value extracted from `git describe`) shall parameterise every package version string.
     *Trace:* [SDD Section 2.2](SDD.md).
 
 ## 9. Diagnostics and Bring-up

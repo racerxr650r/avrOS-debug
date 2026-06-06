@@ -14,7 +14,7 @@ When in doubt about a feature, scope decision, or trade-off, this document is th
 
 `avrOSdb` delivers a seamless, modern debugging experience for cooperative, single-stack embedded architectures by bridging the AVR UPDI interface directly to standard IDEs with native avrOS state-machine awareness without requiring JTAG or ICE controllers like Atmel-ICE. Instead it uses the Serial + 1k Resistor mod to enable debugging with just a USB to 5v serial adapter or directly connect to Raspberry Pi UART pins.
 
-Embedded engineers developing for modern AVR microcontrollers (DA/DB families) on Linux and macOS can debug their finite state machines, queues, and memory pools visually in VS Code or Zed, no longer forced to manually parse raw SRAM dumps or fight hardware breakpoint limitations over a command-line interface.
+Embedded engineers developing for modern AVR microcontrollers (DA/DB families) on Linux can debug their finite state machines, queues, and memory pools visually in VS Code or Zed, no longer forced to manually parse raw SRAM dumps or fight hardware breakpoint limitations over a command-line interface.
 
 ## 3. Problem Statement
 
@@ -54,7 +54,7 @@ The unifying design choice is **State Over Stacks**: presenting the system exact
 These principles are the tie-breakers when requirements conflict.
 
 1.  **FSM-First Visualization.** We never attempt to unwind dormant stack pointers. Execution context is strictly defined by the current function pointer of the avrOS state tables.
-2.  **Lean Host Architecture.** The server runs natively on Linux and macOS. We never introduce heavy host dependencies (like Java, Electron, or Python virtualization) to run the GDB stub.
+2.  **Lean Host Architecture.** The server runs natively on Linux. We never introduce heavy host dependencies (like Java, Electron, or Python virtualization) to run the GDB stub.
 3.  **Editor-Agnostic Core.** The server communicates exclusively via standard GDB remote serial protocol (RSP). We never implement IDE-specific plugins directly inside the server; all VS Code and Zed support is handled via their respective standard adapters (e.g., Cortex-Debug, DAP).
 4.  **Non-Intrusive Polling.** System introspection (queues, events) prioritizes UPDI asynchronous memory reads. We never arbitrarily halt the CPU core to evaluate a system state unless explicitly requested by a user breakpoint.
 5.  **Fail-Safe Address Resolution.** If the server cannot dynamically locate the avrOS system tables in the ELF/FLASH, it gracefully degrades to a standard bare-metal GDB server rather than crashing.
@@ -65,7 +65,7 @@ These principles are the tie-breakers when requirements conflict.
 
 ### 7.1 In Scope
 
-* Native compilation for Linux and macOS.
+* Native compilation for Linux.
 * Written in C using C99 specfication
 * Full UPDI physical layer communication and timing handling.
 * Implementation of the GDB Remote Serial Protocol (RSP).

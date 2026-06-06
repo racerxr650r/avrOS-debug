@@ -125,8 +125,8 @@ Key points:
   via baud-rate manipulation; no `nRESET` line is required.
 
 On Linux the serial adapter typically appears as `/dev/ttyUSB0` (FT232,
-CP210x) or `/dev/ttyACM0` (CDC ACM). On macOS the path is
-`/dev/cu.usbserial-*`.
+CP210x) or `/dev/ttyACM0` (CDC ACM); on a Raspberry Pi's built-in UART it is
+`/dev/ttyAMA*` (e.g. `/dev/ttyAMA2`).
 
 ---
 
@@ -184,7 +184,7 @@ to `stderr`, releases all resources, and exits with code 1 *without* opening the
 
 | Operand | Description |
 | ------- | ----------- |
-| `<serial-device>` | Path to the USB-serial adapter (`/dev/ttyUSB0`, `/dev/cu.usbserial-A50285BI`, …) |
+| `<serial-device>` | Path to the USB-serial adapter (`/dev/ttyUSB0`, `/dev/ttyAMA2`, …) |
 | `<elf-file>` | AVR ELF binary used for symbol lookup and avrOS table discovery. With `--load`, this file is also written to FLASH. |
 
 ### Exit Codes

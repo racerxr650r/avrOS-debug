@@ -54,7 +54,7 @@
 
 | Tool | Purpose |
 | ---- | ------- |
-| `glibc-headers` (Linux) | Provides `<elf.h>`; a bundled `src/elf.h` shim is used on macOS instead |
+| `libdw-dev` / `libelf-dev` | **Required** — elfutils development libraries (also provide the system `<elf.h>`); `elfutils-devel` on Fedora |
 | AddressSanitizer / UBSan | Runtime error detection; enabled via `make ASAN=1` (`-fsanitize=address,undefined`) |
 | `avr-gdb` | End-to-end smoke testing against a live or simulated AVR target |
 
@@ -70,8 +70,8 @@ This implementation follows the complete specification stack authored in this re
 2. All 54 Low-Level Requirements fully implemented and verified by 106 passing tests across 7 test files.
 3. Binary compiles without warnings under `-std=c99 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L`.
 4. No heap allocation on the hot path; only `elf_open()` allocates (freed by `elf_close()` at session end).
-5. Portable: builds and all tests pass on Linux (x86-64, ARM64) and macOS (Intel, Apple Silicon).
-6. Runtime dependencies: only libc — verified by `ldd avrOSdb` showing no libraries beyond libc.
+5. Builds and all tests pass on Linux (x86-64, ARM64) — the sole supported platform.
+6. Runtime dependencies: libc plus the elfutils libraries (libelf/libdw) — verified by `ldd avrOSdb`.
 7. `python3 tools/lint_project.py` continues to report 0 errors, 0 warnings throughout the implementation.
 
 ## 3. Non-Goals
@@ -137,8 +137,8 @@ and reported in the [Software Test Plan](STP.md) and
 | ---------- | ----------- | ----- |
 | `avr-gcc` ≥ 12.0 | Phase 1 test fixtures | Compiles `tests/fixtures/*.c` to `.elf` binaries consumed by `tests/test_elf.c`; not needed for the main binary |
 | Unity test framework v2.6.x | All unit test phases (1–5) | Vendored into `tests/unity/` as three files (`unity.c`, `unity.h`, `unity_internals.h`); no system install required |
-| `openpty()` / POSIX PTY | Phase 2 (UPDI tests) | Part of glibc on Linux (link with `-lutil`); in `<util.h>` on macOS (no extra link flag needed) |
-| `<elf.h>` ELF type definitions | Phase 1 source + tests | System `<elf.h>` on Linux (from `glibc-headers` / `binutils-dev`); bundled `src/elf.h` portability shim used on macOS |
+| `openpty()` / POSIX PTY | Phase 2 (UPDI tests) | Part of glibc on Linux (link with `-lutil`) |
+| `<elf.h>` ELF type definitions | Phase 1 source + tests | Supplied by the elfutils headers / `glibc-headers` on Linux (Phase 15 moved `elf_parser` onto libelf/libdw; no bundled shim) |
 | Phase 1 + 2 headers | Phase 3 | `src/fsm_mapper.c` includes both `src/updi.h` and `src/elf_parser.h`; both must be finalised before Phase 3 begins |
 | Phase 3 complete | Phase 4 (RSP) | `src/gdb_rsp.c` dispatches to `fsm_build_thread_list()` and `fsm_get_registers()`; these must exist before linking the RSP test binary |
 | All prior phases complete | Phase 5 | `src/main.c` integrates all six modules; its test binary links against every module |
@@ -153,7 +153,7 @@ and reported in the [Software Test Plan](STP.md) and
 1. Create directories: `src/`, `tests/`, `tests/fixtures/`, `tests/unity/`.
 2. Vendor Unity test framework: download `unity.c`, `unity.h`, `unity_internals.h` from ThrowTheSwitch/Unity into `tests/unity/`.
 3. Create `Makefile` with targets `all`, `clean`, `test`, `install`. The `all` target compiles all `src/*.c` with `-std=c99 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Wpedantic -Wstrict-prototypes -Wmissing-prototypes -Wshadow -O2 -g`. The `test` target builds ELF fixtures via `avr-gcc`, then builds and runs all test binaries; each test binary carries its own `--wrap` symbol list. Platform detection via `$(shell uname -s)` adds `-lutil` for `openpty()` on Linux.
-4. Create `src/elf.h` — minimal bundled ELF type definitions (`Elf32_Ehdr`, `Elf32_Shdr`, `Elf32_Phdr`, `Elf32_Sym`, `ELFMAG`, `ELFCLASS32`, `EM_AVR 0x0053`, `SHT_SYMTAB`, `SHN_UNDEF`, `PT_LOAD`). Used by `src/elf_parser.c` on macOS; Linux uses the system `<elf.h>` via `#ifdef __linux__` guard.
+4. Create `src/elf.h` — minimal bundled ELF type definitions (`Elf32_Ehdr`, `Elf32_Shdr`, `Elf32_Phdr`, `Elf32_Sym`, `ELFMAG`, `ELFCLASS32`, `EM_AVR 0x0053`, `SHT_SYMTAB`, `SHN_UNDEF`, `PT_LOAD`). (Historical: this shim was removed in Phase 15 when `elf_parser` moved onto elfutils, which supplies the system `<elf.h>`.)
 
 **Acceptance:** `make all` succeeds (even with empty `.c` stub files); `make clean` removes all build artefacts; `make test` compiles and runs (stubs may fail; the infrastructure must work).
 
@@ -162,7 +162,7 @@ and reported in the [Software Test Plan](STP.md) and
 | Test binary | Source files linked (besides `tests/unity/unity.c`) | `--wrap` symbols | Extra link flags |
 | ----------- | --------------------------------------------------- | ---------------- | ---------------- |
 | `test_elf` | `src/elf_parser.c` | `malloc` | — |
-| `test_updi` | `src/updi.c` | `select` | `-lutil` (Linux only; not needed on macOS) |
+| `test_updi` | `src/updi.c` | `select` | `-lutil` (Linux) |
 | `test_fsm` | `src/fsm_mapper.c` | `updi_mem_read` | — |
 | `test_monitor` | `src/monitor.c`, `src/gdb_rsp.c`, `src/elf_parser.c` | `updi_mem_read` | — |
 | `test_rsp` | `src/gdb_rsp.c`, `src/fsm_mapper.c`, `src/monitor.c` | `updi_mem_read`, `updi_halt`, `updi_run`, `updi_step`, `updi_nvm_write_flash`, `updi_console_poll`, `fsm_build_thread_list`, `fsm_get_registers`, `fsm_get_active_thread`, `fsm_invalidate`, `monitor_dispatch` | — |
@@ -841,9 +841,9 @@ Exact base addresses are part-specific; the dispatcher classifies segments by ad
    - `"preLaunchTask"`: optional `tasks.json` entry that builds the ELF and starts `avrOSdb` if not already running; document but mark optional.
    - `"miDebuggerArgs"`: investigate whether passing `--nx` is needed to suppress per-user `.gdbinit` interference on shared dev hosts.
    - `"targetArchitecture"`: VS Code-specific hint; verify whether it adds value beyond `set architecture avr` in `setupCommands`.
-   - `"avoidWindowsConsoleRedirection"`, `"externalConsole"`: confirm the headless-Linux default and whether any change is needed for WSL/macOS hosts.
+   - `"avoidWindowsConsoleRedirection"`, `"externalConsole"`: confirm the headless-Linux default.
    - **Phase-11-specific verification:** with the recommended block, confirm that VS Code's Call Stack view shows all FSMs with their `qThreadExtraInfo` labels, that the Memory view obeys the advertised memory-map regions, and that source-level `next` uses range-step (engine log shows `vCont;r`).
-   - **Deliverable:** a fully-commented `doc/reference/launch.json` sample, a copy-pasteable block in `doc/UserManual.md` §6, and a one-paragraph rationale per non-default setting. The result must work unchanged against an unmodified VS Code + `cppdbg` install on Linux; macOS / Windows-host caveats documented separately.
+   - **Deliverable:** a fully-commented `doc/reference/launch.json` sample, a copy-pasteable block in `doc/UserManual.md` §6, and a one-paragraph rationale per non-default setting. The result must work unchanged against an unmodified VS Code + `cppdbg` install on Linux.
 
 9. **Tests — `tests/test_rsp.c`.** Add cases for: (a) `parse_mp_thread_id()` accepting every bare-decimal, bare-hex, and `p<PID>.<TID>` form including `p0.0` / `p-1.-1`; (b) `Hgp<PID>.<TID>` selecting the right thread and the subsequent `g` returning the matching synthesised frame; (c) `qThreadExtraInfo` returning a hex-encoded label for every known TID and the empty packet for unknown TIDs; (d) `qSupported` reply containing `swbreak+;hwbreak+;qXfer:memory-map:read+`; (e) `qXfer:memory-map:read::0,800` returning a well-formed `<memory-map>` body; (f) a simulated SW-BP halt emitting `T05swbreak:;thread:p<PID>.1;`; (g) `vKill;<pid>` closing the client socket but leaving the listener live (assert the listener `fd` is still in the `select()` set); (h) `vCont?` advertising `r` and a `vCont;r<lo>,<hi>:p<PID>.1` driving repeated single-steps until PC leaves the range.
 
@@ -1019,7 +1019,7 @@ This is not a fixable detail — it is a **model mismatch**. avrOS is a cooperat
 **Plan.**
 
 1. **Document first (no code risk).** Write Appendix B from `guesswork.md` + `updi.h`, and the dual-protocol architecture review. These capture the knowledge the rest of the phase depends on and are independently mergeable.
-2. **elfutils refactor.** Reimplement `elf_parser` over `libelf` (GElf) + `libdw`; delete the `src/elf.h` shim (system `<elf.h>` is supplied by elfutils); link `-ldw -lelf` unconditionally. Add `--wrap`-free unit tests over a `-g` fixture. macOS obtains elfutils via `brew install elfutils` (HLR-033).
+2. **elfutils refactor.** Reimplement `elf_parser` over `libelf` (GElf) + `libdw`; delete the `src/elf.h` shim (system `<elf.h>` is supplied by elfutils); link `-ldw -lelf` unconditionally. Add `--wrap`-free unit tests over a `-g` fixture. Linux is the sole supported platform (HLR-033).
 3. **Debug-core seam.** Per the review, name the core API surface RSP already calls through, and make the low-risk separations (e.g. a `debug_core` header collecting the execution-control/register/memory/arbiter entry points) so a future DAP front-end has a single, documented include. Defer any risky behaviour-affecting moves.
 4. **Spec reconciliation (tracer).** Reconcile HLR-020 / the Editor-Agnostic goal (add HLR-073, Protocol-Agnostic Debug Core) and author the new requirements; render and lint.
 
@@ -1029,7 +1029,7 @@ This is not a fixable detail — it is a **model mismatch**. avrOS is a cooperat
 - **Spec:** new HLRs/LLRs authored and rendered; `python3 tools/lint_project.py` 0 errors / 0 warnings.
 
 **Open questions.**
-- **macOS + elfutils (HLR-033).** `libelf`/`libdw` are GNU/Linux-centric. Resolution (decided): elfutils is a **required** dependency on all platforms — there is no symbol-only fallback and no bundled shim. macOS obtains it via `brew install elfutils`; the Makefile auto-links `-ldw -lelf` with no feature detection.
+- **elfutils dependency (HLR-033).** `libelf`/`libdw` are GNU/Linux-centric. Resolution (decided): elfutils is a **required** dependency with no symbol-only fallback and no bundled shim; the Makefile auto-links `-ldw -lelf` with no feature detection. Linux is the sole supported platform — macOS support was dropped (Phase 16).
 - **Depth of the core extraction.** The seam definition and the lowest-risk structural moves are in scope; a wholesale `gdb_rsp.c` split is deferred to the DAP-server phase to avoid destabilising the verified RSP path.
 
 ### Phase 16 — DAP Foundation: Mode Switch, Transport, Lifecycle + Linux-only Cleanup
@@ -1052,7 +1052,7 @@ This is not a fixable detail — it is a **model mismatch**. avrOS is a cooperat
 | 2 | DAP transport | `Content-Length`-framed JSON-RPC over TCP on the `select()` loop; vendored jsmn tokenizer + hand-rolled emitter; request/response/event scaffolding | `src/dap.c/.h`, vendored `src/jsmn.h` |
 | 3 | Lifecycle | `initialize` (capabilities), `launch`/`attach`, `configurationDone`, `disconnect`/`terminate`; connect target + load ELF via the debug core | `src/dap.c` |
 | 4 | Test harness | `tests/hw/dap_acceptance.lua` (headless Neovim + nvim-dap) + `make hw-test-dap`; initial handshake/attach cases | `tests/hw/`, `Makefile` |
-| 5 | Linux-only | Strike all macOS mentions from docs + spec; reword HLR-033 (Linux only); drop macOS platform/dependency rows; remove the Homebrew (`.rb`) bundle formula + its tests | `doc/Project.xml`, `doc/UserManual.md`, `doc/PVD.md`, `doc/avrOSdb.1`, `Makefile`, `tests/test_install.c` |
+| 5 | Linux-only | Strike all macOS mentions from docs + spec; reword HLR-033 to "Native Linux Build"; drop the macOS platform/dependency rows and the `/dev/cu.*` paths. (The Homebrew bundle formula stays — Homebrew is cross-platform via Linuxbrew — reframed without the "for macOS" wording.) | `doc/Project.xml`, `doc/UserManual.md`, `doc/PVD.md`, `doc/avrOSdb.1`, `doc/reference/dual-protocol-architecture.md` |
 | 6 | Spec | New HLRs (DAP transport, mode select, lifecycle) + LLRs (`dap` function group); render + lint | `doc/Project.xml` |
 
 **Acceptance.**
@@ -1117,8 +1117,6 @@ This is not a fixable detail — it is a **model mismatch**. avrOS is a cooperat
 
 *   **Half-duplex echo cancellation in UPDI tests.** Every byte transmitted over the UPDI UART is echoed back on the RX line by the hardware. PTY pairs do not auto-echo, so the PTY test harness must explicitly write back the echo bytes before injecting each simulated AVR response. If this is omitted, UPDI functions will block waiting to drain echoes that never arrive, causing PTY tests to time out even though the production logic is correct.
 
-*   **macOS `<elf.h>` portability.** Linux glibc provides `<elf.h>`; macOS does not. The bundled `src/elf.h` shim must be guarded with `#ifdef __linux__ #include <elf.h> #else #include "elf.h" #endif` in `src/elf_parser.c`. Risk: if the `#ifdef` guard is accidentally omitted on a macOS build the compiler will fail with a missing-header error that may be non-obvious.
-
 *   **avr-gcc availability for ELF fixtures.** The `tests/test_elf.c` test suite loads real `.elf` binaries generated by `avr-gcc`. If `avr-gcc` is not installed, the ELF fixture `make` rule will fail and block the entire test build. Mitigation: document the requirement prominently in §0, and consider adding a `make check-tools` target that validates availability before attempting a build.
 
 *   **g-packet PC register encoding.** The GDB AVR register layout places the program counter at register index 35, encoded as a 4-byte little-endian value at hex positions 70–77 of the `g`-packet (78 hex chars total). An off-by-one in the buffer offset produces a silently malformed frame — `avr-gdb` will show a wrong PC without reporting an error. Mitigation: `tests/test_fsm.c` includes a dedicated assertion that verifies the exact byte positions independently of any PC value.
@@ -1142,7 +1140,6 @@ T-shirt sizes relative to Phase 0.
 
 ## 11. Out-of-Scope Follow-ups
 
-*   **macOS CI (GitHub Actions).** A workflow that runs `make test` on `macos-latest` to catch portability regressions; depends on `brew install avr-gcc` being available on the hosted runner.
 *   **ASAN/UBSan CI job.** A second CI job that repeats `make test` with `-fsanitize=address,undefined` to catch memory errors and undefined behaviour; already supported by `make ASAN=1` but not wired into CI.
 *   **Live hardware integration test.** An end-to-end script that connects a real AVR DA/DB target via a USB-serial adapter, attaches `avr-gdb`, and verifies `info threads` output and `monitor avros events` decoding.
 *   **Console bridge live testing.** `updi_console_poll()` reads the avrOS UART ring buffer; verifying this against a live target running actual UART output is deferred to post-implementation.

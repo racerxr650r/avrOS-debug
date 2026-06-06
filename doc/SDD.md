@@ -34,7 +34,7 @@ The server connects to the target via a TTL-level UART serial adapter with a 1 k
 
 Unlike conventional GDB stubs that expose a flat memory model, `avrOSdb` provides native avrOS state-machine awareness. At attach time it parses the supplied ELF binary to locate the avrOS FSM registration tables in FLASH, then reads each registered finite state machine's runtime state into a snapshot the developer can inspect via `monitor` commands (which FSM is active, and each FSM's current state). avrOS FSMs are surfaced as introspection, not as GDB threads: the live CPU is the sole GDB thread.
 
-The project ships with a `make install` target that installs the compiled binary to `$(PREFIX)/bin/` and the accompanying Unix man page to `$(PREFIX)/share/man/man1/`. A `make check-tools` target validates that all required build tools (`gcc`, `make`, `avr-gcc`, `avr-binutils`) are present on the host before any compilation is attempted. A `make bundle` target produces native distribution packages for three platforms: a Debian binary package (`.deb`), a Red Hat RPM package (`.rpm`), and a Homebrew formula (`dist/avrOSdb.rb`) for macOS. All output artefacts are written under the `dist/` directory. These targets ensure the project can be built, deployed, and distributed by a developer from a single `make` command sequence with no manual file copying.
+The project ships with a `make install` target that installs the compiled binary to `$(PREFIX)/bin/` and the accompanying Unix man page to `$(PREFIX)/share/man/man1/`. A `make check-tools` target validates that all required build tools (`gcc`, `make`, `avr-gcc`, `avr-binutils`) are present on the host before any compilation is attempted. A `make bundle` target produces distribution packages in three formats: a Debian binary package (`.deb`), a Red Hat RPM package (`.rpm`), and a Homebrew formula (`dist/avrOSdb.rb`). All output artefacts are written under the `dist/` directory. These targets ensure the project can be built, deployed, and distributed by a developer from a single `make` command sequence with no manual file copying.
 
 **Planned — Phase 9 — CI-Grade Loader & Link Diagnostics (not yet implemented).** A forthcoming iteration extends the programmer and the `--device` diagnostic mode with the following capabilities so the tool can be trusted as a CI build/flash step and used as a first-line link-health probe. Tracked in GitHub issue #28; not yet bound to HLRs/LLRs.
 
@@ -1105,7 +1105,7 @@ typedef struct {
 | C standard | C99 | `--std=c99`; no GNU extensions required. |
 | GCC | 4.8 | Or Clang ≥ 3.4. |
 | POSIX API | POSIX.1-2008 | `-D_POSIX_C_SOURCE=200809L` |
-| elfutils | libelf + libdw | **Required.** ELF parsing (libelf/GElf) and DWARF (libdw). `libdw-dev`/`libelf-dev` (Debian) or `elfutils-devel` (Fedora); `brew install elfutils` on macOS. Supplies the system `<elf.h>`. |
+| elfutils | libelf + libdw | **Required.** ELF parsing (libelf/GElf) and DWARF (libdw). `libdw-dev`/`libelf-dev` (Debian/Ubuntu) or `elfutils-devel` (Fedora). Supplies the system `<elf.h>`. |
 | libc | any POSIX libc | Plus the elfutils shared libraries (libelf, libdw) and libdw's compression backends (libz/libzstd/liblzma/libbz2). |
 
 **Recommended compile flags:**
@@ -1122,8 +1122,7 @@ Debug builds add `-fsanitize=address,undefined` for runtime error detection.
 
 | Platform | Status | Notes |
 | -------- | ------ | ----- |
-| Linux (x86-64, ARM64) | Primary target | Tested on Ubuntu 22.04 and Raspberry Pi OS. |
-| macOS (Intel, Apple Silicon) | Secondary target | Requires `brew install elfutils` (libelf/libdw); uses `/dev/cu.usbserial-*` device paths. |
+| Linux (x86-64, ARM64) | Sole supported target | Tested on Ubuntu 22.04 and Raspberry Pi OS. |
 | Windows (native) | Out of scope | See `doc/PVD.md §7.2`; WSL2 may work but is not supported. |
 
 **Build targets (Makefile):**

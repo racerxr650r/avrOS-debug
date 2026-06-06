@@ -48,7 +48,7 @@
       <para><![CDATA[`avrOSdb` is a POSIX C99 GDB stub that bridges the UPDI debug interface of modern AVR microcontrollers (DA/DB families) to standard IDEs over the GDB Remote Serial Protocol (RSP). A developer launches the stub, points it at a serial device and an ELF binary, and connects any GDB-compatible front-end — VS Code with Cortex-Debug, Zed with its DAP adapter, or bare `avr-gdb` — using the standard `target extended-remote` command.]]></para>
       <para><![CDATA[The server connects to the target via a TTL-level UART serial adapter with a 1 kΩ resistor on the UPDI line. No external JTAG programmer or proprietary debugger hardware is required — only a USB-to-serial adapter or direct Raspberry Pi UART pins.]]></para>
       <para><![CDATA[Unlike conventional GDB stubs that expose a flat memory model, `avrOSdb` provides native avrOS state-machine awareness. At attach time it parses the supplied ELF binary to locate the avrOS FSM registration tables in FLASH, then reads each registered finite state machine's runtime state into a snapshot the developer can inspect via `monitor` commands (which FSM is active, and each FSM's current state). avrOS FSMs are surfaced as introspection, not as GDB threads: the live CPU is the sole GDB thread.]]></para>
-      <para><![CDATA[The project ships with a `make install` target that installs the compiled binary to `$(PREFIX)/bin/` and the accompanying Unix man page to `$(PREFIX)/share/man/man1/`. A `make check-tools` target validates that all required build tools (`gcc`, `make`, `avr-gcc`, `avr-binutils`) are present on the host before any compilation is attempted. A `make bundle` target produces native distribution packages for three platforms: a Debian binary package (`.deb`), a Red Hat RPM package (`.rpm`), and a Homebrew formula (`dist/avrOSdb.rb`) for macOS. All output artefacts are written under the `dist/` directory. These targets ensure the project can be built, deployed, and distributed by a developer from a single `make` command sequence with no manual file copying.]]></para>
+      <para><![CDATA[The project ships with a `make install` target that installs the compiled binary to `$(PREFIX)/bin/` and the accompanying Unix man page to `$(PREFIX)/share/man/man1/`. A `make check-tools` target validates that all required build tools (`gcc`, `make`, `avr-gcc`, `avr-binutils`) are present on the host before any compilation is attempted. A `make bundle` target produces distribution packages in three formats: a Debian binary package (`.deb`), a Red Hat RPM package (`.rpm`), and a Homebrew formula (`dist/avrOSdb.rb`). All output artefacts are written under the `dist/` directory. These targets ensure the project can be built, deployed, and distributed by a developer from a single `make` command sequence with no manual file copying.]]></para>
       <para><![CDATA[**Planned — Phase 9 — CI-Grade Loader & Link Diagnostics (not yet implemented).** A forthcoming iteration extends the programmer and the `--device` diagnostic mode with the following capabilities so the tool can be trusted as a CI build/flash step and used as a first-line link-health probe. Tracked in GitHub issue #28; not yet bound to HLRs/LLRs.
 
 * **Read-back verify after `--load`.** After every successful NVM write, re-read the affected pages via UPDI and compare against the ELF payload. Mismatching pages shall be reported by `(window, page-aligned address, expected-CRC, actual-CRC)`, the application shall exit with a distinct non-zero exit code (`2`, reserved for verify failure as opposed to `1` for I/O failure), and shall not enter debug or open the GDB listener. Verify shall cover FLASH, EEPROM, USERROW, and FUSES windows; LOCK is excluded because lockbits become read-only post-write.
@@ -1055,7 +1055,7 @@ typedef struct {
 | C standard | C99 | `--std=c99`; no GNU extensions required. |
 | GCC | 4.8 | Or Clang ≥ 3.4. |
 | POSIX API | POSIX.1-2008 | `-D_POSIX_C_SOURCE=200809L` |
-| elfutils | libelf + libdw | **Required.** ELF parsing (libelf/GElf) and DWARF (libdw). `libdw-dev`/`libelf-dev` (Debian) or `elfutils-devel` (Fedora); `brew install elfutils` on macOS. Supplies the system `<elf.h>`. |
+| elfutils | libelf + libdw | **Required.** ELF parsing (libelf/GElf) and DWARF (libdw). `libdw-dev`/`libelf-dev` (Debian/Ubuntu) or `elfutils-devel` (Fedora). Supplies the system `<elf.h>`. |
 | libc | any POSIX libc | Plus the elfutils shared libraries (libelf, libdw) and libdw's compression backends (libz/libzstd/liblzma/libbz2). |
 
 **Recommended compile flags:**
@@ -1072,8 +1072,7 @@ Debug builds add `-fsanitize=address,undefined` for runtime error detection.
 
 | Platform | Status | Notes |
 | -------- | ------ | ----- |
-| Linux (x86-64, ARM64) | Primary target | Tested on Ubuntu 22.04 and Raspberry Pi OS. |
-| macOS (Intel, Apple Silicon) | Secondary target | Requires `brew install elfutils` (libelf/libdw); uses `/dev/cu.usbserial-*` device paths. |
+| Linux (x86-64, ARM64) | Sole supported target | Tested on Ubuntu 22.04 and Raspberry Pi OS. |
 | Windows (native) | Out of scope | See `doc/PVD.md §7.2`; WSL2 may work but is not supported. |
 
 **Build targets (Makefile):**
@@ -1455,8 +1454,8 @@ Errors are propagated upward through the module stack without retrying:
     <section number="7" title="Platform and Build">
       <intro><![CDATA[Requirements in this section govern the host platforms the server must support and the constraints on its runtime dependencies.]]></intro>
 
-      <hlr id="HLR-033" name="Native Linux and macOS Build">
-        <text><![CDATA[The application shall compile and execute natively on Linux (x86-64 and ARM) and macOS (x86-64 and Apple Silicon) using a C99-conforming toolchain plus the **elfutils** development libraries (libelf and libdw), which are a required dependency (`src/elf_parser.c` is a thin adapter over them). On Linux these come from `libelf-dev`/`libdw-dev` (or `elfutils-devel`); on macOS from `brew install elfutils`. The build shall not require any platform-specific preprocessor workarounds beyond what the C99 standard, POSIX.1-2008, and the elfutils headers provide; in particular, no bundled ELF type shim is used (elfutils supplies the system `<elf.h>`).]]></text>
+      <hlr id="HLR-033" name="Native Linux Build">
+        <text><![CDATA[The application shall compile and execute natively on Linux (x86-64 and ARM/ARM64) using a C99-conforming toolchain plus the **elfutils** development libraries (libelf and libdw), which are a required dependency (`src/elf_parser.c` is a thin adapter over them); these come from `libelf-dev`/`libdw-dev` (Debian/Ubuntu) or `elfutils-devel` (Fedora). Linux is the sole supported platform; other platforms are out of scope (see `doc/PVD.md §7.2`). The build shall not require any platform-specific preprocessor workarounds beyond what the C99 standard, POSIX.1-2008, and the elfutils headers provide; in particular, no bundled ELF type shim is used (elfutils supplies the system `<elf.h>`).]]></text>
         <traces>
           <trace target="SDD" ref="2.2"/>
         </traces>
@@ -1505,7 +1504,7 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-043" name="Distribution Package Bundle">
-        <text><![CDATA[The Makefile shall provide a `bundle` target that produces native distribution packages for three target platforms: a Debian binary package (`dist/avrOSdb_$(VERSION)_amd64.deb`) for Debian/Ubuntu Linux, an RPM binary package (`dist/avrOSdb-$(VERSION)-1.x86_64.rpm`) for Red Hat/Fedora Linux, and a Homebrew formula (`dist/avrOSdb.rb`) for macOS. Each package shall include the `avrOSdb` binary and the man page. All output artefacts shall be written under the `dist/` directory. A `VERSION` variable (defaulting to the value extracted from `git describe`) shall parameterise every package version string.]]></text>
+        <text><![CDATA[The Makefile shall provide a `bundle` target that produces native distribution packages for three target platforms: a Debian binary package (`dist/avrOSdb_$(VERSION)_amd64.deb`) for Debian/Ubuntu Linux, an RPM binary package (`dist/avrOSdb-$(VERSION)-1.x86_64.rpm`) for Red Hat/Fedora Linux, and a Homebrew formula (`dist/avrOSdb.rb`). Each package shall include the `avrOSdb` binary and the man page. All output artefacts shall be written under the `dist/` directory. A `VERSION` variable (defaulting to the value extracted from `git describe`) shall parameterise every package version string.]]></text>
         <traces>
           <trace target="SDD" ref="2.2"/>
         </traces>
@@ -2529,7 +2528,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <llr id="LLR-ELF-07">
         <text><![CDATA[`src/elf_parser.c` shall delegate all ELF and DWARF format parsing to elfutils — libelf via the class-independent GElf API for the ELF container, and libdw for DWARF — and shall not hand-decode ELF byte layouts. elfutils is a required build and runtime dependency; the bundled ELF type shim formerly at `src/elf.h` is removed, and ELF32 type definitions (`Elf32_Ehdr`, `Elf32_Phdr`, `EM_AVR`, `PT_LOAD`, etc.) used by this module and its consumers come from the system `<elf.h>` that elfutils requires. The build shall link `-ldw -lelf` unconditionally (no compile-time feature detection).]]></text>
         <traces>
-          <trace target="HLR" ref="HLR-033" name="Native Linux and macOS Build"/>
+          <trace target="HLR" ref="HLR-033" name="Native Linux Build"/>
           <trace target="HLR" ref="HLR-071" name="ELF and DWARF Parsing via elfutils"/>
         </traces>
       </llr>
