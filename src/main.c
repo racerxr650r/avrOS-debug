@@ -15,11 +15,7 @@
 #include <errno.h>
 #include <sys/select.h>
 
-#ifdef __linux__
 #include <elf.h>
-#else
-#include "elf.h"
-#endif
 
 #include "elf_parser.h"
 #include "updi.h"

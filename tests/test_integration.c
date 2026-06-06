@@ -44,8 +44,10 @@ static void test_build_compiles_clean_on_linux_with_c99_and_posix(void)
     TEST_ASSERT_EQUAL_INT(0, rc);
 }
 
-/* HLR-034 — runtime depends only on libc / loader / vDSO */
-static void test_runtime_links_only_libc_no_heavyweight_deps(void)
+/* HLR-034 — runtime depends only on libc, the loader/vDSO, and the required
+ * elfutils stack (libelf/libdw + libdw's compression backends).  elfutils is a
+ * required dependency: src/elf_parser.c is a thin adapter over it. */
+static void test_runtime_links_only_libc_and_elfutils(void)
 {
     FILE *fp = popen("ldd build/avrOSdb", "r");
     TEST_ASSERT_NOT_NULL(fp);
@@ -61,6 +63,14 @@ static void test_runtime_links_only_libc_no_heavyweight_deps(void)
         if (strstr(line, "linux-gate"))    continue;
         if (strstr(line, "statically linked")) continue;
         if (strstr(line, "not a dynamic")) continue;
+        /* Required elfutils stack (libdw + libelf) and the compression
+         * backends libdw links to read compressed .debug sections. */
+        if (strstr(line, "libdw.so"))      continue;
+        if (strstr(line, "libelf.so"))     continue;
+        if (strstr(line, "libz.so"))       continue;
+        if (strstr(line, "libzstd.so"))    continue;
+        if (strstr(line, "liblzma.so"))    continue;
+        if (strstr(line, "libbz2.so"))     continue;
         /* blank lines & summary noise */
         if (line[0] == '\n' || line[0] == '\0') continue;
         fprintf(stderr, "unexpected dep: %s", line);
@@ -76,6 +86,6 @@ int main(void)
     RUN_TEST(test_integration_server_ready_within_2_seconds_of_client_connect);
     RUN_TEST(test_integration_server_emits_only_standard_rsp_no_ide_extensions);
     RUN_TEST(test_build_compiles_clean_on_linux_with_c99_and_posix);
-    RUN_TEST(test_runtime_links_only_libc_no_heavyweight_deps);
+    RUN_TEST(test_runtime_links_only_libc_and_elfutils);
     return UNITY_END();
 }

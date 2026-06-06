@@ -83,6 +83,12 @@ else
   LUTIL :=
 endif
 
+# ── elfutils (libelf + libdw) — required ──────────────────────────────────────
+# src/elf_parser.c is a thin adapter over elfutils: libelf parses the ELF and
+# libdw the DWARF debug info, so format changes are absorbed by the library.
+# These are hard dependencies; `make prereqs` installs libdw-dev/libelf-dev.
+ELFUTILS_LIBS := -ldw -lelf
+
 # ── Sanitizer flag ────────────────────────────────────────────────────────────
 ifeq ($(ASAN),1)
   SAN_FLAGS := -fsanitize=address,undefined
@@ -202,9 +208,9 @@ GDB_DBG_SESSION_ELF := $(FIXBINDIR)/gdb_debug_session.elf
 # ── Per-test configuration ─────────────────────────────────────────────────────
 # Each entry: TEST_SRCS_<name>, TEST_WRAP_<name>, TEST_EXTRA_LDFLAGS_<name>
 #
-# test_elf
+# test_elf  (no malloc --wrap: libelf/libdw own their allocations)
 TEST_SRCS_test_elf  := $(TESTDIR)/test_elf.c $(SRCDIR)/elf_parser.c
-TEST_WRAP_test_elf  := malloc
+TEST_WRAP_test_elf  :=
 TEST_EXTRA_LDFLAGS_test_elf :=
 
 # test_updi
@@ -311,7 +317,7 @@ all: $(BUILDDIR)/$(TARGET)
 # ── Main binary link ──────────────────────────────────────────────────────────
 $(BUILDDIR)/$(TARGET): $(OBJS)
 	@mkdir -p $(BUILDDIR)
-	$(Q)$(CC) $(CFLAGS) -o $@ $^
+	$(Q)$(CC) $(CFLAGS) -o $@ $^ $(ELFUTILS_LIBS)
 	@echo "  LD  $@"
 
 # ── Compile host object files ─────────────────────────────────────────────────
@@ -371,7 +377,7 @@ $(TESTBINDIR)/$(1): $$(TEST_SRCS_$(1)) $(UNITY_OBJ)
 	    $$(call wrap_flags,$$(TEST_WRAP_$(1))) \
 	    -o $$@ \
 	    $$(TEST_SRCS_$(1)) $(UNITY_OBJ) \
-	    $$(TEST_EXTRA_LDFLAGS_$(1)) $(SAN_FLAGS)
+	    $$(TEST_EXTRA_LDFLAGS_$(1)) $(SAN_FLAGS) $(ELFUTILS_LIBS)
 	@echo "  LD  $$@"
 endef
 
@@ -701,14 +707,18 @@ bundle-brew: $(BUILDDIR)/$(TARGET) $(MANPAGE)
 # Installs host build tools via apt, then downloads and installs the
 # Microchip AVR-Dx Device Family Pack so avr-gcc can target AVR DA/DB parts.
 # Also installs the packaging tools required by `make bundle`
-# (dpkg-deb, rpmbuild, ruby) and the man(1) renderer used by tests.
+# (dpkg-deb, rpmbuild, ruby) and the man(1) renderer used by tests, plus
+# the elfutils dev libraries (libdw/libelf) that enable the optional
+# DWARF source-level features auto-detected by the build (see the DWARF
+# block above and doc/reference/dual-protocol-architecture.md).
 .PHONY: prereqs
 prereqs:
 	@echo "── Installing apt packages ──────────────────────────────────────"
 	sudo apt-get update -q
 	sudo apt-get install -y --no-install-recommends \
 	    make gcc binutils gcc-avr binutils-avr avr-libc wget unzip \
-	    dpkg-dev rpm ruby man-db groff
+	    dpkg-dev rpm ruby man-db groff \
+	    libdw-dev libelf-dev
 	@echo "── Installing AVR-Dx DFP $(DFP_VER) ──────────────────────────"
 	wget -q -O /tmp/$(DFP_PACK) $(DFP_URL)
 	unzip -q -o /tmp/$(DFP_PACK) -d /tmp/Atmel.AVR-Dx_DFP.$(DFP_VER)
