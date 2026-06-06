@@ -4,8 +4,10 @@
  * After QStartNoAckMode is negotiated, +/- ack bytes are not exchanged.
  */
 #include "gdb_rsp.h"
-#include "monitor.h"
-#include "updi.h"
+/* This is the RSP protocol front-end; it drives the target through the
+ * protocol-agnostic debug core aggregated by debug_core.h (updi/elf+dwarf/
+ * fsm/monitor).  See doc/reference/dual-protocol-architecture.md. */
+#include "debug_core.h"
 
 #include <stdio.h>
 #include <stdlib.h>

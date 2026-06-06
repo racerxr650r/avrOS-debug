@@ -109,7 +109,7 @@ Requirements in this section govern the GDB RSP server behaviour, covering packe
     *Trace:* [SDD Section 5.1](SDD.md), [SDD Section 5.3.1](SDD.md).
 
 *   <a id="HLR-020"></a>**HLR-020: Editor-Agnostic Protocol.**
-    The server shall communicate exclusively over standard GDB RSP. No IDE-specific protocol extensions (DAP, Cortex-Debug custom packets, or similar) shall be implemented inside the server; all IDE integration shall be the responsibility of the client-side adapter.
+    The GDB Remote Serial Protocol front-end shall communicate exclusively over standard GDB RSP: it shall not embed IDE-specific protocol extensions (DAP, Cortex-Debug custom packets, or similar) in its wire output, and IDE integration via GDB remains the responsibility of the client-side adapter. This does not preclude an additional, *separate* protocol front-end — notably a future native DAP server — running in parallel over the shared protocol-agnostic debug core (HLR-073); such a front-end is a distinct listener and does not alter the RSP front-end's pure-RSP contract.
     *Trace:* [SDD Section 2.2](SDD.md), [SDD Section 5.1](SDD.md).
 
 *   <a id="HLR-038"></a>**HLR-038: GDB Session Response Latency.**
@@ -239,6 +239,10 @@ Requirements in this section govern the on-target hardware integration test harn
 *   <a id="HLR-072"></a>**HLR-072: DWARF Source-Level Lookup (DAP Groundwork).**
     The ELF module shall expose DWARF-backed source-level lookup so a future native Debug Adapter Protocol (DAP) front-end can map between machine addresses and source locations without delegating to `avr-gdb` (the GDB-RSP path does not use it). It shall provide: `elf_dwarf_available()` (returns 1, since elfutils is a required dependency); `elf_addr_to_line()` mapping a code byte address to its source file and 1-based line via libdw; and `elf_line_to_addr()` resolving a `file:line` (matched by basename) to the first code byte address. The accessors shall be safe to call when the ELF carries no debug info — returning -1 and leaving outputs untouched — and shall never abort the session. This requirement lands the source-mapping capability only; the DAP listener and request handlers are a later phase.
     *Trace:* [SDD Section 6.3.1](SDD.md).
+
+*   <a id="HLR-073"></a>**HLR-073: Protocol-Agnostic Debug Core.**
+    The server's debug logic shall be structured as a protocol-agnostic *debug core* — execution control, register and memory access, the hardware-comparator arbiter and software-breakpoint model, target (avrOS FSM) introspection, and ELF/DWARF — that is independent of any client-facing wire protocol. Client protocols shall be implemented as thin front-ends over this core: the existing GDB-RSP server (`src/gdb_rsp.c`) and, in future, a native DAP server intended to run in parallel. A front-end shall translate wire framing to and from the core's verbs and shall be the only layer that formats a protocol-specific reply; the core shall never emit RSP, DAP, or any other wire encoding, and shall never be reached *into* by a lower layer (per the SDD §2.2 layered-architecture rule, UPDI helpers never choose policy such as breakpoint slots). The core's protocol-neutral entry surface shall be reachable through a single aggregating include, `src/debug_core.h`. Phase 15 establishes this seam by aggregation; physically relocating the arbiter, stop-cause classifier, and software-breakpoint bodies out of the RSP module into a dedicated debug-core translation unit is deferred to the DAP-server phase to avoid destabilising the verified RSP path.
+    *Trace:* [SDD Section 2.2](SDD.md), [SDD Section 5.1](SDD.md).
 
 ## 11. CI-Grade Loader and Link Diagnostics
 

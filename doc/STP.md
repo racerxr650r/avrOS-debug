@@ -277,7 +277,7 @@ Role: **integration**. **4 test(s).**
 | - | ---- | -------- | ------- |
 | 1 | <a id="integration_server_ready_within_2_seconds_of_client_connect"></a>`integration_server_ready_within_2_seconds_of_client_connect` | — | Launch `avrOSdb` against a loopback UPDI stub and a fixture ELF, connect a GDB client, and measure the elapsed time from TCP accept to the first valid RSP response. Assert the elapsed time is less than 2.0 seconds. |
 | 2 | <a id="integration_server_emits_only_standard_rsp_no_ide_extensions"></a>`integration_server_emits_only_standard_rsp_no_ide_extensions` | — | Capture all TCP traffic from a full debug session (connect, register read, memory read, continue, breakpoint, detach) and verify that every server-originated packet conforms to the GDB RSP specification with no DAP, Cortex-Debug, or other IDE-specific packet types present. |
-| 3 | <a id="build_compiles_clean_on_linux_with_c99_and_posix"></a>`build_compiles_clean_on_linux_with_c99_and_posix` | `LLR-ELF-07` | Execute `make` with `CC=gcc CFLAGS="-std=c99 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L"` and assert that the build exits with status 0 and produces no compiler warnings or errors on a Linux x86-64 host. |
+| 3 | <a id="build_compiles_clean_on_linux_with_c99_and_posix"></a>`build_compiles_clean_on_linux_with_c99_and_posix` | `LLR-ELF-07`, `LLR-RSP-51` | Execute `make` with `CC=gcc CFLAGS="-std=c99 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L"` and assert that the build exits with status 0 and produces no compiler warnings or errors on a Linux x86-64 host. |
 | 4 | <a id="runtime_links_only_libc_and_elfutils"></a>`runtime_links_only_libc_and_elfutils` | — | Run `ldd avrOSdb` on the linked binary and verify the only shared-library dependencies are libc, the loader/vDSO, libutil, and the required elfutils stack (libdw, libelf) plus libdw's compression backends (libz, libzstd, liblzma, libbz2). Assert that no Java runtime, Python interpreter, Electron libraries, or other heavyweight dependency appears. |
 
 ### 3.8. [tests/test_install.c](../tests/test_install.c)
@@ -465,6 +465,7 @@ verified by code review — see
 | `LLR-RSP-49` | `rsp` | `HLR-068` | `rsp_logging_enabled_emits_tx_and_rx_markers_to_stderr`, `rsp_logging_disabled_emits_no_markers` |
 | `LLR-RSP-48` | `rsp` | `HLR-067` | `on_read_mem_returns_E14_for_address_outside_advertised_map`, `on_read_mem_allows_address_inside_eeprom_band`, `on_read_mem_permissive_when_no_memory_map_advertised` |
 | `LLR-RSP-50` | `rsp` | `HLR-054` | `continue_after_sw_bp_install_injects_leading_instruction`, `step_after_sw_bp_install_injects_leading_instruction` |
+| `LLR-RSP-51` | `rsp` | `HLR-073` | `build_compiles_clean_on_linux_with_c99_and_posix` |
 | `LLR-ELF-01` | `elf` | `HLR-021`, `HLR-071` | `elf_open_accepts_valid_avr_elf32_binary`, `elf_open_returns_minus1_on_invalid_elf_magic`, `elf_open_returns_minus1_on_wrong_machine_type` |
 | `LLR-ELF-02` | `elf` | `HLR-021`, `HLR-040`, `HLR-071` | `elf_open_accepts_valid_avr_elf32_binary` |
 | `LLR-ELF-03` | `elf` | `HLR-021`, `HLR-071` | `elf_find_avros_tables_populates_all_7_avros_sentinel_fields` |

@@ -146,7 +146,7 @@ Layer 1 (`src/main.c`) is the orchestrator and is permitted to reach into any mo
       <goal name="Layered Architecture"><![CDATA[The source tree is organised into four protocol layers with strictly downward call direction (entry/event-loop → protocol → transport/hardware, with the application layer sitting above the protocol layer; see §2.1). A header in a lower layer shall not `#include` a header from a higher layer, and a lower-layer function shall not call a higher-layer function. The single permitted upward path is dependency-inversion via the `RspHandlers` callback table in `src/gdb_rsp.h`, which lets the protocol layer (Layer 3) invoke application-layer (Layer 4) code without taking a compile-time dependency on it. This rule is checked at review time: every new module shall declare its layer in this SDD, and every new `#include` shall be either same-layer or lower-layer.]]></goal>
       <goal name="FSM-First Visualization"><![CDATA[Virtual threads map 1-to-1 to avrOS FSM table entries. The server never attempts to unwind dormant stack frames; execution context is defined solely by the FSM's current state function pointer.]]></goal>
       <goal name="Lean Host Architecture"><![CDATA[The server is a single C99 process. Runtime dependencies are limited to libc and the POSIX serial and socket APIs. No Java, Python virtualization, or Electron runtime is required on the host.]]></goal>
-      <goal name="Editor-Agnostic Core"><![CDATA[The server exposes only standard GDB RSP. IDE-specific integration (Cortex-Debug, Zed DAP adapter) is handled entirely by the GDB client; the server does not implement any IDE extension protocol.]]></goal>
+      <goal name="Protocol-Agnostic Debug Core"><![CDATA[The server's debug logic (execution control, register/memory access, the breakpoint arbiter, avrOS introspection, and ELF/DWARF) is independent of any client wire protocol. The GDB-RSP front-end exposes that core over standard RSP and remains pure-RSP, so IDE integration via GDB is handled by the GDB client; a future native DAP front-end may run in parallel over the same core. Front-ends own wire framing only — the core never emits a protocol-specific reply. See HLR-073.]]></goal>
       <goal name="Non-Intrusive Polling"><![CDATA[`monitor avros` commands use UPDI background reads, which can be issued while the CPU is running. The core is halted only by an explicit user breakpoint or a step/continue boundary.]]></goal>
       <goal name="Fail-Safe Address Resolution"><![CDATA[If ELF symbol resolution fails to locate the avrOS system tables, the server degrades gracefully to a standard bare-metal GDB stub rather than refusing to connect.]]></goal>
       <goal name="Single-Threaded Concurrency Model"><![CDATA[The server uses a single POSIX `select()` event loop with no POSIX threads. All module entry points are synchronous and return to the event loop promptly. Long-blocking operations (NVM programming, UPDI link initialisation) are permitted only at startup or in direct response to an explicit GDB command, never during the event-loop hot path.]]></goal>
@@ -1352,7 +1352,7 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-020" name="Editor-Agnostic Protocol">
-        <text><![CDATA[The server shall communicate exclusively over standard GDB RSP. No IDE-specific protocol extensions (DAP, Cortex-Debug custom packets, or similar) shall be implemented inside the server; all IDE integration shall be the responsibility of the client-side adapter.]]></text>
+        <text><![CDATA[The GDB Remote Serial Protocol front-end shall communicate exclusively over standard GDB RSP: it shall not embed IDE-specific protocol extensions (DAP, Cortex-Debug custom packets, or similar) in its wire output, and IDE integration via GDB remains the responsibility of the client-side adapter. This does not preclude an additional, *separate* protocol front-end — notably a future native DAP server — running in parallel over the shared protocol-agnostic debug core (HLR-073); such a front-end is a distinct listener and does not alter the RSP front-end's pure-RSP contract.]]></text>
         <traces>
           <trace target="SDD" ref="2.2"/>
           <trace target="SDD" ref="5.1"/>
@@ -1581,6 +1581,14 @@ Errors are propagated upward through the module stack without retrying:
         <text><![CDATA[The ELF module shall expose DWARF-backed source-level lookup so a future native Debug Adapter Protocol (DAP) front-end can map between machine addresses and source locations without delegating to `avr-gdb` (the GDB-RSP path does not use it). It shall provide: `elf_dwarf_available()` (returns 1, since elfutils is a required dependency); `elf_addr_to_line()` mapping a code byte address to its source file and 1-based line via libdw; and `elf_line_to_addr()` resolving a `file:line` (matched by basename) to the first code byte address. The accessors shall be safe to call when the ELF carries no debug info — returning -1 and leaving outputs untouched — and shall never abort the session. This requirement lands the source-mapping capability only; the DAP listener and request handlers are a later phase.]]></text>
         <traces>
           <trace target="SDD" ref="6.3.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-073" name="Protocol-Agnostic Debug Core">
+        <text><![CDATA[The server's debug logic shall be structured as a protocol-agnostic *debug core* — execution control, register and memory access, the hardware-comparator arbiter and software-breakpoint model, target (avrOS FSM) introspection, and ELF/DWARF — that is independent of any client-facing wire protocol. Client protocols shall be implemented as thin front-ends over this core: the existing GDB-RSP server (`src/gdb_rsp.c`) and, in future, a native DAP server intended to run in parallel. A front-end shall translate wire framing to and from the core's verbs and shall be the only layer that formats a protocol-specific reply; the core shall never emit RSP, DAP, or any other wire encoding, and shall never be reached *into* by a lower layer (per the SDD §2.2 layered-architecture rule, UPDI helpers never choose policy such as breakpoint slots). The core's protocol-neutral entry surface shall be reachable through a single aggregating include, `src/debug_core.h`. Phase 15 establishes this seam by aggregation; physically relocating the arbiter, stop-cause classifier, and software-breakpoint bodies out of the RSP module into a dedicated debug-core translation unit is deferred to the DAP-server phase to avoid destabilising the verified RSP path.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+          <trace target="SDD" ref="5.1"/>
         </traces>
       </hlr>
     </section>
@@ -2458,6 +2466,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <text><![CDATA[Installing or removing a software breakpoint via `sw_bp_patch_flash()` enters NVMPROG, which issues a system-reset pulse; the original PC is therefore re-written with `updi_ocd_write_pc()` during `sw_bp_restore_cpu()`. A fresh `OCD.PC` write makes the silicon skip the instruction at PC on the very next step/run, so after such a restore `sw_bp_patch_flash()` shall set `RspContext.pc_dirty = true`. On the next resume, both `dh_continue()` and `dh_step()` shall call a file-private helper `static int consume_pc_skip(RspContext *ctx)` before resuming. The helper shall: return 0 immediately when `pc_dirty` is false; otherwise clear `pc_dirty`, read the live PC and its 4 opcode bytes, and — when the first opcode word is a direct 32-bit `CALL`/`JMP` (`(w0 & 0xFE0E) == 0x940E` or `0x940C`) — return 0 to leave change-of-flow handling to the existing `continue_step_over_leading_cof()` / `dh_step()` emulation (which rewrites `OCD.PC` to the target anyway, so the skip is moot); for any other instruction it shall execute it exactly once via `updi_ocd_step_inject_word0()` (LLR-UPDI-34) — substituting the saved original opcode from the `sw_bp[]` shadow when a `BREAK` is currently patched at PC — and return 1. `dh_continue()` shall call the helper before `continue_step_over_leading_cof()` and `updi_run()`; `dh_step()` shall, when the helper returns 1, treat that injected execution as the single step (rebuild the FSM list, classify the stop cause as `SC_STEP`, and emit the stop reply) without a further `updi_step()`. This prevents the instruction the CPU was halted on (e.g. an argument-setup `ldi` at a breakpoint) from being silently skipped on the next continue/step, which otherwise corrupts downstream execution (observed on hardware as function arguments read as 0).]]></text>
         <traces>
           <trace target="HLR" ref="HLR-054" name="True Software Breakpoints via Flash BREAK Opcode"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-51">
+        <text><![CDATA[`src/gdb_rsp.c` — the GDB-RSP protocol front-end — shall reach the protocol-agnostic debug core exclusively through the single aggregating include `src/debug_core.h` (which re-exports `updi.h`, `elf_parser.h`, `fsm_mapper.h`, and `monitor.h`), rather than including those core module headers individually. This makes the front-end/core seam explicit and gives a future DAP front-end one documented include over the same core. Phase 15 establishes the seam by aggregation only: the breakpoint arbiter, software-breakpoint shadow/step-over model, and stop-cause classifier remain as core policy inside `gdb_rsp.c` pending the deferred extraction into a dedicated debug-core translation unit; no NEW protocol-agnostic policy shall be added to the front-end's wire-framing paths.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-073" name="Protocol-Agnostic Debug Core"/>
         </traces>
       </llr>
     </function>
@@ -3985,6 +4000,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces>
           <trace target="HLR" ref="HLR-033"/>
           <trace target="LLR" ref="LLR-ELF-07"/>
+          <trace target="LLR" ref="LLR-RSP-51"/>
         </traces>
       </test>
 

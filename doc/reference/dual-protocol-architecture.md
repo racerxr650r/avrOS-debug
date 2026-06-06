@@ -142,28 +142,33 @@ entry/event-loop layer (preserves SDD §2.2 layered architecture)." The
 structured stop event generalises exactly this idea: the core reports *what
 happened*; each front-end decides *how to say it*.
 
-## 5. Spec reconciliation required (tracer)
+## 5. Spec reconciliation (tracer) — done in Phase 15
 
-The current spec actively forbids what this phase prepares for:
+The spec originally forbade what this phase prepares for:
 
-- **HLR-031** — "The server shall communicate exclusively over standard GDB
-  RSP. No IDE-specific protocol extensions (DAP, …) shall be implemented inside
-  the server; all IDE integration shall be the responsibility of the
-  client-side adapter."
+- **HLR-020 "Editor-Agnostic Protocol"** — "The server shall communicate
+  exclusively over standard GDB RSP. No IDE-specific protocol extensions (DAP,
+  …) shall be implemented inside the server …"
 - **SDD "Editor-Agnostic Core" design goal** — "The server exposes only
   standard GDB RSP. IDE-specific integration (Cortex-Debug, Zed DAP) is handled
   entirely by the GDB client."
 
-These reflect the original decision to be RSP-only. PVD §9 has since adopted
-*Native DAP Translation* as a theme, so the spec must be reconciled: an
-**in-server DAP front-end becomes permitted**, recast as a second
-protocol-neutral front-end over the shared debug core (not an "IDE extension"
-bolted onto the RSP path). The reconciliation is a deliberate, recorded change —
-HLR-031 is revised (not deleted), the design goal is reworded to "Protocol-
-agnostic debug core with thin RSP and DAP front-ends," and new HLRs/LLRs are
-authored for (a) the DWARF capability in `elf_parser` and (b) the User-Manual
-OCD reference. The DAP front-end itself remains a *future* phase; Phase 15 only
-removes the prohibition and lands the core seam + DWARF.
+These reflected the original RSP-only decision. PVD §9 has since adopted
+*Native DAP Translation* as a theme, so the spec was reconciled (a deliberate,
+recorded change):
+
+- **HLR-020** revised — the *RSP front-end* stays pure-RSP, but a *separate*
+  parallel protocol front-end (a future DAP server over the shared core) is now
+  explicitly permitted; it does not alter the RSP front-end's contract.
+- The SDD design goal was reworded from "Editor-Agnostic Core" to
+  **"Protocol-Agnostic Debug Core"** (thin RSP + future DAP front-ends).
+- **HLR-073 "Protocol-Agnostic Debug Core"** was added, with **LLR-RSP-51**
+  binding `gdb_rsp.c` to the single aggregating seam include `src/debug_core.h`.
+- New HLRs/LLRs were also authored for the DWARF capability (**HLR-072**,
+  LLR-ELF-11..13) and the elfutils adoption (**HLR-071**).
+
+The DAP front-end itself remains a *future* phase; Phase 15 removed the
+prohibition and landed the core seam (`src/debug_core.h`) + DWARF only.
 
 ## 6. Scope boundary for Phase 15
 
