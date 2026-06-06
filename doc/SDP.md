@@ -34,6 +34,10 @@
 | [13](#phase-13--hw-comparator-arbiter-with-a-reserved-single-step-slot) | HW-comparator arbiter: 1 user HW BP + 1 reserved single-step slot (SW BPs unlimited) | ✅ Complete (PR [#46](https://github.com/racerxr650r/avrOS-debug/pull/46)) |
 | [14](#phase-14--full-debug-session-hw-test-coverage) | Full interactive debug-session `hw-test` coverage (G18–G24): breakpoints, stepping, frames, locals/globals | ✅ Complete (PR [#49](https://github.com/racerxr650r/avrOS-debug/pull/49)) |
 | [15](#phase-15--dap-readiness-ocd-reference-appendix-elfutilsdwarf-integration--dual-protocol-architecture-prep) | DAP-readiness: User-Manual OCD reference appendix + `libelf`/`libdw` (elfutils/DWARF) integration in `elf_parser.c` + protocol-agnostic debug-core seam for a future parallel DAP server | ✅ Complete (PR [#51](https://github.com/racerxr650r/avrOS-debug/pull/51)) |
+| [16](#phase-16--dap-foundation-mode-switch-transport-lifecycle--linux-only-cleanup) | DAP foundation: `--dap`/`--rsp` mode switch, JSON + Content-Length transport, `initialize`→`launch`/`attach`→`configurationDone`→`disconnect` lifecycle, Neovim/Lua acceptance harness bootstrap; strike all macOS support | 🔲 In progress (issue [#52](https://github.com/racerxr650r/avrOS-debug/issues/52)) |
+| [17](#phase-17--dap-execution-control-stop-events--shallow-stacktrace) | DAP execution control: `threads`, `continue`/`next`/`stepIn`/`stepOut`/`pause`, `stopped`/`continued`/`exited`/`terminated` events, shallow `stackTrace` with source line | 🔲 Not started (issue [#53](https://github.com/racerxr650r/avrOS-debug/issues/53)) |
+| [18](#phase-18--dap-breakpoints--dwarf-multi-frame-stacktrace) | DAP breakpoints: `setBreakpoints` (source line→addr via DWARF) through the core arbiter, conditional + instruction breakpoints, full multi-frame `stackTrace` via DWARF CFI unwinding | 🔲 Not started (issue [#54](https://github.com/racerxr650r/avrOS-debug/issues/54)) |
+| [19](#phase-19--dap-variables-memory-evaluate--vs-code--neovim-acceptance) | DAP variables: `scopes`/`variables` (DWARF type rendering), `evaluate`, `readMemory`/`writeMemory`, register scope; VS Code launch config + user manual; full Neovim/Lua acceptance suite | 🔲 Not started (issue [#55](https://github.com/racerxr650r/avrOS-debug/issues/55)) |
 
 ## 0. Required Tools for Development
 
@@ -1027,6 +1031,87 @@ This is not a fixable detail — it is a **model mismatch**. avrOS is a cooperat
 **Open questions.**
 - **macOS + elfutils (HLR-033).** `libelf`/`libdw` are GNU/Linux-centric. Resolution (decided): elfutils is a **required** dependency on all platforms — there is no symbol-only fallback and no bundled shim. macOS obtains it via `brew install elfutils`; the Makefile auto-links `-ldw -lelf` with no feature detection.
 - **Depth of the core extraction.** The seam definition and the lowest-risk structural moves are in scope; a wholesale `gdb_rsp.c` split is deferred to the DAP-server phase to avoid destabilising the verified RSP path.
+
+### Phase 16 — DAP Foundation: Mode Switch, Transport, Lifecycle + Linux-only Cleanup
+
+> **Status: 🔲 In progress — issue [#52](https://github.com/racerxr650r/avrOS-debug/issues/52), branch `52-phase-16-dap-foundation`.**
+
+**Motivation.** Phase 15 landed the prerequisites for a native Debug Adapter Protocol (DAP) server: the protocol-agnostic debug core (HLR-073, `src/debug_core.h`), the elfutils/DWARF capability (HLR-071/072), and the spec reconciliation that permits a parallel in-server DAP front-end (HLR-020). Phases 16–19 build that DAP server so DAP-native editors — **VS Code** primarily — can drive `avrOSdb` directly without `avr-gdb` in the loop (PVD §9). **elfutils (libdw) is the engine** for all the source-level work the DAP protocol requires (line tables, stack unwinding, variable/type resolution) — the reason it was integrated in Phase 15 — so the DAP layers consume libdw rather than reinventing DWARF. Automated testing mirrors the GDB hardware harness: headless **Neovim + nvim-dap** driven by Lua scripts. Phase 16 is the foundation — protocol selection, transport, the connection lifecycle, and the test harness bootstrap — plus the project-wide decision to drop macOS and become **Linux-only**.
+
+**Design decisions.**
+- **Mode select:** `--dap` and `--rsp` startup switches, mutually exclusive. **RSP stays the default** when neither is given, so every existing invocation, test, and the Group-G harness is unaffected. `main.c` dispatches to either `rsp_*` (today's `event_loop`) or the new DAP server.
+- **Transport: TCP**, reusing the existing listener + single `select()` event loop (HLR-039) — the same model the RSP server uses, and the same model the Neovim/VS Code clients connect to (host:port, default `:1234`). DAP framing is `Content-Length: <n>\r\n\r\n<json>`. (stdio transport is a possible later add; TCP mirrors the test harness's spawn-and-connect pattern.)
+- **JSON:** vendor **jsmn** (single header, MIT) for tokenising inbound messages; a small hand-rolled serializer emits responses/events. Keeps the dependency footprint lean (no heavyweight JSON library).
+- **Linux-only:** macOS is struck from all documentation and the traceable spec. There is no remaining `<elf.h>` shim concern (Phase 15) and elfutils + the Pi/Linux bench are the only supported platform.
+
+**Scope summary.**
+
+| # | Area | Deliverable | File(s) |
+| - | ---- | ----------- | ------- |
+| 1 | Mode switch | `--dap`/`--rsp` parsing + mutual-exclusion; `AppConfig.mode`; dispatch in `app_main()`; usage/man-page text | `src/main.c`, `doc/avrOSdb.1` |
+| 2 | DAP transport | `Content-Length`-framed JSON-RPC over TCP on the `select()` loop; vendored jsmn tokenizer + hand-rolled emitter; request/response/event scaffolding | `src/dap.c/.h`, vendored `src/jsmn.h` |
+| 3 | Lifecycle | `initialize` (capabilities), `launch`/`attach`, `configurationDone`, `disconnect`/`terminate`; connect target + load ELF via the debug core | `src/dap.c` |
+| 4 | Test harness | `tests/hw/dap_acceptance.lua` (headless Neovim + nvim-dap) + `make hw-test-dap`; initial handshake/attach cases | `tests/hw/`, `Makefile` |
+| 5 | Linux-only | Strike all macOS mentions from docs + spec; reword HLR-033 (Linux only); drop macOS platform/dependency rows; remove the Homebrew (`.rb`) bundle formula + its tests | `doc/Project.xml`, `doc/UserManual.md`, `doc/PVD.md`, `doc/avrOSdb.1`, `Makefile`, `tests/test_install.c` |
+| 6 | Spec | New HLRs (DAP transport, mode select, lifecycle) + LLRs (`dap` function group); render + lint | `doc/Project.xml` |
+
+**Acceptance.**
+- A DAP client (nvim-dap, and a scripted JSON exchange in the unit tests) completes `initialize`→`launch`/`attach`→`configurationDone` and reaches a stopped-at-entry state on hardware; `--rsp` behaviour is byte-for-byte unchanged (Group G G1–G24 still green).
+- `make hw-test-dap` runs the bootstrap cases green on AVR128DA28.
+- No macOS mention remains anywhere; `make` 0 warnings; `make test` all pass; `python3 tools/lint_project.py` 0/0.
+
+### Phase 17 — DAP Execution Control, Stop Events & Shallow stackTrace
+
+> **Status: 🔲 Not started — issue [#53](https://github.com/racerxr650r/avrOS-debug/issues/53).**
+
+**Motivation.** With a connected DAP session (Phase 16), expose run control and the run-state event stream that an IDE's toolbar drives. This reuses the debug core's execution primitives (`updi_run/halt/step`, the stop-cause classifier) — the same ones the RSP front-end composes — so behaviour matches the proven GDB path.
+
+**Scope summary.**
+
+| # | Area | Deliverable |
+| - | ---- | ----------- |
+| 1 | Threads | `threads` request → the single live CPU thread (avrOS FSM tasks remain `monitor`-style introspection, surfaced in a later refinement) |
+| 2 | Run control | `continue`, `next`, `stepIn`, `stepOut`, `pause` mapped to core execution verbs (32-bit step / change-of-flow handled by the existing UPDI helpers) |
+| 3 | Events | `stopped` (reason `entry`/`breakpoint`/`step`/`pause`), `continued`, `exited`, `terminated`, driven by the stop-cause classifier |
+| 4 | Frames | Shallow `stackTrace` (frame 0): PC + `file:line` via `elf_addr_to_line()` (libdw); `scopes` stub |
+| 5 | Harness + spec | nvim-dap step/continue/pause cases; HLRs/LLRs; render + lint |
+
+**Acceptance.** nvim-dap drives stop-at-entry → step/next/continue/pause with correctly-tagged `stopped` events and the right source line on hardware; gates green.
+
+### Phase 18 — DAP Breakpoints & DWARF Multi-Frame stackTrace
+
+> **Status: 🔲 Not started — issue [#54](https://github.com/racerxr650r/avrOS-debug/issues/54).**
+
+**Motivation.** Source-level breakpoints and full backtraces — the two features that most depend on DWARF, and the clearest payoff of the Phase-15 elfutils integration. `setBreakpoints` resolves `path:line` → address through libdw; `stackTrace` unwinds the call stack via libdw CFI.
+
+**Scope summary.**
+
+| # | Area | Deliverable |
+| - | ---- | ----------- |
+| 1 | Source breakpoints | `setBreakpoints`: `path:line` → code address via `elf_line_to_addr()` (libdw), installed through the core HW-comparator arbiter / SW-BP model; `verified` breakpoints + hit events with `hitBreakpointIds` |
+| 2 | More breakpoints | `setInstructionBreakpoints`; conditional breakpoints (`condition` evaluated against the live target) |
+| 3 | Unwinding | Full multi-frame `stackTrace` via DWARF CFI (libdw `.debug_frame`), each frame resolved to `file:line` and function name |
+| 4 | Harness + spec | nvim-dap file:line + conditional breakpoint cases and a `leaf→mid→top→main` backtrace; HLRs/LLRs; render + lint |
+
+**Acceptance.** File:line and conditional breakpoints hit on hardware; `stackTrace` reaches `main` in frame order; gates green.
+
+### Phase 19 — DAP Variables, Memory, Evaluate + VS Code + Neovim Acceptance
+
+> **Status: 🔲 Not started — issue [#55](https://github.com/racerxr650r/avrOS-debug/issues/55).**
+
+**Motivation.** The final DAP phase: source-level state inspection (the richest DWARF consumer), the VS Code integration that is the headline use case, and the complete automated acceptance suite that makes the whole front-end regression-safe — the DAP analogue of Group G.
+
+**Scope summary.**
+
+| # | Area | Deliverable |
+| - | ---- | ----------- |
+| 1 | Variables | `scopes` + `variables`: DWARF variable/type resolution via libdw (locals, args, globals; scalar/struct/array/pointer rendering); a registers scope |
+| 2 | Evaluate / memory | `evaluate` (watch + repl), `readMemory`/`writeMemory`, `setVariable` |
+| 3 | VS Code | A `launch.json` attach config for the `--dap` TCP server + a User Manual section; optional `--emit-vscode-config` helper |
+| 4 | Acceptance suite | Full `tests/hw/dap_acceptance.lua` mirroring Group G (globals scalar/struct/array, struct fields, array elements, per-frame locals/args, a capstone session); `make hw-test-dap` green end-to-end |
+| 5 | Spec / close-out | HLRs/LLRs; render + lint; mark Phases 16–19 complete |
+
+**Acceptance.** Variables/globals/memory read back exactly via nvim-dap on hardware; a VS Code session reaches `main`, hits a breakpoint, and shows correct locals; full `make hw-test-dap` suite green; gates green.
 
 ## 9. Risks & Open Questions
 
