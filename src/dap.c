@@ -10,6 +10,7 @@
  * doc/reference/dual-protocol-architecture.md.
  */
 #include "dap.h"
+#include "gdb_rsp.h"   /* rsp_accept / rsp_close — shared TCP transport helpers */
 
 #include <errno.h>
 #include <limits.h>
@@ -17,6 +18,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>   /* strncasecmp */
+#include <sys/select.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 /* ── JSON tokenizer (recursive descent → flat pre-order token array) ──────── */
@@ -427,19 +430,193 @@ int dap_write_message(int fd, const char *body, size_t len)
     return 0;
 }
 
-/* ── Server entry (scaffold — handlers land next on this branch) ──────────── */
+/* ── Response / event builders ────────────────────────────────────────────── */
+
+#define DAP_OUT_MAX 2048u   /* outgoing handshake messages are small */
+
+static long dap_next_seq(dap_session *s) { return ++s->out_seq; }
+
+static int dap_send_response(dap_session *s, long req_seq, const char *cmd,
+                             bool success, const char *body_json)
+{
+    char cmde[64];
+    dj_escape(cmd, cmde, sizeof cmde);
+    char buf[DAP_OUT_MAX];
+    int  n;
+    if (body_json != NULL && body_json[0] != '\0')
+        n = snprintf(buf, sizeof buf,
+                     "{\"seq\":%ld,\"type\":\"response\",\"request_seq\":%ld,"
+                     "\"success\":%s,\"command\":\"%s\",\"body\":%s}",
+                     dap_next_seq(s), req_seq, success ? "true" : "false",
+                     cmde, body_json);
+    else
+        n = snprintf(buf, sizeof buf,
+                     "{\"seq\":%ld,\"type\":\"response\",\"request_seq\":%ld,"
+                     "\"success\":%s,\"command\":\"%s\"}",
+                     dap_next_seq(s), req_seq, success ? "true" : "false", cmde);
+    if (n < 0 || (size_t)n >= sizeof buf)
+        return -1;
+    return dap_write_message(s->fd, buf, (size_t)n);
+}
+
+static int dap_send_error(dap_session *s, long req_seq, const char *cmd,
+                          const char *message)
+{
+    char cmde[64], msge[256];
+    dj_escape(cmd, cmde, sizeof cmde);
+    dj_escape(message, msge, sizeof msge);
+    char buf[DAP_OUT_MAX];
+    int  n = snprintf(buf, sizeof buf,
+                      "{\"seq\":%ld,\"type\":\"response\",\"request_seq\":%ld,"
+                      "\"success\":false,\"command\":\"%s\",\"message\":\"%s\"}",
+                      dap_next_seq(s), req_seq, cmde, msge);
+    if (n < 0 || (size_t)n >= sizeof buf)
+        return -1;
+    return dap_write_message(s->fd, buf, (size_t)n);
+}
+
+static int dap_send_event(dap_session *s, const char *event,
+                          const char *body_json)
+{
+    char eve[64];
+    dj_escape(event, eve, sizeof eve);
+    char buf[DAP_OUT_MAX];
+    int  n;
+    if (body_json != NULL && body_json[0] != '\0')
+        n = snprintf(buf, sizeof buf,
+                     "{\"seq\":%ld,\"type\":\"event\",\"event\":\"%s\","
+                     "\"body\":%s}", dap_next_seq(s), eve, body_json);
+    else
+        n = snprintf(buf, sizeof buf,
+                     "{\"seq\":%ld,\"type\":\"event\",\"event\":\"%s\"}",
+                     dap_next_seq(s), eve);
+    if (n < 0 || (size_t)n >= sizeof buf)
+        return -1;
+    return dap_write_message(s->fd, buf, (size_t)n);
+}
+
+/* ── Request dispatch ─────────────────────────────────────────────────────── */
+
+int dap_dispatch(dap_session *s, const char *msg, size_t len)
+{
+    dj_tok_t t[256];
+    int      nt = dj_parse(msg, len, t, 256);
+    if (nt < 1 || t[0].type != DJ_OBJECT)
+        return 0;                               /* ignore non-object junk */
+
+    long req_seq = 0;
+    int  seqm = dj_member(msg, t, 0, "seq");
+    if (seqm > 0)
+        (void)dj_long(msg, t, seqm, &req_seq);
+
+    int cmdm = dj_member(msg, t, 0, "command");
+    if (cmdm < 0)
+        return 0;                               /* not a request */
+    char cmd[48];
+    dj_strcpy(msg, t, cmdm, cmd, sizeof cmd);
+
+    /* ── Lifecycle (Phase 16) ── */
+    if (strcmp(cmd, "initialize") == 0) {
+        /* Advertise only what the handshake needs; capabilities grow with the
+         * Phase 17–19 features. */
+        if (dap_send_response(s, req_seq, cmd, true,
+                "{\"supportsConfigurationDoneRequest\":true}") < 0)
+            return -1;
+        return dap_send_event(s, "initialized", NULL) < 0 ? -1 : 0;
+    }
+    if (strcmp(cmd, "launch") == 0 || strcmp(cmd, "attach") == 0)
+        return dap_send_response(s, req_seq, cmd, true, NULL) < 0 ? -1 : 0;
+
+    if (strcmp(cmd, "setExceptionBreakpoints") == 0)
+        return dap_send_response(s, req_seq, cmd, true, NULL) < 0 ? -1 : 0;
+
+    if (strcmp(cmd, "setBreakpoints") == 0)
+        /* Phase 18 resolves source line -> address via DWARF and installs
+         * through the core arbiter; the handshake just needs a valid reply. */
+        return dap_send_response(s, req_seq, cmd, true,
+                                 "{\"breakpoints\":[]}") < 0 ? -1 : 0;
+
+    if (strcmp(cmd, "configurationDone") == 0) {
+        if (s->updi_fd >= 0)
+            (void)updi_halt(s->updi_fd);
+        if (dap_send_response(s, req_seq, cmd, true, NULL) < 0)
+            return -1;
+        /* Reaching a stopped-at-entry state completes the Phase 16 lifecycle. */
+        return dap_send_event(s, "stopped",
+                "{\"reason\":\"entry\",\"threadId\":1,"
+                "\"allThreadsStopped\":true}") < 0 ? -1 : 0;
+    }
+
+    if (strcmp(cmd, "threads") == 0)
+        /* The live CPU is the sole thread; FSM tasks remain introspection
+         * (Phase 17 may enrich this). */
+        return dap_send_response(s, req_seq, cmd, true,
+                "{\"threads\":[{\"id\":1,\"name\":\"cpu\"}]}") < 0 ? -1 : 0;
+
+    if (strcmp(cmd, "disconnect") == 0 || strcmp(cmd, "terminate") == 0) {
+        if (s->updi_fd >= 0)
+            (void)updi_run(s->updi_fd);          /* let the target run on detach */
+        (void)dap_send_response(s, req_seq, cmd, true, NULL);
+        return 1;                                /* close the session */
+    }
+
+    /* Execution control, stack/scopes/variables, memory, evaluate: Phases 17–19. */
+    return dap_send_error(s, req_seq, cmd,
+                          "request not implemented yet (Phase 17+)") < 0 ? -1 : 0;
+}
+
+/* ── Server entry: accept one client, then dispatch on the event loop ─────── */
 
 int dap_serve(int listen_fd, int updi_fd,
               ElfContext *elf, const AvrOsSymbolIndex *idx,
               FsmContext *fsm, volatile sig_atomic_t *quit, bool log)
 {
-    (void)listen_fd; (void)updi_fd; (void)elf; (void)idx;
-    (void)fsm; (void)quit; (void)log;
+    int cfd = rsp_accept(listen_fd);
+    if (cfd < 0) {
+        fprintf(stderr, "avrOSdb: DAP accept failed\n");
+        return -1;
+    }
+    if (log)
+        fprintf(stderr, "avrOSdb: DAP client connected\n");
 
-    fprintf(stderr,
-            "avrOSdb: --dap selected. The DAP transport (framing + JSON codec) "
-            "is in place; the accept/dispatch loop and lifecycle handlers are "
-            "still under construction (Phase 16). Use --rsp (the default) for "
-            "now.\n");
-    return -1;
+    char *buf = malloc(DAP_MSG_MAX);
+    if (buf == NULL) {
+        rsp_close(cfd);
+        return -1;
+    }
+
+    dap_session s = { cfd, updi_fd, elf, idx, fsm, log, 0 };
+    int rc = 0;
+    while (quit == NULL || !*quit) {
+        /* Wait for a readable client (or 200 ms) so the quit flag is honoured
+         * between messages without a busy loop. */
+        fd_set rf;
+        FD_ZERO(&rf);
+        FD_SET(cfd, &rf);
+        struct timeval tv = { 0, 200000 };
+        int sel = select(cfd + 1, &rf, NULL, NULL, &tv);
+        if (sel < 0) {
+            if (errno == EINTR) continue;
+            rc = -1; break;
+        }
+        if (sel == 0)
+            continue;
+
+        size_t mlen = 0;
+        int    r = dap_read_message(cfd, buf, DAP_MSG_MAX, &mlen);
+        if (r == 0) {
+            if (log) fprintf(stderr, "avrOSdb: DAP client disconnected (EOF)\n");
+            break;
+        }
+        if (r < 0) {
+            fprintf(stderr, "avrOSdb: DAP read/framing error\n");
+            rc = -1; break;
+        }
+        if (dap_dispatch(&s, buf, mlen) != 0)
+            break;                               /* disconnect/terminate */
+    }
+
+    free(buf);
+    rsp_close(cfd);
+    return rc;
 }

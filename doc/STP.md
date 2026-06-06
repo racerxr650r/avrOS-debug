@@ -363,7 +363,7 @@ Role: **hardware**. **1 test(s).**
 
 ### 3.12. [tests/test_dap.c](../tests/test_dap.c)
 
-Role: **unit**. **8 test(s).**
+Role: **unit**. **13 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -375,6 +375,11 @@ Role: **unit**. **8 test(s).**
 | 6 | <a id="dj_parse_respects_token_cap"></a>`dj_parse_respects_token_cap` | `LLR-DAP-01` | Verify `dj_parse()` returns -1 (rather than overrunning) when the token array is too small for the input. |
 | 7 | <a id="dap_framing_round_trip_over_pipe"></a>`dap_framing_round_trip_over_pipe` | `LLR-DAP-03`, `LLR-DAP-04` | Write two framed messages to a pipe with `dap_write_message()` and read them back with `dap_read_message()`; verify each body and length round-trips exactly with no over-read into the second message, and that closing the write end then yields EOF (return 0). |
 | 8 | <a id="dap_read_rejects_oversize_body"></a>`dap_read_rejects_oversize_body` | `LLR-DAP-03` | Feed a header advertising a `Content-Length` larger than the reader's buffer and verify `dap_read_message()` returns -1 rather than overflowing. |
+| 9 | <a id="dap_initialize_handshake"></a>`dap_initialize_handshake` | `LLR-DAP-06`, `LLR-DAP-07` | Dispatch an `initialize` request over a socketpair and verify the adapter writes a `response` with `request_seq:1`, `command:"initialize"`, `success:true`, and the `supportsConfigurationDoneRequest` capability, immediately followed by the `initialized` event. |
+| 10 | <a id="dap_configuration_done_emits_stopped_entry"></a>`dap_configuration_done_emits_stopped_entry` | `LLR-DAP-07` | Dispatch `configurationDone` (with `updi_fd = -1`) and verify a `success:true` response for that command followed by a `stopped` event with `reason:"entry"` and `threadId:1`. |
+| 11 | <a id="dap_disconnect_closes_session"></a>`dap_disconnect_closes_session` | `LLR-DAP-07` | Dispatch `disconnect` and verify `dap_dispatch()` returns 1 (close the session) after writing a `success:true` response for the `disconnect` command. |
+| 12 | <a id="dap_unknown_request_returns_error"></a>`dap_unknown_request_returns_error` | `LLR-DAP-06`, `LLR-DAP-07` | Dispatch an unimplemented command and verify the adapter replies with a `success:false` response echoing the command and carrying a `message`, rather than leaving the client waiting. |
+| 13 | <a id="dap_serve_runs_handshake_to_disconnect"></a>`dap_serve_runs_handshake_to_disconnect` | `LLR-DAP-05` | Drive `dap_serve()` end-to-end without hardware: a stubbed `rsp_accept()` hands it a pre-connected socketpair end whose request stream is pre-loaded with `initialize` then `disconnect`. Verify the accept/select/read/dispatch loop processes both (emitting the initialize response, the `initialized` event, and the disconnect response) and returns 0 when the client disconnects. |
 
 ## 4. LLR Coverage Matrix
 
@@ -534,3 +539,6 @@ verified by code review — see
 | `LLR-DAP-02` | `dap` | `HLR-075` | `dj_escape_quotes_backslash_and_controls` |
 | `LLR-DAP-03` | `dap` | `HLR-075` | `dap_framing_round_trip_over_pipe`, `dap_read_rejects_oversize_body` |
 | `LLR-DAP-04` | `dap` | `HLR-075` | `dap_framing_round_trip_over_pipe` |
+| `LLR-DAP-05` | `dap` | `HLR-076` | `dap_serve_runs_handshake_to_disconnect` |
+| `LLR-DAP-06` | `dap` | `HLR-076` | `dap_initialize_handshake`, `dap_unknown_request_returns_error` |
+| `LLR-DAP-07` | `dap` | `HLR-076` | `dap_initialize_handshake`, `dap_configuration_done_emits_stopped_entry`, `dap_disconnect_closes_session`, `dap_unknown_request_returns_error` |

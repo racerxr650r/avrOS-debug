@@ -3,10 +3,23 @@
  * Content-Length message framing. Both are target-independent and exercised
  * here without hardware (framing over an anonymous pipe). */
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include "unity.h"
 #include "dap.h"
+
+/* dap.c references these for its accept loop + lifecycle side effects; this
+ * suite links only dap.c and drives the codec/framing/dispatch directly, never
+ * the real TCP/UPDI, so stub them. (Test objects are built with
+ * -Wno-missing-prototypes.) `rsp_accept` hands dap_serve() a test-controlled
+ * fd (a pre-connected socketpair end) so the accept/dispatch loop is
+ * exercisable without a real listener. */
+static int g_accept_fd = -1;
+int  rsp_accept(int listen_fd)        { (void)listen_fd; return g_accept_fd; }
+void rsp_close(int fd)                { (void)fd; }   /* the test owns the fds */
+int  updi_halt(int fd)                { (void)fd; return 0; }
+int  updi_run(int fd)                 { (void)fd; return 0; }
 
 void setUp(void)    {}
 void tearDown(void) {}
@@ -153,6 +166,131 @@ void test_dap_read_rejects_oversize_body(void)
     close(fds[1]);
 }
 
+/* ── Lifecycle dispatch (over a socketpair; updi_fd = -1 skips UPDI) ───────── */
+
+void test_dap_initialize_handshake(void)
+{
+    int sp[2];
+    TEST_ASSERT_EQUAL_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sp));
+    dap_session s = { sp[1], -1, NULL, NULL, NULL, false, 0 };
+
+    const char *req =
+        "{\"seq\":1,\"type\":\"request\",\"command\":\"initialize\","
+        "\"arguments\":{}}";
+    TEST_ASSERT_EQUAL_INT(0, dap_dispatch(&s, req, strlen(req)));
+
+    char   buf[512];
+    size_t len;
+    /* response */
+    TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"type\":\"response\""));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"command\":\"initialize\""));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"request_seq\":1"));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"success\":true"));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "supportsConfigurationDoneRequest"));
+    /* followed by the initialized event */
+    TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"type\":\"event\""));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"event\":\"initialized\""));
+
+    close(sp[0]); close(sp[1]);
+}
+
+void test_dap_configuration_done_emits_stopped_entry(void)
+{
+    int sp[2];
+    TEST_ASSERT_EQUAL_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sp));
+    dap_session s = { sp[1], -1, NULL, NULL, NULL, false, 0 };
+
+    const char *req = "{\"seq\":7,\"command\":\"configurationDone\"}";
+    TEST_ASSERT_EQUAL_INT(0, dap_dispatch(&s, req, strlen(req)));
+
+    char   buf[512];
+    size_t len;
+    TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"command\":\"configurationDone\""));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"success\":true"));
+    TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"event\":\"stopped\""));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"reason\":\"entry\""));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"threadId\":1"));
+
+    close(sp[0]); close(sp[1]);
+}
+
+void test_dap_disconnect_closes_session(void)
+{
+    int sp[2];
+    TEST_ASSERT_EQUAL_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sp));
+    dap_session s = { sp[1], -1, NULL, NULL, NULL, false, 0 };
+
+    const char *req = "{\"seq\":9,\"command\":\"disconnect\"}";
+    /* dispatch returns 1 = the session should close */
+    TEST_ASSERT_EQUAL_INT(1, dap_dispatch(&s, req, strlen(req)));
+
+    char   buf[512];
+    size_t len;
+    TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"command\":\"disconnect\""));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"success\":true"));
+
+    close(sp[0]); close(sp[1]);
+}
+
+void test_dap_unknown_request_returns_error(void)
+{
+    int sp[2];
+    TEST_ASSERT_EQUAL_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sp));
+    dap_session s = { sp[1], -1, NULL, NULL, NULL, false, 0 };
+
+    const char *req = "{\"seq\":5,\"command\":\"frobnicate\"}";
+    TEST_ASSERT_EQUAL_INT(0, dap_dispatch(&s, req, strlen(req)));
+
+    char   buf[512];
+    size_t len;
+    TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"command\":\"frobnicate\""));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"success\":false"));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"message\""));
+
+    close(sp[0]); close(sp[1]);
+}
+
+/* dap_serve(): accept (via the rsp_accept stub) one client whose request
+ * stream is pre-loaded, run the select/read/dispatch loop, and return 0 when
+ * the client disconnects. */
+void test_dap_serve_runs_handshake_to_disconnect(void)
+{
+    int sp[2];
+    TEST_ASSERT_EQUAL_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sp));
+
+    /* Pre-load the client→server requests so select() sees them immediately. */
+    const char *init = "{\"seq\":1,\"command\":\"initialize\"}";
+    const char *disc = "{\"seq\":2,\"command\":\"disconnect\"}";
+    TEST_ASSERT_EQUAL_INT(0, dap_write_message(sp[0], init, strlen(init)));
+    TEST_ASSERT_EQUAL_INT(0, dap_write_message(sp[0], disc, strlen(disc)));
+
+    g_accept_fd = sp[1];                /* dap_serve "accepts" this fd */
+    volatile sig_atomic_t quit = 0;
+    int rc = dap_serve(0 /*listen fd ignored by stub*/, -1 /*no UPDI*/,
+                       NULL, NULL, NULL, &quit, false);
+    TEST_ASSERT_EQUAL_INT(0, rc);
+
+    /* Drain the server→client side: initialize response, initialized event,
+     * then the disconnect response. */
+    char   buf[512];
+    size_t len;
+    TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"command\":\"initialize\""));
+    TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"event\":\"initialized\""));
+    TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"command\":\"disconnect\""));
+
+    g_accept_fd = -1;
+    close(sp[0]); close(sp[1]);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -164,5 +302,10 @@ int main(void)
     RUN_TEST(test_dj_parse_respects_token_cap);
     RUN_TEST(test_dap_framing_round_trip_over_pipe);
     RUN_TEST(test_dap_read_rejects_oversize_body);
+    RUN_TEST(test_dap_initialize_handshake);
+    RUN_TEST(test_dap_configuration_done_emits_stopped_entry);
+    RUN_TEST(test_dap_disconnect_closes_session);
+    RUN_TEST(test_dap_unknown_request_returns_error);
+    RUN_TEST(test_dap_serve_runs_handshake_to_disconnect);
     return UNITY_END();
 }

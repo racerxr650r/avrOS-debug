@@ -90,6 +90,26 @@ int dap_read_message(int fd, char *buf, size_t cap, size_t *out_len);
 /* Write one DAP message: `Content-Length: <len>\r\n\r\n` + body. 0 / -1. */
 int dap_write_message(int fd, const char *body, size_t len);
 
+/* ── Session + request dispatch ────────────────────────────────────────────
+ * One DAP session over a connected client fd; handlers drive the target via
+ * the debug-core handles. Exposed so the dispatch is unit-testable over a
+ * socketpair without the accept loop or hardware (set `updi_fd = -1` to skip
+ * the UPDI side effects). */
+typedef struct {
+    int                     fd;       /* connected DAP client socket            */
+    int                     updi_fd;  /* target UPDI link (-1 in unit tests)    */
+    ElfContext             *elf;
+    const AvrOsSymbolIndex *idx;
+    FsmContext             *fsm;
+    bool                    log;
+    long                    out_seq;  /* outgoing message seq (pre-incremented) */
+} dap_session;
+
+/* Handle one decoded DAP message: parse, dispatch to the matching request
+ * handler, and write the response (+ any events). Returns 0 to continue, 1 to
+ * disconnect the client (disconnect/terminate), -1 on a write error. */
+int dap_dispatch(dap_session *s, const char *msg, size_t len);
+
 /* Serve the DAP front-end on the already-bound TCP listener `listen_fd` until
  * the client disconnects or `*quit` is set. The target UPDI link (`updi_fd`)
  * and the loaded ELF/DWARF (`elf`), avrOS symbol index (`idx`), and FSM
