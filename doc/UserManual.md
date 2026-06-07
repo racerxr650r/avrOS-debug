@@ -790,6 +790,73 @@ build/avrOSdb --dap --port 1234 /dev/ttyAMA2 firmware.elf
 An automated on-target acceptance harness drives this same path headlessly:
 `make hw-test-dap` (see §7 / the Makefile).
 
+### 6.3 VS Code (native DAP)
+
+VS Code can also talk to the `avrOSdb --dap` server directly. Unlike Neovim,
+VS Code will only attach to a DAP server through a *contributed debug type*, so
+a tiny companion extension is provided in
+[`tools/vscode/avrosdb-dap/`](../tools/vscode/avrosdb-dap/). It launches nothing
+itself — it just points the `avrosdb` debug type at the running server's TCP
+port (`vscode.DebugAdapterServer`).
+
+> [!NOTE]
+> Same scope caveat as §6.2: the native DAP front-end currently performs the
+> connection handshake (attach → stop at entry → threads → disconnect);
+> stepping, breakpoints, and variables arrive in later phases. For full-featured
+> debugging today, use the GDB-RSP path in §6.1.
+
+**Install the companion extension** (one of):
+
+```bash
+# Development Host: open the folder in VS Code and press F5
+code tools/vscode/avrosdb-dap
+
+# …or install it for all workspaces by copying it into the extensions dir
+cp -r tools/vscode/avrosdb-dap ~/.vscode/extensions/avrosdb-dap-0.1.0
+#   (VS Code Remote-SSH: use ~/.vscode-server/extensions/ on the remote host)
+```
+
+Reload VS Code after copying. The extension contributes the `avrosdb` debug type
+and a default *attach* configuration.
+
+**Add a launch configuration** — copy
+[`tools/vscode/launch.json`](../tools/vscode/launch.json) to your project's
+`.vscode/launch.json`:
+
+```jsonc
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "avrosdb",
+      "request": "attach",
+      "name": "Attach to avrOSdb (--dap)",
+      "host": "127.0.0.1",
+      "port": 1234
+    }
+  ]
+}
+```
+
+**Use it:**
+
+```bash
+# 1. start the DAP server on the target host
+build/avrOSdb --dap --port 1234 /dev/ttyAMA2 firmware.elf
+```
+
+2. In VS Code, pick **“Attach to avrOSdb (--dap)”** in the Run and Debug view
+   and press **F5**. VS Code connects to `localhost:1234` and the target stops
+   at entry. (When the server runs on a remote Pi, either use VS Code
+   Remote-SSH, or forward the port — e.g. `ssh -L 1234:localhost:1234 pi` — and
+   keep `"host": "127.0.0.1"`.)
+
+> [!TIP]
+> Prefer a no-extension quick test? Add `"debugServer": 1234` to a
+> configuration whose `type` belongs to an already-installed debugger (e.g.
+> `cppdbg`); VS Code then connects to that port instead of spawning an adapter.
+> The companion extension above is the clean, type-correct route.
+
 ---
 
 ## 7. Troubleshooting
