@@ -38,6 +38,7 @@
 | [17](#phase-17--dap-execution-control-stop-events--shallow-stacktrace) | DAP execution control: `threads`, `continue`/`next`/`stepIn`/`stepOut`/`pause`, `stopped`/`continued`/`exited`/`terminated` events, shallow `stackTrace` with source line | 🔲 Not started (issue [#53](https://github.com/racerxr650r/avrOS-debug/issues/53)) |
 | [18](#phase-18--dap-breakpoints--dwarf-multi-frame-stacktrace) | DAP breakpoints: `setBreakpoints` (source line→addr via DWARF) through the core arbiter, conditional + instruction breakpoints, full multi-frame `stackTrace` via DWARF CFI unwinding | 🔲 Not started (issue [#54](https://github.com/racerxr650r/avrOS-debug/issues/54)) |
 | [19](#phase-19--dap-variables-memory-evaluate--vs-code--neovim-acceptance) | DAP variables: `scopes`/`variables` (DWARF type rendering), `evaluate`, `readMemory`/`writeMemory`, register scope; VS Code launch config + user manual; full Neovim/Lua acceptance suite | 🔲 Not started (issue [#55](https://github.com/racerxr650r/avrOS-debug/issues/55)) |
+| [20](#phase-20--debug-in-sleep-keep-the-system-clock-alive-so-ocd-survives-sleep) | Debug-in-sleep: assert `CLK_REQ` on entering OCD so breakpoints/HW-BP survive the target's `SLEEP` (avrOS `sysSleep()`); on by default, `--sleep` disables it | 🔲 Not started (issue [#57](https://github.com/racerxr650r/avrOS-debug/issues/57)) |
 
 ## 0. Required Tools for Development
 
@@ -1112,6 +1113,42 @@ This is not a fixable detail — it is a **model mismatch**. avrOS is a cooperat
 | 5 | Spec / close-out | HLRs/LLRs; render + lint; mark Phases 16–19 complete |
 
 **Acceptance.** Variables/globals/memory read back exactly via nvim-dap on hardware; a VS Code session reaches `main`, hits a breakpoint, and shows correct locals; full `make hw-test-dap` suite green; gates green.
+
+### Phase 20 — Debug-in-sleep: keep the system clock alive so OCD survives SLEEP
+
+> **Status: 🔲 Not started — issue [#57](https://github.com/racerxr650r/avrOS-debug/issues/57).**
+
+**Motivation.** A breakpoint at `main.c:139` of the avrOS example app is never caught: once the firmware returns from sleep (avrOS `sysSleep()` → `SLEEP_MODE_IDLE`), the OCD never detects the BREAK / HW-breakpoint. This is a known AVR-Dx OCD behaviour — when the CPU executes `SLEEP`, the system clock stops, and the OCD can no longer detect a BREAK / HW-breakpoint match (or service register/memory reads) until the part wakes. Any avrOS application that idles in `sysSleep()` between dispatches is effectively undebuggable past the first sleep. This phase is independent of the DAP work (it lives at the UPDI/OCD layer) and fixes the bug for **both** the RSP and DAP front-ends.
+
+**Fix.** Assert **`CLK_REQ`** (bit 0 of `ASI_SYS_CTRLA`, CS `0x0A`) once when entering OCD, so the system clock keeps running through `SLEEP` and the OCD stays live. In `updi_enter_debug()`, right after the `STOPPED` bit is confirmed (the `return 0;` at ~`src/updi.c:949`):
+
+```c
+/* "Debug in sleep": keep the system clock running so the OCD can still
+ * detect BREAK / HW breakpoints and service register reads after the
+ * target executes SLEEP (e.g. avrOS sysSleep() → SLEEP_MODE_IDLE). */
+(void)updi_stcs(fd, ASI_SYS_CTRLA, ASI_SYS_CTRLA_CLKREQ);
+```
+
+(A new `ASI_SYS_CTRLA_CLKREQ` = `0x01u` macro is added to `src/updi.h`.)
+
+**Design decision — on by default, `--sleep` disables.** Debug-in-sleep is **enabled by default** (CLK_REQ asserted on entering OCD) so breakpoints survive sleep out of the box and the reported bug is fixed without any extra step. A new **`--sleep`** command-line switch **disables** it — the server then does not hold the clock, restoring native target sleep / power behaviour — for when the developer is debugging power paths and wants the part to sleep for real. Implemented by gating the CLK_REQ assertion behind a UPDI-layer flag set from the CLI, consulted at both `updi_enter_debug()` call sites (startup and post-`monitor reset`).
+
+**Below IDLE (Standby / Power-Down) — needs bench confirmation.** Sleep modes deeper than IDLE additionally require `RUN_STBY` (+`RUN_TIME`) set in the memory-mapped OCD control register while halted. ⚠️ The community guidance places these bits in `OCD_CTRLA @ 0x0F80`, but this project's **reverse-engineered** map (`doc/reference/guesswork.md`, validated on AVR-Dx) has `0x0F80 = BP0A` (breakpoint-0 address) and the control bits at `OCD+0x08` (`OCD_CTRL0`). The exact RUN_STBY/RUN_TIME location on AVR-Dx OCD v1 must be confirmed on the bench before this part is implemented (`updi_sts8()` to the confirmed register). The IDLE fix (ASI `CLK_REQ`) is unaffected and resolves the reported `sysSleep()` case.
+
+**Scope summary.**
+
+| # | Area | Deliverable | File(s) |
+| - | ---- | ----------- | ------- |
+| 1 | UPDI/OCD | Add `ASI_SYS_CTRLA_CLKREQ`; assert CLK_REQ in `updi_enter_debug()` unless disabled; a setter for the debug-in-sleep flag (both enter-debug sites honour it) | `src/updi.h`, `src/updi.c` |
+| 2 | CLI | `--sleep` flag in `AppConfig` (default: debug-in-sleep on); usage + man-page text; wire to the UPDI flag before `updi_enter_debug()` | `src/main.c`, `doc/avrOSdb.1` |
+| 3 | Standby (opt.) | After bench-confirming the register, set RUN_STBY/RUN_TIME for sub-IDLE sleep | `src/updi.c` |
+| 4 | Spec | New HLR (debug-in-sleep / CLK_REQ + `--sleep`) + LLRs (UPDI + MAIN); STP; render + lint 0/0 | `doc/Project.xml` |
+| 5 | Tests | Unit (PTY): `updi_enter_debug` emits the `STCS ASI_SYS_CTRLA=CLK_REQ` by default and omits it when disabled; `parse_args` `--sleep`; **hw:** the `main.c:139` breakpoint fires after `sysSleep()` | `tests/test_updi.c`, `tests/test_device.c`, `tests/hw/` |
+
+**Acceptance.**
+- **Unit:** `updi_enter_debug()` issues `STCS ASI_SYS_CTRLA = 0x01` by default and skips it under `--sleep`; `parse_args` sets the flag.
+- **Hardware:** with the avrOS example flashed, a breakpoint at `main.c:139` is hit after the firmware returns from `sysSleep()` (regression that motivated the phase); `--sleep` restores native sleep.
+- **Gate:** `make` 0 warnings; `make test` all pass; `python3 tools/lint_project.py` 0/0.
 
 ## 9. Risks & Open Questions
 
