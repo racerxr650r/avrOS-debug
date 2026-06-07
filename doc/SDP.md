@@ -34,6 +34,11 @@
 | [13](#phase-13--hw-comparator-arbiter-with-a-reserved-single-step-slot) | HW-comparator arbiter: 1 user HW BP + 1 reserved single-step slot (SW BPs unlimited) | ✅ Complete (PR [#46](https://github.com/racerxr650r/avrOS-debug/pull/46)) |
 | [14](#phase-14--full-debug-session-hw-test-coverage) | Full interactive debug-session `hw-test` coverage (G18–G24): breakpoints, stepping, frames, locals/globals | ✅ Complete (PR [#49](https://github.com/racerxr650r/avrOS-debug/pull/49)) |
 | [15](#phase-15--dap-readiness-ocd-reference-appendix-elfutilsdwarf-integration--dual-protocol-architecture-prep) | DAP-readiness: User-Manual OCD reference appendix + `libelf`/`libdw` (elfutils/DWARF) integration in `elf_parser.c` + protocol-agnostic debug-core seam for a future parallel DAP server | ✅ Complete (PR [#51](https://github.com/racerxr650r/avrOS-debug/pull/51)) |
+| [16](#phase-16--dap-foundation-mode-switch-transport-lifecycle--linux-only-cleanup) | DAP foundation: `--dap`/`--rsp` mode switch, JSON + Content-Length transport, `initialize`→`launch`/`attach`→`configurationDone`→`disconnect` lifecycle, Neovim/Lua acceptance harness bootstrap; strike all macOS support | ✅ Complete (PR [#56](https://github.com/racerxr650r/avrOS-debug/pull/56)) |
+| [17](#phase-17--dap-execution-control-stop-events--shallow-stacktrace) | DAP execution control: `threads`, `continue`/`next`/`stepIn`/`stepOut`/`pause`, `stopped`/`continued`/`exited`/`terminated` events, shallow `stackTrace` with source line | 🔲 Not started (issue [#53](https://github.com/racerxr650r/avrOS-debug/issues/53)) |
+| [18](#phase-18--dap-breakpoints--dwarf-multi-frame-stacktrace) | DAP breakpoints: `setBreakpoints` (source line→addr via DWARF) through the core arbiter, conditional + instruction breakpoints, full multi-frame `stackTrace` via DWARF CFI unwinding | 🔲 Not started (issue [#54](https://github.com/racerxr650r/avrOS-debug/issues/54)) |
+| [19](#phase-19--dap-variables-memory-evaluate--vs-code--neovim-acceptance) | DAP variables: `scopes`/`variables` (DWARF type rendering), `evaluate`, `readMemory`/`writeMemory`, register scope; VS Code launch config + user manual; full Neovim/Lua acceptance suite | 🔲 Not started (issue [#55](https://github.com/racerxr650r/avrOS-debug/issues/55)) |
+| [20](#phase-20--debug-in-sleep-keep-the-system-clock-alive-so-ocd-survives-sleep) | Debug-in-sleep: assert `CLK_REQ` on entering OCD so breakpoints/HW-BP survive the target's `SLEEP` (avrOS `sysSleep()`); on by default, `--sleep` disables it | 🔲 Not started (issue [#57](https://github.com/racerxr650r/avrOS-debug/issues/57)) |
 
 ## 0. Required Tools for Development
 
@@ -50,7 +55,7 @@
 
 | Tool | Purpose |
 | ---- | ------- |
-| `glibc-headers` (Linux) | Provides `<elf.h>`; a bundled `src/elf.h` shim is used on macOS instead |
+| `libdw-dev` / `libelf-dev` | **Required** — elfutils development libraries (also provide the system `<elf.h>`); `elfutils-devel` on Fedora |
 | AddressSanitizer / UBSan | Runtime error detection; enabled via `make ASAN=1` (`-fsanitize=address,undefined`) |
 | `avr-gdb` | End-to-end smoke testing against a live or simulated AVR target |
 
@@ -66,8 +71,8 @@ This implementation follows the complete specification stack authored in this re
 2. All 54 Low-Level Requirements fully implemented and verified by 106 passing tests across 7 test files.
 3. Binary compiles without warnings under `-std=c99 -Wall -Wextra -Wpedantic -D_POSIX_C_SOURCE=200809L`.
 4. No heap allocation on the hot path; only `elf_open()` allocates (freed by `elf_close()` at session end).
-5. Portable: builds and all tests pass on Linux (x86-64, ARM64) and macOS (Intel, Apple Silicon).
-6. Runtime dependencies: only libc — verified by `ldd avrOSdb` showing no libraries beyond libc.
+5. Builds and all tests pass on Linux (x86-64, ARM64) — the sole supported platform.
+6. Runtime dependencies: libc plus the elfutils libraries (libelf/libdw) — verified by `ldd avrOSdb`.
 7. `python3 tools/lint_project.py` continues to report 0 errors, 0 warnings throughout the implementation.
 
 ## 3. Non-Goals
@@ -133,8 +138,8 @@ and reported in the [Software Test Plan](STP.md) and
 | ---------- | ----------- | ----- |
 | `avr-gcc` ≥ 12.0 | Phase 1 test fixtures | Compiles `tests/fixtures/*.c` to `.elf` binaries consumed by `tests/test_elf.c`; not needed for the main binary |
 | Unity test framework v2.6.x | All unit test phases (1–5) | Vendored into `tests/unity/` as three files (`unity.c`, `unity.h`, `unity_internals.h`); no system install required |
-| `openpty()` / POSIX PTY | Phase 2 (UPDI tests) | Part of glibc on Linux (link with `-lutil`); in `<util.h>` on macOS (no extra link flag needed) |
-| `<elf.h>` ELF type definitions | Phase 1 source + tests | System `<elf.h>` on Linux (from `glibc-headers` / `binutils-dev`); bundled `src/elf.h` portability shim used on macOS |
+| `openpty()` / POSIX PTY | Phase 2 (UPDI tests) | Part of glibc on Linux (link with `-lutil`) |
+| `<elf.h>` ELF type definitions | Phase 1 source + tests | Supplied by the elfutils headers / `glibc-headers` on Linux (Phase 15 moved `elf_parser` onto libelf/libdw; no bundled shim) |
 | Phase 1 + 2 headers | Phase 3 | `src/fsm_mapper.c` includes both `src/updi.h` and `src/elf_parser.h`; both must be finalised before Phase 3 begins |
 | Phase 3 complete | Phase 4 (RSP) | `src/gdb_rsp.c` dispatches to `fsm_build_thread_list()` and `fsm_get_registers()`; these must exist before linking the RSP test binary |
 | All prior phases complete | Phase 5 | `src/main.c` integrates all six modules; its test binary links against every module |
@@ -149,7 +154,7 @@ and reported in the [Software Test Plan](STP.md) and
 1. Create directories: `src/`, `tests/`, `tests/fixtures/`, `tests/unity/`.
 2. Vendor Unity test framework: download `unity.c`, `unity.h`, `unity_internals.h` from ThrowTheSwitch/Unity into `tests/unity/`.
 3. Create `Makefile` with targets `all`, `clean`, `test`, `install`. The `all` target compiles all `src/*.c` with `-std=c99 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Wpedantic -Wstrict-prototypes -Wmissing-prototypes -Wshadow -O2 -g`. The `test` target builds ELF fixtures via `avr-gcc`, then builds and runs all test binaries; each test binary carries its own `--wrap` symbol list. Platform detection via `$(shell uname -s)` adds `-lutil` for `openpty()` on Linux.
-4. Create `src/elf.h` — minimal bundled ELF type definitions (`Elf32_Ehdr`, `Elf32_Shdr`, `Elf32_Phdr`, `Elf32_Sym`, `ELFMAG`, `ELFCLASS32`, `EM_AVR 0x0053`, `SHT_SYMTAB`, `SHN_UNDEF`, `PT_LOAD`). Used by `src/elf_parser.c` on macOS; Linux uses the system `<elf.h>` via `#ifdef __linux__` guard.
+4. Create `src/elf.h` — minimal bundled ELF type definitions (`Elf32_Ehdr`, `Elf32_Shdr`, `Elf32_Phdr`, `Elf32_Sym`, `ELFMAG`, `ELFCLASS32`, `EM_AVR 0x0053`, `SHT_SYMTAB`, `SHN_UNDEF`, `PT_LOAD`). (Historical: this shim was removed in Phase 15 when `elf_parser` moved onto elfutils, which supplies the system `<elf.h>`.)
 
 **Acceptance:** `make all` succeeds (even with empty `.c` stub files); `make clean` removes all build artefacts; `make test` compiles and runs (stubs may fail; the infrastructure must work).
 
@@ -158,7 +163,7 @@ and reported in the [Software Test Plan](STP.md) and
 | Test binary | Source files linked (besides `tests/unity/unity.c`) | `--wrap` symbols | Extra link flags |
 | ----------- | --------------------------------------------------- | ---------------- | ---------------- |
 | `test_elf` | `src/elf_parser.c` | `malloc` | — |
-| `test_updi` | `src/updi.c` | `select` | `-lutil` (Linux only; not needed on macOS) |
+| `test_updi` | `src/updi.c` | `select` | `-lutil` (Linux) |
 | `test_fsm` | `src/fsm_mapper.c` | `updi_mem_read` | — |
 | `test_monitor` | `src/monitor.c`, `src/gdb_rsp.c`, `src/elf_parser.c` | `updi_mem_read` | — |
 | `test_rsp` | `src/gdb_rsp.c`, `src/fsm_mapper.c`, `src/monitor.c` | `updi_mem_read`, `updi_halt`, `updi_run`, `updi_step`, `updi_nvm_write_flash`, `updi_console_poll`, `fsm_build_thread_list`, `fsm_get_registers`, `fsm_get_active_thread`, `fsm_invalidate`, `monitor_dispatch` | — |
@@ -837,9 +842,9 @@ Exact base addresses are part-specific; the dispatcher classifies segments by ad
    - `"preLaunchTask"`: optional `tasks.json` entry that builds the ELF and starts `avrOSdb` if not already running; document but mark optional.
    - `"miDebuggerArgs"`: investigate whether passing `--nx` is needed to suppress per-user `.gdbinit` interference on shared dev hosts.
    - `"targetArchitecture"`: VS Code-specific hint; verify whether it adds value beyond `set architecture avr` in `setupCommands`.
-   - `"avoidWindowsConsoleRedirection"`, `"externalConsole"`: confirm the headless-Linux default and whether any change is needed for WSL/macOS hosts.
+   - `"avoidWindowsConsoleRedirection"`, `"externalConsole"`: confirm the headless-Linux default.
    - **Phase-11-specific verification:** with the recommended block, confirm that VS Code's Call Stack view shows all FSMs with their `qThreadExtraInfo` labels, that the Memory view obeys the advertised memory-map regions, and that source-level `next` uses range-step (engine log shows `vCont;r`).
-   - **Deliverable:** a fully-commented `doc/reference/launch.json` sample, a copy-pasteable block in `doc/UserManual.md` §6, and a one-paragraph rationale per non-default setting. The result must work unchanged against an unmodified VS Code + `cppdbg` install on Linux; macOS / Windows-host caveats documented separately.
+   - **Deliverable:** a fully-commented `doc/reference/launch.json` sample, a copy-pasteable block in `doc/UserManual.md` §6, and a one-paragraph rationale per non-default setting. The result must work unchanged against an unmodified VS Code + `cppdbg` install on Linux.
 
 9. **Tests — `tests/test_rsp.c`.** Add cases for: (a) `parse_mp_thread_id()` accepting every bare-decimal, bare-hex, and `p<PID>.<TID>` form including `p0.0` / `p-1.-1`; (b) `Hgp<PID>.<TID>` selecting the right thread and the subsequent `g` returning the matching synthesised frame; (c) `qThreadExtraInfo` returning a hex-encoded label for every known TID and the empty packet for unknown TIDs; (d) `qSupported` reply containing `swbreak+;hwbreak+;qXfer:memory-map:read+`; (e) `qXfer:memory-map:read::0,800` returning a well-formed `<memory-map>` body; (f) a simulated SW-BP halt emitting `T05swbreak:;thread:p<PID>.1;`; (g) `vKill;<pid>` closing the client socket but leaving the listener live (assert the listener `fd` is still in the `select()` set); (h) `vCont?` advertising `r` and a `vCont;r<lo>,<hi>:p<PID>.1` driving repeated single-steps until PC leaves the range.
 
@@ -1015,7 +1020,7 @@ This is not a fixable detail — it is a **model mismatch**. avrOS is a cooperat
 **Plan.**
 
 1. **Document first (no code risk).** Write Appendix B from `guesswork.md` + `updi.h`, and the dual-protocol architecture review. These capture the knowledge the rest of the phase depends on and are independently mergeable.
-2. **elfutils refactor.** Reimplement `elf_parser` over `libelf` (GElf) + `libdw`; delete the `src/elf.h` shim (system `<elf.h>` is supplied by elfutils); link `-ldw -lelf` unconditionally. Add `--wrap`-free unit tests over a `-g` fixture. macOS obtains elfutils via `brew install elfutils` (HLR-033).
+2. **elfutils refactor.** Reimplement `elf_parser` over `libelf` (GElf) + `libdw`; delete the `src/elf.h` shim (system `<elf.h>` is supplied by elfutils); link `-ldw -lelf` unconditionally. Add `--wrap`-free unit tests over a `-g` fixture. Linux is the sole supported platform (HLR-033).
 3. **Debug-core seam.** Per the review, name the core API surface RSP already calls through, and make the low-risk separations (e.g. a `debug_core` header collecting the execution-control/register/memory/arbiter entry points) so a future DAP front-end has a single, documented include. Defer any risky behaviour-affecting moves.
 4. **Spec reconciliation (tracer).** Reconcile HLR-020 / the Editor-Agnostic goal (add HLR-073, Protocol-Agnostic Debug Core) and author the new requirements; render and lint.
 
@@ -1025,14 +1030,129 @@ This is not a fixable detail — it is a **model mismatch**. avrOS is a cooperat
 - **Spec:** new HLRs/LLRs authored and rendered; `python3 tools/lint_project.py` 0 errors / 0 warnings.
 
 **Open questions.**
-- **macOS + elfutils (HLR-033).** `libelf`/`libdw` are GNU/Linux-centric. Resolution (decided): elfutils is a **required** dependency on all platforms — there is no symbol-only fallback and no bundled shim. macOS obtains it via `brew install elfutils`; the Makefile auto-links `-ldw -lelf` with no feature detection.
+- **elfutils dependency (HLR-033).** `libelf`/`libdw` are GNU/Linux-centric. Resolution (decided): elfutils is a **required** dependency with no symbol-only fallback and no bundled shim; the Makefile auto-links `-ldw -lelf` with no feature detection. Linux is the sole supported platform — macOS support was dropped (Phase 16).
 - **Depth of the core extraction.** The seam definition and the lowest-risk structural moves are in scope; a wholesale `gdb_rsp.c` split is deferred to the DAP-server phase to avoid destabilising the verified RSP path.
+
+### Phase 16 — DAP Foundation: Mode Switch, Transport, Lifecycle + Linux-only Cleanup
+
+> **Status: ✅ Complete — merges via PR [#56](https://github.com/racerxr650r/avrOS-debug/pull/56) (closes #52).** Landed: the Phases 16–19 SDP plan; the **Linux-only cleanup** (work-item #5 — all macOS mentions struck from the docs + traceable spec, HLR-033 reworded, generated docs re-rendered, lint 0/0); and the **mode-switch foundation** — `--rsp`/`--dap` CLI flags (mutually exclusive, RSP default) in `main.c` dispatching to the RSP `event_loop()` or the new `dap_serve()`, the `src/dap.c`/`dap.h` DAP front-end module (transport/lifecycle still a scaffold), spec **HLR-074** + **LLR-MAIN-24** with two `parse_args` unit tests, and `src/dap.c` wired into the build. The **DAP wire transport** is now implemented in `src/dap.c`: a self-contained recursive-descent JSON codec (`dj_*` tokenizer + member/string/number accessors + escape decode/emit) and the `Content-Length` message framing (`dap_read_message`/`dap_write_message`), spec'd as **HLR-075** + **LLR-DAP-01..04** and covered by the new `test_dap` suite (8 cases). (A self-contained tokenizer was written rather than vendoring jsmn — in-tree, project-style, and directly unit-testable; no network needed.) The **connection lifecycle** is now implemented: `dap_serve()` accepts a client and runs a `select()`-based dispatch loop, and `dap_dispatch()` handles `initialize` (capabilities + `initialized` event), `launch`/`attach`, `setBreakpoints`/`setExceptionBreakpoints` (benign during config; real breakpoints are Phase 18), `configurationDone` (halt + `stopped`/entry event), `threads` (single CPU thread), and `disconnect`/`terminate` (resume + close), with unknown requests answered `success:false` — spec'd as **HLR-076** + **LLR-DAP-05..07** and covered by 5 new `test_dap` cases (handshake, stopped-entry, disconnect, unknown, and the full `dap_serve` loop over a socketpair). The **Neovim/Lua acceptance harness** is in place: `tests/hw/dap_acceptance.lua` (self-bootstrapping `tests/hw/dap_init.lua` fetches nvim-dap) spawns `avrOSdb --dap`, drives it with the real nvim-dap client over TCP, and asserts the handshake (DAP1 initialize, DAP2 stopped/entry, DAP3 threads, DAP4 disconnect); wired as the non-destructive `make hw-test-dap` target (STP `tests/hw/dap_acceptance.lua`, tracing HLR-076), with `neovim`/`git` added to `make prereqs`. All Phase 16 deliverables have landed (`make` 0 warnings; `make test` 10/10, test_dap 13; lint 0/0; Lua syntax-checked), and the editor setup is wired both ways: `make prereqs-nvim` installs nvim-dap + the `~/.config/nvim` config (`tools/nvim/avrosdb-dap.lua`), and a VS Code companion extension + launch.json (`tools/vscode/`) plus User-Manual §6.2/§6.3 document both. **Hardware-validated:** `make hw-test-dap` runs **DAP1–DAP4 green on AVR128DA28** (`/dev/ttyAMA2`) — the full handshake (initialize → stopped/entry → threads → disconnect) with the real nvim-dap client over TCP against live silicon. Phase 16 is complete and ready for PR.
+
+**Motivation.** Phase 15 landed the prerequisites for a native Debug Adapter Protocol (DAP) server: the protocol-agnostic debug core (HLR-073, `src/debug_core.h`), the elfutils/DWARF capability (HLR-071/072), and the spec reconciliation that permits a parallel in-server DAP front-end (HLR-020). Phases 16–19 build that DAP server so DAP-native editors — **VS Code** primarily — can drive `avrOSdb` directly without `avr-gdb` in the loop (PVD §9). **elfutils (libdw) is the engine** for all the source-level work the DAP protocol requires (line tables, stack unwinding, variable/type resolution) — the reason it was integrated in Phase 15 — so the DAP layers consume libdw rather than reinventing DWARF. Automated testing mirrors the GDB hardware harness: headless **Neovim + nvim-dap** driven by Lua scripts. Phase 16 is the foundation — protocol selection, transport, the connection lifecycle, and the test harness bootstrap — plus the project-wide decision to drop macOS and become **Linux-only**.
+
+**Design decisions.**
+- **Mode select:** `--dap` and `--rsp` startup switches, mutually exclusive. **RSP stays the default** when neither is given, so every existing invocation, test, and the Group-G harness is unaffected. `main.c` dispatches to either `rsp_*` (today's `event_loop`) or the new DAP server.
+- **Transport: TCP**, reusing the existing listener + single `select()` event loop (HLR-039) — the same model the RSP server uses, and the same model the Neovim/VS Code clients connect to (host:port, default `:1234`). DAP framing is `Content-Length: <n>\r\n\r\n<json>`. (stdio transport is a possible later add; TCP mirrors the test harness's spawn-and-connect pattern.)
+- **JSON:** vendor **jsmn** (single header, MIT) for tokenising inbound messages; a small hand-rolled serializer emits responses/events. Keeps the dependency footprint lean (no heavyweight JSON library).
+- **Linux-only:** macOS is struck from all documentation and the traceable spec. There is no remaining `<elf.h>` shim concern (Phase 15) and elfutils + the Pi/Linux bench are the only supported platform.
+
+**Scope summary.**
+
+| # | Area | Deliverable | File(s) |
+| - | ---- | ----------- | ------- |
+| 1 | Mode switch | `--dap`/`--rsp` parsing + mutual-exclusion; `AppConfig.mode`; dispatch in `app_main()`; usage/man-page text | `src/main.c`, `doc/avrOSdb.1` |
+| 2 | DAP transport | `Content-Length`-framed JSON-RPC over TCP on the `select()` loop; vendored jsmn tokenizer + hand-rolled emitter; request/response/event scaffolding | `src/dap.c/.h`, vendored `src/jsmn.h` |
+| 3 | Lifecycle | `initialize` (capabilities), `launch`/`attach`, `configurationDone`, `disconnect`/`terminate`; connect target + load ELF via the debug core | `src/dap.c` |
+| 4 | Test harness | `tests/hw/dap_acceptance.lua` (headless Neovim + nvim-dap) + `make hw-test-dap`; initial handshake/attach cases | `tests/hw/`, `Makefile` |
+| 5 | Linux-only | Strike all macOS mentions from docs + spec; reword HLR-033 to "Native Linux Build"; drop the macOS platform/dependency rows and the `/dev/cu.*` paths. (The Homebrew bundle formula stays — Homebrew is cross-platform via Linuxbrew — reframed without the "for macOS" wording.) | `doc/Project.xml`, `doc/UserManual.md`, `doc/PVD.md`, `doc/avrOSdb.1`, `doc/reference/dual-protocol-architecture.md` |
+| 6 | Spec | New HLRs (DAP transport, mode select, lifecycle) + LLRs (`dap` function group); render + lint | `doc/Project.xml` |
+
+**Acceptance.**
+- A DAP client (nvim-dap, and a scripted JSON exchange in the unit tests) completes `initialize`→`launch`/`attach`→`configurationDone` and reaches a stopped-at-entry state on hardware; `--rsp` behaviour is byte-for-byte unchanged (Group G G1–G24 still green).
+- `make hw-test-dap` runs the bootstrap cases green on AVR128DA28.
+- No macOS mention remains anywhere; `make` 0 warnings; `make test` all pass; `python3 tools/lint_project.py` 0/0.
+
+### Phase 17 — DAP Execution Control, Stop Events & Shallow stackTrace
+
+> **Status: 🔲 Not started — issue [#53](https://github.com/racerxr650r/avrOS-debug/issues/53).**
+
+**Motivation.** With a connected DAP session (Phase 16), expose run control and the run-state event stream that an IDE's toolbar drives. This reuses the debug core's execution primitives (`updi_run/halt/step`, the stop-cause classifier) — the same ones the RSP front-end composes — so behaviour matches the proven GDB path.
+
+**Scope summary.**
+
+| # | Area | Deliverable |
+| - | ---- | ----------- |
+| 1 | Threads | `threads` request → the single live CPU thread (avrOS FSM tasks remain `monitor`-style introspection, surfaced in a later refinement) |
+| 2 | Run control | `continue`, `next`, `stepIn`, `stepOut`, `pause` mapped to core execution verbs (32-bit step / change-of-flow handled by the existing UPDI helpers) |
+| 3 | Events | `stopped` (reason `entry`/`breakpoint`/`step`/`pause`), `continued`, `exited`, `terminated`, driven by the stop-cause classifier |
+| 4 | Frames | Shallow `stackTrace` (frame 0): PC + `file:line` via `elf_addr_to_line()` (libdw); `scopes` stub |
+| 5 | Harness + spec | nvim-dap step/continue/pause cases; HLRs/LLRs; render + lint |
+
+**Acceptance.** nvim-dap drives stop-at-entry → step/next/continue/pause with correctly-tagged `stopped` events and the right source line on hardware; gates green.
+
+### Phase 18 — DAP Breakpoints & DWARF Multi-Frame stackTrace
+
+> **Status: 🔲 Not started — issue [#54](https://github.com/racerxr650r/avrOS-debug/issues/54).**
+
+**Motivation.** Source-level breakpoints and full backtraces — the two features that most depend on DWARF, and the clearest payoff of the Phase-15 elfutils integration. `setBreakpoints` resolves `path:line` → address through libdw; `stackTrace` unwinds the call stack via libdw CFI.
+
+**Scope summary.**
+
+| # | Area | Deliverable |
+| - | ---- | ----------- |
+| 1 | Source breakpoints | `setBreakpoints`: `path:line` → code address via `elf_line_to_addr()` (libdw), installed through the core HW-comparator arbiter / SW-BP model; `verified` breakpoints + hit events with `hitBreakpointIds` |
+| 2 | More breakpoints | `setInstructionBreakpoints`; conditional breakpoints (`condition` evaluated against the live target) |
+| 3 | Unwinding | Full multi-frame `stackTrace` via DWARF CFI (libdw `.debug_frame`), each frame resolved to `file:line` and function name |
+| 4 | Harness + spec | nvim-dap file:line + conditional breakpoint cases and a `leaf→mid→top→main` backtrace; HLRs/LLRs; render + lint |
+
+**Acceptance.** File:line and conditional breakpoints hit on hardware; `stackTrace` reaches `main` in frame order; gates green.
+
+### Phase 19 — DAP Variables, Memory, Evaluate + VS Code + Neovim Acceptance
+
+> **Status: 🔲 Not started — issue [#55](https://github.com/racerxr650r/avrOS-debug/issues/55).**
+
+**Motivation.** The final DAP phase: source-level state inspection (the richest DWARF consumer), the VS Code integration that is the headline use case, and the complete automated acceptance suite that makes the whole front-end regression-safe — the DAP analogue of Group G.
+
+**Scope summary.**
+
+| # | Area | Deliverable |
+| - | ---- | ----------- |
+| 1 | Variables | `scopes` + `variables`: DWARF variable/type resolution via libdw (locals, args, globals; scalar/struct/array/pointer rendering); a registers scope |
+| 2 | Evaluate / memory | `evaluate` (watch + repl), `readMemory`/`writeMemory`, `setVariable` |
+| 3 | VS Code | A `launch.json` attach config for the `--dap` TCP server + a User Manual section; optional `--emit-vscode-config` helper |
+| 4 | Acceptance suite | Full `tests/hw/dap_acceptance.lua` mirroring Group G (globals scalar/struct/array, struct fields, array elements, per-frame locals/args, a capstone session); `make hw-test-dap` green end-to-end |
+| 5 | Spec / close-out | HLRs/LLRs; render + lint; mark Phases 16–19 complete |
+
+**Acceptance.** Variables/globals/memory read back exactly via nvim-dap on hardware; a VS Code session reaches `main`, hits a breakpoint, and shows correct locals; full `make hw-test-dap` suite green; gates green.
+
+### Phase 20 — Debug-in-sleep: keep the system clock alive so OCD survives SLEEP
+
+> **Status: 🔲 Not started — issue [#57](https://github.com/racerxr650r/avrOS-debug/issues/57).**
+
+**Motivation.** A breakpoint at `main.c:139` of the avrOS example app is never caught: once the firmware returns from sleep (avrOS `sysSleep()` → `SLEEP_MODE_IDLE`), the OCD never detects the BREAK / HW-breakpoint. This is a known AVR-Dx OCD behaviour — when the CPU executes `SLEEP`, the system clock stops, and the OCD can no longer detect a BREAK / HW-breakpoint match (or service register/memory reads) until the part wakes. Any avrOS application that idles in `sysSleep()` between dispatches is effectively undebuggable past the first sleep. This phase is independent of the DAP work (it lives at the UPDI/OCD layer) and fixes the bug for **both** the RSP and DAP front-ends.
+
+**Fix.** Assert **`CLK_REQ`** (bit 0 of `ASI_SYS_CTRLA`, CS `0x0A`) once when entering OCD, so the system clock keeps running through `SLEEP` and the OCD stays live. In `updi_enter_debug()`, right after the `STOPPED` bit is confirmed (the `return 0;` at ~`src/updi.c:949`):
+
+```c
+/* "Debug in sleep": keep the system clock running so the OCD can still
+ * detect BREAK / HW breakpoints and service register reads after the
+ * target executes SLEEP (e.g. avrOS sysSleep() → SLEEP_MODE_IDLE). */
+(void)updi_stcs(fd, ASI_SYS_CTRLA, ASI_SYS_CTRLA_CLKREQ);
+```
+
+(A new `ASI_SYS_CTRLA_CLKREQ` = `0x01u` macro is added to `src/updi.h`.)
+
+**Design decision — on by default, `--sleep` disables.** Debug-in-sleep is **enabled by default** (CLK_REQ asserted on entering OCD) so breakpoints survive sleep out of the box and the reported bug is fixed without any extra step. A new **`--sleep`** command-line switch **disables** it — the server then does not hold the clock, restoring native target sleep / power behaviour — for when the developer is debugging power paths and wants the part to sleep for real. Implemented by gating the CLK_REQ assertion behind a UPDI-layer flag set from the CLI, consulted at both `updi_enter_debug()` call sites (startup and post-`monitor reset`).
+
+**Below IDLE (Standby / Power-Down) — needs bench confirmation.** Sleep modes deeper than IDLE additionally require `RUN_STBY` (+`RUN_TIME`) set in the memory-mapped OCD control register while halted. ⚠️ The community guidance places these bits in `OCD_CTRLA @ 0x0F80`, but this project's **reverse-engineered** map (`doc/reference/guesswork.md`, validated on AVR-Dx) has `0x0F80 = BP0A` (breakpoint-0 address) and the control bits at `OCD+0x08` (`OCD_CTRL0`). The exact RUN_STBY/RUN_TIME location on AVR-Dx OCD v1 must be confirmed on the bench before this part is implemented (`updi_sts8()` to the confirmed register). The IDLE fix (ASI `CLK_REQ`) is unaffected and resolves the reported `sysSleep()` case.
+
+**Scope summary.**
+
+| # | Area | Deliverable | File(s) |
+| - | ---- | ----------- | ------- |
+| 1 | UPDI/OCD | Add `ASI_SYS_CTRLA_CLKREQ`; assert CLK_REQ in `updi_enter_debug()` unless disabled; a setter for the debug-in-sleep flag (both enter-debug sites honour it) | `src/updi.h`, `src/updi.c` |
+| 2 | CLI | `--sleep` flag in `AppConfig` (default: debug-in-sleep on); usage + man-page text; wire to the UPDI flag before `updi_enter_debug()` | `src/main.c`, `doc/avrOSdb.1` |
+| 3 | Standby (opt.) | After bench-confirming the register, set RUN_STBY/RUN_TIME for sub-IDLE sleep | `src/updi.c` |
+| 4 | Spec | New HLR (debug-in-sleep / CLK_REQ + `--sleep`) + LLRs (UPDI + MAIN); STP; render + lint 0/0 | `doc/Project.xml` |
+| 5 | Tests | Unit (PTY): `updi_enter_debug` emits the `STCS ASI_SYS_CTRLA=CLK_REQ` by default and omits it when disabled; `parse_args` `--sleep`; **hw:** the `main.c:139` breakpoint fires after `sysSleep()` | `tests/test_updi.c`, `tests/test_device.c`, `tests/hw/` |
+
+**Acceptance.**
+- **Unit:** `updi_enter_debug()` issues `STCS ASI_SYS_CTRLA = 0x01` by default and skips it under `--sleep`; `parse_args` sets the flag.
+- **Hardware:** with the avrOS example flashed, a breakpoint at `main.c:139` is hit after the firmware returns from `sysSleep()` (regression that motivated the phase); `--sleep` restores native sleep.
+- **Gate:** `make` 0 warnings; `make test` all pass; `python3 tools/lint_project.py` 0/0.
 
 ## 9. Risks & Open Questions
 
 *   **Half-duplex echo cancellation in UPDI tests.** Every byte transmitted over the UPDI UART is echoed back on the RX line by the hardware. PTY pairs do not auto-echo, so the PTY test harness must explicitly write back the echo bytes before injecting each simulated AVR response. If this is omitted, UPDI functions will block waiting to drain echoes that never arrive, causing PTY tests to time out even though the production logic is correct.
-
-*   **macOS `<elf.h>` portability.** Linux glibc provides `<elf.h>`; macOS does not. The bundled `src/elf.h` shim must be guarded with `#ifdef __linux__ #include <elf.h> #else #include "elf.h" #endif` in `src/elf_parser.c`. Risk: if the `#ifdef` guard is accidentally omitted on a macOS build the compiler will fail with a missing-header error that may be non-obvious.
 
 *   **avr-gcc availability for ELF fixtures.** The `tests/test_elf.c` test suite loads real `.elf` binaries generated by `avr-gcc`. If `avr-gcc` is not installed, the ELF fixture `make` rule will fail and block the entire test build. Mitigation: document the requirement prominently in §0, and consider adding a `make check-tools` target that validates availability before attempting a build.
 
@@ -1057,7 +1177,6 @@ T-shirt sizes relative to Phase 0.
 
 ## 11. Out-of-Scope Follow-ups
 
-*   **macOS CI (GitHub Actions).** A workflow that runs `make test` on `macos-latest` to catch portability regressions; depends on `brew install avr-gcc` being available on the hosted runner.
 *   **ASAN/UBSan CI job.** A second CI job that repeats `make test` with `-fsanitize=address,undefined` to catch memory errors and undefined behaviour; already supported by `make ASAN=1` but not wired into CI.
 *   **Live hardware integration test.** An end-to-end script that connects a real AVR DA/DB target via a USB-serial adapter, attaches `avr-gdb`, and verifies `info threads` output and `monitor avros events` decoding.
 *   **Console bridge live testing.** `updi_console_poll()` reads the avrOS UART ring buffer; verifying this against a live target running actual UART output is deferred to post-implementation.

@@ -48,7 +48,7 @@
       <para><![CDATA[`avrOSdb` is a POSIX C99 GDB stub that bridges the UPDI debug interface of modern AVR microcontrollers (DA/DB families) to standard IDEs over the GDB Remote Serial Protocol (RSP). A developer launches the stub, points it at a serial device and an ELF binary, and connects any GDB-compatible front-end — VS Code with Cortex-Debug, Zed with its DAP adapter, or bare `avr-gdb` — using the standard `target extended-remote` command.]]></para>
       <para><![CDATA[The server connects to the target via a TTL-level UART serial adapter with a 1 kΩ resistor on the UPDI line. No external JTAG programmer or proprietary debugger hardware is required — only a USB-to-serial adapter or direct Raspberry Pi UART pins.]]></para>
       <para><![CDATA[Unlike conventional GDB stubs that expose a flat memory model, `avrOSdb` provides native avrOS state-machine awareness. At attach time it parses the supplied ELF binary to locate the avrOS FSM registration tables in FLASH, then reads each registered finite state machine's runtime state into a snapshot the developer can inspect via `monitor` commands (which FSM is active, and each FSM's current state). avrOS FSMs are surfaced as introspection, not as GDB threads: the live CPU is the sole GDB thread.]]></para>
-      <para><![CDATA[The project ships with a `make install` target that installs the compiled binary to `$(PREFIX)/bin/` and the accompanying Unix man page to `$(PREFIX)/share/man/man1/`. A `make check-tools` target validates that all required build tools (`gcc`, `make`, `avr-gcc`, `avr-binutils`) are present on the host before any compilation is attempted. A `make bundle` target produces native distribution packages for three platforms: a Debian binary package (`.deb`), a Red Hat RPM package (`.rpm`), and a Homebrew formula (`dist/avrOSdb.rb`) for macOS. All output artefacts are written under the `dist/` directory. These targets ensure the project can be built, deployed, and distributed by a developer from a single `make` command sequence with no manual file copying.]]></para>
+      <para><![CDATA[The project ships with a `make install` target that installs the compiled binary to `$(PREFIX)/bin/` and the accompanying Unix man page to `$(PREFIX)/share/man/man1/`. A `make check-tools` target validates that all required build tools (`gcc`, `make`, `avr-gcc`, `avr-binutils`) are present on the host before any compilation is attempted. A `make bundle` target produces distribution packages in three formats: a Debian binary package (`.deb`), a Red Hat RPM package (`.rpm`), and a Homebrew formula (`dist/avrOSdb.rb`). All output artefacts are written under the `dist/` directory. These targets ensure the project can be built, deployed, and distributed by a developer from a single `make` command sequence with no manual file copying.]]></para>
       <para><![CDATA[**Planned — Phase 9 — CI-Grade Loader & Link Diagnostics (not yet implemented).** A forthcoming iteration extends the programmer and the `--device` diagnostic mode with the following capabilities so the tool can be trusted as a CI build/flash step and used as a first-line link-health probe. Tracked in GitHub issue #28; not yet bound to HLRs/LLRs.
 
 * **Read-back verify after `--load`.** After every successful NVM write, re-read the affected pages via UPDI and compare against the ELF payload. Mismatching pages shall be reported by `(window, page-aligned address, expected-CRC, actual-CRC)`, the application shall exit with a distinct non-zero exit code (`2`, reserved for verify failure as opposed to `1` for I/O failure), and shall not enter debug or open the GDB listener. Verify shall cover FLASH, EEPROM, USERROW, and FUSES windows; LOCK is excluded because lockbits become read-only post-write.
@@ -89,7 +89,7 @@ Phase 10 work shall continue to honour the layered architecture (§2.1) and the 
     </references>
 
     <architecture>
-      <intro><![CDATA[`avrOSdb` is a single-process C99 application. Responsibilities are divided into six source modules arranged in four protocol layers; each layer depends only on the layers below it, and no upward calls are permitted. This layering is a hard design rule — see §2.2 "Layered Architecture" — and is enforced by review and by the `.h` dependency graph (the lower layers' headers must not `#include` any header from a higher layer).
+      <intro><![CDATA[`avrOSdb` is a single-process C99 application. Responsibilities are divided into seven source modules arranged in four protocol layers; each layer depends only on the layers below it, and no upward calls are permitted. The protocol layer hosts two interchangeable client-facing front-ends over a shared protocol-agnostic debug core (HLR-073, `src/debug_core.h`): the GDB-RSP server (`src/gdb_rsp.c`) and the DAP server (`src/dap.c`), selected at startup by `--rsp` (default) / `--dap`. This layering is a hard design rule — see §2.2 "Layered Architecture" — and is enforced by review and by the `.h` dependency graph (the lower layers' headers must not `#include` any header from a higher layer).
 
 **Layer stack (top to bottom):**
 
@@ -1055,7 +1055,7 @@ typedef struct {
 | C standard | C99 | `--std=c99`; no GNU extensions required. |
 | GCC | 4.8 | Or Clang ≥ 3.4. |
 | POSIX API | POSIX.1-2008 | `-D_POSIX_C_SOURCE=200809L` |
-| elfutils | libelf + libdw | **Required.** ELF parsing (libelf/GElf) and DWARF (libdw). `libdw-dev`/`libelf-dev` (Debian) or `elfutils-devel` (Fedora); `brew install elfutils` on macOS. Supplies the system `<elf.h>`. |
+| elfutils | libelf + libdw | **Required.** ELF parsing (libelf/GElf) and DWARF (libdw). `libdw-dev`/`libelf-dev` (Debian/Ubuntu) or `elfutils-devel` (Fedora). Supplies the system `<elf.h>`. |
 | libc | any POSIX libc | Plus the elfutils shared libraries (libelf, libdw) and libdw's compression backends (libz/libzstd/liblzma/libbz2). |
 
 **Recommended compile flags:**
@@ -1072,8 +1072,7 @@ Debug builds add `-fsanitize=address,undefined` for runtime error detection.
 
 | Platform | Status | Notes |
 | -------- | ------ | ----- |
-| Linux (x86-64, ARM64) | Primary target | Tested on Ubuntu 22.04 and Raspberry Pi OS. |
-| macOS (Intel, Apple Silicon) | Secondary target | Requires `brew install elfutils` (libelf/libdw); uses `/dev/cu.usbserial-*` device paths. |
+| Linux (x86-64, ARM64) | Sole supported target | Tested on Ubuntu 22.04 and Raspberry Pi OS. |
 | Windows (native) | Out of scope | See `doc/PVD.md §7.2`; WSL2 may work but is not supported. |
 
 **Build targets (Makefile):**
@@ -1455,8 +1454,8 @@ Errors are propagated upward through the module stack without retrying:
     <section number="7" title="Platform and Build">
       <intro><![CDATA[Requirements in this section govern the host platforms the server must support and the constraints on its runtime dependencies.]]></intro>
 
-      <hlr id="HLR-033" name="Native Linux and macOS Build">
-        <text><![CDATA[The application shall compile and execute natively on Linux (x86-64 and ARM) and macOS (x86-64 and Apple Silicon) using a C99-conforming toolchain plus the **elfutils** development libraries (libelf and libdw), which are a required dependency (`src/elf_parser.c` is a thin adapter over them). On Linux these come from `libelf-dev`/`libdw-dev` (or `elfutils-devel`); on macOS from `brew install elfutils`. The build shall not require any platform-specific preprocessor workarounds beyond what the C99 standard, POSIX.1-2008, and the elfutils headers provide; in particular, no bundled ELF type shim is used (elfutils supplies the system `<elf.h>`).]]></text>
+      <hlr id="HLR-033" name="Native Linux Build">
+        <text><![CDATA[The application shall compile and execute natively on Linux (x86-64 and ARM/ARM64) using a C99-conforming toolchain plus the **elfutils** development libraries (libelf and libdw), which are a required dependency (`src/elf_parser.c` is a thin adapter over them); these come from `libelf-dev`/`libdw-dev` (Debian/Ubuntu) or `elfutils-devel` (Fedora). Linux is the sole supported platform; other platforms are out of scope (see `doc/PVD.md §7.2`). The build shall not require any platform-specific preprocessor workarounds beyond what the C99 standard, POSIX.1-2008, and the elfutils headers provide; in particular, no bundled ELF type shim is used (elfutils supplies the system `<elf.h>`).]]></text>
         <traces>
           <trace target="SDD" ref="2.2"/>
         </traces>
@@ -1505,7 +1504,7 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-043" name="Distribution Package Bundle">
-        <text><![CDATA[The Makefile shall provide a `bundle` target that produces native distribution packages for three target platforms: a Debian binary package (`dist/avrOSdb_$(VERSION)_amd64.deb`) for Debian/Ubuntu Linux, an RPM binary package (`dist/avrOSdb-$(VERSION)-1.x86_64.rpm`) for Red Hat/Fedora Linux, and a Homebrew formula (`dist/avrOSdb.rb`) for macOS. Each package shall include the `avrOSdb` binary and the man page. All output artefacts shall be written under the `dist/` directory. A `VERSION` variable (defaulting to the value extracted from `git describe`) shall parameterise every package version string.]]></text>
+        <text><![CDATA[The Makefile shall provide a `bundle` target that produces native distribution packages for three target platforms: a Debian binary package (`dist/avrOSdb_$(VERSION)_amd64.deb`) for Debian/Ubuntu Linux, an RPM binary package (`dist/avrOSdb-$(VERSION)-1.x86_64.rpm`) for Red Hat/Fedora Linux, and a Homebrew formula (`dist/avrOSdb.rb`). Each package shall include the `avrOSdb` binary and the man page. All output artefacts shall be written under the `dist/` directory. A `VERSION` variable (defaulting to the value extracted from `git describe`) shall parameterise every package version string.]]></text>
         <traces>
           <trace target="SDD" ref="2.2"/>
         </traces>
@@ -1586,6 +1585,30 @@ Errors are propagated upward through the module stack without retrying:
 
       <hlr id="HLR-073" name="Protocol-Agnostic Debug Core">
         <text><![CDATA[The server's debug logic shall be structured as a protocol-agnostic *debug core* — execution control, register and memory access, the hardware-comparator arbiter and software-breakpoint model, target (avrOS FSM) introspection, and ELF/DWARF — that is independent of any client-facing wire protocol. Client protocols shall be implemented as thin front-ends over this core: the existing GDB-RSP server (`src/gdb_rsp.c`) and, in future, a native DAP server intended to run in parallel. A front-end shall translate wire framing to and from the core's verbs and shall be the only layer that formats a protocol-specific reply; the core shall never emit RSP, DAP, or any other wire encoding, and shall never be reached *into* by a lower layer (per the SDD §2.2 layered-architecture rule, UPDI helpers never choose policy such as breakpoint slots). The core's protocol-neutral entry surface shall be reachable through a single aggregating include, `src/debug_core.h`. Phase 15 establishes this seam by aggregation; physically relocating the arbiter, stop-cause classifier, and software-breakpoint bodies out of the RSP module into a dedicated debug-core translation unit is deferred to the DAP-server phase to avoid destabilising the verified RSP path.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+          <trace target="SDD" ref="5.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-074" name="Front-End Protocol Selection (RSP/DAP)">
+        <text><![CDATA[The client-facing protocol front-end shall be selectable at startup via two mutually-exclusive command-line switches: `--rsp` (the GDB Remote Serial Protocol server, `src/gdb_rsp.c`) and `--dap` (the Debug Adapter Protocol server, `src/dap.c`). When neither switch is given the default shall be `--rsp`, preserving the historical behaviour of every existing invocation and test. Supplying both `--rsp` and `--dap` shall be rejected with a diagnostic and a non-zero exit. After argument parsing and target/ELF bring-up, the application shall dispatch to the selected front-end; both serve over the same TCP listener and the shared protocol-agnostic debug core (HLR-073). This requirement covers the selection and dispatch only; the DAP front-end's transport, lifecycle, and request handlers are specified by their own requirements as they are implemented (Phases 16–19).]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+          <trace target="SDD" ref="5.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-075" name="DAP Wire Transport (Content-Length JSON-RPC)">
+        <text><![CDATA[The DAP front-end shall exchange messages with the client using the Debug Adapter Protocol wire format: each message is a JSON object framed by a `Content-Length: <n>\r\n\r\n` header block followed by exactly `n` bytes of UTF-8 JSON body. On receive, the server shall consume the header block (matching the `Content-Length` field case-insensitively), then read exactly `n` body bytes — never over-reading into the following message — and shall reject a message whose advertised length is non-negative-overflowing or exceeds the receive buffer (`DAP_MSG_MAX`). On send, it shall prefix the body with the same header framing. JSON shall be handled by a self-contained recursive-descent tokenizer (no third-party JSON library is vendored — chosen so the parser is in-tree, in the project's C99 style, and directly unit-testable) exposing object-member lookup, string extraction with JSON-escape decoding, numeric extraction, and a string escaper for emission. The transport (framing + codec) shall be independent of the target and therefore unit-testable over a pipe/socketpair without hardware.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+          <trace target="SDD" ref="5.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-076" name="DAP Connection Lifecycle">
+        <text><![CDATA[The DAP front-end (`dap_serve()`, reached when the server is started with `--dap`) shall accept one client on the shared TCP listener and service it on the single `select()`-based event loop, honouring the global quit flag between messages. Over that connection it shall implement the DAP connection lifecycle: `initialize` (reply with the adapter capabilities — at minimum `supportsConfigurationDoneRequest` — then emit the `initialized` event); `launch` and `attach` (reply success; the target is already connected and in OCD debug mode, so attach/launch are equivalent here); `setBreakpoints` and `setExceptionBreakpoints` during the configuration phase (reply success — real breakpoint installation is Phase 18); `configurationDone` (halt the target and emit a `stopped` event with reason `entry` for thread 1, reaching the stopped-at-entry state); `threads` (report the single live CPU thread); and `disconnect`/`terminate` (resume the target and close the session). Every reply shall be a well-formed DAP `response` carrying the request's `seq` as `request_seq`, the `command`, and a `success` flag; a request the build does not yet implement shall receive a `success:false` response with a `message` (rather than silence), so the client is never left waiting. Each emitted message shall carry a monotonically increasing `seq`. UPDI side effects shall be skipped when no target link is present so the dispatch is unit-testable without hardware.]]></text>
         <traces>
           <trace target="SDD" ref="2.2"/>
           <trace target="SDD" ref="5.1"/>
@@ -1890,6 +1913,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <text><![CDATA[`parse_args()` shall recognise `--log-rsp` as a boolean flag (no argument) and set `cfg->log_rsp = true` when present. The default initialiser shall set the flag to `false`. The main orchestrator shall pass this flag to `rsp_set_logging()` before entering the event loop.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-068" name="Detailed RSP Traffic Logging"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MAIN-24">
+        <text><![CDATA[`parse_args()` shall recognise two mutually-exclusive boolean flags selecting the client protocol front-end: `--rsp` sets `cfg->dap_mode = false` and `--dap` sets `cfg->dap_mode = true`. The default initialiser shall set `cfg->dap_mode = false` (RSP). When both flags are supplied, `parse_args()` shall print `"--rsp and --dap are mutually exclusive"` to `stderr`, print the usage text, and `exit(1)`. After bring-up, `app_main()` shall dispatch on `cfg->dap_mode`: when true it shall call `dap_serve()` (the DAP front-end, `src/dap.c`) on the bound listener and debug-core handles; otherwise it shall run the existing RSP `event_loop()`. Both front-ends serve over the same `cfg.listen_fd` and UPDI link.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-074" name="Front-End Protocol Selection (RSP/DAP)"/>
         </traces>
       </llr>
 
@@ -2529,7 +2559,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <llr id="LLR-ELF-07">
         <text><![CDATA[`src/elf_parser.c` shall delegate all ELF and DWARF format parsing to elfutils — libelf via the class-independent GElf API for the ELF container, and libdw for DWARF — and shall not hand-decode ELF byte layouts. elfutils is a required build and runtime dependency; the bundled ELF type shim formerly at `src/elf.h` is removed, and ELF32 type definitions (`Elf32_Ehdr`, `Elf32_Phdr`, `EM_AVR`, `PT_LOAD`, etc.) used by this module and its consumers come from the system `<elf.h>` that elfutils requires. The build shall link `-ldw -lelf` unconditionally (no compile-time feature detection).]]></text>
         <traces>
-          <trace target="HLR" ref="HLR-033" name="Native Linux and macOS Build"/>
+          <trace target="HLR" ref="HLR-033" name="Native Linux Build"/>
           <trace target="HLR" ref="HLR-071" name="ELF and DWARF Parsing via elfutils"/>
         </traces>
       </llr>
@@ -2844,6 +2874,59 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
           <trace target="HLR" ref="HLR-056" name="Data Access Watchpoints"/>
           <trace target="HLR" ref="HLR-058" name="vRun / vAttach / vKill"/>
           <trace target="HLR" ref="HLR-059" name="qC / qOffsets / T / R Replies"/>
+        </traces>
+      </llr>
+    </function>
+
+    <function number="10" title="src/dap.c — Debug Adapter Protocol Front-End" name="dap" source="src/dap.c">
+      <intro><![CDATA[Requirements for the DAP front-end (`src/dap.c`), a protocol front-end over the shared debug core parallel to `src/gdb_rsp.c`. Phase 16 implements the wire transport: a self-contained JSON codec and the Content-Length message framing. The accept/dispatch loop and the lifecycle/request handlers are added across Phases 16–19.]]></intro>
+
+      <llr id="LLR-DAP-01">
+        <text><![CDATA[`dj_parse()` shall tokenise a JSON text into a caller-supplied flat, pre-order array of `dj_tok_t` via recursive descent, returning the token count on success or -1 on malformed input or token-array overflow. Each token records its `type` (OBJECT/ARRAY/STRING/NUMBER/TRUE/FALSE/NULL), the source byte range `[start, end)` (for STRING, the content between the quotes), the `size` (OBJECT member count / ARRAY element count), and `next` (the index of the token following its entire subtree). The accessors shall include: `dj_member()` returning the value-token index for an object member by key (or -1); `dj_streq()` testing a STRING token against a C string; `dj_strcpy()` copying a STRING token's content into a bounded buffer while decoding the JSON escapes `\" \\ \/ \b \f \n \r \t` and `\uXXXX` (code points < 0x80 as the byte, otherwise `?`); and `dj_long()` parsing a NUMBER token as a `long`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-075" name="DAP Wire Transport (Content-Length JSON-RPC)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-DAP-02">
+        <text><![CDATA[`dj_escape()` shall append a C string to a caller buffer as a JSON-escaped string body (without surrounding quotes), always NUL-terminating and never writing past `cap`. It shall emit the short escapes for `"`, `\\`, newline, carriage-return, tab, backspace, and form-feed, and shall emit any other control byte (< 0x20) as `\uXXXX`. It shall stop appending rather than overflow when the buffer would be exceeded.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-075" name="DAP Wire Transport (Content-Length JSON-RPC)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-DAP-03">
+        <text><![CDATA[`dap_read_message()` shall read one DAP message off a file descriptor: it shall consume CRLF-terminated header lines until a blank line, parsing the `Content-Length:` value (case-insensitive header name), then read exactly that many body bytes into the caller buffer and NUL-terminate it, setting `*out_len`. It shall read the body with exact-length reads so it never consumes bytes belonging to the next message. It shall return 1 when a message was read, 0 on EOF / peer close before any data, and -1 on read error, a missing/negative `Content-Length`, or a length that does not fit the caller buffer (`>= cap`). It shall retry `read()` on `EINTR`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-075" name="DAP Wire Transport (Content-Length JSON-RPC)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-DAP-04">
+        <text><![CDATA[`dap_write_message()` shall write one DAP message to a file descriptor as `Content-Length: <len>\r\n\r\n` followed by the `len` body bytes, using length-complete writes that retry on `EINTR`. It shall return 0 on success and -1 on write error.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-075" name="DAP Wire Transport (Content-Length JSON-RPC)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-DAP-05">
+        <text><![CDATA[`dap_serve()` shall accept one client on the listener via `rsp_accept()`, allocate a `DAP_MSG_MAX` receive buffer, and run a dispatch loop that, each iteration, waits with `select()` (≈200 ms timeout) on the client fd so the loop re-checks the quit flag without busy-waiting. On a readable socket it shall call `dap_read_message()` and route the message to `dap_dispatch()`; it shall exit the loop on EOF (read returns 0), on a framing/read error (-1), when `dap_dispatch()` returns 1 (disconnect/terminate), or when the quit flag is set. On exit it shall free the buffer and `rsp_close()` the client. It shall return 0 on a clean shutdown and -1 on a fatal accept/read error.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-076" name="DAP Connection Lifecycle"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-DAP-06">
+        <text><![CDATA[`dap_dispatch()` shall tokenise the message, require a top-level OBJECT with a `command` member (ignoring anything else), read the request `seq`, and route on the command string. It shall emit replies through file-private builders that produce well-formed DAP messages with a monotonically increasing outgoing `seq`: a `response` builder (`request_seq`, `command`, `success`, optional `body`), an error builder (`success:false` + `message`), and an `event` builder (`event` + optional `body`); all dynamic string fields shall be JSON-escaped via `dj_escape()`. It shall return 0 to continue the session, 1 to disconnect, or -1 on a write failure.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-076" name="DAP Connection Lifecycle"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-DAP-07">
+        <text><![CDATA[`dap_dispatch()` shall implement the Phase-16 lifecycle commands: `initialize` → a capabilities response (`supportsConfigurationDoneRequest:true`) followed by the `initialized` event; `launch` / `attach` → success; `setExceptionBreakpoints` → success; `setBreakpoints` → success with an empty `breakpoints` array (real installation deferred to Phase 18); `configurationDone` → halt the target (`updi_halt()` when `updi_fd >= 0`) and emit a `stopped` event (`reason:"entry"`, `threadId:1`, `allThreadsStopped:true`); `threads` → one thread `{id:1,name:"cpu"}`; `disconnect` / `terminate` → resume the target (`updi_run()` when `updi_fd >= 0`), reply success, and return 1. Any other command shall receive a `success:false` response with an explanatory `message`. All UPDI side effects shall be guarded by `updi_fd >= 0` so the dispatch is exercisable without hardware.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-076" name="DAP Connection Lifecycle"/>
         </traces>
       </llr>
     </function>
@@ -4060,8 +4143,8 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- Device-signature diagnostic mode tests (Phase 7)             -->
     <!-- ============================================================ -->
-    <file path="tests/test_device.c" role="unit" count="6">
-      <header><![CDATA[Unit and harness-level tests covering the `--device` one-shot diagnostic mode: argument parsing, mutual exclusion with `--load`, `updi_read_device_info()` success and failure paths over a PTY, the human-readable report format, and verification that the diagnostic path bypasses the GDB listener.]]></header>
+    <file path="tests/test_device.c" role="unit" count="8">
+      <header><![CDATA[Unit and harness-level tests covering the `--device` one-shot diagnostic mode and the `--rsp`/`--dap` front-end selection: argument parsing, mutual exclusion (with `--load`, and between `--rsp`/`--dap`), `updi_read_device_info()` success and failure paths over a PTY, the human-readable report format, and verification that the diagnostic path bypasses the GDB listener.]]></header>
 
       <test name="parse_args_accepts_device_flag_without_elf_operand">
         <purpose><![CDATA[Invoke `parse_args()` with `argv = {"avrOSdb", "--device", "/dev/ttyUSB0"}` and assert `cfg.device_info == true`, `cfg.serial_device == "/dev/ttyUSB0"`, `cfg.elf_path == NULL`, and `parse_args()` returns without exiting.]]></purpose>
@@ -4071,6 +4154,16 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="parse_args_rejects_device_combined_with_load">
         <purpose><![CDATA[Fork a subprocess that calls `parse_args()` with `--device --load /dev/ttyUSB0 fw.elf`; assert the child exits with status 1 and that captured stderr contains `"--device is mutually exclusive with --load"`.]]></purpose>
         <traces><trace target="LLR" ref="LLR-MAIN-08"/></traces>
+      </test>
+
+      <test name="parse_args_mode_defaults_to_rsp_and_honours_dap_rsp">
+        <purpose><![CDATA[Invoke `parse_args()` three ways and assert `cfg.dap_mode`: with no mode flag it is `false` (default RSP); with `--dap` it is `true`; with `--rsp` it is `false`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-24"/></traces>
+      </test>
+
+      <test name="parse_args_rejects_rsp_combined_with_dap">
+        <purpose><![CDATA[Fork a subprocess that calls `parse_args()` with `--rsp --dap /dev/ttyUSB0 fw.elf`; assert the child exits with status 1 and that captured stderr contains `"--rsp and --dap are mutually exclusive"`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-24"/></traces>
       </test>
 
       <test name="updi_read_device_info_returns_sigrow_and_asi_bytes">
@@ -4290,6 +4383,105 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="G24_capstone_full_interactive_session">
         <purpose><![CDATA[Phase-14 interactive debug-session coverage (HLR-070). One capstone case driving a realistic session start to finish: break at `top` (confirm `seed = 7` and a `bt` reaching `main`), set a conditional `break leaf if b == 3`, continue to `leaf(7, 3)` (confirm a full `leaf -> mid -> top -> main` backtrace and `a=7, b=3`), read a global (`g_marker = 49374`), and `finish` out of `leaf` reporting the return value `49405`. Combines breakpoints, conditions, multi-frame backtrace, global reads, and finish in a single end-to-end transcript.]]></purpose>
         <traces><trace target="HLR" ref="HLR-070"/></traces>
+      </test>
+    </file>
+
+    <!-- ============================================================ -->
+    <!-- src/dap.c DAP wire-transport tests (Phase 16)                -->
+    <!-- ============================================================ -->
+    <file path="tests/test_dap.c" role="unit" count="13">
+      <header><![CDATA[Unit tests for the DAP front-end: the wire transport (HLR-075) — the JSON codec (`dj_*` recursive-descent tokenizer, member/string/number accessors, escape decode, and the emission escaper) and the Content-Length message framing (`dap_read_message` / `dap_write_message`) — and the connection lifecycle dispatch (HLR-076) driven over a `socketpair` with `updi_fd = -1` so no hardware is touched. Framing is exercised over an anonymous pipe.]]></header>
+
+      <test name="dj_parse_extracts_request_fields">
+        <purpose><![CDATA[Tokenise a representative DAP `initialize` request and verify the accessors: the root is an OBJECT; `command` is the STRING `initialize`; `seq` is the NUMBER 3; `arguments` is a nested OBJECT whose `clientID` copies to `vscode` and whose `linesStartAt1` is the TRUE token; a missing member returns -1.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-01"/></traces>
+      </test>
+
+      <test name="dj_parse_handles_arrays_and_nesting">
+        <purpose><![CDATA[Parse `{"a":[1,2,3],"b":{"c":"x"}}` and verify `a` is an ARRAY of size 3, `b` is an OBJECT, and `b.c` copies to `x` — confirming subtree skipping and nested member lookup.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-01"/></traces>
+      </test>
+
+      <test name="dj_strcpy_decodes_escapes">
+        <purpose><![CDATA[Copy a STRING value containing `\\`, `\"`, and `\n` escapes and verify the decoded bytes are the literal backslash, double-quote, and newline.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-01"/></traces>
+      </test>
+
+      <test name="dj_escape_quotes_backslash_and_controls">
+        <purpose><![CDATA[Escape a string containing `"`, `\\`, and a newline and verify the output uses the short JSON escapes (`\"`, `\\`, `\n`).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-02"/></traces>
+      </test>
+
+      <test name="dj_parse_rejects_malformed">
+        <purpose><![CDATA[Verify `dj_parse()` returns -1 for a member with no value (`{"x":}`), a truncated object (`{"x"`), and an unterminated array (`[1,2`).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-01"/></traces>
+      </test>
+
+      <test name="dj_parse_respects_token_cap">
+        <purpose><![CDATA[Verify `dj_parse()` returns -1 (rather than overrunning) when the token array is too small for the input.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-01"/></traces>
+      </test>
+
+      <test name="dap_framing_round_trip_over_pipe">
+        <purpose><![CDATA[Write two framed messages to a pipe with `dap_write_message()` and read them back with `dap_read_message()`; verify each body and length round-trips exactly with no over-read into the second message, and that closing the write end then yields EOF (return 0).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-03"/><trace target="LLR" ref="LLR-DAP-04"/></traces>
+      </test>
+
+      <test name="dap_read_rejects_oversize_body">
+        <purpose><![CDATA[Feed a header advertising a `Content-Length` larger than the reader's buffer and verify `dap_read_message()` returns -1 rather than overflowing.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-03"/></traces>
+      </test>
+
+      <test name="dap_initialize_handshake">
+        <purpose><![CDATA[Dispatch an `initialize` request over a socketpair and verify the adapter writes a `response` with `request_seq:1`, `command:"initialize"`, `success:true`, and the `supportsConfigurationDoneRequest` capability, immediately followed by the `initialized` event.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-06"/><trace target="LLR" ref="LLR-DAP-07"/></traces>
+      </test>
+
+      <test name="dap_configuration_done_emits_stopped_entry">
+        <purpose><![CDATA[Dispatch `configurationDone` (with `updi_fd = -1`) and verify a `success:true` response for that command followed by a `stopped` event with `reason:"entry"` and `threadId:1`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-07"/></traces>
+      </test>
+
+      <test name="dap_disconnect_closes_session">
+        <purpose><![CDATA[Dispatch `disconnect` and verify `dap_dispatch()` returns 1 (close the session) after writing a `success:true` response for the `disconnect` command.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-07"/></traces>
+      </test>
+
+      <test name="dap_unknown_request_returns_error">
+        <purpose><![CDATA[Dispatch an unimplemented command and verify the adapter replies with a `success:false` response echoing the command and carrying a `message`, rather than leaving the client waiting.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-06"/><trace target="LLR" ref="LLR-DAP-07"/></traces>
+      </test>
+
+      <test name="dap_serve_runs_handshake_to_disconnect">
+        <purpose><![CDATA[Drive `dap_serve()` end-to-end without hardware: a stubbed `rsp_accept()` hands it a pre-connected socketpair end whose request stream is pre-loaded with `initialize` then `disconnect`. Verify the accept/select/read/dispatch loop processes both (emitting the initialize response, the `initialized` event, and the disconnect response) and returns 0 when the client disconnects.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-05"/></traces>
+      </test>
+    </file>
+
+    <!-- ============================================================ -->
+    <!-- src DAP on-target acceptance harness (Neovim + nvim-dap)     -->
+    <!-- ============================================================ -->
+    <file path="tests/hw/dap_acceptance.lua" role="hardware" count="4">
+      <header><![CDATA[On-target DAP acceptance harness (the DAP analogue of the Group-G GDB harness): spawns a fresh `avrOSdb --dap` against live AVR-Dx silicon and drives it with the real nvim-dap client (headless Neovim) over TCP, applying per-case verdicts to the connection lifecycle. Manual-only (`make hw-test-dap`); never invoked by `make test`. Phase 16 covers the handshake (DAP1–DAP4); execution control, breakpoints, and variables grow this suite in Phases 17–19.]]></header>
+
+      <test name="DAP1_initialize_handshake">
+        <purpose><![CDATA[nvim-dap attaches to the `avrOSdb --dap` server; verify the `initialize` request completes (capabilities received) and the adapter emits the `initialized` event, i.e. the session becomes active on live silicon.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-076"/></traces>
+      </test>
+
+      <test name="DAP2_configuration_done_stopped_entry">
+        <purpose><![CDATA[After the configuration phase, verify the adapter emits a `stopped` event with reason `entry`, reaching the stopped-at-entry state on the target.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-076"/></traces>
+      </test>
+
+      <test name="DAP3_threads_single_cpu">
+        <purpose><![CDATA[Issue a `threads` request and verify the adapter reports exactly one live CPU thread.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-076"/></traces>
+      </test>
+
+      <test name="DAP4_disconnect_clean">
+        <purpose><![CDATA[Issue a `disconnect` request and verify the adapter responds successfully and the session tears down cleanly (the target is resumed).]]></purpose>
+        <traces><trace target="HLR" ref="HLR-076"/></traces>
       </test>
     </file>
 

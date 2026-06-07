@@ -1,0 +1,44 @@
+{
+  "name": "avrosdb-dap",
+  "displayName": "avrOSdb (DAP)",
+  "description": "Attach VS Code to a running `avrOSdb --dap` server over TCP.",
+  "version": "0.1.0",
+  "publisher": "avrOS",
+  "engines": { "vscode": "^1.66.0" },
+  "categories": ["Debuggers"],
+  "main": "./extension.js",
+  "activationEvents": ["onDebugResolve:avrosdb"],
+  "contributes": {
+    "debuggers": [
+      {
+        "type": "avrosdb",
+        "label": "avrOSdb (DAP)",
+        "configurationAttributes": {
+          "attach": {
+            "properties": {
+              "host": {
+                "type": "string",
+                "description": "Host the avrOSdb --dap server listens on.",
+                "default": "127.0.0.1"
+              },
+              "port": {
+                "type": "number",
+                "description": "TCP port of the avrOSdb --dap server.",
+                "default": 1234
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "avrosdb",
+            "request": "attach",
+            "name": "Attach to avrOSdb (--dap)",
+            "host": "127.0.0.1",
+            "port": 1234
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -412,6 +412,80 @@ static void parse_args_rejects_device_combined_with_load(void)
 }
 
 /* ══════════════════════════════════════════════════════════════════════
+ *  (b2) parse_args mode select: default RSP, --dap, --rsp   LLR-MAIN-24
+ * ════════════════════════════════════════════════════════════════════ */
+static void parse_args_mode_defaults_to_rsp_and_honours_dap_rsp(void)
+{
+    /* Default (neither flag): RSP. */
+    char *a1[] = { (char*)"avrOSdb", (char*)"/dev/ttyUSB0", (char*)"fw.elf" };
+    AppConfig c1;
+    parse_args(3, a1, &c1);
+    TEST_ASSERT_FALSE(c1.dap_mode);
+
+    /* --dap selects DAP. */
+    char *a2[] = { (char*)"avrOSdb", (char*)"--dap",
+                   (char*)"/dev/ttyUSB0", (char*)"fw.elf" };
+    AppConfig c2;
+    parse_args(4, a2, &c2);
+    TEST_ASSERT_TRUE(c2.dap_mode);
+
+    /* --rsp selects RSP explicitly. */
+    char *a3[] = { (char*)"avrOSdb", (char*)"--rsp",
+                   (char*)"/dev/ttyUSB0", (char*)"fw.elf" };
+    AppConfig c3;
+    parse_args(4, a3, &c3);
+    TEST_ASSERT_FALSE(c3.dap_mode);
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ *  (b3) parse_args rejects --rsp + --dap                    LLR-MAIN-24
+ * ════════════════════════════════════════════════════════════════════ */
+static void parse_args_rejects_rsp_combined_with_dap(void)
+{
+    int pipefd[2];
+    TEST_ASSERT_EQUAL_INT(0, pipe(pipefd));
+
+    pid_t pid = fork();
+    TEST_ASSERT_TRUE(pid >= 0);
+    if (pid == 0) {
+        dup2(pipefd[1], STDERR_FILENO);
+        close(pipefd[0]);
+        close(pipefd[1]);
+        signal(SIGPIPE, SIG_IGN);
+        char *argv[] = { (char*)"avrOSdb",
+                         (char*)"--rsp", (char*)"--dap",
+                         (char*)"/dev/ttyUSB0", (char*)"fw.elf" };
+        AppConfig cfg;
+        parse_args(5, argv, &cfg);
+        _exit(0);  /* unreached on the rejection path */
+    }
+    close(pipefd[1]);
+
+    char buf[2048];
+    size_t total = 0;
+    for (;;) {
+        ssize_t n = read(pipefd[0], buf + total, (sizeof buf - 1) - total);
+        if (n <= 0) break;
+        total += (size_t)n;
+        if (total >= sizeof buf - 1) {
+            char sink[256];
+            while (read(pipefd[0], sink, sizeof sink) > 0) { }
+            break;
+        }
+    }
+    buf[total] = '\0';
+    close(pipefd[0]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    TEST_ASSERT_TRUE(WIFEXITED(status));
+    TEST_ASSERT_EQUAL_INT(1, WEXITSTATUS(status));
+    TEST_ASSERT_NOT_NULL_MESSAGE(
+        strstr(buf, "--rsp and --dap are mutually exclusive"),
+        "expected mode mutual-exclusion diagnostic on stderr");
+}
+
+/* ══════════════════════════════════════════════════════════════════════
  *  (c) updi_read_device_info returns SIGROW + ASI bytes   LLR-UPDI-13
  * ════════════════════════════════════════════════════════════════════ */
 static void updi_read_device_info_returns_sigrow_and_asi_bytes(void)
@@ -558,6 +632,8 @@ int main(void)
     UNITY_BEGIN();
     RUN_TEST(parse_args_accepts_device_flag_without_elf_operand);
     RUN_TEST(parse_args_rejects_device_combined_with_load);
+    RUN_TEST(parse_args_mode_defaults_to_rsp_and_honours_dap_rsp);
+    RUN_TEST(parse_args_rejects_rsp_combined_with_dap);
     RUN_TEST(updi_read_device_info_returns_sigrow_and_asi_bytes);
     RUN_TEST(updi_read_device_info_reports_failed_step_on_nak);
     RUN_TEST(run_device_mode_prints_report_to_stdout);

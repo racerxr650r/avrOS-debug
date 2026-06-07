@@ -77,3 +77,6 @@ logs/
 
 # Temporary AI output directory
 AI-tmp/
+
+# nvim-dap cache fetched by the DAP acceptance harness (tests/hw/dap_init.lua)
+tests/hw/.nvim-dap/

@@ -125,8 +125,8 @@ Key points:
   via baud-rate manipulation; no `nRESET` line is required.
 
 On Linux the serial adapter typically appears as `/dev/ttyUSB0` (FT232,
-CP210x) or `/dev/ttyACM0` (CDC ACM). On macOS the path is
-`/dev/cu.usbserial-*`.
+CP210x) or `/dev/ttyACM0` (CDC ACM); on a Raspberry Pi's built-in UART it is
+`/dev/ttyAMA*` (e.g. `/dev/ttyAMA2`).
 
 ---
 
@@ -184,7 +184,7 @@ to `stderr`, releases all resources, and exits with code 1 *without* opening the
 
 | Operand | Description |
 | ------- | ----------- |
-| `<serial-device>` | Path to the USB-serial adapter (`/dev/ttyUSB0`, `/dev/cu.usbserial-A50285BI`, …) |
+| `<serial-device>` | Path to the USB-serial adapter (`/dev/ttyUSB0`, `/dev/ttyAMA2`, …) |
 | `<elf-file>` | AVR ELF binary used for symbol lookup and avrOS table discovery. With `--load`, this file is also written to FLASH. |
 
 ### Exit Codes
@@ -666,7 +666,13 @@ was started with `--allow-erase`.
 
 ---
 
-## 6. VS Code Integration
+## 6. Editor Integration
+
+`avrOSdb` supports two editor paths: **VS Code** over GDB RSP today (via an
+external `avr-gdb`), and an in-development **native DAP** front-end
+(`avrOSdb --dap`) that DAP-native editors such as Neovim talk to directly.
+
+### 6.1 VS Code (Cortex-Debug, via GDB RSP)
 
 `avrOSdb` speaks standard GDB RSP. While many debug adapters support RSP, the **cortex-debug** extension is the only officially tested extension for `avrOSdb` integration in VS Code.
 
@@ -734,6 +740,122 @@ For a more polished UPDI/AVR-specific UI, the
 extension can be configured similarly with `"servertype": "external"`
 and `"gdbTarget": "localhost:1234"` — useful when an external GDB
 launch script already manages the stub.
+
+### 6.2 Neovim (nvim-dap) — native DAP front-end
+
+`avrOSdb --dap` serves the Debug Adapter Protocol directly, so Neovim's
+[nvim-dap](https://github.com/mfussenegger/nvim-dap) plugin can debug the target
+with **no `avr-gdb` in the loop**.
+
+> [!NOTE]
+> The native DAP front-end is being built up in phases. It currently performs
+> the connection handshake — attach, stop the target at entry, list the CPU
+> thread, and disconnect; source-level stepping, breakpoints, and variable
+> inspection land in subsequent phases. The RSP path (§6.1) remains the
+> full-featured route in the meantime.
+
+**One-time setup.** `make prereqs` (or just `make prereqs-nvim`) installs
+nvim-dap as a native Neovim package and installs the avrOSdb DAP config into
+`~/.config/nvim/init.lua` — idempotent, and it never clobbers an existing
+config (it appends a clearly-marked block if one is absent). Equivalently, by
+hand:
+
+```bash
+# install nvim-dap as a native package (auto-loaded; no plugin manager)
+git clone --depth=1 https://github.com/mfussenegger/nvim-dap \
+    ~/.local/share/nvim/site/pack/dap/start/nvim-dap
+
+# install the avrOSdb DAP config (adapter + attach config + keymaps)
+mkdir -p ~/.config/nvim
+cat tools/nvim/avrosdb-dap.lua >> ~/.config/nvim/init.lua
+```
+
+The config (`tools/nvim/avrosdb-dap.lua`) defines a `server`-type adapter that
+connects to `127.0.0.1:1234` (override with `vim.g.avrosdb_dap_host` /
+`vim.g.avrosdb_dap_port`), an **attach** configuration for C/C++ buffers, and
+debugger keymaps (`<F5>` continue/attach, `<F10>/<F11>/<F12>` step
+over/into/out, `<F9>` toggle breakpoint, `<F6>` terminate, `<leader>dr` REPL).
+
+**Use it:**
+
+```bash
+# 1. start the DAP server on the target host
+build/avrOSdb --dap --port 1234 /dev/ttyAMA2 firmware.elf
+
+# 2. in Neovim, open a source file and attach:
+#      <F5>            (picks the "Attach to avrOSdb (--dap)" config), or
+#      :DapAvrOSdb     (optionally :DapAvrOSdb <host> <port>)
+```
+
+An automated on-target acceptance harness drives this same path headlessly:
+`make hw-test-dap` (see §7 / the Makefile).
+
+### 6.3 VS Code (native DAP)
+
+VS Code can also talk to the `avrOSdb --dap` server directly. Unlike Neovim,
+VS Code will only attach to a DAP server through a *contributed debug type*, so
+a tiny companion extension is provided in
+[`tools/vscode/avrosdb-dap/`](../tools/vscode/avrosdb-dap/). It launches nothing
+itself — it just points the `avrosdb` debug type at the running server's TCP
+port (`vscode.DebugAdapterServer`).
+
+> [!NOTE]
+> Same scope caveat as §6.2: the native DAP front-end currently performs the
+> connection handshake (attach → stop at entry → threads → disconnect);
+> stepping, breakpoints, and variables arrive in later phases. For full-featured
+> debugging today, use the GDB-RSP path in §6.1.
+
+**Install the companion extension** (one of):
+
+```bash
+# Development Host: open the folder in VS Code and press F5
+code tools/vscode/avrosdb-dap
+
+# …or install it for all workspaces by copying it into the extensions dir
+cp -r tools/vscode/avrosdb-dap ~/.vscode/extensions/avrosdb-dap-0.1.0
+#   (VS Code Remote-SSH: use ~/.vscode-server/extensions/ on the remote host)
+```
+
+Reload VS Code after copying. The extension contributes the `avrosdb` debug type
+and a default *attach* configuration.
+
+**Add a launch configuration** — copy
+[`tools/vscode/launch.json`](../tools/vscode/launch.json) to your project's
+`.vscode/launch.json`:
+
+```jsonc
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "avrosdb",
+      "request": "attach",
+      "name": "Attach to avrOSdb (--dap)",
+      "host": "127.0.0.1",
+      "port": 1234
+    }
+  ]
+}
+```
+
+**Use it:**
+
+```bash
+# 1. start the DAP server on the target host
+build/avrOSdb --dap --port 1234 /dev/ttyAMA2 firmware.elf
+```
+
+2. In VS Code, pick **“Attach to avrOSdb (--dap)”** in the Run and Debug view
+   and press **F5**. VS Code connects to `localhost:1234` and the target stops
+   at entry. (When the server runs on a remote Pi, either use VS Code
+   Remote-SSH, or forward the port — e.g. `ssh -L 1234:localhost:1234 pi` — and
+   keep `"host": "127.0.0.1"`.)
+
+> [!TIP]
+> Prefer a no-extension quick test? Add `"debugServer": 1234` to a
+> configuration whose `type` belongs to an already-installed debugger (e.g.
+> `cppdbg`); VS Code then connects to that port instead of spawning an adapter.
+> The companion extension above is the clean, type-correct route.
 
 ---
 

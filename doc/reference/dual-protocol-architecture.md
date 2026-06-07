@@ -191,10 +191,11 @@ prohibition and landed the core seam (`src/debug_core.h`) + DWARF only.
 
 ## 7. Risks
 
-- **macOS / elfutils (HLR-033).** `libdw`/`libelf` are GNU/Linux-centric.
-  Decision: elfutils is a **required** dependency (no symbol-only fallback);
-  macOS obtains it via `brew install elfutils`. `src/elf_parser.c` is a thin
-  adapter over libelf/libdw and the bundled `src/elf.h` shim is deleted.
+- **elfutils dependency (HLR-033).** elfutils (`libelf`/`libdw`) is a
+  **required** dependency (no symbol-only fallback); `src/elf_parser.c` is a
+  thin adapter over it and the bundled `src/elf.h` shim is deleted. Linux is
+  the sole supported platform, so the GNU/Linux-centric elfutils libraries
+  are always available.
 - **Regressing the verified RSP path.** Mitigation: keep the Phase 15 moves
   structural and additive; defer behaviour-sensitive relocation to the phase
   that has the DAP consumer and re-runs `hw-test-gdb` G1–G24 as the gate.

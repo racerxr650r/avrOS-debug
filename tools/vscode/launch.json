@@ -1,0 +1,15 @@
+{
+  "// note": "Sample .vscode/launch.json for debugging with avrOSdb --dap.",
+  "// note2": "Requires the companion extension in tools/vscode/avrosdb-dap/.",
+  "// note3": "Start the server first: build/avrOSdb --dap --port 1234 <serial> <elf>",
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "avrosdb",
+      "request": "attach",
+      "name": "Attach to avrOSdb (--dap)",
+      "host": "127.0.0.1",
+      "port": 1234
+    }
+  ]
+}

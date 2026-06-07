@@ -297,16 +297,18 @@ Role: **integration**. **8 test(s).**
 
 ### 3.9. [tests/test_device.c](../tests/test_device.c)
 
-Role: **unit**. **6 test(s).**
+Role: **unit**. **8 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
 | 1 | <a id="parse_args_accepts_device_flag_without_elf_operand"></a>`parse_args_accepts_device_flag_without_elf_operand` | `LLR-MAIN-08` | Invoke `parse_args()` with `argv = {"avrOSdb", "--device", "/dev/ttyUSB0"}` and assert `cfg.device_info == true`, `cfg.serial_device == "/dev/ttyUSB0"`, `cfg.elf_path == NULL`, and `parse_args()` returns without exiting. |
 | 2 | <a id="parse_args_rejects_device_combined_with_load"></a>`parse_args_rejects_device_combined_with_load` | `LLR-MAIN-08` | Fork a subprocess that calls `parse_args()` with `--device --load /dev/ttyUSB0 fw.elf`; assert the child exits with status 1 and that captured stderr contains `"--device is mutually exclusive with --load"`. |
-| 3 | <a id="updi_read_device_info_returns_sigrow_and_asi_bytes"></a>`updi_read_device_info_returns_sigrow_and_asi_bytes` | `LLR-UPDI-13` | Open a PTY pair; in a helper thread script the slave end to echo half-duplex bytes and respond to a SIGROW DEVICEID read at `0x1100`-`0x1102` with canned signature `0x1E 0x97 0x0A`, a SYSCFG.REVID read at `0x0F01` returning `0xA6`, a SIGROW.SERNUM read at `0x1110`-`0x111F` returning a canned 16-byte serial number, and to LDCS reads of SYS_STATUS / KEY_STATUS / STATUSB. Call `updi_read_device_info()` and assert all struct fields match the canned values and that the function returns 0 with `info.fail_op == NULL`. |
-| 4 | <a id="updi_read_device_info_reports_failed_step_on_nak"></a>`updi_read_device_info_reports_failed_step_on_nak` | `LLR-UPDI-13` | Drive the PTY harness to return an unexpected byte in place of the SIGROW response. Assert `updi_read_device_info()` returns -1, `info.fail_op` equals the string `"sigrow"`, and `info.fail_errno` is negative. |
-| 5 | <a id="run_device_mode_prints_report_to_stdout"></a>`run_device_mode_prints_report_to_stdout` | `LLR-MAIN-09` | Capture `stdout` from `run_device_mode()` driven by the PTY harness with signature `0x1E 0x97 0x0A`. Assert the captured output contains the literal lines `Serial device:`, `Baud rate:`, `Signature:`, `Family:`, `Revision:`, `Serial:`, and `UPDI status:` (case-sensitive prefix match). |
-| 6 | <a id="device_mode_does_not_call_rsp_listen"></a>`device_mode_does_not_call_rsp_listen` | `LLR-MAIN-09` | Link the test binary with a stub `rsp_listen()` that flags a global. Invoke `run_device_mode()` to completion and assert the flag remains clear, proving the diagnostic path bypasses GDB listener startup. |
+| 3 | <a id="parse_args_mode_defaults_to_rsp_and_honours_dap_rsp"></a>`parse_args_mode_defaults_to_rsp_and_honours_dap_rsp` | `LLR-MAIN-24` | Invoke `parse_args()` three ways and assert `cfg.dap_mode`: with no mode flag it is `false` (default RSP); with `--dap` it is `true`; with `--rsp` it is `false`. |
+| 4 | <a id="parse_args_rejects_rsp_combined_with_dap"></a>`parse_args_rejects_rsp_combined_with_dap` | `LLR-MAIN-24` | Fork a subprocess that calls `parse_args()` with `--rsp --dap /dev/ttyUSB0 fw.elf`; assert the child exits with status 1 and that captured stderr contains `"--rsp and --dap are mutually exclusive"`. |
+| 5 | <a id="updi_read_device_info_returns_sigrow_and_asi_bytes"></a>`updi_read_device_info_returns_sigrow_and_asi_bytes` | `LLR-UPDI-13` | Open a PTY pair; in a helper thread script the slave end to echo half-duplex bytes and respond to a SIGROW DEVICEID read at `0x1100`-`0x1102` with canned signature `0x1E 0x97 0x0A`, a SYSCFG.REVID read at `0x0F01` returning `0xA6`, a SIGROW.SERNUM read at `0x1110`-`0x111F` returning a canned 16-byte serial number, and to LDCS reads of SYS_STATUS / KEY_STATUS / STATUSB. Call `updi_read_device_info()` and assert all struct fields match the canned values and that the function returns 0 with `info.fail_op == NULL`. |
+| 6 | <a id="updi_read_device_info_reports_failed_step_on_nak"></a>`updi_read_device_info_reports_failed_step_on_nak` | `LLR-UPDI-13` | Drive the PTY harness to return an unexpected byte in place of the SIGROW response. Assert `updi_read_device_info()` returns -1, `info.fail_op` equals the string `"sigrow"`, and `info.fail_errno` is negative. |
+| 7 | <a id="run_device_mode_prints_report_to_stdout"></a>`run_device_mode_prints_report_to_stdout` | `LLR-MAIN-09` | Capture `stdout` from `run_device_mode()` driven by the PTY harness with signature `0x1E 0x97 0x0A`. Assert the captured output contains the literal lines `Serial device:`, `Baud rate:`, `Signature:`, `Family:`, `Revision:`, `Serial:`, and `UPDI status:` (case-sensitive prefix match). |
+| 8 | <a id="device_mode_does_not_call_rsp_listen"></a>`device_mode_does_not_call_rsp_listen` | `LLR-MAIN-09` | Link the test binary with a stub `rsp_listen()` that flags a global. Invoke `run_device_mode()` to completion and assert the flag remains clear, proving the diagnostic path bypasses GDB listener startup. |
 
 ### 3.10. [tests/hw/hw_test.c](../tests/hw/hw_test.c)
 
@@ -359,6 +361,37 @@ Role: **hardware**. **1 test(s).**
 | 7 | <a id="G23_per_frame_info_args_and_locals"></a>`G23_per_frame_info_args_and_locals` | — | Phase-14 interactive debug-session coverage (HLR-070). Stopped at `leaf(7, 2)`, `info args` must show `a = 7` and `b = 2`; after two `next` steps execute the local assignments, `info locals` and `print` must show `prod = 14` and `sum = 9`. Verifies per-frame argument and local reads return the exact fixture constants once the locals are live, complementing G17's single-type sweep with the call-chain fixture. |
 | 8 | <a id="G24_capstone_full_interactive_session"></a>`G24_capstone_full_interactive_session` | — | Phase-14 interactive debug-session coverage (HLR-070). One capstone case driving a realistic session start to finish: break at `top` (confirm `seed = 7` and a `bt` reaching `main`), set a conditional `break leaf if b == 3`, continue to `leaf(7, 3)` (confirm a full `leaf -> mid -> top -> main` backtrace and `a=7, b=3`), read a global (`g_marker = 49374`), and `finish` out of `leaf` reporting the return value `49405`. Combines breakpoints, conditions, multi-frame backtrace, global reads, and finish in a single end-to-end transcript. |
 
+### 3.12. [tests/test_dap.c](../tests/test_dap.c)
+
+Role: **unit**. **13 test(s).**
+
+| # | Test | Verifies | Purpose |
+| - | ---- | -------- | ------- |
+| 1 | <a id="dj_parse_extracts_request_fields"></a>`dj_parse_extracts_request_fields` | `LLR-DAP-01` | Tokenise a representative DAP `initialize` request and verify the accessors: the root is an OBJECT; `command` is the STRING `initialize`; `seq` is the NUMBER 3; `arguments` is a nested OBJECT whose `clientID` copies to `vscode` and whose `linesStartAt1` is the TRUE token; a missing member returns -1. |
+| 2 | <a id="dj_parse_handles_arrays_and_nesting"></a>`dj_parse_handles_arrays_and_nesting` | `LLR-DAP-01` | Parse `{"a":[1,2,3],"b":{"c":"x"}}` and verify `a` is an ARRAY of size 3, `b` is an OBJECT, and `b.c` copies to `x` — confirming subtree skipping and nested member lookup. |
+| 3 | <a id="dj_strcpy_decodes_escapes"></a>`dj_strcpy_decodes_escapes` | `LLR-DAP-01` | Copy a STRING value containing `\\`, `\"`, and `\n` escapes and verify the decoded bytes are the literal backslash, double-quote, and newline. |
+| 4 | <a id="dj_escape_quotes_backslash_and_controls"></a>`dj_escape_quotes_backslash_and_controls` | `LLR-DAP-02` | Escape a string containing `"`, `\\`, and a newline and verify the output uses the short JSON escapes (`\"`, `\\`, `\n`). |
+| 5 | <a id="dj_parse_rejects_malformed"></a>`dj_parse_rejects_malformed` | `LLR-DAP-01` | Verify `dj_parse()` returns -1 for a member with no value (`{"x":}`), a truncated object (`{"x"`), and an unterminated array (`[1,2`). |
+| 6 | <a id="dj_parse_respects_token_cap"></a>`dj_parse_respects_token_cap` | `LLR-DAP-01` | Verify `dj_parse()` returns -1 (rather than overrunning) when the token array is too small for the input. |
+| 7 | <a id="dap_framing_round_trip_over_pipe"></a>`dap_framing_round_trip_over_pipe` | `LLR-DAP-03`, `LLR-DAP-04` | Write two framed messages to a pipe with `dap_write_message()` and read them back with `dap_read_message()`; verify each body and length round-trips exactly with no over-read into the second message, and that closing the write end then yields EOF (return 0). |
+| 8 | <a id="dap_read_rejects_oversize_body"></a>`dap_read_rejects_oversize_body` | `LLR-DAP-03` | Feed a header advertising a `Content-Length` larger than the reader's buffer and verify `dap_read_message()` returns -1 rather than overflowing. |
+| 9 | <a id="dap_initialize_handshake"></a>`dap_initialize_handshake` | `LLR-DAP-06`, `LLR-DAP-07` | Dispatch an `initialize` request over a socketpair and verify the adapter writes a `response` with `request_seq:1`, `command:"initialize"`, `success:true`, and the `supportsConfigurationDoneRequest` capability, immediately followed by the `initialized` event. |
+| 10 | <a id="dap_configuration_done_emits_stopped_entry"></a>`dap_configuration_done_emits_stopped_entry` | `LLR-DAP-07` | Dispatch `configurationDone` (with `updi_fd = -1`) and verify a `success:true` response for that command followed by a `stopped` event with `reason:"entry"` and `threadId:1`. |
+| 11 | <a id="dap_disconnect_closes_session"></a>`dap_disconnect_closes_session` | `LLR-DAP-07` | Dispatch `disconnect` and verify `dap_dispatch()` returns 1 (close the session) after writing a `success:true` response for the `disconnect` command. |
+| 12 | <a id="dap_unknown_request_returns_error"></a>`dap_unknown_request_returns_error` | `LLR-DAP-06`, `LLR-DAP-07` | Dispatch an unimplemented command and verify the adapter replies with a `success:false` response echoing the command and carrying a `message`, rather than leaving the client waiting. |
+| 13 | <a id="dap_serve_runs_handshake_to_disconnect"></a>`dap_serve_runs_handshake_to_disconnect` | `LLR-DAP-05` | Drive `dap_serve()` end-to-end without hardware: a stubbed `rsp_accept()` hands it a pre-connected socketpair end whose request stream is pre-loaded with `initialize` then `disconnect`. Verify the accept/select/read/dispatch loop processes both (emitting the initialize response, the `initialized` event, and the disconnect response) and returns 0 when the client disconnects. |
+
+### 3.13. [tests/hw/dap_acceptance.lua](../tests/hw/dap_acceptance.lua)
+
+Role: **hardware**. **4 test(s).**
+
+| # | Test | Verifies | Purpose |
+| - | ---- | -------- | ------- |
+| 1 | <a id="DAP1_initialize_handshake"></a>`DAP1_initialize_handshake` | — | nvim-dap attaches to the `avrOSdb --dap` server; verify the `initialize` request completes (capabilities received) and the adapter emits the `initialized` event, i.e. the session becomes active on live silicon. |
+| 2 | <a id="DAP2_configuration_done_stopped_entry"></a>`DAP2_configuration_done_stopped_entry` | — | After the configuration phase, verify the adapter emits a `stopped` event with reason `entry`, reaching the stopped-at-entry state on the target. |
+| 3 | <a id="DAP3_threads_single_cpu"></a>`DAP3_threads_single_cpu` | — | Issue a `threads` request and verify the adapter reports exactly one live CPU thread. |
+| 4 | <a id="DAP4_disconnect_clean"></a>`DAP4_disconnect_clean` | — | Issue a `disconnect` request and verify the adapter responds successfully and the session tears down cleanly (the target is resumed). |
+
 ## 4. LLR Coverage Matrix
 
 Every LLR in [LLRs.md](LLRs.md) and the test(s) that verify it.
@@ -387,6 +420,7 @@ verified by code review — see
 | `LLR-MAIN-17` | `main` | `HLR-050`, `HLR-051`, `HLR-052` | `parse_args_no_autobaud_sets_flag` |
 | `LLR-MAIN-21` | `main` | `HLR-055` | `parse_args_allow_erase_sets_flag`, `parse_args_allow_erase_defaults_false` |
 | `LLR-MAIN-23` | `main` | `HLR-068` | `test_parse_args_log_rsp_sets_flag` |
+| `LLR-MAIN-24` | `main` | `HLR-074` | `parse_args_mode_defaults_to_rsp_and_honours_dap_rsp`, `parse_args_rejects_rsp_combined_with_dap` |
 | `LLR-MAIN-22` | `main` | `HLR-065` | `test_sig_handler_records_signo_in_g_shutdown_signal`, `test_event_loop_clears_disconnect_reason_after_drain` |
 | `LLR-UPDI-01` | `updi` | `HLR-006` | `updi_open_sets_8e2_raw_half_duplex_via_termios`, `updi_open_returns_minus1_on_device_open_failure` |
 | `LLR-UPDI-02` | `updi` | `HLR-006`, `HLR-036` | `updi_open_asserts_wake_byte_then_stcs_ctrlb`, `updi_open_restores_session_baud_after_break` |
@@ -512,3 +546,10 @@ verified by code review — see
 | `LLR-HWTEST-06` | `hwtest` | `HLR-045` | `B0_sram_single_byte_round_trip` |
 | `LLR-HWTEST-07` | `hwtest` | `HLR-045`, `HLR-049`, `HLR-050`, `HLR-051`, `HLR-052` | `F1_autobaud_picks_reliable_rung`, `F2_fuse_pretty_print_round_trip`, `F3_prog_mode_end_to_end_with_verify` |
 | `LLR-HWTEST-08` | `hwtest` | `HLR-053`, `HLR-054`, `HLR-055`, `HLR-056`, `HLR-058`, `HLR-059` | `D4_rsp_qC_current_thread`, `D5_rsp_qOffsets_section_bases`, `D6_rsp_monitor_info_verb`, `D7_rsp_Z2_z2_replies_empty_packet_unsupported`, `D8_rsp_vRun_reload_returns_Tstop`, `D9_rsp_vFlashErase_vFlashDone_smoke`, `D10_rsp_Z0_z0_sw_bp_flash_break_round_trip` |
+| `LLR-DAP-01` | `dap` | `HLR-075` | `dj_parse_extracts_request_fields`, `dj_parse_handles_arrays_and_nesting`, `dj_strcpy_decodes_escapes`, `dj_parse_rejects_malformed`, `dj_parse_respects_token_cap` |
+| `LLR-DAP-02` | `dap` | `HLR-075` | `dj_escape_quotes_backslash_and_controls` |
+| `LLR-DAP-03` | `dap` | `HLR-075` | `dap_framing_round_trip_over_pipe`, `dap_read_rejects_oversize_body` |
+| `LLR-DAP-04` | `dap` | `HLR-075` | `dap_framing_round_trip_over_pipe` |
+| `LLR-DAP-05` | `dap` | `HLR-076` | `dap_serve_runs_handshake_to_disconnect` |
+| `LLR-DAP-06` | `dap` | `HLR-076` | `dap_initialize_handshake`, `dap_unknown_request_returns_error` |
+| `LLR-DAP-07` | `dap` | `HLR-076` | `dap_initialize_handshake`, `dap_configuration_done_emits_stopped_entry`, `dap_disconnect_closes_session`, `dap_unknown_request_returns_error` |
