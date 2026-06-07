@@ -491,8 +491,13 @@ static int sw_bp_patch_flash(RspContext *ctx, uint32_t byte_addr,
     uint16_t sp;
     uint32_t pc;
     int updi_fd = ctx->updi_fd;
+    /* Phase 20: peripheral I/O snapshot preserved across the NVMPROG system
+     * reset so any SLEEP wake source (timer/USART/pin/...) survives.  No-op
+     * (and `periph` left untouched) when debug-in-sleep is disabled (--sleep). */
+    static uint8_t periph[UPDI_PERIPH_LEN];
 
     if (sw_bp_snapshot_cpu(updi_fd, gpr, &sreg, &sp, &pc) < 0) return -1;
+    if (updi_save_peripherals(updi_fd, periph) < 0) return -1;
 
     if (orig_out != NULL) {
         if (updi_mem_read(updi_fd, UPDI_FLASH_BASE + byte_addr,
@@ -513,6 +518,10 @@ static int sw_bp_patch_flash(RspContext *ctx, uint32_t byte_addr,
                 return -1;
         }
     }
+
+    /* Restore the peripheral configuration the reset wiped, before re-arming
+     * the CPU state (which writes OCD.PC last for the pc_dirty handling). */
+    if (updi_restore_peripherals(updi_fd, periph) < 0) return -1;
 
     if (sw_bp_restore_cpu(updi_fd, gpr, sreg, sp, pc) < 0) return -1;
 

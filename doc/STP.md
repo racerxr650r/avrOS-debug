@@ -59,7 +59,7 @@ Role: **unit**. **37 test(s).**
 
 ### 3.2. [tests/test_updi.c](../tests/test_updi.c)
 
-Role: **unit**. **49 test(s).**
+Role: **unit**. **50 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -113,6 +113,7 @@ Role: **unit**. **49 test(s).**
 | 48 | <a id="updi_crc32_matches_known_vector_for_single_zero_byte"></a>`updi_crc32_matches_known_vector_for_single_zero_byte` | `LLR-UPDI-30` | Call `updi_crc32()` with a single 0x00 byte and assert the result equals `0xD202EF8D`, the canonical IEEE 802.3 CRC-32 of a one-byte zero message. Confirms that the polynomial reflection, initial value (`0xFFFFFFFF`), and final XOR (`0xFFFFFFFF`) are all implemented correctly even on the shortest non-empty input. |
 | 49 | <a id="updi_apply_debug_in_sleep_asserts_clkreq_when_enabled"></a>`updi_apply_debug_in_sleep_asserts_clkreq_when_enabled` | `LLR-UPDI-35` | With debug-in-sleep enabled (the default, via `updi_set_debug_in_sleep(true)`), call `updi_apply_debug_in_sleep()` over a PTY and verify it emits exactly the STCS bytes `0x55 0xCA 0x01` (SYNCH, `STCS|ASI_SYS_CTRLA`, `CLK_REQ`) — the write that keeps the system clock alive across SLEEP. The 3-byte half-duplex echo is prestuffed so `updi_write_bytes()` completes. |
 | 50 | <a id="updi_apply_debug_in_sleep_emits_nothing_when_disabled"></a>`updi_apply_debug_in_sleep_emits_nothing_when_disabled` | `LLR-UPDI-35` | With debug-in-sleep disabled (`updi_set_debug_in_sleep(false)`, the `--sleep` case), call `updi_apply_debug_in_sleep()` over a PTY and verify it returns 0 and sends no bytes — native target sleep behaviour is left intact. |
+| 51 | <a id="updi_save_restore_peripherals_noop_when_disabled"></a>`updi_save_restore_peripherals_noop_when_disabled` | `LLR-UPDI-36` | With debug-in-sleep disabled (`--sleep`), call `updi_save_peripherals()` and `updi_restore_peripherals()` over a PTY and verify both return 0 and emit no UPDI traffic. (The enabled path issues a peripheral-window UPDI burst and is validated on hardware by the SW-breakpoint-survives-sleep acceptance: a Z0/z0/Z0/continue sequence times out stuck-in-sleep with `--sleep` and hits the post-sleep breakpoint by default.) |
 
 ### 3.3. [tests/test_rsp.c](../tests/test_rsp.c)
 
@@ -461,6 +462,7 @@ verified by code review — see
 | `LLR-UPDI-33` | `updi` | `HLR-007`, `HLR-008` | `updi_mem_read_uses_repeat_ld_auto_increment_sequence`, `G17_local_variable_values_and_backtrace` |
 | `LLR-UPDI-34` | `updi` | `HLR-054` | `continue_after_sw_bp_install_injects_leading_instruction`, `step_after_sw_bp_install_injects_leading_instruction` |
 | `LLR-UPDI-35` | `updi` | `HLR-077` | `updi_apply_debug_in_sleep_asserts_clkreq_when_enabled`, `updi_apply_debug_in_sleep_emits_nothing_when_disabled` |
+| `LLR-UPDI-36` | `updi` | `HLR-077` | `updi_save_restore_peripherals_noop_when_disabled` |
 | `LLR-RSP-01` | `rsp` | `HLR-003`, `HLR-038` | `rsp_listen_sets_so_reuseaddr_before_bind`, `rsp_accept_sets_tcp_nodelay_on_client_socket` |
 | `LLR-RSP-02` | `rsp` | `HLR-013` | `rsp_recv_packet_discards_leading_ack_nak_bytes`, `rsp_recv_packet_sends_plus_on_valid_checksum`, `rsp_recv_packet_sends_minus_and_returns_minus1_on_bad_checksum` |
 | `LLR-RSP-03` | `rsp` | `HLR-014` | `on_read_regs_g_returns_78_char_hex_string`, `on_read_regs_g_places_pc_little_endian_at_positions_70_77` |
@@ -493,7 +495,7 @@ verified by code review — see
 | `LLR-RSP-34` | `rsp` | `HLR-053` | `vFlashDone_flushes_buffer_via_nvm_write_flash_and_replies_ok`, `vFlashDone_with_no_active_transaction_replies_ok_noop`, `m_packet_mid_vflash_transaction_aborts_and_returns_E22`, `D9_rsp_vFlashErase_vFlashDone_smoke` |
 | `LLR-RSP-35` | `rsp` | `HLR-053` | `qSupported_advertises_vFlash_packets` |
 | `LLR-RSP-36` | `rsp` | `HLR-054` | `Z0_in_sw_mode_patches_BREAK_opcode_via_flash_patch`, `Z0_in_sw_mode_refuses_data_space_address_with_E22`, `Z0_in_hw_only_mode_falls_back_to_HW_BP_path`, `Z0_in_sw_mode_idempotent_on_same_address`, `D10_rsp_Z0_z0_sw_bp_flash_break_round_trip` |
-| `LLR-RSP-37` | `rsp` | `HLR-054` | `Z0_in_sw_mode_records_original_opcode_from_flash`, `Z0_in_sw_mode_snapshots_and_restores_cpu_state`, `D10_rsp_Z0_z0_sw_bp_flash_break_round_trip` |
+| `LLR-RSP-37` | `rsp` | `HLR-054`, `HLR-077` | `Z0_in_sw_mode_records_original_opcode_from_flash`, `Z0_in_sw_mode_snapshots_and_restores_cpu_state`, `D10_rsp_Z0_z0_sw_bp_flash_break_round_trip` |
 | `LLR-RSP-38` | `rsp` | `HLR-054` | `z0_in_sw_mode_restores_original_opcode`, `D10_rsp_Z0_z0_sw_bp_flash_break_round_trip` |
 | `LLR-RSP-39` | `rsp` | `HLR-054` | `vFlashDone_also_clears_sw_bp_shadow` |
 | `LLR-RSP-43` | `rsp` | `HLR-065` | `on_detach_D_sets_disconnect_reason_to_D`, `vKill_sets_disconnect_reason_to_vKill` |

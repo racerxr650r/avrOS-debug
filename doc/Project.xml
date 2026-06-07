@@ -1615,8 +1615,8 @@ Errors are propagated upward through the module stack without retrying:
         </traces>
       </hlr>
 
-      <hlr id="HLR-077" name="Debug-in-Sleep (keep the system clock alive across SLEEP)">
-        <text><![CDATA[On AVR-Dx the system clock stops when the CPU executes `SLEEP`, after which the OCD can no longer detect a `BREAK` / hardware-breakpoint match or service register/memory reads until the part wakes — so breakpoints set past a sleep (e.g. an avrOS application idling in `sysSleep()` → `SLEEP_MODE_IDLE` between dispatches) are never caught. To prevent this, the application shall, by default, assert `CLK_REQ` (bit 0 of `ASI_SYS_CTRLA`) once when it enters OCD, forcing the system clock to keep running so the OCD stays live through `SLEEP`. The assertion shall be applied at every `updi_enter_debug()` success (session start and any later re-entry, e.g. after `monitor reset`). A `--sleep` command-line switch shall disable this behaviour so the target sleeps natively and its real power/timing characteristics are preserved (for power-path debugging); when disabled, no `CLK_REQ` write is issued. This is a UPDI/OCD-layer behaviour and therefore benefits both the GDB-RSP and DAP front-ends. (Sleep modes below IDLE — Standby/Power-Down — additionally require `RUN_STBY`/`RUN_TIME` in the memory-mapped OCD control register; the exact AVR-Dx OCD-v1 location must be confirmed against `doc/reference/guesswork.md` before that path is implemented and is out of scope for the IDLE fix.)]]></text>
+      <hlr id="HLR-077" name="Debug-in-Sleep (preserve the wake source across the SW-breakpoint reset)">
+        <text><![CDATA[Installing or removing a software breakpoint requires a FLASH write, which on AVR-Dx must enter NVMPROG via a mandatory `ASI_RESET_REQ` system-reset pulse (the pulse latches the NVMProg key). That reset returns every peripheral to its default state — wiping whatever interrupt source the firmware had configured to wake itself from `SLEEP`. Consequently, after a SW-breakpoint flash patch on an already-initialised target, a firmware that idles in `SLEEP` (e.g. avrOS `sysSleep()` → `SLEEP_MODE_IDLE`) has no live wake source and never wakes, so the next breakpoint past the sleep is never reached. (Bench-confirmed: the LED state held before `SLEEP` stays frozen, and a raw `Z0`/`z0`/`Z0`/continue sequence reproduces it; hardware breakpoints — which do not touch FLASH — are unaffected.) To prevent this, the SW-breakpoint flash-patch sequence shall, by default, **snapshot the target peripheral I/O register window before the NVMPROG reset and write it back after re-entering OCD**, restoring the configured wake source regardless of which peripheral (timer, USART, pin-change, …) it is — the firmware need not even use a system tick. As a complementary measure the application shall also assert `CLK_REQ` (bit 0 of `ASI_SYS_CTRLA`) on entering OCD so the system clock keeps running through `SLEEP`. A `--sleep` command-line switch shall disable both behaviours, leaving native target sleep/power characteristics intact (for power-path debugging). This is a UPDI/OCD-layer behaviour and benefits both the GDB-RSP and DAP front-ends. (Sleep modes below IDLE — Standby/Power-Down — may additionally require `RUN_STBY`/`RUN_TIME` in the memory-mapped OCD control register; the exact AVR-Dx OCD-v1 location must be confirmed against `doc/reference/guesswork.md` and is out of scope here.)]]></text>
         <traces>
           <trace target="SDD" ref="4.3.1"/>
         </traces>
@@ -2200,7 +2200,14 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <llr id="LLR-UPDI-35">
         <text><![CDATA[The debug-in-sleep policy (HLR-077) shall be a process-global flag, enabled by default, controlled by `updi_set_debug_in_sleep(bool enable)`. `updi_enter_debug()`, immediately after confirming the `STOPPED` bit (the success path), shall call `updi_apply_debug_in_sleep(fd)`, which — when the policy is enabled — issues `STCS ASI_SYS_CTRLA = ASI_SYS_CTRLA_CLKREQ` (bytes `0x55 0xCA 0x01`: SYNCH, `STCS|0x0A`, `CLK_REQ`) to keep the system clock running through `SLEEP`, and — when disabled — performs no write and returns 0. Because the flag is process-global, the policy is honoured at every `updi_enter_debug()` call site (startup and post-`monitor reset`). `updi_apply_debug_in_sleep()` returns 0 on success (including the disabled no-op) or −1 on a UPDI link error.]]></text>
         <traces>
-          <trace target="HLR" ref="HLR-077" name="Debug-in-Sleep (keep the system clock alive across SLEEP)"/>
+          <trace target="HLR" ref="HLR-077" name="Debug-in-Sleep (preserve the wake source across the SW-breakpoint reset)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-UPDI-36">
+        <text><![CDATA[`updi_save_peripherals(fd, buf)` and `updi_restore_peripherals(fd, buf)` shall snapshot and restore the target peripheral I/O register window `[UPDI_PERIPH_BASE, UPDI_PERIPH_BASE + UPDI_PERIPH_LEN)` = `[0x0040, 0x0C00)` via `updi_mem_read()` / `updi_mem_write()`, so the firmware's configured `SLEEP` wake source survives the NVMPROG system reset of a SW-breakpoint flash patch (HLR-077). The window spans the extended-I/O peripherals (RSTCTRL, SLPCTRL, CLKCTRL, CPUINT, RTC, EVSYS, PORTMUX, PORTs, TCA/TCB, USART, SPI, TWI, AC/ADC/DAC); the low I/O `0x00..0x3F` (CPU core registers + VPORTs — restored separately via the OCD register file and the PORT registers) and NVMCTRL (`0x1000`) are excluded. Both functions shall be gated by the debug-in-sleep flag (LLR-UPDI-35): when disabled (`--sleep`) each shall return 0 immediately without any UPDI traffic. They return 0 on success or −1 on a UPDI link error.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-077" name="Debug-in-Sleep (preserve the wake source across the SW-breakpoint reset)"/>
         </traces>
       </llr>
     </function>
@@ -2441,9 +2448,10 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-RSP-37">
-        <text><![CDATA[The SW-BP install path shall, for each `Z0` accepted in `RSP_BP_MODE_SW`, (1) snapshot R0–R31 via `updi_ocd_read_gpr()`, SREG via `updi_ocd_read_sreg()`, SP via `updi_ocd_read_sp()`, and PC via `updi_ocd_read_pc()`; (2) read the 2-byte original opcode at `UPDI_FLASH_BASE + (addr & GDB_AVR_ADDR_MASK)` via `updi_mem_read()`; (3) write `{0x98, 0x95}` (`BREAK` opcode, little-endian) to the same FLASH word via `updi_nvm_flash_patch()`; (4) call `updi_enter_debug()` to leave NVMPROG and re-enter OCD; (5) restore R0–R31, SREG, SP, and PC via the matching `updi_ocd_write_*()` primitives; and (6) record `(addr, orig[0], orig[1], in_use=true)` in the first free `RspContext.sw_bp[]` slot. Any UPDI link error during the sequence shall cause the handler to reply `E01` without partially populating the shadow slot.]]></text>
+        <text><![CDATA[The SW-BP install path (`sw_bp_patch_flash()`) shall, for each `Z0` accepted in `RSP_BP_MODE_SW`, (1) snapshot R0–R31 via `updi_ocd_read_gpr()`, SREG via `updi_ocd_read_sreg()`, SP via `updi_ocd_read_sp()`, and PC via `updi_ocd_read_pc()`; (1b) snapshot the target peripheral I/O window via `updi_save_peripherals()` (HLR-077 / LLR-UPDI-36) so the firmware's `SLEEP` wake source survives the NVMPROG reset; (2) read the 2-byte original opcode at `UPDI_FLASH_BASE + (addr & GDB_AVR_ADDR_MASK)` via `updi_mem_read()`; (3) write `{0x98, 0x95}` (`BREAK` opcode, little-endian) to the same FLASH word via `updi_nvm_flash_patch()`; (4) call `updi_enter_debug()` to leave NVMPROG and re-enter OCD; (5a) restore the peripheral I/O window via `updi_restore_peripherals()`; (5b) restore R0–R31, SREG, SP, and PC via the matching `updi_ocd_write_*()` primitives (PC last, per the `pc_dirty` handling of LLR-RSP-50); and (6) record `(addr, orig[0], orig[1], in_use=true)` in the first free `RspContext.sw_bp[]` slot. The peripheral save/restore in (1b)/(5a) is a no-op when debug-in-sleep is disabled (`--sleep`). Any UPDI link error during the sequence shall cause the handler to reply `E01` without partially populating the shadow slot.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-054" name="True Software Breakpoints via Flash BREAK Opcode"/>
+          <trace target="HLR" ref="HLR-077" name="Debug-in-Sleep (preserve the wake source across the SW-breakpoint reset)"/>
         </traces>
       </llr>
 
@@ -3151,7 +3159,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/updi.c unit tests                                        -->
     <!-- ============================================================ -->
-    <file path="tests/test_updi.c" role="unit" count="49">
+    <file path="tests/test_updi.c" role="unit" count="50">
       <header><![CDATA[Unit tests for `src/updi.c`: UART configuration, BREAK/SYNCH/LDCS link initialisation, three-frame block memory read/write, NVM flash programming, OCD-mode entry, OCD execution-control primitives (halt/run/step + poll_halted), OCD register-file access (GPR/SREG/SP/PC) and hardware-breakpoint comparator programming, and console polling. A loopback PTY pair substitutes for real UART hardware; a `--wrap=select` linker shim lets tests inject `select()` timeouts.]]></header>
 
       <test name="updi_open_sets_8e2_raw_half_duplex_via_termios">
@@ -3402,6 +3410,11 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="updi_apply_debug_in_sleep_emits_nothing_when_disabled">
         <purpose><![CDATA[With debug-in-sleep disabled (`updi_set_debug_in_sleep(false)`, the `--sleep` case), call `updi_apply_debug_in_sleep()` over a PTY and verify it returns 0 and sends no bytes — native target sleep behaviour is left intact.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-35"/></traces>
+      </test>
+
+      <test name="updi_save_restore_peripherals_noop_when_disabled">
+        <purpose><![CDATA[With debug-in-sleep disabled (`--sleep`), call `updi_save_peripherals()` and `updi_restore_peripherals()` over a PTY and verify both return 0 and emit no UPDI traffic. (The enabled path issues a peripheral-window UPDI burst and is validated on hardware by the SW-breakpoint-survives-sleep acceptance: a Z0/z0/Z0/continue sequence times out stuck-in-sleep with `--sleep` and hits the post-sleep breakpoint by default.)]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-36"/></traces>
       </test>
     </file>
 

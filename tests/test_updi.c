@@ -492,6 +492,29 @@ static void updi_apply_debug_in_sleep_emits_nothing_when_disabled(void)
     updi_set_debug_in_sleep(true);                /* restore default          */
 }
 
+/* Phase 20: the peripheral snapshot/restore preserved across the SW-breakpoint
+ * NVMPROG reset.  When disabled (--sleep) both are no-ops (return 0, no UPDI
+ * traffic), so native sleep/power behaviour is untouched.  (The enabled path
+ * issues a multi-frame UPDI burst over the peripheral window and is validated
+ * on hardware — see the SW-breakpoint-survives-sleep acceptance.) */
+static void updi_save_restore_peripherals_noop_when_disabled(void)
+{
+    static uint8_t buf[UPDI_PERIPH_LEN];
+    uint8_t got[8];
+    size_t  n;
+
+    open_pty_fixture();
+    updi_set_debug_in_sleep(false);
+
+    TEST_ASSERT_EQUAL_INT(0, updi_save_peripherals(g_slave_fd, buf));
+    TEST_ASSERT_EQUAL_INT(0, updi_restore_peripherals(g_slave_fd, buf));
+
+    n = drain_master(g_master_fd, got, sizeof got);
+    TEST_ASSERT_EQUAL_size_t(0u, n);
+
+    updi_set_debug_in_sleep(true);                /* restore default          */
+}
+
 /* Test 22: console_poll returns pending bytes without halting */
 static void updi_console_poll_returns_pending_bytes_without_halting(void)
 {
@@ -1071,6 +1094,7 @@ int main(void)
     RUN_TEST(updi_step_returns_minus1_when_target_never_acknowledges_stopped);
     RUN_TEST(updi_apply_debug_in_sleep_asserts_clkreq_when_enabled);
     RUN_TEST(updi_apply_debug_in_sleep_emits_nothing_when_disabled);
+    RUN_TEST(updi_save_restore_peripherals_noop_when_disabled);
     RUN_TEST(updi_console_poll_returns_pending_bytes_without_halting);
 
     /* Phase D */

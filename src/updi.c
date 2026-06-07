@@ -977,6 +977,20 @@ int updi_apply_debug_in_sleep(int fd)
     return updi_stcs(fd, ASI_SYS_CTRLA, ASI_SYS_CTRLA_CLKREQ);
 }
 
+int updi_save_peripherals(int fd, uint8_t *buf)
+{
+    if (!g_debug_in_sleep)
+        return 0;   /* native sleep: don't preserve peripheral state */
+    return updi_mem_read(fd, UPDI_PERIPH_BASE, buf, UPDI_PERIPH_LEN);
+}
+
+int updi_restore_peripherals(int fd, const uint8_t *buf)
+{
+    if (!g_debug_in_sleep)
+        return 0;
+    return updi_mem_write(fd, UPDI_PERIPH_BASE, buf, UPDI_PERIPH_LEN);
+}
+
 int updi_halt(int fd)
 {
     struct timespec ts = { 0, 500000L };    /* 0.5 ms */

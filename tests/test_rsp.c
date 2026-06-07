@@ -238,6 +238,10 @@ int __wrap_updi_ocd_emulate_cof_32bit(int fd, uint32_t return_pc,
 int __wrap_updi_console_poll(int u, int r) { (void)u; (void)r; return 0; }
 int __wrap_updi_enter_debug(int fd) { (void)fd; return 0; }
 int __wrap_updi_chip_erase(int fd) { (void)fd; return 0; }
+int __wrap_updi_save_peripherals(int fd, uint8_t *buf);
+int __wrap_updi_save_peripherals(int fd, uint8_t *buf) { (void)fd; (void)buf; return 0; }
+int __wrap_updi_restore_peripherals(int fd, const uint8_t *buf);
+int __wrap_updi_restore_peripherals(int fd, const uint8_t *buf) { (void)fd; (void)buf; return 0; }
 
 int __wrap_updi_ocd_poll_halted(int fd, int timeout_ms)
 {
