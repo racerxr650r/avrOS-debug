@@ -182,6 +182,21 @@ Override automatic AVR family detection. Accepts one of
 unconditionally and the ELF-vs-silicon family mismatch check is
 suppressed. Use this when knowingly debugging an ELF against a
 different silicon family.
+.TP
+.B \-\-sleep
+Allow the target to sleep natively. By default
+.B avrOSdb
+asserts the UPDI
+.B CLK_REQ
+bit on entering OCD so the system clock keeps running through
+.BR SLEEP ,
+which lets the on-chip debugger still catch breakpoints and service
+register reads after the firmware sleeps (e.g. an avrOS application
+idling in
+.BR sysSleep() ).
+Pass
+.B \-\-sleep
+to restore native sleep/power behaviour when debugging power paths.
 .SH DEVICE FAMILY SELECTION
 When
 .B \-\-force\-device

@@ -77,6 +77,11 @@
 #define ASI_SYS_CTRLA   0x0A     /* RW: UROWDONE (b1), CLKREQ (b0)           */
 #define ASI_SYS_STATUS  0x0B     /* RO: ERASEFAIL/SYSRST/INSLEEP/NVMPROG/... */
 
+/* ASI_SYS_CTRLA bits */
+#define ASI_SYS_CTRLA_CLKREQ  0x01u  /* force the system clock to keep running
+                                      * (so the OCD survives the target's
+                                      * SLEEP — "debug in sleep")            */
+
 /* ASI_CTRLA bits (datasheet §35.4.2) */
 #define ASI_CTRLA_IBDLY     0x80    /* Inter-Byte Delay enable                */
 
@@ -156,6 +161,20 @@ int  updi_mem_write(int fd, uint32_t addr, const uint8_t *buf, size_t len);
 int  updi_enter_debug(int fd);
 int  updi_halt(int fd);
 int  updi_run(int fd);
+
+/* ── Debug-in-sleep (Phase 20) ──────────────────────────────────────────────
+ * AVR-Dx stops the system clock on SLEEP, after which the OCD can no longer
+ * detect a BREAK / HW-breakpoint or service register reads until the part
+ * wakes — so breakpoints past an avrOS `sysSleep()` are missed. Asserting
+ * `CLK_REQ` keeps the clock running so the OCD stays live through SLEEP.
+ *
+ * `updi_set_debug_in_sleep()` sets the policy (default: enabled); `--sleep`
+ * disables it to leave native target sleep/power behaviour intact.
+ * `updi_apply_debug_in_sleep()` applies the current policy to a STOPPED target
+ * (asserts CLK_REQ when enabled, no-op when disabled) and is called from
+ * `updi_enter_debug()`; it is exposed for unit testing. */
+void updi_set_debug_in_sleep(bool enable);
+int  updi_apply_debug_in_sleep(int fd);
 int  updi_step(int fd);
 int  updi_step_32bit(int fd, int bp_slot,
                      uint32_t target_pc, bool halt_on_jump);

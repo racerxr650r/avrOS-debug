@@ -945,14 +945,36 @@ int updi_enter_debug(int fd)
         int s = updi_ldcs(fd, ASI_OCD_STATUS);
         if (s < 0) return -1;
         last = s;
-        if (s & ASI_OCD_STATUS_STOPPED)
+        if (s & ASI_OCD_STATUS_STOPPED) {
+            /* Debug-in-sleep: keep the system clock alive so the OCD survives
+             * the target's SLEEP (Phase 20).  No-op when disabled (--sleep). */
+            (void)updi_apply_debug_in_sleep(fd);
             return 0;
+        }
         nanosleep(&ts, NULL);
     }
     fprintf(stderr,
             "updi_enter_debug: STOPPED bit never set (last ASI_OCD_STATUS=0x%02x)\n",
             last & 0xFF);
     return -1;
+}
+
+/* ── Debug-in-sleep policy (Phase 20) ───────────────────────────────────────
+ * Process-global so it is honoured at every updi_enter_debug() call site
+ * (startup and post-`monitor reset`).  Enabled by default; `--sleep` disables
+ * it via updi_set_debug_in_sleep(false) in main before the first enter_debug. */
+static bool g_debug_in_sleep = true;
+
+void updi_set_debug_in_sleep(bool enable)
+{
+    g_debug_in_sleep = enable;
+}
+
+int updi_apply_debug_in_sleep(int fd)
+{
+    if (!g_debug_in_sleep)
+        return 0;   /* leave native sleep behaviour intact */
+    return updi_stcs(fd, ASI_SYS_CTRLA, ASI_SYS_CTRLA_CLKREQ);
 }
 
 int updi_halt(int fd)

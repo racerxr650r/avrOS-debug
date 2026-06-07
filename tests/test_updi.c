@@ -451,6 +451,47 @@ static void updi_step_returns_minus1_when_target_never_acknowledges_stopped(void
     TEST_ASSERT_EQUAL_INT(-1, updi_step(g_slave_fd));
 }
 
+/* Phase 20: debug-in-sleep. When enabled (the default), applying the policy on
+ * a STOPPED target asserts CLK_REQ via STCS ASI_SYS_CTRLA — bytes
+ * { SYNCH=0x55, STCS|0x0A=0xCA, CLK_REQ=0x01 }.  updi_write_bytes() drains its
+ * own 3-byte half-duplex echo, so the echo is prestuffed. */
+static void updi_apply_debug_in_sleep_asserts_clkreq_when_enabled(void)
+{
+    static const uint8_t echo[3] = { 0x55u, 0xCAu, 0x01u };
+    uint8_t got[8];
+    size_t  n;
+
+    open_pty_fixture();
+    updi_set_debug_in_sleep(true);
+    prestuff(g_master_fd, echo, sizeof echo);     /* satisfy the echo read */
+
+    TEST_ASSERT_EQUAL_INT(0, updi_apply_debug_in_sleep(g_slave_fd));
+
+    n = drain_master(g_master_fd, got, sizeof got);
+    TEST_ASSERT_EQUAL_size_t(3u, n);
+    TEST_ASSERT_EQUAL_HEX8(0x55u, got[0]);        /* SYNCH                    */
+    TEST_ASSERT_EQUAL_HEX8(0xCAu, got[1]);        /* STCS | ASI_SYS_CTRLA     */
+    TEST_ASSERT_EQUAL_HEX8(0x01u, got[2]);        /* CLK_REQ                  */
+}
+
+/* When disabled (--sleep), applying the policy is a no-op — nothing is sent,
+ * so native target sleep behaviour is left intact. */
+static void updi_apply_debug_in_sleep_emits_nothing_when_disabled(void)
+{
+    uint8_t got[8];
+    size_t  n;
+
+    open_pty_fixture();
+    updi_set_debug_in_sleep(false);
+
+    TEST_ASSERT_EQUAL_INT(0, updi_apply_debug_in_sleep(g_slave_fd));
+
+    n = drain_master(g_master_fd, got, sizeof got);
+    TEST_ASSERT_EQUAL_size_t(0u, n);
+
+    updi_set_debug_in_sleep(true);                /* restore default          */
+}
+
 /* Test 22: console_poll returns pending bytes without halting */
 static void updi_console_poll_returns_pending_bytes_without_halting(void)
 {
@@ -1028,6 +1069,8 @@ int main(void)
     RUN_TEST(updi_halt_returns_minus1_when_target_never_acknowledges_stopped);
     RUN_TEST(updi_run_returns_minus1_on_stcs_link_failure);
     RUN_TEST(updi_step_returns_minus1_when_target_never_acknowledges_stopped);
+    RUN_TEST(updi_apply_debug_in_sleep_asserts_clkreq_when_enabled);
+    RUN_TEST(updi_apply_debug_in_sleep_emits_nothing_when_disabled);
     RUN_TEST(updi_console_poll_returns_pending_bytes_without_halting);
 
     /* Phase D */

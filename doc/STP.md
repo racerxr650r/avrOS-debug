@@ -59,7 +59,7 @@ Role: **unit**. **37 test(s).**
 
 ### 3.2. [tests/test_updi.c](../tests/test_updi.c)
 
-Role: **unit**. **47 test(s).**
+Role: **unit**. **49 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -111,6 +111,8 @@ Role: **unit**. **47 test(s).**
 | 46 | <a id="updi_crc32_returns_zero_for_empty_buffer"></a>`updi_crc32_returns_zero_for_empty_buffer` | `LLR-UPDI-30` | Call `updi_crc32(NULL, 0)` and assert the result equals `0x00000000` — the canonical IEEE 802.3 CRC-32 of the empty message (verified against zlib and crc32 CLI tools). |
 | 47 | <a id="updi_crc32_matches_known_vector_for_123456789"></a>`updi_crc32_matches_known_vector_for_123456789` | `LLR-UPDI-30` | Call `updi_crc32()` with the canonical IEEE 802.3 / zlib test vector — the 9-byte ASCII string `"123456789"` — and assert the result equals the published expected value `0xCBF43926`. |
 | 48 | <a id="updi_crc32_matches_known_vector_for_single_zero_byte"></a>`updi_crc32_matches_known_vector_for_single_zero_byte` | `LLR-UPDI-30` | Call `updi_crc32()` with a single 0x00 byte and assert the result equals `0xD202EF8D`, the canonical IEEE 802.3 CRC-32 of a one-byte zero message. Confirms that the polynomial reflection, initial value (`0xFFFFFFFF`), and final XOR (`0xFFFFFFFF`) are all implemented correctly even on the shortest non-empty input. |
+| 49 | <a id="updi_apply_debug_in_sleep_asserts_clkreq_when_enabled"></a>`updi_apply_debug_in_sleep_asserts_clkreq_when_enabled` | `LLR-UPDI-35` | With debug-in-sleep enabled (the default, via `updi_set_debug_in_sleep(true)`), call `updi_apply_debug_in_sleep()` over a PTY and verify it emits exactly the STCS bytes `0x55 0xCA 0x01` (SYNCH, `STCS|ASI_SYS_CTRLA`, `CLK_REQ`) — the write that keeps the system clock alive across SLEEP. The 3-byte half-duplex echo is prestuffed so `updi_write_bytes()` completes. |
+| 50 | <a id="updi_apply_debug_in_sleep_emits_nothing_when_disabled"></a>`updi_apply_debug_in_sleep_emits_nothing_when_disabled` | `LLR-UPDI-35` | With debug-in-sleep disabled (`updi_set_debug_in_sleep(false)`, the `--sleep` case), call `updi_apply_debug_in_sleep()` over a PTY and verify it returns 0 and sends no bytes — native target sleep behaviour is left intact. |
 
 ### 3.3. [tests/test_rsp.c](../tests/test_rsp.c)
 
@@ -297,7 +299,7 @@ Role: **integration**. **8 test(s).**
 
 ### 3.9. [tests/test_device.c](../tests/test_device.c)
 
-Role: **unit**. **8 test(s).**
+Role: **unit**. **9 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -307,8 +309,9 @@ Role: **unit**. **8 test(s).**
 | 4 | <a id="parse_args_rejects_rsp_combined_with_dap"></a>`parse_args_rejects_rsp_combined_with_dap` | `LLR-MAIN-24` | Fork a subprocess that calls `parse_args()` with `--rsp --dap /dev/ttyUSB0 fw.elf`; assert the child exits with status 1 and that captured stderr contains `"--rsp and --dap are mutually exclusive"`. |
 | 5 | <a id="updi_read_device_info_returns_sigrow_and_asi_bytes"></a>`updi_read_device_info_returns_sigrow_and_asi_bytes` | `LLR-UPDI-13` | Open a PTY pair; in a helper thread script the slave end to echo half-duplex bytes and respond to a SIGROW DEVICEID read at `0x1100`-`0x1102` with canned signature `0x1E 0x97 0x0A`, a SYSCFG.REVID read at `0x0F01` returning `0xA6`, a SIGROW.SERNUM read at `0x1110`-`0x111F` returning a canned 16-byte serial number, and to LDCS reads of SYS_STATUS / KEY_STATUS / STATUSB. Call `updi_read_device_info()` and assert all struct fields match the canned values and that the function returns 0 with `info.fail_op == NULL`. |
 | 6 | <a id="updi_read_device_info_reports_failed_step_on_nak"></a>`updi_read_device_info_reports_failed_step_on_nak` | `LLR-UPDI-13` | Drive the PTY harness to return an unexpected byte in place of the SIGROW response. Assert `updi_read_device_info()` returns -1, `info.fail_op` equals the string `"sigrow"`, and `info.fail_errno` is negative. |
-| 7 | <a id="run_device_mode_prints_report_to_stdout"></a>`run_device_mode_prints_report_to_stdout` | `LLR-MAIN-09` | Capture `stdout` from `run_device_mode()` driven by the PTY harness with signature `0x1E 0x97 0x0A`. Assert the captured output contains the literal lines `Serial device:`, `Baud rate:`, `Signature:`, `Family:`, `Revision:`, `Serial:`, and `UPDI status:` (case-sensitive prefix match). |
-| 8 | <a id="device_mode_does_not_call_rsp_listen"></a>`device_mode_does_not_call_rsp_listen` | `LLR-MAIN-09` | Link the test binary with a stub `rsp_listen()` that flags a global. Invoke `run_device_mode()` to completion and assert the flag remains clear, proving the diagnostic path bypasses GDB listener startup. |
+| 7 | <a id="parse_args_sleep_flag_disables_debug_in_sleep"></a>`parse_args_sleep_flag_disables_debug_in_sleep` | `LLR-MAIN-25` | Verify `parse_args()` defaults `cfg.debug_in_sleep` to true and that passing `--sleep` sets it false (HLR-077 / LLR-MAIN-25). |
+| 8 | <a id="run_device_mode_prints_report_to_stdout"></a>`run_device_mode_prints_report_to_stdout` | `LLR-MAIN-09` | Capture `stdout` from `run_device_mode()` driven by the PTY harness with signature `0x1E 0x97 0x0A`. Assert the captured output contains the literal lines `Serial device:`, `Baud rate:`, `Signature:`, `Family:`, `Revision:`, `Serial:`, and `UPDI status:` (case-sensitive prefix match). |
+| 9 | <a id="device_mode_does_not_call_rsp_listen"></a>`device_mode_does_not_call_rsp_listen` | `LLR-MAIN-09` | Link the test binary with a stub `rsp_listen()` that flags a global. Invoke `run_device_mode()` to completion and assert the flag remains clear, proving the diagnostic path bypasses GDB listener startup. |
 
 ### 3.10. [tests/hw/hw_test.c](../tests/hw/hw_test.c)
 
@@ -421,6 +424,7 @@ verified by code review — see
 | `LLR-MAIN-21` | `main` | `HLR-055` | `parse_args_allow_erase_sets_flag`, `parse_args_allow_erase_defaults_false` |
 | `LLR-MAIN-23` | `main` | `HLR-068` | `test_parse_args_log_rsp_sets_flag` |
 | `LLR-MAIN-24` | `main` | `HLR-074` | `parse_args_mode_defaults_to_rsp_and_honours_dap_rsp`, `parse_args_rejects_rsp_combined_with_dap` |
+| `LLR-MAIN-25` | `main` | `HLR-077` | `parse_args_sleep_flag_disables_debug_in_sleep` |
 | `LLR-MAIN-22` | `main` | `HLR-065` | `test_sig_handler_records_signo_in_g_shutdown_signal`, `test_event_loop_clears_disconnect_reason_after_drain` |
 | `LLR-UPDI-01` | `updi` | `HLR-006` | `updi_open_sets_8e2_raw_half_duplex_via_termios`, `updi_open_returns_minus1_on_device_open_failure` |
 | `LLR-UPDI-02` | `updi` | `HLR-006`, `HLR-036` | `updi_open_asserts_wake_byte_then_stcs_ctrlb`, `updi_open_restores_session_baud_after_break` |
@@ -456,6 +460,7 @@ verified by code review — see
 | `LLR-UPDI-32` | `updi` | `HLR-051` | `F2_fuse_pretty_print_round_trip` |
 | `LLR-UPDI-33` | `updi` | `HLR-007`, `HLR-008` | `updi_mem_read_uses_repeat_ld_auto_increment_sequence`, `G17_local_variable_values_and_backtrace` |
 | `LLR-UPDI-34` | `updi` | `HLR-054` | `continue_after_sw_bp_install_injects_leading_instruction`, `step_after_sw_bp_install_injects_leading_instruction` |
+| `LLR-UPDI-35` | `updi` | `HLR-077` | `updi_apply_debug_in_sleep_asserts_clkreq_when_enabled`, `updi_apply_debug_in_sleep_emits_nothing_when_disabled` |
 | `LLR-RSP-01` | `rsp` | `HLR-003`, `HLR-038` | `rsp_listen_sets_so_reuseaddr_before_bind`, `rsp_accept_sets_tcp_nodelay_on_client_socket` |
 | `LLR-RSP-02` | `rsp` | `HLR-013` | `rsp_recv_packet_discards_leading_ack_nak_bytes`, `rsp_recv_packet_sends_plus_on_valid_checksum`, `rsp_recv_packet_sends_minus_and_returns_minus1_on_bad_checksum` |
 | `LLR-RSP-03` | `rsp` | `HLR-014` | `on_read_regs_g_returns_78_char_hex_string`, `on_read_regs_g_places_pc_little_endian_at_positions_70_77` |

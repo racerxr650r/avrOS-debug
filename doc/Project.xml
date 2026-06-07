@@ -1614,6 +1614,13 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="SDD" ref="5.1"/>
         </traces>
       </hlr>
+
+      <hlr id="HLR-077" name="Debug-in-Sleep (keep the system clock alive across SLEEP)">
+        <text><![CDATA[On AVR-Dx the system clock stops when the CPU executes `SLEEP`, after which the OCD can no longer detect a `BREAK` / hardware-breakpoint match or service register/memory reads until the part wakes — so breakpoints set past a sleep (e.g. an avrOS application idling in `sysSleep()` → `SLEEP_MODE_IDLE` between dispatches) are never caught. To prevent this, the application shall, by default, assert `CLK_REQ` (bit 0 of `ASI_SYS_CTRLA`) once when it enters OCD, forcing the system clock to keep running so the OCD stays live through `SLEEP`. The assertion shall be applied at every `updi_enter_debug()` success (session start and any later re-entry, e.g. after `monitor reset`). A `--sleep` command-line switch shall disable this behaviour so the target sleeps natively and its real power/timing characteristics are preserved (for power-path debugging); when disabled, no `CLK_REQ` write is issued. This is a UPDI/OCD-layer behaviour and therefore benefits both the GDB-RSP and DAP front-ends. (Sleep modes below IDLE — Standby/Power-Down — additionally require `RUN_STBY`/`RUN_TIME` in the memory-mapped OCD control register; the exact AVR-Dx OCD-v1 location must be confirmed against `doc/reference/guesswork.md` before that path is implemented and is out of scope for the IDLE fix.)]]></text>
+        <traces>
+          <trace target="SDD" ref="4.3.1"/>
+        </traces>
+      </hlr>
     </section>
 
     <section number="11" title="CI-Grade Loader and Link Diagnostics">
@@ -1923,6 +1930,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         </traces>
       </llr>
 
+      <llr id="LLR-MAIN-25">
+        <text><![CDATA[`parse_args()` shall recognise `--sleep` as a boolean flag that sets `cfg->debug_in_sleep = false`; the default initialiser shall set `cfg->debug_in_sleep = true` (debug-in-sleep enabled). Before the startup `updi_enter_debug()` call, `app_main()` shall apply the policy with `updi_set_debug_in_sleep(cfg.debug_in_sleep)` so the choice takes effect at that entry and every later re-entry (HLR-077, LLR-UPDI-35). The usage/`--help` text and the man page shall document that `--sleep` restores native target sleep (the debugger otherwise keeps the system clock alive so breakpoints fire after the firmware sleeps).]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-077" name="Debug-in-Sleep (keep the system clock alive across SLEEP)"/>
+        </traces>
+      </llr>
+
       <llr id="LLR-MAIN-22">
         <text><![CDATA[`main()` and `event_loop()` shall emit lifecycle log lines to `stderr` per HLR-065. Specifically: (a) immediately after `rsp_listen()` returns a non-negative fd in `app_main()`, print `"avrOSdb: listening on :%u\n"` with `cfg.gdb_port`; (b) inside `event_loop()`, after every successful `rsp_accept()` that yields a non-negative fd, call `getpeername()` on the new fd and print `"avrOSdb: client connected from %s:%u\n"` with the dotted-quad IPv4 address and port from the returned `sockaddr_in`; on `getpeername()` failure print `"avrOSdb: client connected from <unknown>\n"`; (c) when `rsp_recv_packet()` returns 0 print `"avrOSdb: client disconnected (EOF)\n"` before closing the fd, when it returns negative print `"avrOSdb: client disconnected (read error: %s)\n"` with `strerror(errno)`; (d) after `rsp_dispatch_n()` returns, if `gdb_fd < 0` (the handler closed the socket) and `rctx.disconnect_reason != NULL`, print `"avrOSdb: client disconnected (%s)\n"` with that reason and clear the field by setting it to `NULL`; if instead `gdb_fd >= 0` but `disconnect_reason != NULL` (vKill while listener-survival is still TODO), print the same line, then close `gdb_fd` and clear it locally; (e) immediately after `event_loop()` returns in `app_main()`, before the `teardown:` label runs, print `"avrOSdb: shutting down (%s)\n"` where the reason is selected from a `volatile sig_atomic_t g_shutdown_signal` set by `sig_handler()` (`SIGINT`/`SIGTERM`) when applicable, defaulting to `"fatal: <best-effort context>"` for any other quit path. The signal handler shall record `signo` into `g_shutdown_signal` in addition to setting `g_quit = 1`. All log lines shall use `fprintf(stderr, ...)` followed by `fflush(stderr)`; no new flag gates them and they shall not be emitted on `stdout`. Duplicate emissions for the same transition are forbidden — only one disconnect line per fd-close.]]></text>
         <traces>
@@ -2180,6 +2194,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <text><![CDATA[`updi_ocd_step_inject_word0(fd, word0)` shall execute exactly one instruction at the current program counter by *injecting* its first opcode word and single-stepping, rather than letting the core fetch from Flash. It shall write the low and high bytes of `word0` to `OCD_INSN0` / `OCD_INSN0+1` and then call `updi_step()` WITHOUT setting `OCD_CTRL0.PCHOLD`, so the core executes the injected instruction and advances the PC normally (per `doc/reference/guesswork.md`: a single-word instruction advances PC by one; for a two-word instruction only the first word is injected and the second word is fetched from Flash, advancing PC by two). The CPU must be halted on entry and remains halted on return; the function returns 0 on success or −1 on any UPDI error. This is the canonical "step over a software `BREAK` / freshly-written PC" primitive: because the opcode is fed to the core directly, it reliably executes the real instruction regardless of (a) a `BREAK` opcode patched into Flash at PC, or (b) the one-instruction skip the silicon performs on the first step/run after a fresh `OCD.PC` write (the inverse hazard documented for `updi_ocd_write_pc()`). It is consumed by the RSP resume path (LLR-RSP-50).]]></text>
         <traces>
           <trace target="HLR" ref="HLR-054" name="True Software Breakpoints via Flash BREAK Opcode"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-UPDI-35">
+        <text><![CDATA[The debug-in-sleep policy (HLR-077) shall be a process-global flag, enabled by default, controlled by `updi_set_debug_in_sleep(bool enable)`. `updi_enter_debug()`, immediately after confirming the `STOPPED` bit (the success path), shall call `updi_apply_debug_in_sleep(fd)`, which — when the policy is enabled — issues `STCS ASI_SYS_CTRLA = ASI_SYS_CTRLA_CLKREQ` (bytes `0x55 0xCA 0x01`: SYNCH, `STCS|0x0A`, `CLK_REQ`) to keep the system clock running through `SLEEP`, and — when disabled — performs no write and returns 0. Because the flag is process-global, the policy is honoured at every `updi_enter_debug()` call site (startup and post-`monitor reset`). `updi_apply_debug_in_sleep()` returns 0 on success (including the disabled no-op) or −1 on a UPDI link error.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-077" name="Debug-in-Sleep (keep the system clock alive across SLEEP)"/>
         </traces>
       </llr>
     </function>
@@ -3130,7 +3151,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/updi.c unit tests                                        -->
     <!-- ============================================================ -->
-    <file path="tests/test_updi.c" role="unit" count="47">
+    <file path="tests/test_updi.c" role="unit" count="49">
       <header><![CDATA[Unit tests for `src/updi.c`: UART configuration, BREAK/SYNCH/LDCS link initialisation, three-frame block memory read/write, NVM flash programming, OCD-mode entry, OCD execution-control primitives (halt/run/step + poll_halted), OCD register-file access (GPR/SREG/SP/PC) and hardware-breakpoint comparator programming, and console polling. A loopback PTY pair substitutes for real UART hardware; a `--wrap=select` linker shim lets tests inject `select()` timeouts.]]></header>
 
       <test name="updi_open_sets_8e2_raw_half_duplex_via_termios">
@@ -3371,6 +3392,16 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="updi_crc32_matches_known_vector_for_single_zero_byte">
         <purpose><![CDATA[Call `updi_crc32()` with a single 0x00 byte and assert the result equals `0xD202EF8D`, the canonical IEEE 802.3 CRC-32 of a one-byte zero message. Confirms that the polynomial reflection, initial value (`0xFFFFFFFF`), and final XOR (`0xFFFFFFFF`) are all implemented correctly even on the shortest non-empty input.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-30"/></traces>
+      </test>
+
+      <test name="updi_apply_debug_in_sleep_asserts_clkreq_when_enabled">
+        <purpose><![CDATA[With debug-in-sleep enabled (the default, via `updi_set_debug_in_sleep(true)`), call `updi_apply_debug_in_sleep()` over a PTY and verify it emits exactly the STCS bytes `0x55 0xCA 0x01` (SYNCH, `STCS|ASI_SYS_CTRLA`, `CLK_REQ`) — the write that keeps the system clock alive across SLEEP. The 3-byte half-duplex echo is prestuffed so `updi_write_bytes()` completes.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-35"/></traces>
+      </test>
+
+      <test name="updi_apply_debug_in_sleep_emits_nothing_when_disabled">
+        <purpose><![CDATA[With debug-in-sleep disabled (`updi_set_debug_in_sleep(false)`, the `--sleep` case), call `updi_apply_debug_in_sleep()` over a PTY and verify it returns 0 and sends no bytes — native target sleep behaviour is left intact.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-35"/></traces>
       </test>
     </file>
 
@@ -4143,7 +4174,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- Device-signature diagnostic mode tests (Phase 7)             -->
     <!-- ============================================================ -->
-    <file path="tests/test_device.c" role="unit" count="8">
+    <file path="tests/test_device.c" role="unit" count="9">
       <header><![CDATA[Unit and harness-level tests covering the `--device` one-shot diagnostic mode and the `--rsp`/`--dap` front-end selection: argument parsing, mutual exclusion (with `--load`, and between `--rsp`/`--dap`), `updi_read_device_info()` success and failure paths over a PTY, the human-readable report format, and verification that the diagnostic path bypasses the GDB listener.]]></header>
 
       <test name="parse_args_accepts_device_flag_without_elf_operand">
@@ -4174,6 +4205,11 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="updi_read_device_info_reports_failed_step_on_nak">
         <purpose><![CDATA[Drive the PTY harness to return an unexpected byte in place of the SIGROW response. Assert `updi_read_device_info()` returns -1, `info.fail_op` equals the string `"sigrow"`, and `info.fail_errno` is negative.]]></purpose>
         <traces><trace target="LLR" ref="LLR-UPDI-13"/></traces>
+      </test>
+
+      <test name="parse_args_sleep_flag_disables_debug_in_sleep">
+        <purpose><![CDATA[Verify `parse_args()` defaults `cfg.debug_in_sleep` to true and that passing `--sleep` sets it false (HLR-077 / LLR-MAIN-25).]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-25"/></traces>
       </test>
 
       <test name="run_device_mode_prints_report_to_stdout">
