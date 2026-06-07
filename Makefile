@@ -31,7 +31,9 @@
 #   uninstall    Remove files placed by `install` (idempotent)
 #   bundle       Build dist/ packages: .deb, .rpm, Homebrew formula
 #   prereqs      Install all dev prerequisites via apt and download the AVR-Dx DFP
-#                (Debian/Ubuntu only; requires sudo)
+#                (Debian/Ubuntu only; requires sudo). Also runs prereqs-nvim.
+#   prereqs-nvim Set up Neovim for DAP debugging: install nvim-dap + the avrOSdb
+#                DAP config into ~/.config/nvim/init.lua (idempotent; no sudo)
 #   help         Print this target list
 #
 # Variables:
@@ -733,7 +735,8 @@ bundle-brew: $(BUILDDIR)/$(TARGET) $(MANPAGE)
 # (dpkg-deb, rpmbuild, ruby) and the man(1) renderer used by tests, plus
 # the elfutils dev libraries (libdw/libelf) that enable the optional
 # DWARF source-level features auto-detected by the build (see the DWARF
-# block above and doc/reference/dual-protocol-architecture.md).
+# block above and doc/reference/dual-protocol-architecture.md).  Finally it
+# sets up Neovim for DAP debugging via `make prereqs-nvim` (below).
 .PHONY: prereqs
 prereqs:
 	@echo "── Installing apt packages ──────────────────────────────────────"
@@ -748,7 +751,38 @@ prereqs:
 	sudo mkdir -p $(dir $(DFP))
 	sudo cp -R /tmp/Atmel.AVR-Dx_DFP.$(DFP_VER) $(DFP)
 	rm -rf /tmp/Atmel.AVR-Dx_DFP.$(DFP_VER) /tmp/$(DFP_PACK)
+	@$(MAKE) --no-print-directory prereqs-nvim
 	@echo "── Prerequisites installed successfully ──────────────────────"
+
+# ── prereqs-nvim target ───────────────────────────────────────────────────────
+# Set up Neovim for DAP debugging of `avrOSdb --dap`: install nvim-dap as a
+# native Neovim package and install the avrOSdb DAP config into the user's
+# init.lua.  Idempotent and non-destructive: an existing init.lua is never
+# clobbered — the marked config block (tools/nvim/avrosdb-dap.lua) is appended
+# only if not already present.  Edits the invoking user's HOME (no sudo).
+NVIM_PACK_DIR := $(HOME)/.local/share/nvim/site/pack/dap/start/nvim-dap
+NVIM_INIT     := $(HOME)/.config/nvim/init.lua
+NVIM_DAP_CFG  := tools/nvim/avrosdb-dap.lua
+.PHONY: prereqs-nvim
+prereqs-nvim:
+	@echo "── Neovim nvim-dap setup ─────────────────────────────────────"
+	@if [ -d "$(NVIM_PACK_DIR)/.git" ]; then \
+	    echo "  nvim-dap already installed at $(NVIM_PACK_DIR)"; \
+	else \
+	    mkdir -p "$(dir $(NVIM_PACK_DIR))"; \
+	    git clone --depth=1 https://github.com/mfussenegger/nvim-dap "$(NVIM_PACK_DIR)"; \
+	fi
+	@mkdir -p "$(dir $(NVIM_INIT))"
+	@if [ ! -f "$(NVIM_INIT)" ]; then \
+	    cp "$(NVIM_DAP_CFG)" "$(NVIM_INIT)"; \
+	    echo "  wrote $(NVIM_INIT)"; \
+	elif grep -q "avrOSdb DAP config" "$(NVIM_INIT)"; then \
+	    echo "  avrOSdb DAP config already present in $(NVIM_INIT)"; \
+	else \
+	    printf '\n' >> "$(NVIM_INIT)"; \
+	    cat "$(NVIM_DAP_CFG)" >> "$(NVIM_INIT)"; \
+	    echo "  appended avrOSdb DAP config to $(NVIM_INIT)"; \
+	fi
 # ── clean target ──────────────────────────────────────────────────────────────
 .PHONY: clean
 clean:

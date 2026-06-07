@@ -666,7 +666,13 @@ was started with `--allow-erase`.
 
 ---
 
-## 6. VS Code Integration
+## 6. Editor Integration
+
+`avrOSdb` supports two editor paths: **VS Code** over GDB RSP today (via an
+external `avr-gdb`), and an in-development **native DAP** front-end
+(`avrOSdb --dap`) that DAP-native editors such as Neovim talk to directly.
+
+### 6.1 VS Code (Cortex-Debug, via GDB RSP)
 
 `avrOSdb` speaks standard GDB RSP. While many debug adapters support RSP, the **cortex-debug** extension is the only officially tested extension for `avrOSdb` integration in VS Code.
 
@@ -734,6 +740,55 @@ For a more polished UPDI/AVR-specific UI, the
 extension can be configured similarly with `"servertype": "external"`
 and `"gdbTarget": "localhost:1234"` — useful when an external GDB
 launch script already manages the stub.
+
+### 6.2 Neovim (nvim-dap) — native DAP front-end
+
+`avrOSdb --dap` serves the Debug Adapter Protocol directly, so Neovim's
+[nvim-dap](https://github.com/mfussenegger/nvim-dap) plugin can debug the target
+with **no `avr-gdb` in the loop**.
+
+> [!NOTE]
+> The native DAP front-end is being built up in phases. It currently performs
+> the connection handshake — attach, stop the target at entry, list the CPU
+> thread, and disconnect; source-level stepping, breakpoints, and variable
+> inspection land in subsequent phases. The RSP path (§6.1) remains the
+> full-featured route in the meantime.
+
+**One-time setup.** `make prereqs` (or just `make prereqs-nvim`) installs
+nvim-dap as a native Neovim package and installs the avrOSdb DAP config into
+`~/.config/nvim/init.lua` — idempotent, and it never clobbers an existing
+config (it appends a clearly-marked block if one is absent). Equivalently, by
+hand:
+
+```bash
+# install nvim-dap as a native package (auto-loaded; no plugin manager)
+git clone --depth=1 https://github.com/mfussenegger/nvim-dap \
+    ~/.local/share/nvim/site/pack/dap/start/nvim-dap
+
+# install the avrOSdb DAP config (adapter + attach config + keymaps)
+mkdir -p ~/.config/nvim
+cat tools/nvim/avrosdb-dap.lua >> ~/.config/nvim/init.lua
+```
+
+The config (`tools/nvim/avrosdb-dap.lua`) defines a `server`-type adapter that
+connects to `127.0.0.1:1234` (override with `vim.g.avrosdb_dap_host` /
+`vim.g.avrosdb_dap_port`), an **attach** configuration for C/C++ buffers, and
+debugger keymaps (`<F5>` continue/attach, `<F10>/<F11>/<F12>` step
+over/into/out, `<F9>` toggle breakpoint, `<F6>` terminate, `<leader>dr` REPL).
+
+**Use it:**
+
+```bash
+# 1. start the DAP server on the target host
+build/avrOSdb --dap --port 1234 /dev/ttyAMA2 firmware.elf
+
+# 2. in Neovim, open a source file and attach:
+#      <F5>            (picks the "Attach to avrOSdb (--dap)" config), or
+#      :DapAvrOSdb     (optionally :DapAvrOSdb <host> <port>)
+```
+
+An automated on-target acceptance harness drives this same path headlessly:
+`make hw-test-dap` (see §7 / the Makefile).
 
 ---
 
