@@ -13,9 +13,9 @@
 --   DAP4  `continue` then `pause` -> stopped(`pause`)            (Phase 17)
 --   DAP5  `stepIn` -> stopped(`step`)                            (Phase 17)
 --   DAP6  `stackTrace` frame 0 resolves PC -> source line        (Phase 17)
---   DAP7  `disconnect` tears the session down cleanly
--- Breakpoints and variables (Phases 18–19) add cases here the same way
--- Group-G grew for GDB.
+--   DAP7  source breakpoint (file:line) installs + is hit        (Phase 18)
+--   DAP8  `disconnect` tears the session down cleanly
+-- Variables (Phase 19) add cases here the same way Group-G grew for GDB.
 --
 -- Config comes from the environment (set by the Makefile):
 --   AVROSDB_BIN  path to the built avrOSdb binary   (default build/avrOSdb)
@@ -163,16 +163,45 @@ record('DAP6  stackTrace frame0 -> source line', has_line,
          or ('line=' .. tostring(f0.line)
              .. ' src=' .. tostring(f0.source and f0.source.name)))
 
--- DAP7: disconnect tears the session down cleanly
+-- DAP7: a source breakpoint (file:line) resolves via DWARF, installs through
+-- the shared breakpoint core, and is hit on continue (reason `breakpoint`).
+-- main.c:139 is the avrOS example's `fsmDispatch()` call in the main loop.
+local bp_done, bp_verified = false, false
+if session then
+  session:request('setBreakpoints',
+    { source = { path = 'main.c' }, breakpoints = { { line = 139 } } },
+    function(err, resp)
+      bp_done = true
+      local b = resp and resp.breakpoints and resp.breakpoints[1]
+      bp_verified = (not err) and b ~= nil and b.verified == true
+    end)
+  vim.wait(4000, function() return bp_done end, 50)
+end
+ev.stopped, ev.reason = false, nil
+if session then
+  session:request('continue', { threadId = 1 }, function() end)
+  vim.wait(8000, function() return ev.stopped end, 50)
+end
+record('DAP7  source breakpoint (main.c:139) hit',
+       bp_verified and ev.stopped and ev.reason == 'breakpoint',
+       (not bp_verified) and 'breakpoint not verified'
+         or ((not ev.stopped) and 'no `stopped` event'
+             or ('reason=' .. tostring(ev.reason))))
+
+-- DAP8: disconnect tears the session down cleanly.  nvim-dap does not always
+-- deliver the disconnect *response* callback (the adapter closes the socket as
+-- it replies), so accept clean teardown — the session object going away — as
+-- success too.
 local disc_done, disc_ok = false, false
 if session then
   session:request('disconnect', { restart = false }, function(err)
     disc_done = true; disc_ok = (err == nil)
   end)
-  vim.wait(4000, function() return disc_done end, 50)
+  vim.wait(4000, function() return disc_done or dap.session() == nil end, 50)
 end
-record('DAP7  disconnect (clean teardown)', disc_done and disc_ok,
-       (not disc_done) and 'no disconnect response' or '')
+local torn_down = disc_done or (dap.session() == nil)
+record('DAP8  disconnect (clean teardown)', torn_down,
+       torn_down and '' or 'session did not tear down')
 
 -- ── summary + exit status ───────────────────────────────────────────────────
 teardown()

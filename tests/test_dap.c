@@ -364,6 +364,74 @@ void test_dap_scopes_returns_empty(void)
     close(sp[0]); close(sp[1]);
 }
 
+/* ── Phase 18: source breakpoints ─────────────────────────────────────────── */
+
+void test_dap_set_breakpoints_responds_with_per_line_entries(void)
+{
+    int sp[2];
+    TEST_ASSERT_EQUAL_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sp));
+    dap_session s = { sp[1], -1, NULL, NULL, NULL, false, 0 };
+    dap_bp_reset(&s);
+
+    /* Two source breakpoints; no ELF/target in the unit test, so they resolve
+     * unverified — but the per-line response shape (ids, lines) is exercised. */
+    const char *req =
+        "{\"seq\":20,\"command\":\"setBreakpoints\",\"arguments\":{"
+        "\"source\":{\"path\":\"main.c\"},"
+        "\"breakpoints\":[{\"line\":139},{\"line\":141,\"condition\":\"n==3\"}]}}";
+    TEST_ASSERT_EQUAL_INT(0, dap_dispatch(&s, req, strlen(req)));
+
+    char buf[1024]; size_t len;
+    TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"command\":\"setBreakpoints\""));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"breakpoints\":["));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"id\":1"));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"line\":139"));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"id\":2"));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"line\":141"));
+    /* Two entries recorded in the session table; condition captured. */
+    TEST_ASSERT_TRUE(s.bps[0].in_use && s.bps[1].in_use);
+    TEST_ASSERT_EQUAL_INT(139, s.bps[0].line);
+    TEST_ASSERT_EQUAL_STRING("n==3", s.bps[1].condition);
+    TEST_ASSERT_EQUAL_INT(3, s.next_bp_id);
+
+    close(sp[0]); close(sp[1]);
+}
+
+/* A second setBreakpoints for the same source replaces the prior set. */
+void test_dap_set_breakpoints_replaces_prior_set_for_source(void)
+{
+    int sp[2];
+    TEST_ASSERT_EQUAL_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sp));
+    dap_session s = { sp[1], -1, NULL, NULL, NULL, false, 0 };
+    dap_bp_reset(&s);
+
+    const char *r1 =
+        "{\"seq\":1,\"command\":\"setBreakpoints\",\"arguments\":{"
+        "\"source\":{\"path\":\"main.c\"},\"breakpoints\":[{\"line\":10},{\"line\":20}]}}";
+    TEST_ASSERT_EQUAL_INT(0, dap_dispatch(&s, r1, strlen(r1)));
+    char buf[1024]; size_t len;
+    (void)dap_read_message(sp[0], buf, sizeof buf, &len);
+
+    const char *r2 =
+        "{\"seq\":2,\"command\":\"setBreakpoints\",\"arguments\":{"
+        "\"source\":{\"path\":\"main.c\"},\"breakpoints\":[{\"line\":30}]}}";
+    TEST_ASSERT_EQUAL_INT(0, dap_dispatch(&s, r2, strlen(r2)));
+    (void)dap_read_message(sp[0], buf, sizeof buf, &len);
+
+    /* Only the single line-30 breakpoint remains in the table. */
+    int live = 0, line30 = 0;
+    for (int i = 0; i < DAP_MAX_BREAKPOINTS; i++) {
+        if (!s.bps[i].in_use) continue;
+        live++;
+        if (s.bps[i].line == 30) line30 = 1;
+    }
+    TEST_ASSERT_EQUAL_INT(1, live);
+    TEST_ASSERT_TRUE(line30);
+
+    close(sp[0]); close(sp[1]);
+}
+
 /* dap_serve(): accept (via the rsp_accept stub) one client whose request
  * stream is pre-loaded, run the select/read/dispatch loop, and return 0 when
  * the client disconnects. */
@@ -419,6 +487,8 @@ int main(void)
     RUN_TEST(test_dap_step_emits_stopped_step);
     RUN_TEST(test_dap_stack_trace_returns_one_frame);
     RUN_TEST(test_dap_scopes_returns_empty);
+    RUN_TEST(test_dap_set_breakpoints_responds_with_per_line_entries);
+    RUN_TEST(test_dap_set_breakpoints_replaces_prior_set_for_source);
     RUN_TEST(test_dap_serve_runs_handshake_to_disconnect);
     return UNITY_END();
 }

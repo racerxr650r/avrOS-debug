@@ -1629,6 +1629,14 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="SDD" ref="5.1"/>
         </traces>
       </hlr>
+
+      <hlr id="HLR-079" name="DAP Source Breakpoints">
+        <text><![CDATA[The DAP front-end shall implement `setBreakpoints` for source-level breakpoints, installed through the shared breakpoint core (debug_bp.h, HLR-054/055/016) — exactly the HW-comparator arbiter + SW-`BREAK` model the GDB-RSP front-end uses. For each requested `{line[,condition]}` against `arguments.source.path`, the adapter shall resolve the source line to a code byte address with libdw (`elf_line_to_addr()`, HLR-072) and, when a target is attached, install it via the core (`bp_insert`, `auto` mode: a free OCD comparator else a SW FLASH-`BREAK`). The response shall carry a `breakpoints` array — one entry per request in order, each with an `id`, a `verified` flag (true when resolved-and-installed), and the `line`. A `setBreakpoints` call shall **replace** the full breakpoint set for that source (the prior set for the same path is removed from silicon first). When the target later halts on an installed breakpoint, the `stopped` event (HLR-078) shall carry reason `breakpoint` and the matching `hitBreakpointIds`. On `disconnect`/`terminate` all installed breakpoints shall be removed from silicon before the target is resumed, so detach leaves it running free. The breakpoint table and install/remove shall be guarded by the target link so the dispatch is unit-testable without hardware. (Conditional-expression evaluation, `setInstructionBreakpoints`, and DWARF-CFI multi-frame unwinding are tracked as later Phase-18 refinements.)]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+          <trace target="SDD" ref="5.3.1"/>
+        </traces>
+      </hlr>
     </section>
 
     <section number="11" title="CI-Grade Loader and Link Diagnostics">
@@ -2991,6 +2999,14 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces>
           <trace target="HLR" ref="HLR-078" name="DAP Execution Control, Stop Events &amp; Shallow stackTrace"/>
           <trace target="HLR" ref="HLR-072" name="DWARF Source-Level Lookup (DAP Groundwork)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-DAP-10">
+        <text><![CDATA[`dap_dispatch()` shall serve `setBreakpoints` via a private `dap_handle_set_breakpoints()` helper, and `dap_session` shall carry the shared breakpoint state (`hw_bp_addr[2]`, `hw_bp_pinned[2]`, `sw_bp[RSP_MAX_SW_BREAKPOINTS]`, `bp_mode`, `pc_dirty`) plus a `bps[DAP_MAX_BREAKPOINTS]` table (`id`, `addr`, `line`, `verified`, `in_use`, `source`, `condition`) and `next_bp_id`; `dap_bp_reset()` shall initialise it (HW shadow slots `HW_BP_SLOT_EMPTY`, `bp_mode = RSP_BP_MODE_AUTO`, `next_bp_id = 1`) and shall be called at session start (`dap_serve`).  The handler shall: (1) read `arguments.source.path` (falling back to `name`); (2) remove every existing breakpoint whose `source` equals that path — `bp_remove()` per installed entry — so the call replaces that source's set; (3) for each element of `arguments.breakpoints`, read `line` and optional `condition`, resolve `line` to a code byte address via `elf_line_to_addr(elf, path, line, &addr)`, and — when resolved and `updi_fd >= 0` — install it with `bp_insert(updi_fd, hw_bp_addr, hw_bp_pinned, sw_bp, bp_mode, &pc_dirty, '0', addr)` (verified iff `BP_OK`); record the entry (assigning `id = next_bp_id++`); (4) reply `{"breakpoints":[{"id":<id>,"verified":<bool>,"line":<line>}, …]}` in request order.  When the target later halts while `running`, `dap_serve()` shall emit the `stopped` event via `dap_emit_stopped_breakpoint()`, which reads the live PC and, for every `bps[]` entry whose `addr` matches, includes its id in `hitBreakpointIds` (falling back to a plain reason-`breakpoint` stop when none match).  `disconnect`/`terminate` shall `bp_remove()` every installed breakpoint before `updi_run()`.  Conditional-expression evaluation, `setInstructionBreakpoints`, and DWARF-CFI multi-frame unwinding are deferred Phase-18 refinements.  All target side effects are guarded by `updi_fd >= 0`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-079" name="DAP Source Breakpoints"/>
+          <trace target="HLR" ref="HLR-054" name="True Software Breakpoints via Flash BREAK Opcode"/>
         </traces>
       </llr>
     </function>
@@ -4518,7 +4534,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/dap.c DAP wire-transport tests (Phase 16)                -->
     <!-- ============================================================ -->
-    <file path="tests/test_dap.c" role="unit" count="18">
+    <file path="tests/test_dap.c" role="unit" count="20">
       <header><![CDATA[Unit tests for the DAP front-end: the wire transport (HLR-075) — the JSON codec (`dj_*` recursive-descent tokenizer, member/string/number accessors, escape decode, and the emission escaper) and the Content-Length message framing (`dap_read_message` / `dap_write_message`) — and the connection lifecycle dispatch (HLR-076) driven over a `socketpair` with `updi_fd = -1` so no hardware is touched. Framing is exercised over an anonymous pipe.]]></header>
 
       <test name="dj_parse_extracts_request_fields">
@@ -4606,6 +4622,16 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces><trace target="LLR" ref="LLR-DAP-09"/></traces>
       </test>
 
+      <test name="dap_set_breakpoints_responds_with_per_line_entries">
+        <purpose><![CDATA[Dispatch `setBreakpoints` with two source breakpoints (`{line:139}`, `{line:141,condition:"n==3"}`) and no ELF/target; verify the response carries a `breakpoints` array with per-line entries (`id:1`/`line:139`, `id:2`/`line:141`), that both entries are recorded in the session table with the condition captured, and that `next_bp_id` advanced to 3. Per LLR-DAP-10.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-10"/></traces>
+      </test>
+
+      <test name="dap_set_breakpoints_replaces_prior_set_for_source">
+        <purpose><![CDATA[Dispatch `setBreakpoints` for `main.c` with two lines, then again with one line; verify the second call replaces the source's set wholesale — only the single new breakpoint remains in the session table. Per LLR-DAP-10.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-10"/></traces>
+      </test>
+
       <test name="dap_serve_runs_handshake_to_disconnect">
         <purpose><![CDATA[Drive `dap_serve()` end-to-end without hardware: a stubbed `rsp_accept()` hands it a pre-connected socketpair end whose request stream is pre-loaded with `initialize` then `disconnect`. Verify the accept/select/read/dispatch loop processes both (emitting the initialize response, the `initialized` event, and the disconnect response) and returns 0 when the client disconnects.]]></purpose>
         <traces><trace target="LLR" ref="LLR-DAP-05"/></traces>
@@ -4615,7 +4641,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src DAP on-target acceptance harness (Neovim + nvim-dap)     -->
     <!-- ============================================================ -->
-    <file path="tests/hw/dap_acceptance.lua" role="hardware" count="7">
+    <file path="tests/hw/dap_acceptance.lua" role="hardware" count="8">
       <header><![CDATA[On-target DAP acceptance harness (the DAP analogue of the Group-G GDB harness): spawns a fresh `avrOSdb --dap` against live AVR-Dx silicon and drives it with the real nvim-dap client (headless Neovim) over TCP, applying per-case verdicts to the connection lifecycle. Manual-only (`make hw-test-dap`); never invoked by `make test`. Phase 16 covers the handshake (DAP1–DAP4); execution control, breakpoints, and variables grow this suite in Phases 17–19.]]></header>
 
       <test name="DAP1_initialize_handshake">
@@ -4648,8 +4674,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces><trace target="HLR" ref="HLR-078"/></traces>
       </test>
 
-      <test name="DAP7_disconnect_clean">
-        <purpose><![CDATA[Issue a `disconnect` request and verify the adapter responds successfully and the session tears down cleanly (the target is resumed).]]></purpose>
+      <test name="DAP7_source_breakpoint_hit">
+        <purpose><![CDATA[Phase-18 source breakpoints. `setBreakpoints` for `main.c:139` (the avrOS example's `fsmDispatch()` call) — verify it resolves+verifies via DWARF and installs through the shared breakpoint core — then `continue` and verify the adapter emits a `stopped` event with reason `breakpoint`, proving file:line breakpoint resolution + install + hit end-to-end on silicon. Per HLR-079 / LLR-DAP-10.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-079"/></traces>
+      </test>
+
+      <test name="DAP8_disconnect_clean">
+        <purpose><![CDATA[Issue a `disconnect` request and verify the session tears down cleanly (installed breakpoints removed, target resumed) — accepting either the disconnect response or the session object going away, since nvim-dap does not always deliver the response callback as the adapter closes the socket. Per HLR-076 / HLR-079.]]></purpose>
         <traces><trace target="HLR" ref="HLR-076"/></traces>
       </test>
     </file>

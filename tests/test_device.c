@@ -194,10 +194,12 @@ int elf_has_fsm_symbols(const AvrOsSymbolIndex *idx);
 int elf_has_fsm_symbols(const AvrOsSymbolIndex *idx) { (void)idx; return 1; }
 
 /* dap.c (linked here for the --rsp/--dap mode tests) references the DWARF
- * line accessor in its Phase-17 stackTrace handler; elf_parser.c is not
- * linked, so a plain stub resolves it. */
+ * line accessors in its stackTrace / setBreakpoints handlers; elf_parser.c is
+ * not linked, so plain stubs resolve them. */
 int elf_addr_to_line(const ElfContext *c, uint32_t a, char *f, size_t cap, int *ln)
 { (void)c; (void)a; (void)f; (void)cap; (void)ln; return -1; }
+int elf_line_to_addr(const ElfContext *c, const char *f, int line, uint32_t *a)
+{ (void)c; (void)f; (void)line; (void)a; return -1; }
 
 int __wrap_fsm_build_thread_list(FsmContext *c, const AvrOsSymbolIndex *i, int fd);
 int __wrap_fsm_build_thread_list(FsmContext *c, const AvrOsSymbolIndex *i, int fd)

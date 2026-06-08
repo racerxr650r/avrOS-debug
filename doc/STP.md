@@ -376,7 +376,7 @@ Role: **hardware**. **1 test(s).**
 
 ### 3.12. [tests/test_dap.c](../tests/test_dap.c)
 
-Role: **unit**. **18 test(s).**
+Role: **unit**. **20 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -397,11 +397,13 @@ Role: **unit**. **18 test(s).**
 | 15 | <a id="dap_step_emits_stopped_step"></a>`dap_step_emits_stopped_step` | `LLR-DAP-08` | For each of `next`, `stepIn`, `stepOut`, dispatch the request and verify a `success:true` response followed by a `stopped` event with `reason:"step"`. Per LLR-DAP-08. |
 | 16 | <a id="dap_stack_trace_returns_one_frame"></a>`dap_stack_trace_returns_one_frame` | `LLR-DAP-09` | Dispatch `stackTrace` (no target/DWARF) and verify the response carries a `stackFrames` array with a single frame `id:0` and `totalFrames:1`. Per LLR-DAP-09. |
 | 17 | <a id="dap_scopes_returns_empty"></a>`dap_scopes_returns_empty` | `LLR-DAP-09` | Dispatch `scopes` and verify the response carries an empty `scopes` array (frame variables are Phase 19). Per LLR-DAP-09. |
-| 18 | <a id="dap_serve_runs_handshake_to_disconnect"></a>`dap_serve_runs_handshake_to_disconnect` | `LLR-DAP-05` | Drive `dap_serve()` end-to-end without hardware: a stubbed `rsp_accept()` hands it a pre-connected socketpair end whose request stream is pre-loaded with `initialize` then `disconnect`. Verify the accept/select/read/dispatch loop processes both (emitting the initialize response, the `initialized` event, and the disconnect response) and returns 0 when the client disconnects. |
+| 18 | <a id="dap_set_breakpoints_responds_with_per_line_entries"></a>`dap_set_breakpoints_responds_with_per_line_entries` | `LLR-DAP-10` | Dispatch `setBreakpoints` with two source breakpoints (`{line:139}`, `{line:141,condition:"n==3"}`) and no ELF/target; verify the response carries a `breakpoints` array with per-line entries (`id:1`/`line:139`, `id:2`/`line:141`), that both entries are recorded in the session table with the condition captured, and that `next_bp_id` advanced to 3. Per LLR-DAP-10. |
+| 19 | <a id="dap_set_breakpoints_replaces_prior_set_for_source"></a>`dap_set_breakpoints_replaces_prior_set_for_source` | `LLR-DAP-10` | Dispatch `setBreakpoints` for `main.c` with two lines, then again with one line; verify the second call replaces the source's set wholesale — only the single new breakpoint remains in the session table. Per LLR-DAP-10. |
+| 20 | <a id="dap_serve_runs_handshake_to_disconnect"></a>`dap_serve_runs_handshake_to_disconnect` | `LLR-DAP-05` | Drive `dap_serve()` end-to-end without hardware: a stubbed `rsp_accept()` hands it a pre-connected socketpair end whose request stream is pre-loaded with `initialize` then `disconnect`. Verify the accept/select/read/dispatch loop processes both (emitting the initialize response, the `initialized` event, and the disconnect response) and returns 0 when the client disconnects. |
 
 ### 3.13. [tests/hw/dap_acceptance.lua](../tests/hw/dap_acceptance.lua)
 
-Role: **hardware**. **7 test(s).**
+Role: **hardware**. **8 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -411,7 +413,8 @@ Role: **hardware**. **7 test(s).**
 | 4 | <a id="DAP4_continue_pause_stopped"></a>`DAP4_continue_pause_stopped` | — | Phase-17 execution control. Issue `continue` (the target runs), then `pause`, and verify the adapter emits a `stopped` event with reason `pause` — re-halting a freely running target (no breakpoints are installed yet, Phase 18). Per HLR-078 / LLR-DAP-08. |
 | 5 | <a id="DAP5_step_stopped"></a>`DAP5_step_stopped` | — | Phase-17 execution control. From the halted target, issue `stepIn` and verify the adapter emits a `stopped` event with reason `step`. Per HLR-078 / LLR-DAP-08. |
 | 6 | <a id="DAP6_stacktrace_source_line"></a>`DAP6_stacktrace_source_line` | — | Phase-17 shallow stackTrace. Issue `stackTrace` and verify frame 0 resolves the live PC to a source line (numeric `line > 0`) via DWARF, with a `source` object — proving the OCD PC read + libdw line lookup work end-to-end on silicon. Per HLR-078 / LLR-DAP-09. |
-| 7 | <a id="DAP7_disconnect_clean"></a>`DAP7_disconnect_clean` | — | Issue a `disconnect` request and verify the adapter responds successfully and the session tears down cleanly (the target is resumed). |
+| 7 | <a id="DAP7_source_breakpoint_hit"></a>`DAP7_source_breakpoint_hit` | — | Phase-18 source breakpoints. `setBreakpoints` for `main.c:139` (the avrOS example's `fsmDispatch()` call) — verify it resolves+verifies via DWARF and installs through the shared breakpoint core — then `continue` and verify the adapter emits a `stopped` event with reason `breakpoint`, proving file:line breakpoint resolution + install + hit end-to-end on silicon. Per HLR-079 / LLR-DAP-10. |
+| 8 | <a id="DAP8_disconnect_clean"></a>`DAP8_disconnect_clean` | — | Issue a `disconnect` request and verify the session tears down cleanly (installed breakpoints removed, target resumed) — accepting either the disconnect response or the session object going away, since nvim-dap does not always deliver the response callback as the adapter closes the socket. Per HLR-076 / HLR-079. |
 
 ## 4. LLR Coverage Matrix
 
@@ -580,3 +583,4 @@ verified by code review — see
 | `LLR-DAP-07` | `dap` | `HLR-076` | `dap_initialize_handshake`, `dap_configuration_done_emits_stopped_entry`, `dap_disconnect_closes_session`, `dap_unknown_request_returns_error` |
 | `LLR-DAP-08` | `dap` | `HLR-078` | `dap_continue_responds_and_emits_continued`, `dap_pause_emits_stopped_pause`, `dap_step_emits_stopped_step` |
 | `LLR-DAP-09` | `dap` | `HLR-078`, `HLR-072` | `dap_stack_trace_returns_one_frame`, `dap_scopes_returns_empty` |
+| `LLR-DAP-10` | `dap` | `HLR-079`, `HLR-054` | `dap_set_breakpoints_responds_with_per_line_entries`, `dap_set_breakpoints_replaces_prior_set_for_source` |

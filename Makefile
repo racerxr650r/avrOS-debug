@@ -130,8 +130,11 @@ CFLAGS := -std=c99 -D_POSIX_C_SOURCE=200809L \
 
 # Test builds: suppress warnings on __wrap_* stubs (no header declares them),
 # and pass -DUNIT_TEST so src/main.c can exclude its main() entry point.
+# -Wno-missing-field-initializers: test fixtures positionally partial-init
+# larger structs (e.g. dap_session) on purpose and reset the rest at runtime.
 TEST_CFLAGS := $(CFLAGS) -DUNIT_TEST \
-               -Wno-missing-prototypes -Wno-strict-prototypes
+               -Wno-missing-prototypes -Wno-strict-prototypes \
+               -Wno-missing-field-initializers
 
 # ── Directories ───────────────────────────────────────────────────────────────
 SRCDIR      := src
@@ -220,7 +223,7 @@ TEST_WRAP_test_elf  :=
 TEST_EXTRA_LDFLAGS_test_elf :=
 
 # test_dap  (DAP transport: JSON codec + Content-Length framing)
-TEST_SRCS_test_dap  := $(TESTDIR)/test_dap.c $(SRCDIR)/dap.c
+TEST_SRCS_test_dap  := $(TESTDIR)/test_dap.c $(SRCDIR)/dap.c $(SRCDIR)/debug_bp.c $(TESTDIR)/ocd_stubs.c
 TEST_WRAP_test_dap  :=
 TEST_EXTRA_LDFLAGS_test_dap :=
 
@@ -275,7 +278,7 @@ TEST_EXTRA_LDFLAGS_test_rsp :=
 
 # test_main — test_main.c #includes src/main.c so it can reach the
 # static parse_args() / event_loop() / load_flash_segments() helpers.
-TEST_SRCS_test_main := $(TESTDIR)/test_main.c $(SRCDIR)/dap.c
+TEST_SRCS_test_main := $(TESTDIR)/test_main.c $(SRCDIR)/dap.c $(SRCDIR)/debug_bp.c $(TESTDIR)/ocd_stubs.c
 TEST_WRAP_test_main  := updi_open updi_close updi_console_poll \
                         updi_select_device updi_get_device \
                         updi_nvm_write_flash updi_nvm_flash_patch \
@@ -307,7 +310,7 @@ TEST_EXTRA_LDFLAGS_test_install :=
 # updi.c is linked in real so updi_read_device_info exercises the PTY
 # harness; updi_open / updi_close are wrapped to substitute a pre-opened
 # PTY slave fd.
-TEST_SRCS_test_device := $(TESTDIR)/test_device.c $(SRCDIR)/updi.c $(SRCDIR)/dap.c
+TEST_SRCS_test_device := $(TESTDIR)/test_device.c $(SRCDIR)/updi.c $(SRCDIR)/dap.c $(SRCDIR)/debug_bp.c
 TEST_WRAP_test_device  := select updi_open updi_close \
                           updi_nvm_write_flash updi_console_poll \
                           updi_probe_baud updi_nvm_read \

@@ -550,6 +550,140 @@ static int dap_handle_stack_trace(dap_session *s, long req_seq)
     return dap_send_response(s, req_seq, "stackTrace", true, body);
 }
 
+/* ── Breakpoints (Phase 18) ───────────────────────────────────────────────── */
+
+void dap_bp_reset(dap_session *s)
+{
+    s->hw_bp_addr[0] = s->hw_bp_addr[1] = HW_BP_SLOT_EMPTY;
+    s->hw_bp_pinned[0] = s->hw_bp_pinned[1] = false;
+    bp_clear_all_sw(s->sw_bp);
+    s->bp_mode  = RSP_BP_MODE_AUTO;
+    s->pc_dirty = false;
+    for (int i = 0; i < DAP_MAX_BREAKPOINTS; i++) s->bps[i].in_use = false;
+    s->next_bp_id = 1;
+}
+
+/* Uninstall + drop every DAP breakpoint whose source path equals `path`
+ * (setBreakpoints replaces the full set for one source per call). */
+static void dap_bp_clear_source(dap_session *s, const char *path)
+{
+    for (int i = 0; i < DAP_MAX_BREAKPOINTS; i++) {
+        if (!s->bps[i].in_use || strcmp(s->bps[i].source, path) != 0) continue;
+        if (s->bps[i].verified && s->updi_fd >= 0)
+            (void)bp_remove(s->updi_fd, s->hw_bp_addr, s->hw_bp_pinned,
+                            s->sw_bp, s->bp_mode, &s->pc_dirty,
+                            '0', s->bps[i].addr);
+        s->bps[i].in_use = false;
+    }
+}
+
+static int dap_bp_alloc(dap_session *s)
+{
+    for (int i = 0; i < DAP_MAX_BREAKPOINTS; i++)
+        if (!s->bps[i].in_use) return i;
+    return -1;
+}
+
+/* setBreakpoints: resolve each source `line` to a code address via libdw and
+ * install it through the shared breakpoint core (file:line source bps). */
+static int dap_handle_set_breakpoints(dap_session *s, const char *msg,
+                                      const dj_tok_t *t, long req_seq)
+{
+    char path[256] = "";
+    int args = dj_member(msg, t, 0, "arguments");
+    int srcobj = (args >= 0) ? dj_member(msg, t, args, "source") : -1;
+    if (srcobj >= 0) {
+        int p = dj_member(msg, t, srcobj, "path");
+        if (p < 0) p = dj_member(msg, t, srcobj, "name");
+        if (p >= 0) dj_strcpy(msg, t, p, path, sizeof path);
+    }
+
+    /* Replace this source's breakpoints wholesale. */
+    dap_bp_clear_source(s, path);
+
+    char body[1536];
+    size_t off = 0;
+    int    n   = snprintf(body, sizeof body, "{\"breakpoints\":[");
+    if (n > 0) off = (size_t)n;
+
+    int arr = (args >= 0) ? dj_member(msg, t, args, "breakpoints") : -1;
+    int count = (arr >= 0 && t[arr].type == DJ_ARRAY) ? t[arr].size : 0;
+    int elem = arr + 1;
+    for (int k = 0; k < count; k++, elem = t[elem].next) {
+        long line = 0;
+        int lm = dj_member(msg, t, elem, "line");
+        if (lm >= 0) (void)dj_long(msg, t, lm, &line);
+        char cond[128] = "";
+        int cm = dj_member(msg, t, elem, "condition");
+        if (cm >= 0) dj_strcpy(msg, t, cm, cond, sizeof cond);
+
+        uint32_t addr = 0;
+        bool resolved = (s->elf != NULL && path[0] != '\0' &&
+                         elf_line_to_addr(s->elf, path, (int)line, &addr) == 0);
+        bool verified = false;
+        int  id = s->next_bp_id;
+        if (resolved && s->updi_fd >= 0) {
+            int st = bp_insert(s->updi_fd, s->hw_bp_addr, s->hw_bp_pinned,
+                               s->sw_bp, s->bp_mode, &s->pc_dirty, '0', addr);
+            verified = (st == BP_OK);
+        } else if (resolved) {
+            verified = true;   /* unit-test path: resolved, no target to install */
+        }
+
+        int slot = dap_bp_alloc(s);
+        if (slot >= 0) {
+            s->bps[slot].id       = id;
+            s->bps[slot].addr     = addr;
+            s->bps[slot].line     = (int)line;
+            s->bps[slot].verified = verified;
+            s->bps[slot].in_use   = true;
+            snprintf(s->bps[slot].source, sizeof s->bps[slot].source, "%s", path);
+            snprintf(s->bps[slot].condition, sizeof s->bps[slot].condition,
+                     "%s", cond);
+            s->next_bp_id++;
+        }
+
+        int w = snprintf(body + off, sizeof body - off,
+                         "%s{\"id\":%d,\"verified\":%s,\"line\":%ld}",
+                         k ? "," : "", id, verified ? "true" : "false", line);
+        if (w < 0 || (size_t)w >= sizeof body - off) break;   /* bound the reply */
+        off += (size_t)w;
+    }
+    (void)snprintf(body + off, sizeof body - off, "]}");
+    return dap_send_response(s, req_seq, "setBreakpoints", true, body);
+}
+
+/* Emit a `stopped` event after a halt detected while running: if the live PC
+ * matches an installed DAP breakpoint, report reason `breakpoint` with its
+ * `hitBreakpointIds`; otherwise a plain `breakpoint` stop. */
+static int dap_emit_stopped_breakpoint(dap_session *s)
+{
+    uint32_t pc = 0;
+    int ids[DAP_MAX_BREAKPOINTS];
+    int nids = 0;
+    if (s->updi_fd >= 0 && updi_ocd_read_pc(s->updi_fd, &pc) == 0) {
+        for (int i = 0; i < DAP_MAX_BREAKPOINTS && nids < DAP_MAX_BREAKPOINTS; i++)
+            if (s->bps[i].in_use && s->bps[i].verified && s->bps[i].addr == pc)
+                ids[nids++] = s->bps[i].id;
+    }
+    if (nids == 0)
+        return dap_emit_stopped(s, "breakpoint");
+
+    char   body[256];
+    size_t off = 0;
+    int    w = snprintf(body, sizeof body,
+        "{\"reason\":\"breakpoint\",\"threadId\":1,\"allThreadsStopped\":true,"
+        "\"hitBreakpointIds\":[");
+    if (w > 0) off = (size_t)w;
+    for (int i = 0; i < nids; i++) {
+        w = snprintf(body + off, sizeof body - off, "%s%d", i ? "," : "", ids[i]);
+        if (w < 0 || (size_t)w >= sizeof body - off) break;
+        off += (size_t)w;
+    }
+    (void)snprintf(body + off, sizeof body - off, "]}");
+    return dap_send_event(s, "stopped", body);
+}
+
 /* ── Request dispatch ─────────────────────────────────────────────────────── */
 
 int dap_dispatch(dap_session *s, const char *msg, size_t len)
@@ -586,10 +720,7 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
         return dap_send_response(s, req_seq, cmd, true, NULL) < 0 ? -1 : 0;
 
     if (strcmp(cmd, "setBreakpoints") == 0)
-        /* Phase 18 resolves source line -> address via DWARF and installs
-         * through the core arbiter; the handshake just needs a valid reply. */
-        return dap_send_response(s, req_seq, cmd, true,
-                                 "{\"breakpoints\":[]}") < 0 ? -1 : 0;
+        return dap_handle_set_breakpoints(s, msg, t, req_seq) < 0 ? -1 : 0;
 
     if (strcmp(cmd, "configurationDone") == 0) {
         if (s->updi_fd >= 0)
@@ -656,8 +787,19 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
                 "{\"scopes\":[]}") < 0 ? -1 : 0;
 
     if (strcmp(cmd, "disconnect") == 0 || strcmp(cmd, "terminate") == 0) {
-        if (s->updi_fd >= 0)
+        /* Remove all installed breakpoints from silicon before resuming, so
+         * the target runs free (and is not left halted on an armed comparator
+         * at the current PC).  Then let it run on detach. */
+        if (s->updi_fd >= 0) {
+            for (int i = 0; i < DAP_MAX_BREAKPOINTS; i++) {
+                if (s->bps[i].in_use && s->bps[i].verified)
+                    (void)bp_remove(s->updi_fd, s->hw_bp_addr, s->hw_bp_pinned,
+                                    s->sw_bp, s->bp_mode, &s->pc_dirty,
+                                    '0', s->bps[i].addr);
+                s->bps[i].in_use = false;
+            }
             (void)updi_run(s->updi_fd);          /* let the target run on detach */
+        }
         s->running = false;
         /* `terminate` asks the adapter to stop the debuggee; signal the
          * session end with a `terminated` event before the response.       */
@@ -692,7 +834,9 @@ int dap_serve(int listen_fd, int updi_fd,
         return -1;
     }
 
-    dap_session s = { cfd, updi_fd, elf, idx, fsm, log, 0, false };
+    dap_session s = { .fd = cfd, .updi_fd = updi_fd, .elf = elf, .idx = idx,
+                      .fsm = fsm, .log = log, .out_seq = 0, .running = false };
+    dap_bp_reset(&s);   /* initialise breakpoint state (hw slots EMPTY, AUTO) */
     int rc = 0;
     while (quit == NULL || !*quit) {
         /* Wait for a readable client.  Tick faster while the target is running
@@ -714,7 +858,7 @@ int dap_serve(int listen_fd, int updi_fd,
                 int h = updi_ocd_poll_halted(updi_fd, 1);
                 if (h == 0) {
                     s.running = false;
-                    if (dap_emit_stopped(&s, "breakpoint") < 0) { rc = -1; break; }
+                    if (dap_emit_stopped_breakpoint(&s) < 0) { rc = -1; break; }
                 } else if (h < 0) {
                     fprintf(stderr, "avrOSdb: DAP target poll error\n");
                     rc = -1; break;
