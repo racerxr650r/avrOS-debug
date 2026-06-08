@@ -1081,7 +1081,14 @@ This is not a fixable detail — it is a **model mismatch**. avrOS is a cooperat
 
 ### Phase 18 — DAP Breakpoints & DWARF Multi-Frame stackTrace
 
-> **Status: 🔲 Not started — issue [#54](https://github.com/racerxr650r/avrOS-debug/issues/54).**
+> **Status: 🔲 In progress — issue [#54](https://github.com/racerxr650r/avrOS-debug/issues/54), branch `54-phase-18-dap-breakpoints`.** Breakpoint policy extracted to a shared core `src/debug_bp.{h,c}` (used by both the RSP and DAP front-ends); GDB Group-G **24/25** (only the pre-existing G19) — better than `develop` (23/25), since the eviction arbiter below fixed G8. DAP `setBreakpoints` + DWARF CFI `stackTrace` are the remaining work.
+
+> **📓 Lessons learned — breakpoints & reading `.rodata` (Phase 18 + the two prior PRs: #58 Phase 20, #59 Phase 17).** Consolidated, and kept current, in **User Manual Appendix B** (the canonical reference). In brief:
+> - **Comparator 1 is unreliable as a general user breakpoint on `continue`** — proven on hardware: the same address fires on comparator 0 but is *missed* on comparator 1 during a free run. It is dependable only for the brief, controlled 32-bit step-over. So `avrOSdb` keeps **one** user comparator (comparator 0) and routes any second breakpoint to a SW `BREAK`. (Appendix **B.11**.)
+> - **`auto` bp-mode + `hbreak` eviction:** `auto` (the default) prefers the comparator (glitch-free, sleep-safe) and falls back to SW; an explicit `hbreak` (`Z1`) **evicts** an evictable `auto`-`Z0` from the comparator so the hardware breakpoint always wins the slot — fixing the `hbreak`/`break` `E08` contention (Group-G G8). (Appendix **B.15**.)
+> - **SW-breakpoint patches pulse an NVMPROG reset** that wipes peripheral state (and the `SLEEP` wake source); Phase 20 preserves the peripheral window across the patch and asserts `CLK_REQ` (`--sleep` disables). The reset also glitches pins — an LED blink per SW breakpoint — another reason `auto` prefers HW. (Appendix **B.10**.)
+> - **Reading flash-resident `.rodata`** (e.g. `currStateName`): AVR-Dx maps FLASH into data space (`≥ 0x8000`); GDB reads the string as data at `0x80_8xxx`. The window must be **advertised** (qXfer ROM region) so GDB issues the read, and each read **translated** to the physical flash LMA via `flash_lma_off = LMA − (VMA & 0xFFFF)` through the UPDI flash mirror — avr-gcc 14.2 emits full-VMA `.rodata`, so masking to 16 bits is essential. (Appendix **B.16**.)
+> - **Build hygiene:** the Makefile now tracks header dependencies (`-MMD -MP`). A struct change without it left a stale object that corrupted the advertised memory map and made every memory read fail with `E14` — suspect a stale object before logic when a struct change yields broad, inexplicable hardware failures. (Appendix **B.16**.)
 
 **Motivation.** Source-level breakpoints and full backtraces — the two features that most depend on DWARF, and the clearest payoff of the Phase-15 elfutils integration. `setBreakpoints` resolves `path:line` → address through libdw; `stackTrace` unwinds the call stack via libdw CFI.
 

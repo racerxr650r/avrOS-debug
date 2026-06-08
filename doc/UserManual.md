@@ -1215,8 +1215,8 @@ stays planted and only the inevitable plant/remove cycles cost flash wear.
 
 ### B.10 Software breakpoints (`Z0`/`z0`) — the `BREAK` opcode
 
-Software breakpoints are unlimited and are `avrOSdb`'s default
-(`bp-mode sw`):
+Software breakpoints are unlimited and reliable. They are the fallback path of
+the default `auto` policy and the whole of `bp-mode sw` (§B.16):
 
 - **Insert:** read and save the original 16-bit opcode at the target flash
   word, then overwrite it with the AVR `BREAK` opcode **`0x9598`** via the NVM
@@ -1225,12 +1225,28 @@ Software breakpoints are unlimited and are `avrOSdb`'s default
 - **Remove:** rewrite the saved original opcode.
 - **Step over** without two flash writes: see §B.9.
 
-> [!NOTE]
-> Every flash patch enters NVMPROG, whose mandatory reset pulse resets the
-> AVR-Dx peripherals (including any avrOS tick timer). This is a UPDI/NVMPROG
-> constraint, not an `avrOSdb` defect — it is why some tick-driven firmware
-> cannot re-enter its dispatch loop after a software-breakpoint plant (see the
-> Phase 14 notes in `doc/SDP.md`).
+> [!WARNING]
+> **The NVMPROG reset wipes peripheral state — preserve it across the patch.**
+> Every flash patch enters NVMPROG, whose mandatory `ASI_RESET_REQ` pulse (it
+> latches the NVMProg key) resets **all** AVR-Dx peripherals to defaults. That
+> erases whatever interrupt source the firmware configured to wake itself from
+> `SLEEP`, so a firmware idling in `sysSleep()` never wakes after a
+> software-breakpoint plant and the next breakpoint past the sleep is never
+> reached (the LED simply freezes). This is a UPDI/NVMPROG constraint, not an
+> `avrOSdb` defect.
+>
+> **Fix (Phase 20, HLR-077, on by default):** the SW-breakpoint patch
+> snapshots the peripheral I/O register window before the reset and writes it
+> back after re-entering OCD, so *any* wake source survives (no system tick
+> required). The complementary `CLK_REQ` bit (`ASI_SYS_CTRLA[0]`) is also
+> asserted on OCD entry to keep the system clock running through `SLEEP`. The
+> `--sleep` flag disables both, restoring native sleep/power behaviour for
+> power-path debugging.
+>
+> **Cost:** the patch still pulses a reset, so target pins briefly glitch to
+> their reset state on every SW-breakpoint insert/remove (a visible LED blink
+> per breakpoint). Hardware breakpoints avoid this entirely — which is the
+> motivation for the `auto` policy (§B.16).
 
 ### B.11 Hardware breakpoints (`Z1`/`z1`) — the PC comparators
 
@@ -1241,7 +1257,8 @@ enable in `OCD_CTRL1` (`BP0`/`BP1`) **and** the global `OCD_CTRL0.HWBP` bit.
 `avrOSdb` reserves these via a single arbiter (Phase 13):
 
 - **Comparator 0** is the sole *user* hardware-breakpoint slot — a second
-  `Z1` request returns `E08`.
+  concurrent hardware breakpoint returns `E08` (extra breakpoints fall back to
+  SW; see §B.16).
 - **Comparator 1** is permanently reserved for the 32-bit `LDS`/`STS`
   single-step-over workaround, so stepping is always possible regardless of any
   user breakpoint.
@@ -1249,6 +1266,20 @@ enable in `OCD_CTRL1` (`BP0`/`BP1`) **and** the global `OCD_CTRL0.HWBP` bit.
 Write the 17-bit byte address into the comparator (LSb is always 0), set the
 enable bits, and resume. On halt, `OCD_STATUS1[0]`/`[1]` indicate which
 comparator matched.
+
+> [!WARNING]
+> **Comparator 1 is not dependable as a *general* user breakpoint on
+> `continue`.** Phase 18 tried to manage both comparators as user slots
+> (eviction arbiter, with the step-over *borrowing* a slot). On hardware the
+> *same* breakpoint address fired reliably on comparator 0 but was **missed on
+> comparator 1** during a free run — the CPU ran straight past it (proven with
+> the avrOS example: a breakpoint at `fsmDispatch+10` on comparator 1 never
+> halted; on comparator 0 it always did). Comparator 1 *does* work for the
+> brief, controlled 32-bit step-over (a one-instruction run to `PC+4`), which is
+> why it is fine as the reserved step slot but unsafe for arbitrary user
+> breakpoints. **Conclusion:** keep one user comparator (comparator 0) and
+> route any second breakpoint to a SW `BREAK` (always reliable). This is the
+> original Phase-13 split, now validated by direct experiment.
 
 ### B.12 Halt-on-change-of-flow, halt-on-interrupt, external break
 
@@ -1296,7 +1327,71 @@ Note `BP0_STEP` is shared between hardware comparator 0 and step completion;
 the arbiter (§B.11) disambiguates using whether a step was armed and which slot
 holds a user breakpoint.
 
-### B.15 Further reading
+### B.15 Breakpoint-mode policy (`auto` / `sw` / `hw-only`) and hbreak eviction
+
+`monitor bp-mode <auto|sw|hw-only>` selects how a `Z0` (`break`) is installed
+(Phase 20 added `auto` and made it the default; Phase 18 added the eviction
+arbiter that makes it safe to mix with `hbreak`):
+
+- **`auto` (default).** A `break` in FLASH is placed on the free user
+  comparator (comparator 0) when available — no flash write, so no NVMPROG
+  reset glitch (§B.10) and no SLEEP wake-source loss — and **falls back to a SW
+  `BREAK`** once the comparator is taken. Glitch-free for the common
+  single-breakpoint case, unlimited beyond it.
+- **`sw`.** Every `break` is a SW `BREAK` patch. Unlimited, but each
+  insert/remove pulses the NVMPROG reset (§B.10).
+- **`hw-only`.** `break` aliases to the comparator (legacy); a second returns
+  `E08`.
+
+**hbreak eviction (the key correctness rule).** With only one user comparator,
+an explicit `hbreak` (`Z1`) and an `auto`-placed `break` (`Z0`) both want it.
+GDB removes and re-inserts *all* breakpoints on every resume, in an order that
+can let an `auto` `Z0` grab the comparator before the `hbreak` — which then
+fails with `E08` and silently drops, derailing the run. The fix: an `auto`
+`Z0` on the comparator is **evictable**; when an `hbreak` needs the slot, the
+`auto` `Z0` is converted to a SW `BREAK` to make room, so an explicit hardware
+breakpoint **always** wins the comparator. (Without this, mixing `hbreak` with
+ordinary breakpoints on the avrOS example failed intermittently — Group-G G8.)
+
+### B.16 Reading flash-resident data (`.rodata`, FSM state names)
+
+AVR-Dx maps a 32 KiB window of FLASH into the **high half of the 16-bit data
+space** (data addresses `≥ 0x8000`; `NVMCTRL.FLMAP` selects which physical
+section). `avr-gcc` places `.rodata` there, so a plain `const char *` (e.g. an
+avrOS `stateMachine->currStateName`) holds a value like `0x8156`, and GDB reads
+the string as **data** at GDB address `0x80_8156`. Three things must line up
+or the read fails or returns garbage:
+
+1. **Advertise the window.** GDB honours the target memory map
+   (`qXfer:memory-map:read`); an undescribed address is refused client-side
+   with *"Cannot access memory"* (it never reaches the server). `avrOSdb`
+   advertises the mapped-flash window as a read-only `rom` region at
+   `0x808000` so GDB will issue the read (Phase 20).
+2. **Translate to the physical LMA.** A raw UPDI data-space read of `0x8xxx`
+   returns FLMAP-dependent garbage. The read must be routed through the UPDI
+   **flash mirror** at the *physical* flash byte (LMA). `avrOSdb` translates the
+   16-bit mapped pointer with `flash_lma_off` and reads via the mirror — the
+   same path `fsm_mapper` uses to resolve FSM state-name strings.
+3. **Compute `flash_lma_off` against the 16-bit pointer, not the full VMA.**
+   `flash_lma_off = LMA − (VMA & 0xFFFF)`. avr-gcc 14.2 emits `.rodata` /
+   `FSM_TABLE` at a *full* mapped-flash VMA (e.g. `0x00a08000`); subtracting the
+   full VMA yields a bogus (negative) delta that misdirects every flash-string
+   read. Masking to 16 bits is correct for both the new full-VMA convention and
+   the legacy 16-bit-VMA fixtures. (This bug had silently turned every FSM name
+   in `monitor avros tasks` into `<unnamed>` after the toolchain upgrade.)
+
+> [!NOTE]
+> **Build hygiene that this work exposed.** Adding a field to a shared struct
+> (`RspContext`) while the Makefile did *not* track header dependencies left a
+> stale `main.c.o` compiled against the old layout — it wrote `ctx->map` at one
+> offset while freshly-built code read it at another, corrupting the advertised
+> memory map and making *every* memory read fail with `E14`. The Makefile now
+> emits and includes per-object `.d` dependency files (`-MMD -MP`), so a header
+> edit always recompiles its dependents. If you ever see broad, inexplicable
+> hardware failures after a struct change, suspect a stale object before the
+> logic.
+
+### B.17 Further reading
 
 - [`doc/reference/guesswork.md`](reference/guesswork.md) — the reverse-engineering
   lab notebook, including the FF-bomb register-mapping method and the full v0/v1

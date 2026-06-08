@@ -149,6 +149,7 @@ SRCS     := $(SRCDIR)/main.c \
              $(SRCDIR)/elf_parser.c \
              $(SRCDIR)/fsm_mapper.c \
              $(SRCDIR)/monitor.c \
+             $(SRCDIR)/debug_bp.c \
              $(SRCDIR)/gdb_rsp.c \
              $(SRCDIR)/dap.c
 OBJS     := $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(SRCS))
@@ -249,6 +250,7 @@ TEST_EXTRA_LDFLAGS_test_monitor :=
 # test_rsp
 TEST_SRCS_test_rsp := $(TESTDIR)/test_rsp.c \
                        $(SRCDIR)/gdb_rsp.c \
+                       $(SRCDIR)/debug_bp.c \
                        $(SRCDIR)/fsm_mapper.c \
                        $(SRCDIR)/monitor.c
 TEST_WRAP_test_rsp  := updi_mem_read updi_mem_write updi_halt updi_run updi_step \
@@ -333,10 +335,18 @@ $(BUILDDIR)/$(TARGET): $(OBJS)
 	@echo "  LD  $@"
 
 # ── Compile host object files ─────────────────────────────────────────────────
+# `-MMD -MP` emits a per-object `.d` makefrag listing the headers each object
+# depends on, so editing a header (e.g. a field added to RspContext) forces a
+# rebuild of every dependent object.  Without this, an incremental build leaves
+# stale objects with a mismatched struct layout — a silent, memory-corrupting
+# footgun.  (Test binaries compile all their sources in one invocation, so they
+# are always consistent and need no `.d` tracking.)
 $(BUILDDIR)/%.o: $(SRCDIR)/%.c
 	@mkdir -p $(BUILDDIR)
-	$(Q)$(CC) $(CFLAGS) -I$(SRCDIR) -c $< -o $@
+	$(Q)$(CC) $(CFLAGS) -MMD -MP -I$(SRCDIR) -c $< -o $@
 	@echo "  CC  $<"
+
+-include $(OBJS:.o=.d)
 
 # ── Unity object ─────────────────────────────────────────────────────────────
 $(UNITY_OBJ): $(UNITY_SRC)
