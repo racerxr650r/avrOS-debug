@@ -432,6 +432,32 @@ void test_dap_set_breakpoints_replaces_prior_set_for_source(void)
     close(sp[0]); close(sp[1]);
 }
 
+void test_dap_set_instruction_breakpoints_responds_with_refs(void)
+{
+    int sp[2];
+    TEST_ASSERT_EQUAL_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sp));
+    dap_session s = { sp[1], -1, NULL, NULL, NULL, false, 0 };
+    dap_bp_reset(&s);
+
+    const char *req =
+        "{\"seq\":21,\"command\":\"setInstructionBreakpoints\",\"arguments\":{"
+        "\"breakpoints\":[{\"instructionReference\":\"0x40c\"},"
+        "{\"instructionReference\":\"0x400\",\"offset\":4}]}}";
+    TEST_ASSERT_EQUAL_INT(0, dap_dispatch(&s, req, strlen(req)));
+
+    char buf[1024]; size_t len;
+    TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"command\":\"setInstructionBreakpoints\""));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"id\":1"));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"id\":2"));
+    /* No target → verified=true (resolved address; install path skipped). */
+    TEST_ASSERT_EQUAL_INT(0x40cu, s.bps[0].addr);
+    TEST_ASSERT_EQUAL_INT(-1, s.bps[0].line);          /* instruction-bp marker */
+    TEST_ASSERT_EQUAL_INT(0x404u, s.bps[1].addr);      /* 0x400 + offset 4      */
+
+    close(sp[0]); close(sp[1]);
+}
+
 /* dap_serve(): accept (via the rsp_accept stub) one client whose request
  * stream is pre-loaded, run the select/read/dispatch loop, and return 0 when
  * the client disconnects. */
@@ -489,6 +515,7 @@ int main(void)
     RUN_TEST(test_dap_scopes_returns_empty);
     RUN_TEST(test_dap_set_breakpoints_responds_with_per_line_entries);
     RUN_TEST(test_dap_set_breakpoints_replaces_prior_set_for_source);
+    RUN_TEST(test_dap_set_instruction_breakpoints_responds_with_refs);
     RUN_TEST(test_dap_serve_runs_handshake_to_disconnect);
     return UNITY_END();
 }

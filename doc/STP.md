@@ -376,7 +376,7 @@ Role: **hardware**. **1 test(s).**
 
 ### 3.12. [tests/test_dap.c](../tests/test_dap.c)
 
-Role: **unit**. **20 test(s).**
+Role: **unit**. **21 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -399,7 +399,8 @@ Role: **unit**. **20 test(s).**
 | 17 | <a id="dap_scopes_returns_empty"></a>`dap_scopes_returns_empty` | `LLR-DAP-09` | Dispatch `scopes` and verify the response carries an empty `scopes` array (frame variables are Phase 19). Per LLR-DAP-09. |
 | 18 | <a id="dap_set_breakpoints_responds_with_per_line_entries"></a>`dap_set_breakpoints_responds_with_per_line_entries` | `LLR-DAP-10` | Dispatch `setBreakpoints` with two source breakpoints (`{line:139}`, `{line:141,condition:"n==3"}`) and no ELF/target; verify the response carries a `breakpoints` array with per-line entries (`id:1`/`line:139`, `id:2`/`line:141`), that both entries are recorded in the session table with the condition captured, and that `next_bp_id` advanced to 3. Per LLR-DAP-10. |
 | 19 | <a id="dap_set_breakpoints_replaces_prior_set_for_source"></a>`dap_set_breakpoints_replaces_prior_set_for_source` | `LLR-DAP-10` | Dispatch `setBreakpoints` for `main.c` with two lines, then again with one line; verify the second call replaces the source's set wholesale — only the single new breakpoint remains in the session table. Per LLR-DAP-10. |
-| 20 | <a id="dap_serve_runs_handshake_to_disconnect"></a>`dap_serve_runs_handshake_to_disconnect` | `LLR-DAP-05` | Drive `dap_serve()` end-to-end without hardware: a stubbed `rsp_accept()` hands it a pre-connected socketpair end whose request stream is pre-loaded with `initialize` then `disconnect`. Verify the accept/select/read/dispatch loop processes both (emitting the initialize response, the `initialized` event, and the disconnect response) and returns 0 when the client disconnects. |
+| 20 | <a id="dap_set_instruction_breakpoints_responds_with_refs"></a>`dap_set_instruction_breakpoints_responds_with_refs` | `LLR-DAP-10` | Dispatch `setInstructionBreakpoints` with two entries (`instructionReference:"0x40c"`, and `"0x400"` with `offset:4`) and no target; verify the response carries per-entry `{id,verified,instructionReference}`, that the addresses resolve (0x40c; 0x400+4=0x404), and that the table entries are marked as instruction breakpoints (`line == -1`). Per LLR-DAP-10. |
+| 21 | <a id="dap_serve_runs_handshake_to_disconnect"></a>`dap_serve_runs_handshake_to_disconnect` | `LLR-DAP-05` | Drive `dap_serve()` end-to-end without hardware: a stubbed `rsp_accept()` hands it a pre-connected socketpair end whose request stream is pre-loaded with `initialize` then `disconnect`. Verify the accept/select/read/dispatch loop processes both (emitting the initialize response, the `initialized` event, and the disconnect response) and returns 0 when the client disconnects. |
 
 ### 3.13. [tests/hw/dap_acceptance.lua](../tests/hw/dap_acceptance.lua)
 
@@ -583,4 +584,4 @@ verified by code review — see
 | `LLR-DAP-07` | `dap` | `HLR-076` | `dap_initialize_handshake`, `dap_configuration_done_emits_stopped_entry`, `dap_disconnect_closes_session`, `dap_unknown_request_returns_error` |
 | `LLR-DAP-08` | `dap` | `HLR-078` | `dap_continue_responds_and_emits_continued`, `dap_pause_emits_stopped_pause`, `dap_step_emits_stopped_step` |
 | `LLR-DAP-09` | `dap` | `HLR-078`, `HLR-072` | `dap_stack_trace_returns_one_frame`, `dap_scopes_returns_empty` |
-| `LLR-DAP-10` | `dap` | `HLR-079`, `HLR-054` | `dap_set_breakpoints_responds_with_per_line_entries`, `dap_set_breakpoints_replaces_prior_set_for_source` |
+| `LLR-DAP-10` | `dap` | `HLR-079`, `HLR-054` | `dap_set_breakpoints_responds_with_per_line_entries`, `dap_set_breakpoints_replaces_prior_set_for_source`, `dap_set_instruction_breakpoints_responds_with_refs` |

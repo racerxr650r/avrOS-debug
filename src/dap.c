@@ -653,6 +653,76 @@ static int dap_handle_set_breakpoints(dap_session *s, const char *msg,
     return dap_send_response(s, req_seq, "setBreakpoints", true, body);
 }
 
+/* setInstructionBreakpoints: install breakpoints at raw instruction addresses
+ * (`instructionReference` + optional `offset`).  Replaces the full set of
+ * instruction breakpoints (marked with line == -1) each call. */
+static int dap_handle_set_instruction_breakpoints(dap_session *s, const char *msg,
+                                                  const dj_tok_t *t, long req_seq)
+{
+    /* Drop any previously-installed instruction breakpoints (line == -1). */
+    for (int i = 0; i < DAP_MAX_BREAKPOINTS; i++) {
+        if (!s->bps[i].in_use || s->bps[i].line != -1) continue;
+        if (s->bps[i].verified && s->updi_fd >= 0)
+            (void)bp_remove(s->updi_fd, s->hw_bp_addr, s->hw_bp_pinned,
+                            s->sw_bp, s->bp_mode, &s->pc_dirty, '0', s->bps[i].addr);
+        s->bps[i].in_use = false;
+    }
+
+    int args = dj_member(msg, t, 0, "arguments");
+    char body[1536];
+    size_t off = 0;
+    int    n   = snprintf(body, sizeof body, "{\"breakpoints\":[");
+    if (n > 0) off = (size_t)n;
+
+    int arr = (args >= 0) ? dj_member(msg, t, args, "breakpoints") : -1;
+    int count = (arr >= 0 && t[arr].type == DJ_ARRAY) ? t[arr].size : 0;
+    int elem = arr + 1;
+    for (int k = 0; k < count; k++, elem = t[elem].next) {
+        char ref[32] = "";
+        int rm = dj_member(msg, t, elem, "instructionReference");
+        if (rm >= 0) dj_strcpy(msg, t, rm, ref, sizeof ref);
+        long offw = 0;
+        int om = dj_member(msg, t, elem, "offset");
+        if (om >= 0) (void)dj_long(msg, t, om, &offw);
+
+        uint32_t addr = 0;
+        bool ok = (ref[0] != '\0');
+        if (ok) addr = (uint32_t)(strtoul(ref, NULL, 0) + offw);
+
+        bool verified = false;
+        int  id = s->next_bp_id;
+        if (ok && s->updi_fd >= 0) {
+            int st = bp_insert(s->updi_fd, s->hw_bp_addr, s->hw_bp_pinned,
+                               s->sw_bp, s->bp_mode, &s->pc_dirty, '0', addr);
+            verified = (st == BP_OK);
+        } else if (ok) {
+            verified = true;   /* unit-test path: no target to install */
+        }
+
+        int slot = dap_bp_alloc(s);
+        if (slot >= 0) {
+            s->bps[slot].id        = id;
+            s->bps[slot].addr      = addr;
+            s->bps[slot].line      = -1;     /* marks an instruction breakpoint */
+            s->bps[slot].verified  = verified;
+            s->bps[slot].in_use    = true;
+            s->bps[slot].source[0] = '\0';
+            s->bps[slot].condition[0] = '\0';
+            s->next_bp_id++;
+        }
+
+        int w = snprintf(body + off, sizeof body - off,
+                         "%s{\"id\":%d,\"verified\":%s,"
+                         "\"instructionReference\":\"0x%lx\"}",
+                         k ? "," : "", id, verified ? "true" : "false",
+                         (unsigned long)addr);
+        if (w < 0 || (size_t)w >= sizeof body - off) break;
+        off += (size_t)w;
+    }
+    (void)snprintf(body + off, sizeof body - off, "]}");
+    return dap_send_response(s, req_seq, "setInstructionBreakpoints", true, body);
+}
+
 /* Emit a `stopped` event after a halt detected while running: if the live PC
  * matches an installed DAP breakpoint, report reason `breakpoint` with its
  * `hitBreakpointIds`; otherwise a plain `breakpoint` stop. */
@@ -709,7 +779,8 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
         /* Advertise only what the handshake needs; capabilities grow with the
          * Phase 17–19 features. */
         if (dap_send_response(s, req_seq, cmd, true,
-                "{\"supportsConfigurationDoneRequest\":true}") < 0)
+                "{\"supportsConfigurationDoneRequest\":true,"
+                "\"supportsInstructionBreakpoints\":true}") < 0)
             return -1;
         return dap_send_event(s, "initialized", NULL) < 0 ? -1 : 0;
     }
@@ -721,6 +792,9 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
 
     if (strcmp(cmd, "setBreakpoints") == 0)
         return dap_handle_set_breakpoints(s, msg, t, req_seq) < 0 ? -1 : 0;
+
+    if (strcmp(cmd, "setInstructionBreakpoints") == 0)
+        return dap_handle_set_instruction_breakpoints(s, msg, t, req_seq) < 0 ? -1 : 0;
 
     if (strcmp(cmd, "configurationDone") == 0) {
         if (s->updi_fd >= 0)
