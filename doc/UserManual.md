@@ -1186,6 +1186,26 @@ halted-CPU `LDS`/`STS`. Two PC quirks must be handled:
   one-instruction skip that Phase 14 fixed for the software-breakpoint resume
   path (`pc_dirty` + resume-time instruction injection).
 
+> [!WARNING]
+> **The fresh-PC-write skip bites a subsequent *run*, not just a step — and it
+> hides behind change-of-flow emulation.** The 32-bit CALL/JMP step-over
+> (`updi_ocd_emulate_cof_32bit`, §B.11/issue #40) finishes by writing a fresh
+> `OCD_PC` at the branch target. A subsequent single-*step* settles cleanly,
+> but a subsequent *run* (`continue`) **skips the instruction at the target**.
+> GDB's source-level `step` *into* a function is exactly that pattern — an
+> instruction-step of the `call` (the CoF emulation) followed by a `continue`
+> to the function's first source line — so the `continue` skipped the callee's
+> **first prologue instruction** (`push r28`). That dropped the caller's saved
+> frame pointer, and every unwound caller value then read as garbage (`bt`
+> showed `seed=32710`; `finish` returned the wrong value). It surfaced only in
+> Phase 18's full step→`bt`/`finish` flow (Group-G G19) — single-stepping the
+> prologue, or tests that don't inspect the *caller* frame (G11/G12), masked
+> it. **Fix:** mark `pc_dirty` after the CoF emulation too, so the next resume
+> *injects* the skipped instruction (§B.9) instead of running over it — the
+> same mechanism the software-breakpoint path already used. The lesson: any
+> path that writes `OCD_PC` and may be followed by a `continue` must arm the
+> skip-injection, not just the step paths.
+
 ### B.9 Instruction injection (software-breakpoint step-over)
 
 The OCD can be made to execute an opcode the host supplies instead of the one

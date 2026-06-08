@@ -940,10 +940,20 @@ static int dh_step(int fd, const char *pkt, void *vctx)
             if (updi_ocd_emulate_cof_32bit(ctx->updi_fd,
                                            pc_byte + 4u, target_pc) < 0)
                 return reply_err(fd, "E01");
+            /* emulate_cof wrote a fresh OCD.PC at the CoF target.  A fresh PC
+             * write makes the silicon skip the instruction at PC on the next
+             * *run* (a subsequent step is fine — see B.8).  GDB's source
+             * `step` into a function is `s`(this CoF) then `c` to the first
+             * line, and that `c` would skip the callee's first prologue
+             * instruction (`push r28`), corrupting the saved caller frame and
+             * every unwound caller value (Group-G G19).  Mark the PC dirty so
+             * the next resume injects that instruction instead of skipping. */
+            ctx->pc_dirty = true;
         } else if (is_jmp_32bit) {
             if (updi_ocd_emulate_cof_32bit(ctx->updi_fd,
                                            0u, target_pc) < 0)
                 return reply_err(fd, "E01");
+            ctx->pc_dirty = true;   /* fresh-PC-write skip — see above */
         } else {
             if (updi_step_32bit(ctx->updi_fd, RSP_HW_BP_STEP_SLOT,
                                 target_pc, halt_on_jump) < 0)
