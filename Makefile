@@ -265,6 +265,7 @@ TEST_WRAP_test_rsp  := updi_mem_read updi_mem_write updi_halt updi_run updi_step
 					   updi_ocd_step_inject_word0 \
                        updi_ocd_emulate_cof_32bit \
                        updi_ocd_set_hw_bp updi_ocd_clear_hw_bp \
+                       updi_save_peripherals updi_restore_peripherals \
                        fsm_build_thread_list \
                        fsm_get_active_thread fsm_invalidate \
                        monitor_dispatch monitor_dispatch_ex
@@ -279,6 +280,7 @@ TEST_WRAP_test_main  := updi_open updi_close updi_console_poll \
                         updi_nvm_write_eeprom updi_nvm_write_userrow \
                         updi_nvm_write_fuses updi_nvm_write_lockbits \
                         updi_chip_erase updi_enter_debug updi_halt updi_run \
+                        updi_set_debug_in_sleep \
                         updi_nvm_read updi_probe_baud updi_crc32 \
                         updi_format_fuses updi_set_nvm_progress \
                         rsp_listen rsp_accept rsp_close \

@@ -209,6 +209,9 @@ int __wrap_updi_run(int fd)
     return 0;
 }
 
+void __wrap_updi_set_debug_in_sleep(bool enable);
+void __wrap_updi_set_debug_in_sleep(bool enable) { (void)enable; }
+
 /* Phase 9 wraps (LLR-MAIN-14, LLR-MAIN-15, LLR-MAIN-16, LLR-UPDI-30..32) */
 static int      mk_updi_nvm_read_calls;
 static int      mk_updi_nvm_read_ret    = 0;

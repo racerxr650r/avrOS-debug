@@ -182,6 +182,25 @@ Override automatic AVR family detection. Accepts one of
 unconditionally and the ELF-vs-silicon family mismatch check is
 suppressed. Use this when knowingly debugging an ELF against a
 different silicon family.
+.TP
+.B \-\-sleep
+Allow the target to sleep natively. Installing a software breakpoint
+requires a FLASH write, which enters NVMPROG via a mandatory system
+reset that wipes the firmware's peripheral configuration \(em including
+whatever interrupt wakes it from
+.BR SLEEP .
+By default
+.B avrOSdb
+snapshots the peripheral registers before that reset and restores them
+afterward (and asserts the UPDI
+.B CLK_REQ
+bit), so the wake source survives and breakpoints still fire after the
+firmware sleeps (e.g. an avrOS application idling in
+.BR sysSleep() ).
+Pass
+.B \-\-sleep
+to disable this and restore native sleep/power behaviour when debugging
+power paths.
 .SH DEVICE FAMILY SELECTION
 When
 .B \-\-force\-device
@@ -309,11 +328,20 @@ avrOSdb \-\-allow\-erase /dev/ttyUSB0 firmware.elf
 From GDB the Phase-10 surface offers
 .BR "load" " (vFlashErase/Write/Done),"
 .BR "watch" / "rwatch" / "awatch" " (Z2/Z3/Z4 data watchpoints),"
-.BR "run" / "kill" " (vRun/vKill), and software breakpoints via"
-.BR Z0 " (FLASH"
+.BR "run" / "kill" " (vRun/vKill), and breakpoints via"
+.BR Z0 .
+By default
+.RB ( "monitor bp-mode auto" )
+a
+.B Z0
+in FLASH is placed on a free OCD hardware comparator \(em avoiding the
+FLASH write and its NVMPROG reset glitch, and surviving target
+.BR SLEEP \(em
+and falls back to the FLASH
 .B BREAK
-opcode by default, switchable via
-.BR "monitor bp-mode" ).
+opcode patch once the single user comparator is in use. Force one policy
+with
+.BR "monitor bp-mode sw" " or " "monitor bp-mode hw-only" .
 .SH SEE ALSO
 .BR avr-gdb (1),
 .BR avrdude (1),

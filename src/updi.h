@@ -77,6 +77,11 @@
 #define ASI_SYS_CTRLA   0x0A     /* RW: UROWDONE (b1), CLKREQ (b0)           */
 #define ASI_SYS_STATUS  0x0B     /* RO: ERASEFAIL/SYSRST/INSLEEP/NVMPROG/... */
 
+/* ASI_SYS_CTRLA bits */
+#define ASI_SYS_CTRLA_CLKREQ  0x01u  /* force the system clock to keep running
+                                      * (so the OCD survives the target's
+                                      * SLEEP — "debug in sleep")            */
+
 /* ASI_CTRLA bits (datasheet §35.4.2) */
 #define ASI_CTRLA_IBDLY     0x80    /* Inter-Byte Delay enable                */
 
@@ -156,6 +161,41 @@ int  updi_mem_write(int fd, uint32_t addr, const uint8_t *buf, size_t len);
 int  updi_enter_debug(int fd);
 int  updi_halt(int fd);
 int  updi_run(int fd);
+
+/* ── Debug-in-sleep (Phase 20) ──────────────────────────────────────────────
+ * AVR-Dx stops the system clock on SLEEP, after which the OCD can no longer
+ * detect a BREAK / HW-breakpoint or service register reads until the part
+ * wakes — so breakpoints past an avrOS `sysSleep()` are missed. Asserting
+ * `CLK_REQ` keeps the clock running so the OCD stays live through SLEEP.
+ *
+ * `updi_set_debug_in_sleep()` sets the policy (default: enabled); `--sleep`
+ * disables it to leave native target sleep/power behaviour intact.
+ * `updi_apply_debug_in_sleep()` applies the current policy to a STOPPED target
+ * (asserts CLK_REQ when enabled, no-op when disabled) and is called from
+ * `updi_enter_debug()`; it is exposed for unit testing. */
+void updi_set_debug_in_sleep(bool enable);
+int  updi_apply_debug_in_sleep(int fd);
+
+/* Peripheral I/O register window saved/restored across the software-breakpoint
+ * NVMPROG flash patch (Phase 20). Entering NVMPROG requires a mandatory system
+ * reset (ASI_RESET_REQ latches the NVMProg key), which resets all peripherals
+ * to defaults — wiping whatever interrupt source the firmware uses to wake from
+ * `SLEEP`. With no live wake source, a target that idles in SLEEP (e.g. avrOS
+ * `sysSleep()` → IDLE) never wakes, so the next breakpoint is never reached.
+ * Snapshotting the peripheral configuration before the patch and writing it
+ * back after re-entering OCD preserves *any* wake source (timer, USART, pin
+ * change, ...) — the firmware need not even use a system tick.
+ *
+ * The window spans the extended-I/O peripherals (RSTCTRL, SLPCTRL, CLKCTRL,
+ * CPUINT, RTC, EVSYS, PORTMUX, PORTs, TCA/TCB, USART, SPI, TWI, AC/ADC/DAC).
+ * The low I/O 0x00..0x3F (CPU core registers + VPORTs, restored separately via
+ * the OCD register file / PORT registers) and NVMCTRL (0x1000) are excluded.
+ * Both calls are no-ops (return 0) when debug-in-sleep is disabled (--sleep).
+ * `buf` must be at least UPDI_PERIPH_LEN bytes. */
+#define UPDI_PERIPH_BASE  0x0040u
+#define UPDI_PERIPH_LEN   0x0BC0u   /* 0x0040 .. 0x0BFF */
+int  updi_save_peripherals(int fd, uint8_t *buf);
+int  updi_restore_peripherals(int fd, const uint8_t *buf);
 int  updi_step(int fd);
 int  updi_step_32bit(int fd, int bp_slot,
                      uint32_t target_pc, bool halt_on_jump);

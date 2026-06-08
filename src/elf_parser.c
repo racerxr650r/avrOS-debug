@@ -243,10 +243,20 @@ int elf_find_avros_tables(ElfContext *ctx, AvrOsSymbolIndex *idx)
      * physical FLASH byte (LMA) via the PT_LOAD p_paddr basis — the same
      * translation the loader uses — and record the window's LMA-VMA delta so
      * fsm_mapper can translate the per-entry name pointers it reads at runtime.
-     * Per-entry strides match the avrOS struct layouts (9 / 10 / 4 bytes). */
+     * Per-entry strides match the avrOS struct layouts (9 / 10 / 4 bytes).
+     *
+     * `flash_lma_off` is added at runtime to a *16-bit* AVR C pointer (the
+     * mapped-flash data-space value 0x8000..0xFFFF stored in `char *`
+     * fields), so it must be the delta from that 16-bit value to the
+     * physical FLASH LMA — i.e. `LMA - (VMA & 0xFFFF)` — NOT `LMA - VMA`.
+     * With avr-gcc 14.2 `.rodata` carries a full mapped-flash VMA
+     * (e.g. 0x00a08000), so subtracting the full VMA yielded a bogus
+     * (negative) delta and every FSM name / `currStateName` string read
+     * landed in the wrong FLASH page.  Masking to 16 bits is correct for
+     * both the new full-VMA convention and any 16-bit-VMA fixture.       */
     if (found & B_FSM_S) {
         idx->fsm_table_addr = elf_phys_flash_byte_addr(ctx, fsm_start);
-        idx->flash_lma_off  = idx->fsm_table_addr - fsm_start;
+        idx->flash_lma_off  = idx->fsm_table_addr - (fsm_start & 0xFFFFu);
     }
     if ((found & (B_FSM_S | B_FSM_E)) == (B_FSM_S | B_FSM_E))
         idx->fsm_table_count = (uint8_t)((fsm_end - fsm_start) / 9U);

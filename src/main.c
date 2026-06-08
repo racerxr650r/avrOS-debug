@@ -53,6 +53,9 @@ typedef struct {
     bool        dap_mode;        /* --dap: serve DAP instead of RSP (default).
                                   *  --rsp selects RSP explicitly; the two are
                                   *  mutually exclusive (Phase 16).            */
+    bool        debug_in_sleep;  /* keep the system clock alive (CLK_REQ) so the
+                                  *  OCD survives the target's SLEEP. On by
+                                  *  default; --sleep disables it (Phase 20).  */
     /* fds owned by main; -1 = closed/unset */
     int         listen_fd;
     int         gdb_fd;
@@ -120,6 +123,12 @@ static void usage(const char *prog)
         "                     Redundant when combined with --prog.\n"
         "  --log-rsp          Log all incoming and outgoing GDB RSP packets\n"
         "                     to standard error.\n"
+        "  --sleep            Allow the target to sleep natively. By default the\n"
+        "                     debugger preserves the firmware's peripheral state\n"
+        "                     across the software-breakpoint NVMPROG reset (and\n"
+        "                     asserts CLK_REQ) so the SLEEP wake source survives\n"
+        "                     and breakpoints still fire after the firmware sleeps;\n"
+        "                     pass --sleep to restore native sleep/power behaviour.\n"
         "  --no-introspect    Disable avrOS FSM introspection (the `monitor\n"
         "                     avros` task/state view). The GDB thread model is\n"
         "                     unaffected: the live CPU is always the sole GDB\n"
@@ -414,6 +423,7 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
     cfg->no_introspect = false;
     cfg->reset_cpu      = false;
     cfg->dap_mode       = false;   /* default: RSP front-end */
+    cfg->debug_in_sleep = true;    /* default: keep clock alive in SLEEP */
     cfg->listen_fd     = -1;
     cfg->gdb_fd        = -1;
     cfg->updi_fd       = -1;
@@ -462,6 +472,8 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
             cfg->no_introspect = true;
         } else if (strcmp(a, "--reset") == 0) {
             cfg->reset_cpu = true;
+        } else if (strcmp(a, "--sleep") == 0) {
+            cfg->debug_in_sleep = false;
         } else if (strcmp(a, "--rsp") == 0) {
             cfg->dap_mode = false;
             saw_rsp = true;
@@ -1465,6 +1477,10 @@ int MAIN_NAME(int argc, char *argv[])
      * CPU halts at the reset vector (SOR_DIS=0 by default), giving GDB
      * a clean stopped state to attach to.  Any NVMPROG state left over
      * from --erase / --load is dropped by the reset.                  */
+    /* Phase 20: select the debug-in-sleep clock policy before entering OCD
+     * (and for every later re-entry, e.g. monitor reset). Default on; --sleep
+     * disables it to keep native target sleep/power behaviour. */
+    updi_set_debug_in_sleep(cfg.debug_in_sleep);
     if (updi_enter_debug(cfg.updi_fd) < 0) {
         fprintf(stderr, "error: failed to enter OCD debug mode\n");
         exit_code = 1;
@@ -1531,7 +1547,7 @@ int MAIN_NAME(int argc, char *argv[])
         .c_thread_p = &c_thread,
         .quit_p     = &g_quit,
         .allow_erase = cfg.allow_erase ? 1 : 0,
-        .bp_mode    = RSP_BP_MODE_SW,
+        .bp_mode    = RSP_BP_MODE_AUTO,
                 /* HLR-063: feed the target-detected memory layout to the
          * qXfer:memory-map:read handler.  Zero values disable the
          * map advertisement entirely.                                */

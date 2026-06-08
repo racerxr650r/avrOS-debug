@@ -278,12 +278,25 @@ link, no dedicated debugger probe required.
 * **Breakpoints.** The AVR-Dx OCD has **two** PC comparators, but
   avrOSdb reserves **one for single-stepping** (so stepping always
   works, regardless of your breakpoints), leaving **one** for a user
-  hardware breakpoint. By default `break` (Z0) installs an unlimited
-  **software** breakpoint (the AVR `BREAK` opcode patched into FLASH);
-  `hbreak` (Z1) — or any breakpoint under `monitor bp-mode hw-only` —
-  uses the single user comparator. Requesting a **second** hardware
-  breakpoint returns GDB error `E08`; remove one first, or rely on
-  software breakpoints.
+  hardware breakpoint. By default (`monitor bp-mode auto`) a `break`
+  (Z0) in FLASH is placed on that **free user comparator** — no FLASH
+  write, so no NVMPROG reset glitch, and the breakpoint stays valid
+  while the target sleeps — and only **falls back** to an unlimited
+  **software** breakpoint (the AVR `BREAK` opcode patched into FLASH)
+  once the comparator is already in use. `hbreak` (Z1) always uses the
+  comparator directly. Switch the policy at runtime with `monitor
+  bp-mode`:
+  - `auto` (default) — prefer the HW comparator, fall back to SW.
+  - `sw` — force the FLASH `BREAK` patch for every `break` (unlimited,
+    but each install/remove briefly pulses an NVMPROG reset).
+  - `hw-only` — alias every `break` to the comparator (legacy; a
+    second concurrent HW breakpoint then returns GDB error `E08`).
+
+  The reset pulse behind a software breakpoint would otherwise wipe the
+  firmware's peripheral state; avrOSdb snapshots and restores it across
+  the patch (see `--sleep`) so wake sources survive. Preferring the
+  comparator in `auto` mode avoids that pulse entirely for the common
+  single-breakpoint case.
 
 * **Run / step / continue.** `c`, `s`, `si`, and `ni` are all handled
   by the OCD primitives (RUN, single-step, STOP). A halt is reported
@@ -302,9 +315,9 @@ Example session:
 
 ```
 (gdb) target remote :1234
-(gdb) break main                   # software breakpoint (unlimited)
-(gdb) hbreak my_isr_handler        # the single user HW comparator
-(gdb) hbreak some_other_fn         # FAILS — E08 (HW comparator in use)
+(gdb) break main                   # auto: takes the free HW comparator
+(gdb) break other_fn               # auto: comparator busy → SW fallback (unlimited)
+(gdb) monitor bp-mode sw           # optional: force SW for every breakpoint
 (gdb) continue
 ^C                                 # halts target, prints SIGINT
 (gdb) step                         # always works (reserved step comparator)

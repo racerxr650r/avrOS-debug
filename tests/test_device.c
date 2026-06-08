@@ -486,6 +486,25 @@ static void parse_args_rejects_rsp_combined_with_dap(void)
 }
 
 /* ══════════════════════════════════════════════════════════════════════
+ *  (b4) parse_args --sleep disables debug-in-sleep            LLR-MAIN-25
+ * ════════════════════════════════════════════════════════════════════ */
+static void parse_args_sleep_flag_disables_debug_in_sleep(void)
+{
+    /* Default: debug-in-sleep enabled. */
+    char *a1[] = { (char*)"avrOSdb", (char*)"/dev/ttyUSB0", (char*)"fw.elf" };
+    AppConfig c1;
+    parse_args(3, a1, &c1);
+    TEST_ASSERT_TRUE(c1.debug_in_sleep);
+
+    /* --sleep: disabled (native target sleep). */
+    char *a2[] = { (char*)"avrOSdb", (char*)"--sleep",
+                   (char*)"/dev/ttyUSB0", (char*)"fw.elf" };
+    AppConfig c2;
+    parse_args(4, a2, &c2);
+    TEST_ASSERT_FALSE(c2.debug_in_sleep);
+}
+
+/* ══════════════════════════════════════════════════════════════════════
  *  (c) updi_read_device_info returns SIGROW + ASI bytes   LLR-UPDI-13
  * ════════════════════════════════════════════════════════════════════ */
 static void updi_read_device_info_returns_sigrow_and_asi_bytes(void)
@@ -634,6 +653,7 @@ int main(void)
     RUN_TEST(parse_args_rejects_device_combined_with_load);
     RUN_TEST(parse_args_mode_defaults_to_rsp_and_honours_dap_rsp);
     RUN_TEST(parse_args_rejects_rsp_combined_with_dap);
+    RUN_TEST(parse_args_sleep_flag_disables_debug_in_sleep);
     RUN_TEST(updi_read_device_info_returns_sigrow_and_asi_bytes);
     RUN_TEST(updi_read_device_info_reports_failed_step_on_nak);
     RUN_TEST(run_device_mode_prints_report_to_stdout);

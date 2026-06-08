@@ -238,6 +238,10 @@ int __wrap_updi_ocd_emulate_cof_32bit(int fd, uint32_t return_pc,
 int __wrap_updi_console_poll(int u, int r) { (void)u; (void)r; return 0; }
 int __wrap_updi_enter_debug(int fd) { (void)fd; return 0; }
 int __wrap_updi_chip_erase(int fd) { (void)fd; return 0; }
+int __wrap_updi_save_peripherals(int fd, uint8_t *buf);
+int __wrap_updi_save_peripherals(int fd, uint8_t *buf) { (void)fd; (void)buf; return 0; }
+int __wrap_updi_restore_peripherals(int fd, const uint8_t *buf);
+int __wrap_updi_restore_peripherals(int fd, const uint8_t *buf) { (void)fd; (void)buf; return 0; }
 
 int __wrap_updi_ocd_poll_halted(int fd, int timeout_ms)
 {
@@ -726,6 +730,46 @@ static void on_read_mem_m_calls_updi_mem_read_and_returns_hex(void)
     TEST_ASSERT_EQUAL(1, mock_read_count);
     TEST_ASSERT_EQUAL(0x100u, mock_reads[0].addr);
     TEST_ASSERT_EQUAL(4u, mock_reads[0].len);
+}
+
+/* ── LLR-RSP-52 (HLR-067): mapped-flash data reads ──────────────────── */
+
+/* A data-space read in the AVR-Dx mapped-flash window (data >= 0x8000)
+ * targets FLASH aliased into the data space — the case that left an avrOS
+ * `stateMachine->currStateName` unreadable.  It must be served from the
+ * physical flash LMA via the ELF index's flash_lma_off, through the UPDI
+ * flash mirror, exactly as fsm_mapper does. */
+static void on_read_mem_mapped_flash_translates_via_flash_lma_off(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    AvrOsSymbolIndex idx; memset(&idx, 0, sizeof idx);
+    idx.flash_lma_off = 0x6000u;          /* LMA = VMA16 + 0x6000 */
+    ctx.idx = &idx;
+    mock_read_canned_len = 2;
+    mock_read_canned[0] = 0x48;           /* 'H' */
+    mock_read_canned[1] = 0x69;           /* 'i' */
+    /* GDB data read of a char* into mapped flash: 0x808156 (off16 0x8156,
+     * >= 0x8000) → flash_to_updi(0x8156 + 0x6000) = 0x80E156.            */
+    rsp_dispatch(sock_pair[1], "m808156,2", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("4869", payload);   /* not E14 */
+    TEST_ASSERT_EQUAL(1, mock_read_count);
+    TEST_ASSERT_EQUAL_HEX32(0x80E156u, mock_reads[0].addr);
+}
+
+/* Without an ELF index there is no flash_lma_off to translate the window,
+ * so the read falls through to the ordinary data-space path (no flash
+ * mirror) — the mapped-flash capability is avrOS-session only. */
+static void on_read_mem_mapped_flash_without_idx_is_not_translated(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);  /* idx == NULL */
+    mock_read_canned_len = 2;
+    mock_read_canned[0] = 0x11; mock_read_canned[1] = 0x22;
+    rsp_dispatch(sock_pair[1], "m808156,2", &h);
+    TEST_ASSERT_EQUAL(1, mock_read_count);
+    TEST_ASSERT_EQUAL_HEX32(0x8156u, mock_reads[0].addr);  /* no LMA xlate */
 }
 
 /* ── LLR-RSP-06: `M` / `X` ──────────────────────────────────────────── */
@@ -1647,6 +1691,41 @@ static void qXfer_memory_map_read_returns_xml_with_flash_and_ram_regions(void)
         "<memory type=\"ram\" start=\"0x803000\" length=\"0x4000\"/>"));
 }
 
+/* HLR-067 (LLR-RSP-52): with an ELF index present, the map also advertises
+ * the AVR-Dx mapped-flash data window (data >= 0x8000 aliases FLASH) as
+ * read-only ROM so GDB will issue reads of flash-resident .rodata (e.g. an
+ * avrOS currStateName string) instead of refusing them client-side.      */
+static void qXfer_memory_map_read_advertises_mapped_flash_rom_with_idx(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    AvrOsSymbolIndex idx; memset(&idx, 0, sizeof idx);
+    ctx.idx = &idx;
+    ctx.map.flash_size = 0x20000u;       /* 128 KiB → 32 KiB window */
+    ctx.map.sram_base  = 0x803000u;
+    ctx.map.sram_size  = 0x4000u;
+    rsp_dispatch(sock_pair[1], "qXfer:memory-map:read::0,800", &h);
+    char stream[2048]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[2048];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_NOT_NULL(strstr(payload,
+        "<memory type=\"rom\" start=\"0x808000\" length=\"0x8000\"/>"));
+}
+
+/* Without an ELF index the mapped-flash ROM window is NOT advertised (the
+ * server cannot translate it, so it must not invite reads it can't serve).*/
+static void qXfer_memory_map_read_omits_mapped_flash_rom_without_idx(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);  /* idx == NULL */
+    ctx.map.flash_size = 0x20000u;
+    ctx.map.sram_base  = 0x803000u;
+    ctx.map.sram_size  = 0x4000u;
+    rsp_dispatch(sock_pair[1], "qXfer:memory-map:read::0,800", &h);
+    char stream[2048]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[2048];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_NULL(strstr(payload, "type=\"rom\""));
+}
+
 /* HLR-063: the memory-map must also describe the five non-FLASH NVM
  * regions (EEPROM, FUSES, LOCK, SIGROW, USERROW) at their GDB-visible
  * ELF VMA bands so `info mem` reports them and M-packet writes route
@@ -2086,6 +2165,73 @@ static void Z0_in_sw_mode_idempotent_on_same_address(void)
     TEST_ASSERT_EQUAL(1, mock_flash_patch_count);
 }
 
+/* ── LLR-RSP-36 / LLR-RSP-38: auto bp-mode — prefer HW, fall back to SW ─ */
+
+static void Z0_in_auto_mode_prefers_hw_comparator(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    ctx.bp_mode = RSP_BP_MODE_AUTO;
+    rsp_dispatch(sock_pair[1], "Z0,400,2", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("OK", payload);
+    /* The free user comparator is used — no FLASH write, no NVMPROG reset. */
+    TEST_ASSERT_EQUAL(1, mock_hw_bp_set_calls);
+    TEST_ASSERT_EQUAL(0x400u, mock_hw_bp_silicon[0]);
+    TEST_ASSERT_EQUAL(0, mock_flash_patch_count);
+    TEST_ASSERT_FALSE(ctx.sw_bp[0].in_use);
+}
+
+static void Z0_in_auto_mode_falls_back_to_sw_when_hw_slot_occupied(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    ctx.bp_mode = RSP_BP_MODE_AUTO;
+    /* First Z0 takes the single user comparator. */
+    rsp_dispatch(sock_pair[1], "Z0,400,2", &h);
+    /* Second Z0 must fall back to the SW FLASH-BREAK patch. */
+    rsp_dispatch(sock_pair[1], "Z0,500,2", &h);
+    char stream[128]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("OK", payload);
+    /* Exactly one FLASH-BREAK patch (the fallback); the comparator is
+     * retained, holding the first address.  (sw_bp_patch_flash re-arms
+     * live HW comparators after its NVMPROG reset, so the HW set-call
+     * count legitimately bumps — assert the retained slot, not it.)    */
+    TEST_ASSERT_EQUAL(1, mock_flash_patch_count);
+    TEST_ASSERT_EQUAL(UPDI_FLASH_BASE + 0x500u, mock_flash_patches[0].addr);
+    TEST_ASSERT_EQUAL(0x400u, ctx.hw_bp_addr[0]);
+    TEST_ASSERT_TRUE(ctx.sw_bp[0].in_use);
+    TEST_ASSERT_EQUAL(0x500u, ctx.sw_bp[0].addr);
+}
+
+static void z0_in_auto_mode_removes_both_hw_and_sw(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    ctx.bp_mode = RSP_BP_MODE_AUTO;
+    rsp_dispatch(sock_pair[1], "Z0,400,2", &h);   /* HW comparator */
+    rsp_dispatch(sock_pair[1], "Z0,500,2", &h);   /* SW fallback   */
+    char drain_buf[256]; drain(sock_pair[0], drain_buf, sizeof drain_buf);
+    /* Removing the SW fallback drains the SW shadow, not the comparator. */
+    rsp_dispatch(sock_pair[1], "z0,500,2", &h);
+    TEST_ASSERT_FALSE(ctx.sw_bp[0].in_use);
+    TEST_ASSERT_EQUAL(0, mock_hw_bp_clear_calls);
+    /* Removing the HW breakpoint frees the comparator. */
+    rsp_dispatch(sock_pair[1], "z0,400,2", &h);
+    TEST_ASSERT_EQUAL(1, mock_hw_bp_clear_calls);
+}
+
+static void Z0_in_auto_mode_idempotent_on_hw_address(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    ctx.bp_mode = RSP_BP_MODE_AUTO;
+    rsp_dispatch(sock_pair[1], "Z0,400,2", &h);
+    rsp_dispatch(sock_pair[1], "Z0,400,2", &h);
+    TEST_ASSERT_EQUAL(1, mock_hw_bp_set_calls);
+    TEST_ASSERT_EQUAL(0, mock_flash_patch_count);
+}
+
 static void vFlashDone_also_clears_sw_bp_shadow(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
@@ -2147,6 +2293,8 @@ int main(void)
     RUN_TEST(on_write_regs_G_writes_all_registers_via_ocd);
     RUN_TEST(on_write_regs_P_writes_single_register_via_ocd);
     RUN_TEST(on_read_mem_m_calls_updi_mem_read_and_returns_hex);
+    RUN_TEST(on_read_mem_mapped_flash_translates_via_flash_lma_off);
+    RUN_TEST(on_read_mem_mapped_flash_without_idx_is_not_translated);
     RUN_TEST(on_write_mem_M_calls_updi_mem_write_for_sram_address);
     RUN_TEST(on_write_mem_X_calls_nvm_write_flash_for_flash_address);
     RUN_TEST(on_insert_bp_calls_updi_ocd_set_hw_bp_with_byte_addr);
@@ -2199,6 +2347,8 @@ int main(void)
     /* HLR-063: qXfer:memory-map:read+ */
     RUN_TEST(qSupported_advertises_qXfer_memory_map_read);
     RUN_TEST(qXfer_memory_map_read_returns_xml_with_flash_and_ram_regions);
+    RUN_TEST(qXfer_memory_map_read_advertises_mapped_flash_rom_with_idx);
+    RUN_TEST(qXfer_memory_map_read_omits_mapped_flash_rom_without_idx);
     RUN_TEST(qXfer_memory_map_read_includes_eeprom_fuses_lock_sigrow_userrow);
     RUN_TEST(qXfer_memory_map_read_supports_chunked_offset_length);
     RUN_TEST(qXfer_memory_map_read_replies_l_when_no_elf_loaded);
@@ -2222,6 +2372,10 @@ int main(void)
     RUN_TEST(z0_in_sw_mode_stabilizes_pc_after_restore);
     RUN_TEST(Z0_in_sw_mode_refuses_data_space_address_with_E22);
     RUN_TEST(Z0_in_sw_mode_snapshots_and_restores_cpu_state);
+    RUN_TEST(Z0_in_auto_mode_prefers_hw_comparator);
+    RUN_TEST(Z0_in_auto_mode_falls_back_to_sw_when_hw_slot_occupied);
+    RUN_TEST(z0_in_auto_mode_removes_both_hw_and_sw);
+    RUN_TEST(Z0_in_auto_mode_idempotent_on_hw_address);
     RUN_TEST(Z0_in_hw_only_mode_falls_back_to_HW_BP_path);
     RUN_TEST(Z0_in_sw_mode_idempotent_on_same_address);
     RUN_TEST(continue_after_sw_bp_install_injects_leading_instruction);

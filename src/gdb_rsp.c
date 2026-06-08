@@ -42,6 +42,17 @@ bool rsp_get_noack(void)   { return g_noack; }
 /* GDB AVR ↔ UPDI address-space translation helpers live in updi.h
  * (GDB_AVR_DATA_FLAG, GDB_AVR_ADDR_MASK, sram_to_updi, flash_to_updi). */
 
+/* HLR-067: AVR-Dx maps a 32 KiB flash window into the high half of the
+ * 16-bit data space — data addresses >= 0x8000 alias FLASH (FLMAP selects
+ * which physical 32 KiB section).  avr-gcc places `.rodata` there, so a
+ * plain `char *` to a string literal (e.g. an avrOS FSM `currStateName`)
+ * is read by GDB as *data* at `0x80_8xxx`.  Such a read must be served
+ * from the physical flash LMA (via `flash_lma_off`), not from a raw
+ * data-space probe of 0x8xxx, which returns FLMAP-dependent garbage —
+ * the same translation fsm_mapper.c already uses for state-name strings. */
+#define AVR_MAPPED_FLASH_OFF  0x8000u   /* data-space base of the window  */
+#define AVR_MAPPED_FLASH_LEN  0x8000u   /* 32 KiB mapped-flash window size */
+
 /* Sentinel: no breakpoint installed in this HW comparator slot. */
 #define HW_BP_SLOT_EMPTY    0xFFFFFFFFu
 
@@ -491,8 +502,13 @@ static int sw_bp_patch_flash(RspContext *ctx, uint32_t byte_addr,
     uint16_t sp;
     uint32_t pc;
     int updi_fd = ctx->updi_fd;
+    /* Phase 20: peripheral I/O snapshot preserved across the NVMPROG system
+     * reset so any SLEEP wake source (timer/USART/pin/...) survives.  No-op
+     * (and `periph` left untouched) when debug-in-sleep is disabled (--sleep). */
+    static uint8_t periph[UPDI_PERIPH_LEN];
 
     if (sw_bp_snapshot_cpu(updi_fd, gpr, &sreg, &sp, &pc) < 0) return -1;
+    if (updi_save_peripherals(updi_fd, periph) < 0) return -1;
 
     if (orig_out != NULL) {
         if (updi_mem_read(updi_fd, UPDI_FLASH_BASE + byte_addr,
@@ -513,6 +529,10 @@ static int sw_bp_patch_flash(RspContext *ctx, uint32_t byte_addr,
                 return -1;
         }
     }
+
+    /* Restore the peripheral configuration the reset wiped, before re-arming
+     * the CPU state (which writes OCD.PC last for the pc_dirty handling). */
+    if (updi_restore_peripherals(updi_fd, periph) < 0) return -1;
 
     if (sw_bp_restore_cpu(updi_fd, gpr, sreg, sp, pc) < 0) return -1;
 
@@ -742,23 +762,38 @@ static int dh_read_mem(int fd, const char *pkt, void *vctx)
     if (parse_hex_u32(&p, &len) < 0) return reply_err(fd, "E01");
     if (len == 0 || len > 512u) return reply_err(fd, "E01");
 
-    /* HLR-067: refuse reads outside the advertised memory map so GDB's
-     * `finish` / `step-out` (which reads the return address off the
-     * stack via DWARF CFI) reports an honest "unreliable" error
-     * rather than receiving filler from a no-such-memory UPDI probe
-     * and jumping to a fabricated address.  E14 = EFAULT per the
-     * Linux errno convention GDB documents for memory faults.        */
-    if (!mm_range_in_advertised_region(ctx, addr, len)) {
-        return reply_err(fd, "E14");
+    uint32_t updi_addr;
+    /* HLR-067: a data-space read in the AVR-Dx mapped-flash window
+     * (data >= 0x8000) targets FLASH aliased into the data space — e.g.
+     * GDB dereferencing a `char *` into `.rodata`, the case that left an
+     * avrOS `stateMachine->currStateName` unreadable.  Translate the
+     * 16-bit mapped VMA to its physical flash LMA (via the ELF index's
+     * `flash_lma_off`) and route through the UPDI flash mirror, exactly
+     * as fsm_mapper does.  This window is read-only FLASH and always
+     * present, so it bypasses the advertised-region SRAM-fault gate
+     * below.  Only served when the ELF symbol index is available.     */
+    uint32_t off16 = addr & 0xFFFFu;
+    if ((addr & GDB_AVR_DATA_FLAG) && off16 >= AVR_MAPPED_FLASH_OFF
+        && ctx->idx != NULL) {
+        updi_addr = flash_to_updi(off16 + ctx->idx->flash_lma_off);
+    } else {
+        /* HLR-067: refuse reads outside the advertised memory map so
+         * GDB's `finish` / `step-out` (which reads the return address
+         * off the stack via DWARF CFI) reports an honest "unreliable"
+         * error rather than receiving filler from a no-such-memory UPDI
+         * probe and jumping to a fabricated address.  E14 = EFAULT per
+         * the Linux errno convention GDB documents for memory faults. */
+        if (!mm_range_in_advertised_region(ctx, addr, len)) {
+            return reply_err(fd, "E14");
+        }
+        /* GDB AVR memory map: 0x000000-0x7FFFFF = FLASH (program memory),
+         * 0x800000+ = SRAM/IO (data memory).  AVR-Dx UPDI memory map:
+         * FLASH at UPDI 0x800000+, SRAM/IO at UPDI 0x000000+.  Swap the
+         * bit-23 sense to translate between the two spaces. */
+        updi_addr = (addr & GDB_AVR_DATA_FLAG)
+                  ? (addr & GDB_AVR_ADDR_MASK)
+                  : (addr | UPDI_FLASH_BASE);
     }
-
-    /* GDB AVR memory map: 0x000000-0x7FFFFF = FLASH (program memory),
-     * 0x800000+ = SRAM/IO (data memory).  AVR-Dx UPDI memory map: FLASH at
-     * UPDI 0x800000+, SRAM/IO at UPDI 0x000000+.  Swap the bit-23 sense to
-     * translate between the two spaces. */
-    uint32_t updi_addr = (addr & GDB_AVR_DATA_FLAG)
-                       ? (addr & GDB_AVR_ADDR_MASK)
-                       : (addr | UPDI_FLASH_BASE);
     uint8_t buf[512];
     if (updi_mem_read(ctx->updi_fd, updi_addr, buf, len) < 0) {
         return reply_err(fd, "E01");
@@ -1195,11 +1230,45 @@ static int dh_insert_bp(int fd, const char *pkt, void *vctx)
     uint32_t addr;
     if (parse_hex_u32(&p, &addr) < 0) return reply_err(fd, "E01");
 
-    /* HLR-054: Z0 with bp_mode==SW patches the BREAK opcode into FLASH
-     * for an unbounded number of simultaneous SW breakpoints.  Z1, or
-     * Z0 in `hw-only` mode (HLR-055), still aliases to the two OCD HW
-     * comparators preserved from the Phase 1–8 baseline (HLR-016).    */
-    if (kind == '0' && ctx->bp_mode == RSP_BP_MODE_SW) {
+    /* HLR-054 / HLR-055: decide whether this Z0 is installed as a SW
+     * FLASH-BREAK patch or routed to a HW comparator.
+     *   - bp_mode == sw       → always SW.
+     *   - bp_mode == hw-only  → always HW (Z0 aliases the comparator).
+     *   - bp_mode == auto     → prefer a HW comparator when the single
+     *     user slot is free (no NVMPROG reset glitch, survives SLEEP),
+     *     and fall back to SW only once that slot is occupied.
+     * Z1 always takes the HW path below regardless of bp_mode.        */
+    bool z0_use_sw = (kind == '0' && ctx->bp_mode == RSP_BP_MODE_SW);
+    if (kind == '0' && ctx->bp_mode == RSP_BP_MODE_AUTO) {
+        /* `BREAK` is only meaningful fetched from FLASH; a data-space
+         * address can be neither a SW patch nor a PC comparator hit.  */
+        if (addr & GDB_AVR_DATA_FLAG) return reply_err(fd, "E22");
+        /* Idempotent: already installed as SW (an earlier fallback)?  */
+        for (int i = 0; i < RSP_MAX_SW_BREAKPOINTS; i++) {
+            if (ctx->sw_bp[i].in_use && ctx->sw_bp[i].addr == addr)
+                return reply_ok(fd);
+        }
+        /* Idempotent: already on a HW comparator?  Catch this here so a
+         * re-insert of an address that already holds the (now occupied)
+         * comparator does not wrongly fall through to a duplicate SW
+         * patch at the same address.                                  */
+        for (int i = 0; i < RSP_HW_BP_USER_SLOTS; i++) {
+            if (ctx->hw_bp_addr[i] == addr) return reply_ok(fd);
+        }
+        /* Prefer HW: fall back to SW only when no user slot is free.
+         * (HW install is handled by the HW path below.)               */
+        bool hw_free = false;
+        for (int i = 0; i < RSP_HW_BP_USER_SLOTS; i++) {
+            if (ctx->hw_bp_addr[i] == HW_BP_SLOT_EMPTY) { hw_free = true; break; }
+        }
+        z0_use_sw = !hw_free;
+    }
+
+    /* HLR-054: Z0 routed to SW patches the BREAK opcode into FLASH for an
+     * unbounded number of simultaneous SW breakpoints.  Z1, or Z0 in
+     * `hw-only` mode (HLR-055) / `auto` with the comparator occupied,
+     * aliases to the OCD HW comparators (HLR-016).                     */
+    if (z0_use_sw) {
         /* Reject addresses in the data-space windows (SIGROW, FUSES,
          * USERROW, EEPROM, LOCK) — `BREAK` is only meaningful when
          * fetched from FLASH as an instruction.                       */
@@ -1258,11 +1327,14 @@ static int dh_remove_bp(int fd, const char *pkt, void *vctx)
     uint32_t addr;
     if (parse_hex_u32(&p, &addr) < 0) return reply_err(fd, "E01");
 
-    /* HLR-054: matching z0 in SW mode restores the captured original
-     * opcode and frees the shadow slot.  If no shadow matches we fall
-     * through to the HW-comparator path so a server that toggled
-     * bp_mode mid-session still drains both shadow tables.            */
-    if (kind == '0' && ctx->bp_mode == RSP_BP_MODE_SW) {
+    /* HLR-054: a matching z0 restores the captured original opcode and
+     * frees the shadow slot.  Scanned in `sw` and `auto` modes (the
+     * latter may have installed either kind); if no SW shadow matches we
+     * fall through to the HW-comparator scan, so a server that toggled
+     * bp_mode mid-session — or an `auto` breakpoint that took the HW
+     * slot — still drains the correct table.                          */
+    if (kind == '0' && (ctx->bp_mode == RSP_BP_MODE_SW ||
+                        ctx->bp_mode == RSP_BP_MODE_AUTO)) {
         for (int i = 0; i < RSP_MAX_SW_BREAKPOINTS; i++) {
             if (ctx->sw_bp[i].in_use && ctx->sw_bp[i].addr == addr) {
                 uint32_t byte_addr = addr & GDB_AVR_ADDR_MASK;
@@ -1368,6 +1440,21 @@ static int dh_qxfer_memory_map(int fd, const char *pkt, void *vctx)
         MM_APPEND("<memory type=\"ram\" start=\"0x%lx\" length=\"0x%lx\"/>",
                   (unsigned long)ctx->map.sram_base,
                   (unsigned long)ctx->map.sram_size);
+    }
+    /* HLR-067: advertise the AVR-Dx mapped-flash data window (data
+     * >= 0x8000 aliases FLASH) as read-only ROM so GDB will *issue*
+     * reads of flash-resident `.rodata` (e.g. an avrOS FSM
+     * `currStateName` string) instead of refusing them client-side
+     * because the address is undescribed.  dh_read_mem serves them via
+     * the flash LMA.  Gated on the ELF index (flash_lma_off) being
+     * available to translate the window.                              */
+    if (ctx->idx != NULL && ctx->map.flash_size != 0u) {
+        unsigned long win = ctx->map.flash_size < AVR_MAPPED_FLASH_LEN
+                          ? (unsigned long)ctx->map.flash_size
+                          : (unsigned long)AVR_MAPPED_FLASH_LEN;
+        MM_APPEND("<memory type=\"rom\" start=\"0x%lx\" length=\"0x%lx\"/>",
+                  (unsigned long)(GDB_AVR_DATA_FLAG | AVR_MAPPED_FLASH_OFF),
+                  win);
     }
     if (ctx->map.eeprom_size != 0u) {
         MM_APPEND("<memory type=\"flash\" start=\"0x%lx\" length=\"0x%lx\">"

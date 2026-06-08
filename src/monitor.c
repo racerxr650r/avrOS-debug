@@ -368,9 +368,11 @@ static int verb_version(int rsp_fd)
 static int verb_bp_mode(int rsp_fd, RspContext *ctx, const char *arg)
 {
     if (arg == NULL || arg[0] == '\0') {
+        const char *name = ctx->bp_mode == RSP_BP_MODE_HW_ONLY ? "hw-only"
+                         : ctx->bp_mode == RSP_BP_MODE_AUTO     ? "auto"
+                         :                                        "sw";
         char line[64];
-        snprintf(line, sizeof line, "bp-mode: %s\n",
-                 ctx->bp_mode == RSP_BP_MODE_HW_ONLY ? "hw-only" : "sw");
+        snprintf(line, sizeof line, "bp-mode: %s\n", name);
         (void)o_line(rsp_fd, line);
         return 0;
     }
@@ -384,7 +386,13 @@ static int verb_bp_mode(int rsp_fd, RspContext *ctx, const char *arg)
         (void)o_line(rsp_fd, "bp-mode: hw-only\n");
         return 0;
     }
-    (void)o_line(rsp_fd, "bp-mode: argument must be 'sw' or 'hw-only'\n");
+    if (strcmp(arg, "auto") == 0) {
+        ctx->bp_mode = RSP_BP_MODE_AUTO;
+        (void)o_line(rsp_fd, "bp-mode: auto\n");
+        return 0;
+    }
+    (void)o_line(rsp_fd,
+                 "bp-mode: argument must be 'auto', 'sw' or 'hw-only'\n");
     return -2;
 }
 
@@ -397,7 +405,7 @@ static int verb_help(int rsp_fd)
         "monitor erase            — chip-erase (requires --allow-erase)\n",
         "monitor chip-erase       — alias of `monitor erase`\n",
         "monitor version          — print server version + build date\n",
-        "monitor bp-mode <sw|hw-only> — select breakpoint installation policy\n",
+        "monitor bp-mode <auto|sw|hw-only> — select breakpoint installation policy\n",
         "monitor help             — this help text\n",
         "monitor avros events     — list avrOS event descriptors\n",
         "monitor avros queues     — list avrOS queue descriptors\n",
