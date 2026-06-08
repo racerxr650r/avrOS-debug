@@ -1547,7 +1547,7 @@ int MAIN_NAME(int argc, char *argv[])
         .c_thread_p = &c_thread,
         .quit_p     = &g_quit,
         .allow_erase = cfg.allow_erase ? 1 : 0,
-        .bp_mode    = RSP_BP_MODE_SW,
+        .bp_mode    = RSP_BP_MODE_AUTO,
                 /* HLR-063: feed the target-detected memory layout to the
          * qXfer:memory-map:read handler.  Zero values disable the
          * map advertisement entirely.                                */

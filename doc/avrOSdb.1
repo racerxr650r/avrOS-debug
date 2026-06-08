@@ -328,11 +328,20 @@ avrOSdb \-\-allow\-erase /dev/ttyUSB0 firmware.elf
 From GDB the Phase-10 surface offers
 .BR "load" " (vFlashErase/Write/Done),"
 .BR "watch" / "rwatch" / "awatch" " (Z2/Z3/Z4 data watchpoints),"
-.BR "run" / "kill" " (vRun/vKill), and software breakpoints via"
-.BR Z0 " (FLASH"
+.BR "run" / "kill" " (vRun/vKill), and breakpoints via"
+.BR Z0 .
+By default
+.RB ( "monitor bp-mode auto" )
+a
+.B Z0
+in FLASH is placed on a free OCD hardware comparator \(em avoiding the
+FLASH write and its NVMPROG reset glitch, and surviving target
+.BR SLEEP \(em
+and falls back to the FLASH
 .B BREAK
-opcode by default, switchable via
-.BR "monitor bp-mode" ).
+opcode patch once the single user comparator is in use. Force one policy
+with
+.BR "monitor bp-mode sw" " or " "monitor bp-mode hw-only" .
 .SH SEE ALSO
 .BR avr-gdb (1),
 .BR avrdude (1),

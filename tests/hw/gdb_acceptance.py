@@ -456,6 +456,17 @@ PER_TEST_CMDS: dict[int, str] = {
          "print g_marker\n"              # 49374
          "finish\n"                      # Value returned is N = 49405
          "delete breakpoints\n"),
+    # G25: read an avrOS FSM state-name string. Stopped inside ledsFlash(),
+    # `stateMachine->currStateName` is a char* into the AVR-Dx mapped-flash
+    # data window (.rodata aliased at data >= 0x8000). Recreates the
+    # "couldn't read the address" failure for flash-resident strings.
+    25: ("break ledsFlash\n"
+         "continue\n"
+         "print stateMachine\n"                 # (fsmStateMachine_t *) 0x....
+         "print/x stateMachine->currStateName\n"# raw 16-bit mapped-flash ptr
+         "print stateMachine->currStateName\n"  # the failing string read
+         "x/s stateMachine->currStateName\n"    # ditto, as a C string
+         "delete breakpoints\n"),
 }
 
 # Per-test wall-clock cap (s) when running `avr-gdb -batch`. G2 has to
@@ -484,6 +495,7 @@ PER_TEST_TIMEOUT: dict[int, float] = {
     22: 30.0,
     23: 30.0,
     24: 40.0,
+    25: 25.0,
 }
 
 def build_test_script(n: int, rsp_port: int) -> str:
@@ -904,6 +916,31 @@ def verdict_G24(sect: str) -> Tuple[str, str]:
         return "FAIL", "finish from leaf(7,3) did not return 49405"
     return "PASS", ""
 
+def verdict_G25(sect: str) -> Tuple[str, str]:
+    # avrOS FSM state-name string read. Stopped inside ledsFlash(), GDB reads
+    # stateMachine->currStateName — a char* into the AVR-Dx mapped-flash data
+    # window (.rodata aliased at data >= 0x8000). Before the dh_read_mem
+    # mapped-flash translation + qXfer ROM advertisement, GDB refuses the read
+    # ("Cannot access memory at address 0x80....") because the window is
+    # undescribed; after the fix the flash-resident string reads back.
+    if "Error in sourced command file" in sect:
+        return "FAIL", "GDB command failed before reading currStateName"
+    if "remote failure" in sect.lower():
+        return "FAIL", "remote read failed while inspecting currStateName"
+    if re.search(r"No symbol .* in current context", sect):
+        return "FAIL", "stateMachine not in scope (frame/DWARF not resolved)"
+    if re.search(r"Cannot access memory at address", sect):
+        m = re.search(r"Cannot access memory at address (0x[0-9a-fA-F]+)", sect)
+        where = m.group(1) if m else "?"
+        return "FAIL", (f"currStateName string unreadable at {where} "
+                        "(mapped-flash data window not served)")
+    # A quoted, non-empty string in the transcript can only come from the
+    # currStateName print / x/s — its presence means the flash read worked.
+    m = re.search(r'=\s*(?:0x[0-9a-fA-F]+\s+)?"([^"]*)"', sect)
+    if not m or m.group(1) == "":
+        return "FAIL", "currStateName did not resolve to a non-empty string"
+    return "PASS", f'currStateName = "{m.group(1)}"'
+
 def verdict_G8(sect: str) -> Tuple[str, str]:
     # Continue must produce breakpoint hit lines for blink, blink2, blink3
     hits_blink = len(re.findall(r"Breakpoint \d+,.*\bblink\b", sect))
@@ -944,6 +981,7 @@ VERDICTS = {
     22: ("globals: scalar, struct, array reads", verdict_G22),
     23: ("per-frame info args + info locals values", verdict_G23),
     24: ("capstone: full interactive debug session", verdict_G24),
+    25: ("avrOS FSM state-name string read (mapped-flash char*)", verdict_G25),
 }
 
 # ──────────────────────────────────────────────────────────────────────
@@ -982,6 +1020,9 @@ def main() -> int:
     ap.add_argument("--verbose", "-v", action="count", default=0)
     ap.add_argument("--keep-transcript", action="store_true",
                     help="Don't delete the GDB transcript on success")
+    ap.add_argument("--only", type=int, action="append", metavar="N",
+                    help="Run only the given Group-G test number(s); repeatable. "
+                         "Speeds up single-case debug cycles.")
     args = ap.parse_args()
 
     if not os.path.isfile(args.avros_bin) or not os.access(args.avros_bin, os.X_OK):
@@ -1026,11 +1067,12 @@ def main() -> int:
 
         any_fail = False
         all_transcripts: List[str] = []
-        for n in sorted(VERDICTS):
+        selected = sorted(n for n in VERDICTS if not args.only or n in args.only)
+        for n in selected:
             if n == 9:
                 desired_extra_args = ["--log-rsp", "--no-introspect"]
             elif n in (10, 11, 12, 13, 14, 15, 16, 17,
-                       18, 19, 20, 21, 22, 23, 24):
+                       18, 19, 20, 21, 22, 23, 24, 25):
                 desired_extra_args = ["--log-rsp", "--load"]
             else:
                 desired_extra_args = ["--log-rsp"]
@@ -1038,12 +1080,12 @@ def main() -> int:
                 desired_elf = args.dbg_elf
             elif n == 17:
                 desired_elf = args.g17_elf
-            elif n in (10, 11, 12, 13, 14, 15, 16):
-                desired_elf = args.g10_elf
+            elif n in (10, 11, 12, 13, 14, 15, 16, 25):
+                desired_elf = args.g10_elf      # avrOS example (has ledsFlash)
             else:
                 desired_elf = args.elf
             force_restart = (n in (11, 12, 13, 14, 15, 16, 17,
-                                   18, 19, 20, 21, 22, 23, 24))
+                                   18, 19, 20, 21, 22, 23, 24, 25))
             if (force_restart or desired_extra_args != current_extra_args or
                     desired_elf != current_elf):
                 kill_server(server)
@@ -1123,8 +1165,7 @@ def main() -> int:
         # Simpler: print summary using a second pass over VERDICTS by
         # re-judging the transcripts we kept.
         per_results = []
-        for idx, n in enumerate(sorted(VERDICTS)):
-            tr = all_transcripts[idx]
+        for n, tr in zip(selected, all_transcripts):
             if "*** avr-gdb -batch timed out" in tr:
                 per_results.append("SKIP" if n == 5 else "FAIL")
             else:

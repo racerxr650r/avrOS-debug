@@ -30,6 +30,12 @@ typedef struct {
 /* HLR-055: monitor bp-mode values. */
 #define RSP_BP_MODE_SW       0
 #define RSP_BP_MODE_HW_ONLY  1
+/* HLR-055: `auto` (the default) — a Z0 in FLASH is installed on the free
+ * user HW comparator when one is available (no flash write ⇒ no NVMPROG
+ * system-reset glitch, and the breakpoint survives target SLEEP), and
+ * falls back to the unbounded SW FLASH-BREAK patch (peripheral-preserved,
+ * HLR-077) only once the single user comparator is occupied.            */
+#define RSP_BP_MODE_AUTO     2
 
 /* HLR-054: maximum number of simultaneous software breakpoints.  The
  * AVR architecture imposes no inherent limit (every two-byte FLASH
@@ -65,10 +71,12 @@ typedef struct {
     uint32_t                  hw_bp_addr[2];
     /* HLR-055: monitor verbs.  `allow_erase` mirrors the --allow-erase
      * CLI flag and gates `monitor erase` / `monitor chip-erase`.
-     * `bp_mode` is 0 = "sw" (true SW BPs via FLASH BREAK, HLR-054) or
-     * 1 = "hw-only" (legacy: Z0 aliases to HW comparators).  Mode is
-     * mutated by `monitor bp-mode <sw|hw-only>` and persists for the
-     * lifetime of the server process.                                */
+     * `bp_mode` is 0 = "sw" (true SW BPs via FLASH BREAK, HLR-054),
+     * 1 = "hw-only" (legacy: Z0 aliases to HW comparators), or
+     * 2 = "auto" (the default: Z0 prefers a free HW comparator, falls
+     * back to SW once it is taken).  Mutated by
+     * `monitor bp-mode <auto|sw|hw-only>` and persists for the lifetime
+     * of the server process.                                          */
     int                       allow_erase;
     int                       bp_mode;
     /* HLR-053: in-progress vFlash* transaction state.  `flash_xact_buf`

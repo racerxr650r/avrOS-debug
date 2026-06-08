@@ -73,10 +73,12 @@ typedef struct {
     uint32_t event_table_addr;   /* FLASH byte LMA of EVNT_TABLE   */
     uint8_t  event_count;        /* entries: stride 4              */
     uint32_t current_fsm_addr;   /* SRAM VMA of currStateMachine   */
-    uint32_t flash_lma_off;      /* LMA-VMA delta for the mapped-flash
-                                  * window (0 when unknown); add to a
-                                  * data-space mapped-flash pointer to get
-                                  * the physical FLASH byte (LMA) for UPDI. */
+    uint32_t flash_lma_off;      /* delta from a 16-bit mapped-flash
+                                  * data-space pointer (0x8000..0xFFFF) to
+                                  * the physical FLASH byte (LMA); add it to
+                                  * a `char *` value (masked to 16 bits) to
+                                  * get the LMA for a UPDI flash-mirror read.
+                                  * = LMA - (VMA & 0xFFFF).  0 when unknown. */
 } AvrOsSymbolIndex;
 
 /* Open `path`, validate it is an ELF32 EM_AVR object, capture the PT_LOAD
