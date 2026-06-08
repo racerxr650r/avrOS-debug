@@ -103,6 +103,10 @@ typedef struct {
     FsmContext             *fsm;
     bool                    log;
     long                    out_seq;  /* outgoing message seq (pre-incremented) */
+    bool                    running;  /* Phase 17: target resumed via `continue`;
+                                       * dap_serve() polls the OCD STOPPED status
+                                       * each idle tick and emits `stopped` when
+                                       * the target halts (breakpoint / spontaneous). */
 } dap_session;
 
 /* Handle one decoded DAP message: parse, dispatch to the matching request

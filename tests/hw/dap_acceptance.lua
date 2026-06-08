@@ -5,13 +5,17 @@
 -- nvim-dap client over TCP, and applies per-case verdicts to the connection
 -- lifecycle. Manual-only (needs hardware); run via `make hw-test-dap`.
 --
--- Phase 16 covers the connection handshake (the DAP "Group-D" equivalent):
+-- Phase 16 covers the connection handshake (the DAP "Group-D" equivalent);
+-- Phase 17 adds execution control, stop events, and a shallow stackTrace:
 --   DAP1  initialize handshake completes + `initialized` event
 --   DAP2  configurationDone reaches a stopped/`entry` state
 --   DAP3  `threads` reports the single live CPU thread
---   DAP4  `disconnect` tears the session down cleanly
--- Execution control, breakpoints, stack/variables (Phases 17–19) add cases
--- here the same way Group-G grew for GDB.
+--   DAP4  `continue` then `pause` -> stopped(`pause`)            (Phase 17)
+--   DAP5  `stepIn` -> stopped(`step`)                            (Phase 17)
+--   DAP6  `stackTrace` frame 0 resolves PC -> source line        (Phase 17)
+--   DAP7  `disconnect` tears the session down cleanly
+-- Breakpoints and variables (Phases 18–19) add cases here the same way
+-- Group-G grew for GDB.
 --
 -- Config comes from the environment (set by the Makefile):
 --   AVROSDB_BIN  path to the built avrOSdb binary   (default build/avrOSdb)
@@ -118,7 +122,48 @@ record('DAP3  threads -> single CPU thread', one_thread,
        threads == nil and 'no threads response'
          or ('#threads=' .. tostring(#threads)))
 
--- DAP4: disconnect tears the session down cleanly
+-- DAP4: continue, then pause -> stopped(pause). No breakpoints are installed
+-- yet (Phase 18), so `pause` is how we re-halt a freely running target.
+ev.stopped, ev.reason = false, nil
+if session then
+  session:request('continue', { threadId = 1 }, function() end)
+  vim.wait(600)                                   -- let the target run a little
+  session:request('pause', { threadId = 1 }, function() end)
+  vim.wait(5000, function() return ev.stopped end, 50)
+end
+record('DAP4  continue -> pause -> stopped(pause)',
+       ev.stopped and ev.reason == 'pause',
+       (not ev.stopped) and 'no `stopped` event'
+         or ('reason=' .. tostring(ev.reason)))
+
+-- DAP5: stepIn -> stopped(step). From the halted target, one instruction step.
+ev.stopped, ev.reason = false, nil
+if session then
+  session:request('stepIn', { threadId = 1 }, function() end)
+  vim.wait(5000, function() return ev.stopped end, 50)
+end
+record('DAP5  stepIn -> stopped(step)',
+       ev.stopped and ev.reason == 'step',
+       (not ev.stopped) and 'no `stopped` event'
+         or ('reason=' .. tostring(ev.reason)))
+
+-- DAP6: stackTrace frame 0 resolves the live PC to a source line via DWARF.
+local st_done, frames = false, nil
+if session then
+  session:request('stackTrace', { threadId = 1 }, function(err, resp)
+    st_done = true
+    if not err and resp then frames = resp.stackFrames end
+  end)
+  vim.wait(4000, function() return st_done end, 50)
+end
+local f0 = frames and frames[1]
+local has_line = f0 ~= nil and type(f0.line) == 'number' and f0.line > 0
+record('DAP6  stackTrace frame0 -> source line', has_line,
+       (f0 == nil) and 'no frame 0'
+         or ('line=' .. tostring(f0.line)
+             .. ' src=' .. tostring(f0.source and f0.source.name)))
+
+-- DAP7: disconnect tears the session down cleanly
 local disc_done, disc_ok = false, false
 if session then
   session:request('disconnect', { restart = false }, function(err)
@@ -126,7 +171,7 @@ if session then
   end)
   vim.wait(4000, function() return disc_done end, 50)
 end
-record('DAP4  disconnect (clean teardown)', disc_done and disc_ok,
+record('DAP7  disconnect (clean teardown)', disc_done and disc_ok,
        (not disc_done) and 'no disconnect response' or '')
 
 -- ── summary + exit status ───────────────────────────────────────────────────

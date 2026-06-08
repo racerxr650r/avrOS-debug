@@ -1063,7 +1063,7 @@ This is not a fixable detail — it is a **model mismatch**. avrOS is a cooperat
 
 ### Phase 17 — DAP Execution Control, Stop Events & Shallow stackTrace
 
-> **Status: 🔲 Not started — issue [#53](https://github.com/racerxr650r/avrOS-debug/issues/53).**
+> **Status: 🔲 In progress — issue [#53](https://github.com/racerxr650r/avrOS-debug/issues/53), branch `53-phase-17-dap-execution-control`.** Implemented in `src/dap.c` on the Phase-16 foundation: `continue` (resume + `continued` event; `dap_serve()` idle-tick polls `updi_ocd_poll_halted()` and emits `stopped` on halt), `pause` (`stopped` reason `pause`), `next`/`stepIn`/`stepOut` (one OCD `updi_step()` → `stopped` reason `step`; source-line-granular step-over/out deferred), `threads`, a shallow `stackTrace` (frame 0: live PC via `updi_ocd_read_pc()` → `file:line` via `elf_addr_to_line()`), a `scopes` stub, and a `terminated` event on `terminate`. Spec via **tracer**: **HLR-078** added; **LLR-DAP-08/09** added; STP gained 5 `test_dap` unit cases + hw cases **DAP4–DAP6**. `make` 0 warnings; `make test` 10/10 (test_dap 18); lint 0/0. **Bench-validated:** `make hw-test-dap` against AVR128DA28 with the avrOS example ELF — **DAP1–DAP7 all pass** (stop-at-entry → continue→pause → stepIn → shallow stackTrace resolving the live PC to a DWARF source line → clean disconnect).
 
 **Motivation.** With a connected DAP session (Phase 16), expose run control and the run-state event stream that an IDE's toolbar drives. This reuses the debug core's execution primitives (`updi_run/halt/step`, the stop-cause classifier) — the same ones the RSP front-end composes — so behaviour matches the proven GDB path.
 
