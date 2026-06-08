@@ -376,7 +376,7 @@ Role: **hardware**. **1 test(s).**
 
 ### 3.12. [tests/test_dap.c](../tests/test_dap.c)
 
-Role: **unit**. **13 test(s).**
+Role: **unit**. **18 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -392,18 +392,26 @@ Role: **unit**. **13 test(s).**
 | 10 | <a id="dap_configuration_done_emits_stopped_entry"></a>`dap_configuration_done_emits_stopped_entry` | `LLR-DAP-07` | Dispatch `configurationDone` (with `updi_fd = -1`) and verify a `success:true` response for that command followed by a `stopped` event with `reason:"entry"` and `threadId:1`. |
 | 11 | <a id="dap_disconnect_closes_session"></a>`dap_disconnect_closes_session` | `LLR-DAP-07` | Dispatch `disconnect` and verify `dap_dispatch()` returns 1 (close the session) after writing a `success:true` response for the `disconnect` command. |
 | 12 | <a id="dap_unknown_request_returns_error"></a>`dap_unknown_request_returns_error` | `LLR-DAP-06`, `LLR-DAP-07` | Dispatch an unimplemented command and verify the adapter replies with a `success:false` response echoing the command and carrying a `message`, rather than leaving the client waiting. |
-| 13 | <a id="dap_serve_runs_handshake_to_disconnect"></a>`dap_serve_runs_handshake_to_disconnect` | `LLR-DAP-05` | Drive `dap_serve()` end-to-end without hardware: a stubbed `rsp_accept()` hands it a pre-connected socketpair end whose request stream is pre-loaded with `initialize` then `disconnect`. Verify the accept/select/read/dispatch loop processes both (emitting the initialize response, the `initialized` event, and the disconnect response) and returns 0 when the client disconnects. |
+| 13 | <a id="dap_continue_responds_and_emits_continued"></a>`dap_continue_responds_and_emits_continued` | `LLR-DAP-08` | Dispatch `continue` (updi_fd = -1) and verify the adapter replies `{allThreadsContinued:true}` and emits a `continued` event. Per LLR-DAP-08. |
+| 14 | <a id="dap_pause_emits_stopped_pause"></a>`dap_pause_emits_stopped_pause` | `LLR-DAP-08` | Dispatch `pause` and verify a `success:true` response followed by a `stopped` event with `reason:"pause"`. Per LLR-DAP-08. |
+| 15 | <a id="dap_step_emits_stopped_step"></a>`dap_step_emits_stopped_step` | `LLR-DAP-08` | For each of `next`, `stepIn`, `stepOut`, dispatch the request and verify a `success:true` response followed by a `stopped` event with `reason:"step"`. Per LLR-DAP-08. |
+| 16 | <a id="dap_stack_trace_returns_one_frame"></a>`dap_stack_trace_returns_one_frame` | `LLR-DAP-09` | Dispatch `stackTrace` (no target/DWARF) and verify the response carries a `stackFrames` array with a single frame `id:0` and `totalFrames:1`. Per LLR-DAP-09. |
+| 17 | <a id="dap_scopes_returns_empty"></a>`dap_scopes_returns_empty` | `LLR-DAP-09` | Dispatch `scopes` and verify the response carries an empty `scopes` array (frame variables are Phase 19). Per LLR-DAP-09. |
+| 18 | <a id="dap_serve_runs_handshake_to_disconnect"></a>`dap_serve_runs_handshake_to_disconnect` | `LLR-DAP-05` | Drive `dap_serve()` end-to-end without hardware: a stubbed `rsp_accept()` hands it a pre-connected socketpair end whose request stream is pre-loaded with `initialize` then `disconnect`. Verify the accept/select/read/dispatch loop processes both (emitting the initialize response, the `initialized` event, and the disconnect response) and returns 0 when the client disconnects. |
 
 ### 3.13. [tests/hw/dap_acceptance.lua](../tests/hw/dap_acceptance.lua)
 
-Role: **hardware**. **4 test(s).**
+Role: **hardware**. **7 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
 | 1 | <a id="DAP1_initialize_handshake"></a>`DAP1_initialize_handshake` | — | nvim-dap attaches to the `avrOSdb --dap` server; verify the `initialize` request completes (capabilities received) and the adapter emits the `initialized` event, i.e. the session becomes active on live silicon. |
 | 2 | <a id="DAP2_configuration_done_stopped_entry"></a>`DAP2_configuration_done_stopped_entry` | — | After the configuration phase, verify the adapter emits a `stopped` event with reason `entry`, reaching the stopped-at-entry state on the target. |
 | 3 | <a id="DAP3_threads_single_cpu"></a>`DAP3_threads_single_cpu` | — | Issue a `threads` request and verify the adapter reports exactly one live CPU thread. |
-| 4 | <a id="DAP4_disconnect_clean"></a>`DAP4_disconnect_clean` | — | Issue a `disconnect` request and verify the adapter responds successfully and the session tears down cleanly (the target is resumed). |
+| 4 | <a id="DAP4_continue_pause_stopped"></a>`DAP4_continue_pause_stopped` | — | Phase-17 execution control. Issue `continue` (the target runs), then `pause`, and verify the adapter emits a `stopped` event with reason `pause` — re-halting a freely running target (no breakpoints are installed yet, Phase 18). Per HLR-078 / LLR-DAP-08. |
+| 5 | <a id="DAP5_step_stopped"></a>`DAP5_step_stopped` | — | Phase-17 execution control. From the halted target, issue `stepIn` and verify the adapter emits a `stopped` event with reason `step`. Per HLR-078 / LLR-DAP-08. |
+| 6 | <a id="DAP6_stacktrace_source_line"></a>`DAP6_stacktrace_source_line` | — | Phase-17 shallow stackTrace. Issue `stackTrace` and verify frame 0 resolves the live PC to a source line (numeric `line > 0`) via DWARF, with a `source` object — proving the OCD PC read + libdw line lookup work end-to-end on silicon. Per HLR-078 / LLR-DAP-09. |
+| 7 | <a id="DAP7_disconnect_clean"></a>`DAP7_disconnect_clean` | — | Issue a `disconnect` request and verify the adapter responds successfully and the session tears down cleanly (the target is resumed). |
 
 ## 4. LLR Coverage Matrix
 
@@ -570,3 +578,5 @@ verified by code review — see
 | `LLR-DAP-05` | `dap` | `HLR-076` | `dap_serve_runs_handshake_to_disconnect` |
 | `LLR-DAP-06` | `dap` | `HLR-076` | `dap_initialize_handshake`, `dap_unknown_request_returns_error` |
 | `LLR-DAP-07` | `dap` | `HLR-076` | `dap_initialize_handshake`, `dap_configuration_done_emits_stopped_entry`, `dap_disconnect_closes_session`, `dap_unknown_request_returns_error` |
+| `LLR-DAP-08` | `dap` | `HLR-078` | `dap_continue_responds_and_emits_continued`, `dap_pause_emits_stopped_pause`, `dap_step_emits_stopped_step` |
+| `LLR-DAP-09` | `dap` | `HLR-078`, `HLR-072` | `dap_stack_trace_returns_one_frame`, `dap_scopes_returns_empty` |

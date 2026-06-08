@@ -20,6 +20,13 @@ int  rsp_accept(int listen_fd)        { (void)listen_fd; return g_accept_fd; }
 void rsp_close(int fd)                { (void)fd; }   /* the test owns the fds */
 int  updi_halt(int fd)                { (void)fd; return 0; }
 int  updi_run(int fd)                 { (void)fd; return 0; }
+int  updi_step(int fd)                { (void)fd; return 0; }
+int  updi_ocd_poll_halted(int fd, int t) { (void)fd; (void)t; return 0; }
+int  updi_ocd_read_pc(int fd, uint32_t *a) { (void)fd; if (a) *a = 0; return 0; }
+/* Dispatch tests run with updi_fd = -1 and elf = NULL, so the stackTrace
+ * handler never calls into elf_addr_to_line; this stub satisfies the linker. */
+int  elf_addr_to_line(const ElfContext *c, uint32_t a, char *f, size_t cap, int *ln)
+{ (void)c; (void)a; (void)f; (void)cap; (void)ln; return -1; }
 
 void setUp(void)    {}
 void tearDown(void) {}
@@ -256,6 +263,107 @@ void test_dap_unknown_request_returns_error(void)
     close(sp[0]); close(sp[1]);
 }
 
+/* ── Phase 17: execution control + stop events ───────────────────────────── */
+
+void test_dap_continue_responds_and_emits_continued(void)
+{
+    int sp[2];
+    TEST_ASSERT_EQUAL_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sp));
+    dap_session s = { sp[1], -1, NULL, NULL, NULL, false, 0 };
+
+    const char *req = "{\"seq\":11,\"command\":\"continue\"}";
+    TEST_ASSERT_EQUAL_INT(0, dap_dispatch(&s, req, strlen(req)));
+
+    char buf[512]; size_t len;
+    TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"command\":\"continue\""));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"allThreadsContinued\":true"));
+    TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"event\":\"continued\""));
+
+    close(sp[0]); close(sp[1]);
+}
+
+void test_dap_pause_emits_stopped_pause(void)
+{
+    int sp[2];
+    TEST_ASSERT_EQUAL_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sp));
+    dap_session s = { sp[1], -1, NULL, NULL, NULL, false, 0 };
+
+    const char *req = "{\"seq\":12,\"command\":\"pause\"}";
+    TEST_ASSERT_EQUAL_INT(0, dap_dispatch(&s, req, strlen(req)));
+
+    char buf[512]; size_t len;
+    TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"command\":\"pause\""));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"success\":true"));
+    TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"event\":\"stopped\""));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"reason\":\"pause\""));
+
+    close(sp[0]); close(sp[1]);
+}
+
+void test_dap_step_emits_stopped_step(void)
+{
+    const char *cmds[] = { "next", "stepIn", "stepOut" };
+    for (unsigned i = 0; i < 3; i++) {
+        int sp[2];
+        TEST_ASSERT_EQUAL_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sp));
+        dap_session s = { sp[1], -1, NULL, NULL, NULL, false, 0 };
+
+        char req[64];
+        snprintf(req, sizeof req, "{\"seq\":13,\"command\":\"%s\"}", cmds[i]);
+        TEST_ASSERT_EQUAL_INT(0, dap_dispatch(&s, req, strlen(req)));
+
+        char buf[512]; size_t len;
+        TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+        TEST_ASSERT_NOT_NULL(strstr(buf, cmds[i]));
+        TEST_ASSERT_NOT_NULL(strstr(buf, "\"success\":true"));
+        TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+        TEST_ASSERT_NOT_NULL(strstr(buf, "\"event\":\"stopped\""));
+        TEST_ASSERT_NOT_NULL(strstr(buf, "\"reason\":\"step\""));
+
+        close(sp[0]); close(sp[1]);
+    }
+}
+
+void test_dap_stack_trace_returns_one_frame(void)
+{
+    int sp[2];
+    TEST_ASSERT_EQUAL_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sp));
+    dap_session s = { sp[1], -1, NULL, NULL, NULL, false, 0 };
+
+    const char *req = "{\"seq\":14,\"command\":\"stackTrace\"}";
+    TEST_ASSERT_EQUAL_INT(0, dap_dispatch(&s, req, strlen(req)));
+
+    char buf[1024]; size_t len;
+    TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"command\":\"stackTrace\""));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"stackFrames\":["));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"id\":0"));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"totalFrames\":1"));
+
+    close(sp[0]); close(sp[1]);
+}
+
+void test_dap_scopes_returns_empty(void)
+{
+    int sp[2];
+    TEST_ASSERT_EQUAL_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sp));
+    dap_session s = { sp[1], -1, NULL, NULL, NULL, false, 0 };
+
+    const char *req = "{\"seq\":15,\"command\":\"scopes\"}";
+    TEST_ASSERT_EQUAL_INT(0, dap_dispatch(&s, req, strlen(req)));
+
+    char buf[512]; size_t len;
+    TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"command\":\"scopes\""));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"scopes\":[]"));
+
+    close(sp[0]); close(sp[1]);
+}
+
 /* dap_serve(): accept (via the rsp_accept stub) one client whose request
  * stream is pre-loaded, run the select/read/dispatch loop, and return 0 when
  * the client disconnects. */
@@ -306,6 +414,11 @@ int main(void)
     RUN_TEST(test_dap_configuration_done_emits_stopped_entry);
     RUN_TEST(test_dap_disconnect_closes_session);
     RUN_TEST(test_dap_unknown_request_returns_error);
+    RUN_TEST(test_dap_continue_responds_and_emits_continued);
+    RUN_TEST(test_dap_pause_emits_stopped_pause);
+    RUN_TEST(test_dap_step_emits_stopped_step);
+    RUN_TEST(test_dap_stack_trace_returns_one_frame);
+    RUN_TEST(test_dap_scopes_returns_empty);
     RUN_TEST(test_dap_serve_runs_handshake_to_disconnect);
     return UNITY_END();
 }

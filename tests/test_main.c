@@ -209,6 +209,16 @@ int __wrap_updi_run(int fd)
     return 0;
 }
 
+/* dap.c is linked into this unit (DAP mode dispatch); its Phase-17 execution
+ * handlers reference these core primitives.  The event-loop tests never drive
+ * a DAP session, so plain stubs satisfy the linker without pulling in
+ * updi.c / elf_parser.c (and their -ldw/-lelf deps). */
+int updi_step(int fd) { (void)fd; return 0; }
+int updi_ocd_poll_halted(int fd, int t) { (void)fd; (void)t; return 0; }
+int updi_ocd_read_pc(int fd, uint32_t *a) { (void)fd; if (a) *a = 0; return 0; }
+int elf_addr_to_line(const ElfContext *c, uint32_t a, char *f, size_t cap, int *ln)
+{ (void)c; (void)a; (void)f; (void)cap; (void)ln; return -1; }
+
 void __wrap_updi_set_debug_in_sleep(bool enable);
 void __wrap_updi_set_debug_in_sleep(bool enable) { (void)enable; }
 

@@ -1621,6 +1621,14 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="SDD" ref="4.3.1"/>
         </traces>
       </hlr>
+
+      <hlr id="HLR-078" name="DAP Execution Control, Stop Events &amp; Shallow stackTrace">
+        <text><![CDATA[Over a connected DAP session (HLR-076), the DAP front-end shall expose run control and the run-state event stream, mapping each request to the debug-core execution verbs (the same OCD primitives the GDB-RSP front-end composes, HLR-073). It shall implement: `continue` — reply `{allThreadsContinued:true}`, emit a `continued` event, and resume the target (`updi_run()`); the server's idle event-loop tick shall then poll the OCD STOPPED status (`updi_ocd_poll_halted()`) and, on halt, emit a `stopped` event. `pause` — halt the target (`updi_halt()`) and emit `stopped` with reason `pause`. `next` / `stepIn` / `stepOut` — advance the target by one OCD instruction step (`updi_step()`) and emit `stopped` with reason `step`; true source-line-granular step-over and step-out are a deferred refinement, but the resulting PC still resolves to the correct source line. `threads` — report the single live CPU thread (`{id:1,name:"cpu"}`); avrOS FSM tasks remain `monitor`-style introspection, surfaced in a later refinement. Every `stopped` event shall carry `threadId:1` and `allThreadsStopped:true`; the defined reasons are `entry` (configurationDone, HLR-076), `step`, `breakpoint` (a halt detected while the target was running), and `pause`. `terminate` shall additionally emit a `terminated` event before closing. The front-end shall also serve a **shallow `stackTrace`** — frame 0 only: the live PC read over OCD (`updi_ocd_read_pc()`), resolved to `file:line` via libdw (`elf_addr_to_line()`, HLR-072) and returned with a `source` object; when no target or no DWARF line is available it shall still return one frame so the client has a valid stack. `scopes` shall return an empty array (frame variables are Phase 19); deeper frames via DWARF CFI unwinding and real function names are Phase 18. All target side effects shall be guarded (`updi_fd >= 0`) so the dispatch is unit-testable over a socketpair without hardware.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+          <trace target="SDD" ref="5.1"/>
+        </traces>
+      </hlr>
     </section>
 
     <section number="11" title="CI-Grade Loader and Link Diagnostics">
@@ -2968,6 +2976,21 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <text><![CDATA[`dap_dispatch()` shall implement the Phase-16 lifecycle commands: `initialize` → a capabilities response (`supportsConfigurationDoneRequest:true`) followed by the `initialized` event; `launch` / `attach` → success; `setExceptionBreakpoints` → success; `setBreakpoints` → success with an empty `breakpoints` array (real installation deferred to Phase 18); `configurationDone` → halt the target (`updi_halt()` when `updi_fd >= 0`) and emit a `stopped` event (`reason:"entry"`, `threadId:1`, `allThreadsStopped:true`); `threads` → one thread `{id:1,name:"cpu"}`; `disconnect` / `terminate` → resume the target (`updi_run()` when `updi_fd >= 0`), reply success, and return 1. Any other command shall receive a `success:false` response with an explanatory `message`. All UPDI side effects shall be guarded by `updi_fd >= 0` so the dispatch is exercisable without hardware.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-076" name="DAP Connection Lifecycle"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-DAP-08">
+        <text><![CDATA[`dap_dispatch()` shall implement the Phase-17 execution-control commands. `continue`: send a `{allThreadsContinued:true}` response and a `continued` event (`{threadId:1,allThreadsContinued:true}`), then — when `updi_fd >= 0` — call `updi_run()`; on success set `dap_session.running = true` (so `dap_serve()` polls for the halt), and on a run failure emit `stopped` (reason `breakpoint`) instead. `pause`: call `updi_halt()` (when `updi_fd >= 0`), clear `running`, reply success, and emit `stopped` reason `pause`. `next` / `stepIn` / `stepOut`: call `updi_step()` (when `updi_fd >= 0`), clear `running`, reply success, and emit `stopped` reason `step`. `threads`: reply one thread `{id:1,name:"cpu"}`. `configurationDone` shall additionally clear `running` and emit its `stopped` via the shared helper with reason `entry`. `terminate` shall emit a `terminated` event before its success response (then return 1); `disconnect` returns 1 without the event. A shared `dap_emit_stopped(reason)` helper shall format the `stopped` event body (`{reason,threadId:1,allThreadsStopped:true}`) for all reasons. `dap_serve()` shall, on an idle `select()` tick while `running` and `updi_fd >= 0`, call `updi_ocd_poll_halted(updi_fd, 1)` and — on a halted result — clear `running` and emit `stopped` reason `breakpoint`; a poll I/O error shall end the session with a diagnostic. The idle tick shall be shortened while `running` so a halt surfaces promptly. All UPDI side effects shall be guarded by `updi_fd >= 0`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-078" name="DAP Execution Control, Stop Events &amp; Shallow stackTrace"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-DAP-09">
+        <text><![CDATA[`dap_dispatch()` shall serve a shallow `stackTrace` via a private `dap_handle_stack_trace()` helper: when `updi_fd >= 0`, read the live PC with `updi_ocd_read_pc()`; when an `ElfContext` is present, resolve the PC to `file:line` with the libdw accessor `elf_addr_to_line()`. It shall emit a response `{stackFrames:[<frame0>],totalFrames:1}` where frame 0 is `{id:0,name:"0x<pc>",line:<n>,column:1,instructionPointerReference:"0x<pc>",source:{name:<basename>,path:<file>}}` with the `source` object and `line` present only when the DWARF lookup succeeds; otherwise a single frame with `line:0` and no `source` (so the client always has a valid stack). The source `name`/`path` strings shall be JSON-escaped via `dj_escape()`. `scopes` shall reply `{scopes:[]}` (frame variables are Phase 19). Real frame names and deeper frames (DWARF CFI unwinding) are Phase 18. The handler shall touch no target when `updi_fd < 0`, so it is unit-testable over a socketpair.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-078" name="DAP Execution Control, Stop Events &amp; Shallow stackTrace"/>
+          <trace target="HLR" ref="HLR-072" name="DWARF Source-Level Lookup (DAP Groundwork)"/>
         </traces>
       </llr>
     </function>
@@ -4495,7 +4518,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/dap.c DAP wire-transport tests (Phase 16)                -->
     <!-- ============================================================ -->
-    <file path="tests/test_dap.c" role="unit" count="13">
+    <file path="tests/test_dap.c" role="unit" count="18">
       <header><![CDATA[Unit tests for the DAP front-end: the wire transport (HLR-075) — the JSON codec (`dj_*` recursive-descent tokenizer, member/string/number accessors, escape decode, and the emission escaper) and the Content-Length message framing (`dap_read_message` / `dap_write_message`) — and the connection lifecycle dispatch (HLR-076) driven over a `socketpair` with `updi_fd = -1` so no hardware is touched. Framing is exercised over an anonymous pipe.]]></header>
 
       <test name="dj_parse_extracts_request_fields">
@@ -4558,6 +4581,31 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces><trace target="LLR" ref="LLR-DAP-06"/><trace target="LLR" ref="LLR-DAP-07"/></traces>
       </test>
 
+      <test name="dap_continue_responds_and_emits_continued">
+        <purpose><![CDATA[Dispatch `continue` (updi_fd = -1) and verify the adapter replies `{allThreadsContinued:true}` and emits a `continued` event. Per LLR-DAP-08.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-08"/></traces>
+      </test>
+
+      <test name="dap_pause_emits_stopped_pause">
+        <purpose><![CDATA[Dispatch `pause` and verify a `success:true` response followed by a `stopped` event with `reason:"pause"`. Per LLR-DAP-08.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-08"/></traces>
+      </test>
+
+      <test name="dap_step_emits_stopped_step">
+        <purpose><![CDATA[For each of `next`, `stepIn`, `stepOut`, dispatch the request and verify a `success:true` response followed by a `stopped` event with `reason:"step"`. Per LLR-DAP-08.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-08"/></traces>
+      </test>
+
+      <test name="dap_stack_trace_returns_one_frame">
+        <purpose><![CDATA[Dispatch `stackTrace` (no target/DWARF) and verify the response carries a `stackFrames` array with a single frame `id:0` and `totalFrames:1`. Per LLR-DAP-09.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-09"/></traces>
+      </test>
+
+      <test name="dap_scopes_returns_empty">
+        <purpose><![CDATA[Dispatch `scopes` and verify the response carries an empty `scopes` array (frame variables are Phase 19). Per LLR-DAP-09.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-09"/></traces>
+      </test>
+
       <test name="dap_serve_runs_handshake_to_disconnect">
         <purpose><![CDATA[Drive `dap_serve()` end-to-end without hardware: a stubbed `rsp_accept()` hands it a pre-connected socketpair end whose request stream is pre-loaded with `initialize` then `disconnect`. Verify the accept/select/read/dispatch loop processes both (emitting the initialize response, the `initialized` event, and the disconnect response) and returns 0 when the client disconnects.]]></purpose>
         <traces><trace target="LLR" ref="LLR-DAP-05"/></traces>
@@ -4567,7 +4615,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src DAP on-target acceptance harness (Neovim + nvim-dap)     -->
     <!-- ============================================================ -->
-    <file path="tests/hw/dap_acceptance.lua" role="hardware" count="4">
+    <file path="tests/hw/dap_acceptance.lua" role="hardware" count="7">
       <header><![CDATA[On-target DAP acceptance harness (the DAP analogue of the Group-G GDB harness): spawns a fresh `avrOSdb --dap` against live AVR-Dx silicon and drives it with the real nvim-dap client (headless Neovim) over TCP, applying per-case verdicts to the connection lifecycle. Manual-only (`make hw-test-dap`); never invoked by `make test`. Phase 16 covers the handshake (DAP1–DAP4); execution control, breakpoints, and variables grow this suite in Phases 17–19.]]></header>
 
       <test name="DAP1_initialize_handshake">
@@ -4585,7 +4633,22 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces><trace target="HLR" ref="HLR-076"/></traces>
       </test>
 
-      <test name="DAP4_disconnect_clean">
+      <test name="DAP4_continue_pause_stopped">
+        <purpose><![CDATA[Phase-17 execution control. Issue `continue` (the target runs), then `pause`, and verify the adapter emits a `stopped` event with reason `pause` — re-halting a freely running target (no breakpoints are installed yet, Phase 18). Per HLR-078 / LLR-DAP-08.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-078"/></traces>
+      </test>
+
+      <test name="DAP5_step_stopped">
+        <purpose><![CDATA[Phase-17 execution control. From the halted target, issue `stepIn` and verify the adapter emits a `stopped` event with reason `step`. Per HLR-078 / LLR-DAP-08.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-078"/></traces>
+      </test>
+
+      <test name="DAP6_stacktrace_source_line">
+        <purpose><![CDATA[Phase-17 shallow stackTrace. Issue `stackTrace` and verify frame 0 resolves the live PC to a source line (numeric `line > 0`) via DWARF, with a `source` object — proving the OCD PC read + libdw line lookup work end-to-end on silicon. Per HLR-078 / LLR-DAP-09.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-078"/></traces>
+      </test>
+
+      <test name="DAP7_disconnect_clean">
         <purpose><![CDATA[Issue a `disconnect` request and verify the adapter responds successfully and the session tears down cleanly (the target is resumed).]]></purpose>
         <traces><trace target="HLR" ref="HLR-076"/></traces>
       </test>

@@ -495,6 +495,61 @@ static int dap_send_event(dap_session *s, const char *event,
     return dap_write_message(s->fd, buf, (size_t)n);
 }
 
+/* Emit a `stopped` event for the single CPU thread.  `reason` is one of the
+ * DAP-defined run-state reasons ("entry", "step", "breakpoint", "pause") and
+ * is a fixed internal literal, so no escaping is needed.  (Phase 17) */
+static int dap_emit_stopped(dap_session *s, const char *reason)
+{
+    char body[96];
+    (void)snprintf(body, sizeof body,
+                   "{\"reason\":\"%s\",\"threadId\":1,"
+                   "\"allThreadsStopped\":true}", reason);
+    return dap_send_event(s, "stopped", body);
+}
+
+/* Phase 17: shallow `stackTrace` — frame 0 only.  Reads the live PC over OCD
+ * and resolves it to `file:line` via libdw (elf_addr_to_line).  Deeper frames
+ * (DWARF CFI unwinding) and real function names are Phase 18.  With no target
+ * (updi_fd < 0, unit tests) or no DWARF, it still returns one frame so the
+ * client has a valid stack. */
+static int dap_handle_stack_trace(dap_session *s, long req_seq)
+{
+    uint32_t pc = 0;
+    char     file[256];
+    int      line = 0;
+    bool     have_src = false;
+
+    if (s->updi_fd >= 0 && updi_ocd_read_pc(s->updi_fd, &pc) == 0 &&
+        s->elf != NULL &&
+        elf_addr_to_line(s->elf, pc, file, sizeof file, &line) == 0)
+        have_src = true;
+
+    char frame[1024];
+    if (have_src) {
+        char        pesc[600];
+        const char *base = strrchr(file, '/');
+        base = base ? base + 1 : file;
+        char besc[200];
+        dj_escape(file, pesc, sizeof pesc);
+        dj_escape(base, besc, sizeof besc);
+        (void)snprintf(frame, sizeof frame,
+            "{\"id\":0,\"name\":\"0x%06lx\",\"line\":%d,\"column\":1,"
+            "\"instructionPointerReference\":\"0x%lx\","
+            "\"source\":{\"name\":\"%s\",\"path\":\"%s\"}}",
+            (unsigned long)pc, line, (unsigned long)pc, besc, pesc);
+    } else {
+        (void)snprintf(frame, sizeof frame,
+            "{\"id\":0,\"name\":\"0x%06lx\",\"line\":0,\"column\":1,"
+            "\"instructionPointerReference\":\"0x%lx\"}",
+            (unsigned long)pc, (unsigned long)pc);
+    }
+
+    char body[1100];
+    (void)snprintf(body, sizeof body,
+                   "{\"stackFrames\":[%s],\"totalFrames\":1}", frame);
+    return dap_send_response(s, req_seq, "stackTrace", true, body);
+}
+
 /* ── Request dispatch ─────────────────────────────────────────────────────── */
 
 int dap_dispatch(dap_session *s, const char *msg, size_t len)
@@ -539,30 +594,82 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
     if (strcmp(cmd, "configurationDone") == 0) {
         if (s->updi_fd >= 0)
             (void)updi_halt(s->updi_fd);
+        s->running = false;
         if (dap_send_response(s, req_seq, cmd, true, NULL) < 0)
             return -1;
-        /* Reaching a stopped-at-entry state completes the Phase 16 lifecycle. */
-        return dap_send_event(s, "stopped",
-                "{\"reason\":\"entry\",\"threadId\":1,"
-                "\"allThreadsStopped\":true}") < 0 ? -1 : 0;
+        /* Reaching a stopped-at-entry state completes the lifecycle handshake. */
+        return dap_emit_stopped(s, "entry") < 0 ? -1 : 0;
     }
 
     if (strcmp(cmd, "threads") == 0)
         /* The live CPU is the sole thread; FSM tasks remain introspection
-         * (Phase 17 may enrich this). */
+         * (surfaced as a later refinement). */
         return dap_send_response(s, req_seq, cmd, true,
                 "{\"threads\":[{\"id\":1,\"name\":\"cpu\"}]}") < 0 ? -1 : 0;
+
+    /* ── Execution control + stop events (Phase 17) ── */
+    if (strcmp(cmd, "continue") == 0) {
+        if (dap_send_response(s, req_seq, cmd, true,
+                "{\"allThreadsContinued\":true}") < 0)
+            return -1;
+        if (dap_send_event(s, "continued",
+                "{\"threadId\":1,\"allThreadsContinued\":true}") < 0)
+            return -1;
+        if (s->updi_fd >= 0) {
+            if (updi_run(s->updi_fd) == 0)
+                s->running = true;   /* dap_serve() polls for the halt */
+            else
+                return dap_emit_stopped(s, "breakpoint") < 0 ? -1 : 0;
+        }
+        return 0;
+    }
+
+    if (strcmp(cmd, "pause") == 0) {
+        if (s->updi_fd >= 0)
+            (void)updi_halt(s->updi_fd);
+        s->running = false;
+        if (dap_send_response(s, req_seq, cmd, true, NULL) < 0)
+            return -1;
+        return dap_emit_stopped(s, "pause") < 0 ? -1 : 0;
+    }
+
+    /* next / stepIn / stepOut map to a single OCD instruction step (the core
+     * execution verb); source-line granularity and true step-over/step-out
+     * are a later refinement.  Either way the resulting PC resolves to the
+     * correct source line via the shallow stackTrace.                      */
+    if (strcmp(cmd, "next") == 0 || strcmp(cmd, "stepIn") == 0 ||
+        strcmp(cmd, "stepOut") == 0) {
+        if (s->updi_fd >= 0)
+            (void)updi_step(s->updi_fd);
+        s->running = false;
+        if (dap_send_response(s, req_seq, cmd, true, NULL) < 0)
+            return -1;
+        return dap_emit_stopped(s, "step") < 0 ? -1 : 0;
+    }
+
+    if (strcmp(cmd, "stackTrace") == 0)
+        return dap_handle_stack_trace(s, req_seq) < 0 ? -1 : 0;
+
+    if (strcmp(cmd, "scopes") == 0)
+        /* Frame scopes (locals/registers) carry variables — Phase 19. */
+        return dap_send_response(s, req_seq, cmd, true,
+                "{\"scopes\":[]}") < 0 ? -1 : 0;
 
     if (strcmp(cmd, "disconnect") == 0 || strcmp(cmd, "terminate") == 0) {
         if (s->updi_fd >= 0)
             (void)updi_run(s->updi_fd);          /* let the target run on detach */
+        s->running = false;
+        /* `terminate` asks the adapter to stop the debuggee; signal the
+         * session end with a `terminated` event before the response.       */
+        if (strcmp(cmd, "terminate") == 0)
+            (void)dap_send_event(s, "terminated", NULL);
         (void)dap_send_response(s, req_seq, cmd, true, NULL);
         return 1;                                /* close the session */
     }
 
-    /* Execution control, stack/scopes/variables, memory, evaluate: Phases 17–19. */
+    /* Variables, memory, evaluate, and breakpoint installation: Phases 18–19. */
     return dap_send_error(s, req_seq, cmd,
-                          "request not implemented yet (Phase 17+)") < 0 ? -1 : 0;
+                          "request not implemented yet (Phase 18+)") < 0 ? -1 : 0;
 }
 
 /* ── Server entry: accept one client, then dispatch on the event loop ─────── */
@@ -585,22 +692,36 @@ int dap_serve(int listen_fd, int updi_fd,
         return -1;
     }
 
-    dap_session s = { cfd, updi_fd, elf, idx, fsm, log, 0 };
+    dap_session s = { cfd, updi_fd, elf, idx, fsm, log, 0, false };
     int rc = 0;
     while (quit == NULL || !*quit) {
-        /* Wait for a readable client (or 200 ms) so the quit flag is honoured
-         * between messages without a busy loop. */
+        /* Wait for a readable client.  Tick faster while the target is running
+         * (Phase 17) so a breakpoint/spontaneous halt surfaces promptly; idle
+         * slower otherwise so the quit flag is honoured without a busy loop. */
         fd_set rf;
         FD_ZERO(&rf);
         FD_SET(cfd, &rf);
-        struct timeval tv = { 0, 200000 };
+        struct timeval tv = { 0, s.running ? 20000 : 200000 };
         int sel = select(cfd + 1, &rf, NULL, NULL, &tv);
         if (sel < 0) {
             if (errno == EINTR) continue;
             rc = -1; break;
         }
-        if (sel == 0)
+        if (sel == 0) {
+            /* Idle tick: if the target was resumed via `continue`, probe the
+             * OCD STOPPED status and emit `stopped` when it halts. */
+            if (s.running && updi_fd >= 0) {
+                int h = updi_ocd_poll_halted(updi_fd, 1);
+                if (h == 0) {
+                    s.running = false;
+                    if (dap_emit_stopped(&s, "breakpoint") < 0) { rc = -1; break; }
+                } else if (h < 0) {
+                    fprintf(stderr, "avrOSdb: DAP target poll error\n");
+                    rc = -1; break;
+                }
+            }
             continue;
+        }
 
         size_t mlen = 0;
         int    r = dap_read_message(cfd, buf, DAP_MSG_MAX, &mlen);
