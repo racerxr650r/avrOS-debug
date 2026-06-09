@@ -433,7 +433,9 @@ int dap_write_message(int fd, const char *body, size_t len)
 
 /* ── Response / event builders ────────────────────────────────────────────── */
 
-#define DAP_OUT_MAX 2048u   /* outgoing handshake messages are small */
+#define DAP_OUT_MAX 16384u  /* fits the largest responses: a Registers scope
+                             * (~35 vars), a deep stackTrace, or a wide
+                             * variables/array expansion */
 
 static long dap_next_seq(dap_session *s) { return ++s->out_seq; }
 
@@ -546,31 +548,30 @@ static void dap_format_frame(dap_session *s, int id, uint32_t pc,
     }
 }
 
-#define DAP_MAX_FRAMES 32
-
-/* Phase 18: multi-frame stack unwind via .debug_frame CFI + the live target.
+/* Phase 18/19: multi-frame stack unwind via .debug_frame CFI + the live target.
  *
  * For each frame we get the CFA rule (CFA = value(cfa_reg) + offset) from
  * elf_cfi_cfa(), where cfa_reg is the Y frame-pointer pair r28:r29 (28) or SP
  * (32).  AVR's fixed stack conventions then give the caller:
- *   - the 2-byte word return address sits just below the CFA (a `call` pushes
- *     the word PC); the code-space byte PC is that word << 1;
+ *   - the 2-byte word return address sits at [CFA-1, CFA] (a `call` pushes the
+ *     word PC); the code-space byte PC is that word << 1;
  *   - the caller's Y was saved by the callee prologue (push r28; push r29), so
- *     r28 (Y-low) is the byte just under the return address and r29 (Y-high)
- *     one lower still.
+ *     r28 (Y-low) lands at CFA-2 and r29 (Y-high) at CFA-3.
  * The caller's SP at its call site is the CFA.  We stop at an invalid return
- * address (0, odd-of-range), when the CFA stops advancing, or at DAP_MAX_FRAMES.
- * The exact byte offsets are AVR-silicon conventions, locked against avr-gdb's
- * backtrace on the gdb_debug_session fixture (DAP9, doc/UserManual Appendix B).
+ * address, where no CFI covers the PC (the C-runtime frame above main), when
+ * the CFA stops advancing, or at DAP_MAX_FRAMES.  The byte offsets are AVR
+ * conventions locked against avr-gdb (Appendix B.17).
  *
- * Fills pcs[0..n-1] (frame 0 = innermost) and returns n (>= 1), or 0 if the
- * live registers can't be read. */
-static int dap_unwind(dap_session *s, uint32_t *pcs, int max)
+ * Fills s->frames[0..n-1] (frame 0 = innermost) with each frame's PC and its
+ * register context (CFA / Y / SP — consumed by `scopes`), sets s->nframes, and
+ * returns n (>= 1), or 0 if the live registers can't be read. */
+static int dap_unwind(dap_session *s)
 {
     uint32_t pc = 0, y;
     uint16_t sp16 = 0;
     uint8_t  r28 = 0, r29 = 0;
 
+    s->nframes = 0;
     if (s->updi_fd < 0 || s->elf == NULL) return 0;
     if (updi_ocd_read_pc (s->updi_fd, &pc)      != 0) return 0;
     if (updi_ocd_read_sp (s->updi_fd, &sp16)    != 0) return 0;
@@ -580,72 +581,66 @@ static int dap_unwind(dap_session *s, uint32_t *pcs, int max)
     uint32_t sp = sp16;
     y = (uint32_t)r28 | ((uint32_t)r29 << 8);
 
-    uint32_t flash_size = s->elf->flash_size;
+    uint32_t   flash_size = s->elf->flash_size;
     const bool dbg = getenv("AVROSDB_DAP_UNWIND_LOG") != NULL;
 
-    int n = 0;
-    pcs[n++] = pc;
+    int      n = 0;
     uint32_t prev_cfa = 0;
-    while (n < max) {
-        int cfa_reg = 0, cfa_off = 0;
-        if (elf_cfi_cfa(s->elf, pc, &cfa_reg, &cfa_off) != 0) break;
-        uint32_t base = (cfa_reg == 32) ? sp : y;
-        uint32_t cfa  = (base + (uint32_t)cfa_off) & 0xffffu;
+    for (;;) {
+        if (n >= DAP_MAX_FRAMES) break;
 
-        uint32_t ra_word = 0, caller_y = 0;
-        /* Return-address word spans [CFA-1, CFA] — the CIE's "RA at cfa-1" — as
-         * the 2-byte word PC a `call` pushed, high byte at CFA-1, low at CFA. */
-        {
-            uint8_t rb[2];
-            if (updi_mem_read(s->updi_fd, (cfa - 1u) & 0xffffu, rb, 2) < 0) break;
-            ra_word = (uint32_t)rb[1] | ((uint32_t)rb[0] << 8);
-        }
-        /* Caller's saved Y: the callee prologue did `push r28; push r29`, so
-         * r28 (Y-low) lands at CFA-2 and r29 (Y-high) at CFA-3. */
-        {
-            uint8_t yb[2];
-            if (updi_mem_read(s->updi_fd, (cfa - 3u) & 0xffffu, yb, 2) >= 0)
-                caller_y = (uint32_t)yb[1] | ((uint32_t)yb[0] << 8);
-        }
+        int  cfa_reg = 0, cfa_off = 0;
+        bool have_cfa = (elf_cfi_cfa(s->elf, pc, &cfa_reg, &cfa_off) == 0);
+        uint32_t cfa = have_cfa
+            ? (((cfa_reg == 32 ? sp : y) + (uint32_t)cfa_off) & 0xffffu) : 0;
 
-        if (dbg) {
-            uint8_t win[10];
-            (void)updi_mem_read(s->updi_fd, (cfa - 6u) & 0xffffu, win, sizeof win);
-            fprintf(stderr,
-                "[unwind] f%d pc=0x%04x cfa=r%d+%d=0x%04x  win[cfa-6..+3]="
-                "%02x %02x %02x %02x %02x %02x|%02x %02x %02x %02x  "
-                "ra_word@cfa=0x%04x->pc=0x%04x  caller_y=0x%04x\n",
-                n - 1, pc, cfa_reg, cfa_off, cfa,
-                win[0],win[1],win[2],win[3],win[4],win[5],win[6],win[7],win[8],win[9],
-                ra_word, ra_word << 1, caller_y);
-        }
+        /* Record this frame and its register context. */
+        s->frames[n].pc     = pc;
+        s->frames[n].fr.cfa = cfa;
+        s->frames[n].fr.y   = y;
+        s->frames[n].fr.sp  = sp;
+        n++;
+        if (!have_cfa) break;            /* no CFI here — outermost reachable */
 
-        uint32_t ra_byte = ra_word << 1;   /* AVR word PC -> byte address */
+        uint8_t rb[2], yb[2];
+        if (updi_mem_read(s->updi_fd, (cfa - 1u) & 0xffffu, rb, 2) < 0) break;
+        uint32_t ra_word  = (uint32_t)rb[1] | ((uint32_t)rb[0] << 8);
+        uint32_t caller_y = 0;
+        if (updi_mem_read(s->updi_fd, (cfa - 3u) & 0xffffu, yb, 2) >= 0)
+            caller_y = (uint32_t)yb[1] | ((uint32_t)yb[0] << 8);
+        uint32_t ra_byte = ra_word << 1;
+
+        if (dbg)
+            fprintf(stderr, "[unwind] f%d pc=0x%04x cfa=r%d+%d=0x%04x "
+                    "ra=0x%04x->0x%04x cy=0x%04x\n", n - 1, pc, cfa_reg, cfa_off,
+                    cfa, ra_word, ra_byte, caller_y);
+
         if (ra_word == 0) break;
         if (flash_size != 0 && ra_byte >= flash_size) break;
-        if (cfa == prev_cfa) break;        /* no progress — bail */
+        if (cfa == prev_cfa) break;      /* no progress — bail */
 
         prev_cfa = cfa;
         pc = ra_byte;
         sp = cfa;
         y  = caller_y;
-        pcs[n++] = pc;
     }
+    s->nframes = n;
     return n;
 }
 
-/* Phase 17 → 18: `stackTrace`.  Frame 0 from the live PC; deeper frames via
- * DWARF CFI unwinding (dap_unwind).  With no target (updi_fd < 0, unit tests)
- * or no DWARF it still returns one frame so the client has a valid stack. */
+/* Phase 17 → 18/19: `stackTrace`.  Frame 0 from the live PC; deeper frames via
+ * DWARF CFI unwinding (dap_unwind), recording each frame's register context for
+ * `scopes`.  With no target (updi_fd < 0, unit tests) or no DWARF it still
+ * returns one frame so the client has a valid stack. */
 static int dap_handle_stack_trace(dap_session *s, long req_seq)
 {
-    uint32_t pcs[DAP_MAX_FRAMES];
-    int n = dap_unwind(s, pcs, DAP_MAX_FRAMES);
+    int n = dap_unwind(s);
     if (n <= 0) {
         uint32_t pc = 0;
         (void)(s->updi_fd >= 0 && updi_ocd_read_pc(s->updi_fd, &pc) == 0);
-        pcs[0] = pc;
-        n = 1;
+        s->frames[0].pc = pc;
+        s->frames[0].fr.cfa = s->frames[0].fr.y = s->frames[0].fr.sp = 0;
+        s->nframes = n = 1;
     }
 
     char body[4096];
@@ -654,7 +649,7 @@ static int dap_handle_stack_trace(dap_session *s, long req_seq)
     if (w > 0) off = (size_t)w;
     for (int i = 0; i < n; i++) {
         char frame[1600];   /* fits id + function name + escaped file:line */
-        dap_format_frame(s, i, pcs[i], frame, sizeof frame);
+        dap_format_frame(s, i, s->frames[i].pc, frame, sizeof frame);
         w = snprintf(body + off, sizeof body - off, "%s%s", i ? "," : "", frame);
         if (w < 0 || (size_t)w >= sizeof body - off) break;
         off += (size_t)w;
@@ -662,6 +657,402 @@ static int dap_handle_stack_trace(dap_session *s, long req_seq)
     (void)snprintf(body + off, sizeof body - off,
                    "],\"totalFrames\":%d}", n);
     return dap_send_response(s, req_seq, "stackTrace", true, body);
+}
+
+/* ── Scopes & Variables (Phase 19) ────────────────────────────────────────── */
+
+/* elf_type_render memory-read callback over the target data space: SRAM/IO are
+ * the low 16-bit data addresses; the mapped-flash window (data >= 0x8000, where
+ * avr-gcc places `.rodata`) is routed through the UPDI flash mirror. */
+static int dap_mem_cb(void *user, uint32_t addr, uint8_t *buf, int len)
+{
+    dap_session *s = (dap_session *)user;
+    if (s->updi_fd < 0) return -1;
+    uint32_t a = (addr >= 0x8000u) ? flash_to_updi(addr) : (addr & 0xffffu);
+    return updi_mem_read(s->updi_fd, a, buf, (size_t)len) < 0 ? -1 : 0;
+}
+
+/* Allocate a variablesReference (1-based); returns 0 when the table is full
+ * (DAP treats 0 as "no children"). */
+static int dap_varref_alloc(dap_session *s, int kind, uint32_t pc,
+                            const ElfFrameRegs *fr, uint32_t addr,
+                            uint64_t type_off)
+{
+    if (s->next_varref < 1) s->next_varref = 1;
+    if (s->next_varref >= DAP_MAX_VARREFS) return 0;
+    int r = s->next_varref++;
+    s->varrefs[r].kind     = kind;
+    s->varrefs[r].pc       = pc;
+    s->varrefs[r].addr     = addr;
+    s->varrefs[r].type_off = type_off;
+    if (fr) s->varrefs[r].fr = *fr;
+    else    s->varrefs[r].fr.cfa = s->varrefs[r].fr.y = s->varrefs[r].fr.sp = 0;
+    return r;
+}
+
+/* Invalidate all frame + variable handles (the target moved). */
+static void dap_varref_reset(dap_session *s) { s->next_varref = 1; s->nframes = 0; }
+
+/* Format one DAP Variable object for `v` (render its value; allocate a child
+ * variablesReference when it is an aggregate). */
+static int dap_format_var(dap_session *s, const ElfVar *v, char *out, size_t cap)
+{
+    char val[320];
+    bool expandable = false;
+    if (s->elf == NULL ||
+        elf_type_render(s->elf, v->addr, v->type_off, dap_mem_cb, s,
+                        val, sizeof val, &expandable) != 0)
+        snprintf(val, sizeof val, "<unavailable>");
+    int ref = expandable
+        ? dap_varref_alloc(s, DAP_VR_AGGREGATE, 0, NULL, v->addr, v->type_off) : 0;
+    char ne[140], ve[640];
+    dj_escape(v->name, ne, sizeof ne);
+    dj_escape(val, ve, sizeof ve);
+    return snprintf(out, cap,
+        "{\"name\":\"%s\",\"value\":\"%s\",\"variablesReference\":%d,"
+        "\"memoryReference\":\"0x%x\"}", ne, ve, ref, v->addr);
+}
+
+/* `scopes`: per frame, a Locals scope, a Registers scope (innermost frame only
+ * — the live CPU registers), and a Globals scope.  Each carries a
+ * variablesReference the client expands with `variables`. */
+static int dap_handle_scopes(dap_session *s, const char *msg,
+                             const dj_tok_t *t, long req_seq)
+{
+    long frame_id = 0;
+    int  args = dj_member(msg, t, 0, "arguments");
+    int  fm   = (args >= 0) ? dj_member(msg, t, args, "frameId") : -1;
+    if (fm >= 0) (void)dj_long(msg, t, fm, &frame_id);
+    if (frame_id < 0 || frame_id >= s->nframes) frame_id = 0;
+
+    uint32_t     pc = (s->nframes > 0) ? s->frames[frame_id].pc : 0;
+    ElfFrameRegs fr = (s->nframes > 0) ? s->frames[frame_id].fr
+                                       : (ElfFrameRegs){0, 0, 0};
+
+    int locals  = dap_varref_alloc(s, DAP_VR_LOCALS,  pc, &fr,  0, 0);
+    int globals = dap_varref_alloc(s, DAP_VR_GLOBALS, pc, NULL, 0, 0);
+    int regs    = (frame_id == 0)
+        ? dap_varref_alloc(s, DAP_VR_REGISTERS, pc, NULL, 0, 0) : 0;
+
+    char   body[512];
+    size_t off = (size_t)snprintf(body, sizeof body,
+        "{\"scopes\":[{\"name\":\"Locals\",\"variablesReference\":%d,"
+        "\"presentationHint\":\"locals\",\"expensive\":false}", locals);
+    if (regs)
+        off += (size_t)snprintf(body + off, sizeof body - off,
+            ",{\"name\":\"Registers\",\"variablesReference\":%d,"
+            "\"presentationHint\":\"registers\",\"expensive\":false}", regs);
+    off += (size_t)snprintf(body + off, sizeof body - off,
+        ",{\"name\":\"Globals\",\"variablesReference\":%d,\"expensive\":false}]}",
+        globals);
+    return dap_send_response(s, req_seq, "scopes", true, body);
+}
+
+/* Append the live-register list (r0–r31, SP, SREG, PC) to `body`. */
+static size_t dap_append_registers(dap_session *s, char *body, size_t cap,
+                                   size_t off, int *first)
+{
+    for (int i = 0; i < 32; i++) {
+        uint8_t rv = 0;
+        if (s->updi_fd >= 0) (void)updi_ocd_read_gpr(s->updi_fd, (uint8_t)i, &rv);
+        int w = snprintf(body + off, cap - off,
+            "%s{\"name\":\"r%d\",\"value\":\"0x%02x\",\"variablesReference\":0}",
+            *first ? "" : ",", i, rv);
+        if (w < 0 || (size_t)w >= cap - off) return off;
+        off += (size_t)w; *first = 0;
+    }
+    uint16_t sp = 0; uint8_t sreg = 0; uint32_t pc = 0;
+    if (s->updi_fd >= 0) {
+        (void)updi_ocd_read_sp(s->updi_fd, &sp);
+        (void)updi_ocd_read_sreg(s->updi_fd, &sreg);
+        (void)updi_ocd_read_pc(s->updi_fd, &pc);
+    }
+    int w = snprintf(body + off, cap - off,
+        ",{\"name\":\"SP\",\"value\":\"0x%04x\",\"variablesReference\":0}"
+        ",{\"name\":\"SREG\",\"value\":\"0x%02x\",\"variablesReference\":0}"
+        ",{\"name\":\"PC\",\"value\":\"0x%06x\",\"variablesReference\":0}",
+        sp, sreg, pc);
+    if (w > 0 && (size_t)w < cap - off) off += (size_t)w;
+    return off;
+}
+
+/* `variables`: expand a scope (Locals/Registers/Globals) or an aggregate
+ * (struct/union members, array elements) named by `variablesReference`. */
+static int dap_handle_variables(dap_session *s, const char *msg,
+                                const dj_tok_t *t, long req_seq)
+{
+    long vref = 0;
+    int  args = dj_member(msg, t, 0, "arguments");
+    int  vm   = (args >= 0) ? dj_member(msg, t, args, "variablesReference") : -1;
+    if (vm >= 0) (void)dj_long(msg, t, vm, &vref);
+
+    char   body[8192];
+    size_t off   = (size_t)snprintf(body, sizeof body, "{\"variables\":[");
+    int    first = 1;
+
+    if (vref >= 1 && vref < DAP_MAX_VARREFS) {
+        int kind = s->varrefs[vref].kind;
+        if (kind == DAP_VR_REGISTERS) {
+            off = dap_append_registers(s, body, sizeof body, off, &first);
+        } else if (s->elf != NULL) {
+            ElfVar vs[64];
+            int nv;
+            if (kind == DAP_VR_AGGREGATE)
+                nv = elf_type_children(s->elf, s->varrefs[vref].addr,
+                                       s->varrefs[vref].type_off, vs, 64);
+            else
+                nv = elf_var_enum(s->elf, s->varrefs[vref].pc, &s->varrefs[vref].fr,
+                                  kind == DAP_VR_GLOBALS ? ELF_SCOPE_GLOBALS
+                                                         : ELF_SCOPE_LOCALS,
+                                  vs, 64);
+            for (int i = 0; i < nv; i++) {
+                char e[960];
+                int  w = dap_format_var(s, &vs[i], e, sizeof e);
+                if (w < 0) continue;
+                int pw = snprintf(body + off, sizeof body - off, "%s%s",
+                                  first ? "" : ",", e);
+                if (pw < 0 || (size_t)pw >= sizeof body - off) break;
+                off += (size_t)pw; first = 0;
+            }
+        }
+    }
+    (void)snprintf(body + off, sizeof body - off, "]}");
+    return dap_send_response(s, req_seq, "variables", true, body);
+}
+
+/* ── evaluate / memory / setVariable (Phase 19) ──────────────────────────── */
+
+static const char DAP_B64[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static size_t dap_b64_encode(const uint8_t *in, size_t n, char *out, size_t cap)
+{
+    size_t o = 0;
+    for (size_t i = 0; i < n; i += 3) {
+        uint32_t v = (uint32_t)in[i] << 16;
+        if (i + 1 < n) v |= (uint32_t)in[i + 1] << 8;
+        if (i + 2 < n) v |= in[i + 2];
+        char c[4] = { DAP_B64[(v >> 18) & 63], DAP_B64[(v >> 12) & 63],
+                      (i + 1 < n) ? DAP_B64[(v >> 6) & 63] : '=',
+                      (i + 2 < n) ? DAP_B64[v & 63] : '=' };
+        if (o + 4 >= cap) break;
+        for (int k = 0; k < 4; k++) out[o++] = c[k];
+    }
+    if (o < cap) out[o] = '\0';
+    return o;
+}
+
+static int dap_b64_val(char c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static size_t dap_b64_decode(const char *in, uint8_t *out, size_t cap)
+{
+    int q[4], qi = 0; size_t o = 0;
+    for (const char *p = in; *p; p++) {
+        if (*p == '=') break;
+        int v = dap_b64_val(*p);
+        if (v < 0) continue;
+        q[qi++] = v;
+        if (qi == 4) {
+            if (o < cap) out[o++] = (uint8_t)((q[0] << 2) | (q[1] >> 4));
+            if (o < cap) out[o++] = (uint8_t)(((q[1] & 15) << 4) | (q[2] >> 2));
+            if (o < cap) out[o++] = (uint8_t)(((q[2] & 3) << 6) | q[3]);
+            qi = 0;
+        }
+    }
+    if (qi >= 2 && o < cap) out[o++] = (uint8_t)((q[0] << 2) | (q[1] >> 4));
+    if (qi >= 3 && o < cap) out[o++] = (uint8_t)(((q[1] & 15) << 4) | (q[2] >> 2));
+    return o;
+}
+
+/* Resolve an `evaluate` expression — `ident` then a chain of `.field` /
+ * `[index]` — at the given frame to (addr, type_off).  Returns 0 on success. */
+static int dap_resolve_expr(dap_session *s, uint32_t pc, const ElfFrameRegs *fr,
+                            const char *expr, uint32_t *addr, uint64_t *type_off)
+{
+    const char *p = expr;
+    while (*p == ' ' || *p == '\t') p++;
+    char id[64]; int k = 0;
+    if (!(isalpha((unsigned char)*p) || *p == '_')) return -1;
+    while ((isalnum((unsigned char)*p) || *p == '_') && k < 63) id[k++] = *p++;
+    id[k] = '\0';
+
+    uint32_t a; uint64_t to;
+    if (s->elf == NULL || elf_var_find(s->elf, pc, fr, id, &a, &to) != 0) return -1;
+
+    while (*p) {
+        ElfVar ch[64];
+        if (*p == '.') {
+            p++;
+            char fn[64]; int j = 0;
+            while ((isalnum((unsigned char)*p) || *p == '_') && j < 63) fn[j++] = *p++;
+            fn[j] = '\0';
+            int nc = elf_type_children(s->elf, a, to, ch, 64), hit = 0;
+            for (int i = 0; i < nc; i++)
+                if (strcmp(ch[i].name, fn) == 0) { a = ch[i].addr; to = ch[i].type_off; hit = 1; break; }
+            if (!hit) return -1;
+        } else if (*p == '[') {
+            p++;
+            long idx = strtol(p, (char **)&p, 0);
+            if (*p == ']') p++;
+            int nc = elf_type_children(s->elf, a, to, ch, 64);
+            if (idx < 0 || idx >= nc) return -1;
+            a = ch[idx].addr; to = ch[idx].type_off;
+        } else if (*p == ' ' || *p == '\t') {
+            p++;
+        } else {
+            return -1;
+        }
+    }
+    *addr = a; *type_off = to;
+    return 0;
+}
+
+/* `evaluate`: render a watch/REPL variable expression in a frame's context. */
+static int dap_handle_evaluate(dap_session *s, const char *msg,
+                               const dj_tok_t *t, long req_seq)
+{
+    int  args = dj_member(msg, t, 0, "arguments");
+    char expr[160] = {0};
+    long frame_id = 0;
+    if (args >= 0) {
+        int em = dj_member(msg, t, args, "expression");
+        if (em >= 0) dj_strcpy(msg, t, em, expr, sizeof expr);
+        int fm = dj_member(msg, t, args, "frameId");
+        if (fm >= 0) (void)dj_long(msg, t, fm, &frame_id);
+    }
+    if (frame_id < 0 || frame_id >= s->nframes) frame_id = 0;
+    uint32_t     pc = (s->nframes > 0) ? s->frames[frame_id].pc : 0;
+    ElfFrameRegs fr = (s->nframes > 0) ? s->frames[frame_id].fr
+                                       : (ElfFrameRegs){0, 0, 0};
+
+    uint32_t addr = 0; uint64_t type_off = 0;
+    if (expr[0] == '\0' ||
+        dap_resolve_expr(s, pc, &fr, expr, &addr, &type_off) != 0)
+        return dap_send_error(s, req_seq, "evaluate",
+                              "not available") < 0 ? -1 : 0;
+
+    char val[320]; bool ex = false;
+    if (elf_type_render(s->elf, addr, type_off, dap_mem_cb, s,
+                        val, sizeof val, &ex) != 0)
+        return dap_send_error(s, req_seq, "evaluate", "unreadable") < 0 ? -1 : 0;
+    int ref = ex ? dap_varref_alloc(s, DAP_VR_AGGREGATE, 0, NULL, addr, type_off) : 0;
+
+    char ve[640], body[800];
+    dj_escape(val, ve, sizeof ve);
+    snprintf(body, sizeof body,
+        "{\"result\":\"%s\",\"variablesReference\":%d,\"memoryReference\":\"0x%x\"}",
+        ve, ref, addr);
+    return dap_send_response(s, req_seq, "evaluate", true, body);
+}
+
+/* Parse a memoryReference ("0x….." / decimal) into a data-space address. */
+static uint32_t dap_parse_memref(const char *ref) { return (uint32_t)strtoul(ref, NULL, 0); }
+
+/* `readMemory`: base64 of `count` bytes from `memoryReference` + `offset`. */
+static int dap_handle_read_memory(dap_session *s, const char *msg,
+                                  const dj_tok_t *t, long req_seq)
+{
+    int  args = dj_member(msg, t, 0, "arguments");
+    char ref[40] = {0}; long offset = 0, count = 0;
+    if (args >= 0) {
+        int rm = dj_member(msg, t, args, "memoryReference");
+        if (rm >= 0) dj_strcpy(msg, t, rm, ref, sizeof ref);
+        int om = dj_member(msg, t, args, "offset");  if (om >= 0) (void)dj_long(msg, t, om, &offset);
+        int cm = dj_member(msg, t, args, "count");   if (cm >= 0) (void)dj_long(msg, t, cm, &count);
+    }
+    uint32_t addr = dap_parse_memref(ref) + (uint32_t)offset;
+    if (count < 0) count = 0;
+    if (count > 1024) count = 1024;
+
+    uint8_t buf[1024];
+    int got = 0;
+    if (s->updi_fd >= 0 && count > 0) {
+        uint32_t a = (addr >= 0x8000u) ? flash_to_updi(addr) : (addr & 0xffffu);
+        if (updi_mem_read(s->updi_fd, a, buf, (size_t)count) >= 0) got = (int)count;
+    }
+    char b64[1400];
+    dap_b64_encode(buf, (size_t)got, b64, sizeof b64);
+    char body[1600];
+    snprintf(body, sizeof body,
+        "{\"address\":\"0x%x\",\"data\":\"%s\"%s}", addr, b64,
+        got < count ? ",\"unreadableBytes\":1" : "");
+    return dap_send_response(s, req_seq, "readMemory", true, body);
+}
+
+/* `writeMemory`: write base64 `data` to `memoryReference` + `offset`. */
+static int dap_handle_write_memory(dap_session *s, const char *msg,
+                                   const dj_tok_t *t, long req_seq)
+{
+    int  args = dj_member(msg, t, 0, "arguments");
+    char ref[40] = {0}, data[1400] = {0}; long offset = 0;
+    if (args >= 0) {
+        int rm = dj_member(msg, t, args, "memoryReference");
+        if (rm >= 0) dj_strcpy(msg, t, rm, ref, sizeof ref);
+        int om = dj_member(msg, t, args, "offset"); if (om >= 0) (void)dj_long(msg, t, om, &offset);
+        int dm = dj_member(msg, t, args, "data");   if (dm >= 0) dj_strcpy(msg, t, dm, data, sizeof data);
+    }
+    uint32_t addr = dap_parse_memref(ref) + (uint32_t)offset;
+    uint8_t buf[1024];
+    size_t  n = dap_b64_decode(data, buf, sizeof buf);
+    bool ok = false;
+    if (s->updi_fd >= 0 && n > 0 && addr < 0x8000u)
+        ok = (updi_mem_write(s->updi_fd, addr & 0xffffu, buf, n) >= 0);
+    char body[64];
+    snprintf(body, sizeof body, "{\"bytesWritten\":%zu}", ok ? n : (size_t)0);
+    return dap_send_response(s, req_seq, "writeMemory", ok, body);
+}
+
+/* `setVariable`: write a scalar back to a child of a Locals/Globals/aggregate
+ * reference, named `name`, parsed from `value` (decimal or 0x-hex). */
+static int dap_handle_set_variable(dap_session *s, const char *msg,
+                                   const dj_tok_t *t, long req_seq)
+{
+    int  args = dj_member(msg, t, 0, "arguments");
+    long vref = 0; char name[64] = {0}, value[64] = {0};
+    if (args >= 0) {
+        int vm = dj_member(msg, t, args, "variablesReference");
+        if (vm >= 0) (void)dj_long(msg, t, vm, &vref);
+        int nm = dj_member(msg, t, args, "name");  if (nm >= 0) dj_strcpy(msg, t, nm, name, sizeof name);
+        int lm = dj_member(msg, t, args, "value"); if (lm >= 0) dj_strcpy(msg, t, lm, value, sizeof value);
+    }
+    if (vref < 1 || vref >= DAP_MAX_VARREFS || s->elf == NULL)
+        return dap_send_error(s, req_seq, "setVariable", "no such variable") < 0 ? -1 : 0;
+
+    /* Locate the named child in the reference to get its address + type. */
+    ElfVar vs[64]; int nv; int kind = s->varrefs[vref].kind;
+    if (kind == DAP_VR_AGGREGATE)
+        nv = elf_type_children(s->elf, s->varrefs[vref].addr, s->varrefs[vref].type_off, vs, 64);
+    else
+        nv = elf_var_enum(s->elf, s->varrefs[vref].pc, &s->varrefs[vref].fr,
+                          kind == DAP_VR_GLOBALS ? ELF_SCOPE_GLOBALS : ELF_SCOPE_LOCALS, vs, 64);
+    ElfVar *target = NULL;
+    for (int i = 0; i < nv; i++) if (strcmp(vs[i].name, name) == 0) { target = &vs[i]; break; }
+    if (target == NULL)
+        return dap_send_error(s, req_seq, "setVariable", "no such variable") < 0 ? -1 : 0;
+
+    /* Write the new scalar little-endian, at the type's byte width. */
+    long newval = strtol(value, NULL, 0);
+    int  wsize  = elf_type_size(s->elf, target->type_off);
+    uint8_t b[4];
+    for (int i = 0; i < wsize; i++) b[i] = (uint8_t)((newval >> (8 * i)) & 0xff);
+    bool ok = (s->updi_fd >= 0 && target->addr < 0x8000u &&
+               updi_mem_write(s->updi_fd, target->addr & 0xffffu, b, (size_t)wsize) >= 0);
+
+    char val[320]; bool ex = false;
+    if (ok) elf_type_render(s->elf, target->addr, target->type_off, dap_mem_cb, s, val, sizeof val, &ex);
+    else    snprintf(val, sizeof val, "<write failed>");
+    char ve[640], body[720];
+    dj_escape(val, ve, sizeof ve);
+    snprintf(body, sizeof body, "{\"value\":\"%s\",\"variablesReference\":0}", ve);
+    return dap_send_response(s, req_seq, "setVariable", ok, body);
 }
 
 /* ── Breakpoints (Phase 18) ───────────────────────────────────────────────── */
@@ -1026,7 +1417,11 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
          * Phase 17–19 features. */
         if (dap_send_response(s, req_seq, cmd, true,
                 "{\"supportsConfigurationDoneRequest\":true,"
-                "\"supportsInstructionBreakpoints\":true}") < 0)
+                "\"supportsInstructionBreakpoints\":true,"
+                "\"supportsEvaluateForHovers\":true,"
+                "\"supportsReadMemoryRequest\":true,"
+                "\"supportsWriteMemoryRequest\":true,"
+                "\"supportsSetVariable\":true}") < 0)
             return -1;
         return dap_send_event(s, "initialized", NULL) < 0 ? -1 : 0;
     }
@@ -1066,6 +1461,7 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
         if (dap_send_event(s, "continued",
                 "{\"threadId\":1,\"allThreadsContinued\":true}") < 0)
             return -1;
+        dap_varref_reset(s);         /* frame/var handles go stale on resume */
         if (s->updi_fd >= 0) {
             if (dap_target_resume(s) == 0)
                 s->running = true;   /* dap_serve() polls for the halt */
@@ -1090,6 +1486,7 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
      * correct source line via the shallow stackTrace.                      */
     if (strcmp(cmd, "next") == 0 || strcmp(cmd, "stepIn") == 0 ||
         strcmp(cmd, "stepOut") == 0) {
+        dap_varref_reset(s);         /* frame/var handles go stale on step */
         if (s->updi_fd >= 0)
             (void)updi_step(s->updi_fd);
         s->running = false;
@@ -1102,9 +1499,22 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
         return dap_handle_stack_trace(s, req_seq) < 0 ? -1 : 0;
 
     if (strcmp(cmd, "scopes") == 0)
-        /* Frame scopes (locals/registers) carry variables — Phase 19. */
-        return dap_send_response(s, req_seq, cmd, true,
-                "{\"scopes\":[]}") < 0 ? -1 : 0;
+        return dap_handle_scopes(s, msg, t, req_seq) < 0 ? -1 : 0;
+
+    if (strcmp(cmd, "variables") == 0)
+        return dap_handle_variables(s, msg, t, req_seq) < 0 ? -1 : 0;
+
+    if (strcmp(cmd, "evaluate") == 0)
+        return dap_handle_evaluate(s, msg, t, req_seq) < 0 ? -1 : 0;
+
+    if (strcmp(cmd, "readMemory") == 0)
+        return dap_handle_read_memory(s, msg, t, req_seq) < 0 ? -1 : 0;
+
+    if (strcmp(cmd, "writeMemory") == 0)
+        return dap_handle_write_memory(s, msg, t, req_seq) < 0 ? -1 : 0;
+
+    if (strcmp(cmd, "setVariable") == 0)
+        return dap_handle_set_variable(s, msg, t, req_seq) < 0 ? -1 : 0;
 
     if (strcmp(cmd, "disconnect") == 0 || strcmp(cmd, "terminate") == 0) {
         /* Remove all installed breakpoints from silicon before resuming, so

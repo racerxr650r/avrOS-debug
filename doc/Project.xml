@@ -748,6 +748,16 @@ The symbol and string tables are **not** copied into application heap buffers �
                     summary="Resolve a variable visible at pc to its 16-bit data-space address, size, and signedness, evaluating its DWARF location with live frame registers (dwarf_getscopes/getscopevar; DW_OP_addr globals, DW_OP_breg28/breg32/fbreg locals). Backs DAP conditional-breakpoint evaluation. 0 on success, -1 when not in scope/unsupported."/>
           <function signature="int elf_addr_to_func(const ElfContext *ctx, uint32_t pc, char *name, size_t cap)"
                     summary="Resolve a code byte address to the enclosing function name (the DW_TAG_subprogram covering pc, via dwarf_getscopes + dwarf_diename); names the DAP stackTrace frames. 0 on success, -1 when no DWARF or pc is in no subprogram (the caller falls back to the raw address)."/>
+          <function signature="int elf_var_enum(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr, int scope, ElfVar *out, int max)"
+                    summary="Enumerate variables visible at pc — a frame's params+locals (ELF_SCOPE_LOCALS, addresses via fr) or the CU's file-scope globals (ELF_SCOPE_GLOBALS) — as {name, addr, type DIE offset}. Backs the DAP variables Locals/Globals scopes. Returns the count, -1 with no DWARF."/>
+          <function signature="int elf_type_render(const ElfContext *ctx, uint32_t addr, uint64_t type_off, ElfMemRead read, void *user, char *out, size_t cap, bool *expandable)"
+                    summary="Render the value at (addr, type_off) by DWARF type — scalars by encoding, pointers as hex, enums by name, structs/arrays inline to a bounded depth — fetching target bytes via the ElfMemRead callback; sets *expandable for aggregates. 0 on success."/>
+          <function signature="int elf_type_children(const ElfContext *ctx, uint32_t addr, uint64_t type_off, ElfVar *out, int max)"
+                    summary="List a struct/union's members or an array's elements as child ElfVars (name, address, type) for lazy DAP variables expansion. Returns the count, -1 when not an aggregate."/>
+          <function signature="int elf_var_find(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr, const char *name, uint32_t *addr, uint64_t *type_off)"
+                    summary="Resolve a variable name visible at pc (local via fr, else global) to its address + type DIE offset — the DAP evaluate base-identifier entry point. 0 on success, -1 when not in scope."/>
+          <function signature="int elf_type_size(const ElfContext *ctx, uint64_t type_off)"
+                    summary="Byte size of the peeled type at type_off, clamped to 1..4 (default 2) — used by DAP setVariable to write the correct scalar width."/>
         </functions>
         <algorithm><![CDATA[`elf_open()` validates and loads the ELF via libelf as follows:
 
@@ -1123,7 +1133,9 @@ void dap_bp_reset(dap_session *s);
 
 **`dj_tok_t`** — one node of the in-tree JSON tokenizer's flat token array (type, span, child/next links), produced by `dj_parse()` and navigated with `dj_member()`/`dj_strcpy()`/`dj_long()`.
 
-**`ElfFrameRegs`** — the live frame registers (CFA, Y pair, SP) the stack unwinder and the conditional-expression variable resolver pass to `elf_var_addr()`.]]></data_structures>
+**`ElfFrameRegs`** — the live frame registers (CFA, Y pair, SP) the stack unwinder and the conditional-expression variable resolver pass to `elf_var_addr()`.
+
+For source-level state inspection (Phase 19) `dap_session` also holds `frames[DAP_MAX_FRAMES]` (each `{pc, ElfFrameRegs}`, filled by `stackTrace` and indexed by `frameId`) and `varrefs[DAP_MAX_VARREFS]` — the `variablesReference` table (`{kind, pc, fr, addr, type_off}`, kinds Locals/Registers/Globals/Aggregate) — with `next_varref`; both are reset whenever the target resumes.]]></data_structures>
         <functions>
           <function signature="int dap_serve(int updi_fd, int port, ElfContext *elf, const AvrOsSymbolIndex *idx, FsmContext *fsm, bool log)"
                     summary="Accept one DAP client and run the select()-based read/dispatch loop; while the target is running, poll the OCD halt status and emit a stopped event (honouring conditional breakpoints). Returns 0 on clean disconnect."/>
@@ -1159,6 +1171,16 @@ void dap_bp_reset(dap_session *s);
                     summary="Resume past breakpoints parked at the live PC via the GDB remove/single-step/insert dance: bp_remove() each, bp_step_over() one instruction, bp_insert() to re-arm, then updi_run()."/>
           <function signature="static int dap_target_resume(dap_session *s)"
                     summary="Resume for continue: dap_resume_over_current() when a breakpoint sits at the live PC, else a plain updi_run()."/>
+          <function signature="static int dap_handle_scopes(dap_session *s, const char *msg, const dj_tok_t *t, long req_seq)"
+                    summary="Per frameId, return Locals + Globals scopes (and Registers for frame 0), each with a variablesReference allocated from s->varrefs[] carrying the frame's PC + register context."/>
+          <function signature="static int dap_handle_variables(dap_session *s, const char *msg, const dj_tok_t *t, long req_seq)"
+                    summary="Expand a variablesReference: live registers (DAP_VR_REGISTERS), a scope via elf_var_enum (Locals/Globals), or aggregate children via elf_type_children; renders each value with elf_type_render through dap_mem_cb, giving aggregates a child reference."/>
+          <function signature="static int dap_handle_evaluate(dap_session *s, const char *msg, const dj_tok_t *t, long req_seq)"
+                    summary="Resolve a watch/REPL expression (dap_resolve_expr: ident + .field/[index]) in a frame to addr+type, render it, and reply result + variablesReference + memoryReference; success:false when unresolvable."/>
+          <function signature="static int dap_handle_read_memory(dap_session *s, const char *msg, const dj_tok_t *t, long req_seq) / dap_handle_write_memory(...)"
+                    summary="readMemory/writeMemory: base64 (dap_b64_encode/decode) over the target data space (mapped-flash via flash_to_updi for reads; writes confined to the writable SRAM window below 0x8000)."/>
+          <function signature="static int dap_handle_set_variable(dap_session *s, const char *msg, const dj_tok_t *t, long req_seq)"
+                    summary="Locate the named child of a variablesReference (elf_type_children / elf_var_enum), parse the new scalar, and write elf_type_size() little-endian bytes via updi_mem_write; re-renders the stored value."/>
         </functions>
         <algorithm><![CDATA[**Lifecycle.** `dap_dispatch()` answers `initialize` with the capability set + an `initialized` event, treats `launch`/`attach` as an attach, halts at `configurationDone` with a `stopped`/`entry` event, reports the single live CPU as the sole `threads` entry, and on `disconnect`/`terminate` removes every installed breakpoint before resuming the target so detach leaves it running free. All target side effects are guarded by `updi_fd >= 0`, so the dispatch is unit-testable over a socketpair with no hardware.
 
@@ -1166,7 +1188,9 @@ void dap_bp_reset(dap_session *s);
 
 **Multi-frame stackTrace (HLR-080).** libdw's high-level CFI executor errors on AVR `.debug_frame`, so the unwinder uses the in-tree `elf_cfi_cfa()` (§6) for the per-PC CFA rule and applies AVR's fixed stack conventions to recover each caller (2-byte word return address, word-to-byte PC, Y-pair frame pointer). See User Manual Appendix B.17.
 
-**Conditional breakpoints (HLR-081).** When a breakpoint is hit, `dap_conditional_skip()` evaluates each matching `bps[]` entry's `condition` on the live target: the variable is resolved from DWARF with `elf_var_addr()` (§6) using the live frame registers, read over OCD, and compared to the literal. A false condition steps over the breakpoint and auto-resumes (the shared `bp_step_over`, §9); a true / unevaluable / unconditional hit reports the stop — a bad condition never hides a breakpoint. See User Manual Appendix B.18.]]></algorithm>
+**Conditional breakpoints (HLR-081).** When a breakpoint is hit, `dap_conditional_skip()` evaluates each matching `bps[]` entry's `condition` on the live target: the variable is resolved from DWARF with `elf_var_addr()` (§6) using the live frame registers, read over OCD, and compared to the literal. A false condition steps over the breakpoint and auto-resumes (the shared `bp_step_over`, §9); a true / unevaluable / unconditional hit reports the stop — a bad condition never hides a breakpoint. See User Manual Appendix B.18.
+
+**State inspection (Phase 19 — HLR-082/083/084).** `stackTrace` records each frame's register context into `s->frames[]`. `scopes` allocates `variablesReference` handles (the `s->varrefs[]` table, reset on every resume) for a Locals scope (the frame's params+locals), a Registers scope (the innermost frame's live CPU registers), and a Globals scope. `variables` expands a reference via the §6 value model — `elf_var_enum()` for a scope, `elf_type_children()` for an aggregate — rendering each value with `elf_type_render()` through the `dap_mem_cb()` data-space read. `evaluate` resolves an `ident` + `.field`/`[index]` chain (`elf_var_find()` + `elf_type_children()`) and renders it. `readMemory`/`writeMemory` move base64 over the data space; `setVariable` writes a scalar back at the variable's resolved address and `elf_type_size()` width. All target access is guarded by `updi_fd >= 0`.]]></algorithm>
         <dependencies>
           <dep><![CDATA[`src/debug_bp.c` — the breakpoint arbiter and single-step core (`bp_insert`/`bp_remove`/`bp_step_over`/…).]]></dep>
           <dep><![CDATA[`src/elf_parser.c` — `elf_line_to_addr`, `elf_addr_to_line`, `elf_cfi_cfa`, `elf_var_addr`.]]></dep>
@@ -1868,6 +1892,40 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="SDD" ref="6.1"/>
         </traces>
       </hlr>
+
+      <hlr id="HLR-082" name="DAP Scopes &amp; Variables">
+        <text><![CDATA[The DAP front-end shall implement `scopes` and `variables` for source-level state inspection.  For a stopped target, `stackTrace` (HLR-080) records each frame's register context (CFA / Y pair / SP); `scopes` for a `frameId` shall return a **Locals** scope (the frame's parameters and locals, addresses resolved against that frame's registers), a **Registers** scope for the innermost frame (the live CPU r0–r31, SP, SREG, PC), and a **Globals** scope (the compilation unit's file-scope variables) — each carrying a `variablesReference`.  `variables` shall expand a scope, or a structured reference, lazily: each variable is rendered to a value string by its DWARF type — scalars by encoding (signed/unsigned/char/bool/enum/float), pointers as hex, structs as `{field = v, …}`, arrays as `{v0, v1, …}` — and an aggregate (struct/union/array) carries a child `variablesReference` that expands to its members/elements.  Values are read from the target over OCD (the mapped-flash data window routed through the flash mirror).  variablesReference handles are invalidated whenever the target resumes (continue/step).  All target access is guarded by the link so the dispatch is unit-testable without hardware.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+          <trace target="SDD" ref="10.1"/>
+          <trace target="SDD" ref="6.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-083" name="DAP Evaluate (Watch / REPL)">
+        <text><![CDATA[The DAP front-end shall implement `evaluate` for watch and REPL expressions over the loaded DWARF.  An expression is a variable reference: an identifier (resolved in the given `frameId`'s scope, then file scope) followed by a chain of `.field` (struct/union member) and `[index]` (array element) accessors.  The adapter shall resolve the expression to a data-space address and DWARF type, render its value (HLR-082), and reply with the `result`, a `variablesReference` (non-zero for an aggregate, so the client can drill in), and a `memoryReference`.  An unresolvable or unreadable expression shall be answered `success:false` rather than a fabricated value.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+          <trace target="SDD" ref="10.1"/>
+          <trace target="SDD" ref="6.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-084" name="DAP Memory &amp; Set Variable">
+        <text><![CDATA[The DAP front-end shall implement `readMemory`, `writeMemory`, and `setVariable`, advertising the corresponding capabilities.  `readMemory` shall return base64 of `count` bytes from `memoryReference` + `offset` over the target data space (mapped-flash window via the flash mirror), marking unreadable bytes.  `writeMemory` shall write base64 `data` to `memoryReference` + `offset` over the data space.  `setVariable` shall write a scalar value (decimal or `0x`-hex) back to a named child of a Locals/Globals/aggregate reference, at the variable's resolved address and DWARF byte width, then re-render the stored value.  Writes are confined to the writable data space and guarded by the target link.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+          <trace target="SDD" ref="10.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-085" name="VS Code Attach-Config Helper">
+        <text><![CDATA[To ease VS Code setup for the `--dap` server, `avrOSdb --emit-vscode-config` shall print a ready-to-use attach `launch.json` (the `avrosdb` debug type pointed at `127.0.0.1:<port>`) to stdout and exit, needing no target or ELF, so it can be redirected into a project's `.vscode/launch.json`.  It complements the companion `avrosdb-dap` debug-type extension and the User-Manual VS Code section.]]></text>
+        <traces>
+          <trace target="SDD" ref="3.1"/>
+          <trace target="SDD" ref="3.2.2"/>
+        </traces>
+      </hlr>
     </section>
 
     <section number="11" title="CI-Grade Loader and Link Diagnostics">
@@ -2181,6 +2239,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <text><![CDATA[`parse_args()` shall recognise `--sleep` as a boolean flag that sets `cfg->debug_in_sleep = false`; the default initialiser shall set `cfg->debug_in_sleep = true` (debug-in-sleep enabled). Before the startup `updi_enter_debug()` call, `app_main()` shall apply the policy with `updi_set_debug_in_sleep(cfg.debug_in_sleep)` so the choice takes effect at that entry and every later re-entry (HLR-077, LLR-UPDI-35). The usage/`--help` text and the man page shall document that `--sleep` restores native target sleep (the debugger otherwise keeps the system clock alive so breakpoints fire after the firmware sleeps).]]></text>
         <traces>
           <trace target="HLR" ref="HLR-077" name="Debug-in-Sleep (keep the system clock alive across SLEEP)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MAIN-26">
+        <text><![CDATA[`MAIN_NAME()` shall, before `parse_args()` and any device/ELF handling, scan `argv` for `--emit-vscode-config`; when present it shall call `emit_vscode_config()` — which writes a VS Code attach `launch.json` (the `avrosdb` debug type at `127.0.0.1:1234`) to stdout — and return 0 without touching the target.  The usage/`--help` text shall document the flag.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-085" name="VS Code Attach-Config Helper"/>
         </traces>
       </llr>
 
@@ -2917,6 +2982,41 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
           <trace target="HLR" ref="HLR-080" name="DAP Multi-Frame Stack Trace"/>
         </traces>
       </llr>
+
+      <llr id="LLR-ELF-17">
+        <text><![CDATA[`elf_var_enum()` shall enumerate the variables visible at a code byte address in a scope.  For `ELF_SCOPE_LOCALS` it shall walk every lexical scope containing the PC (`dwarf_getscopes`), and for each `DW_TAG_subprogram`/`lexical_block`/`inlined_subroutine` scope list its direct `DW_TAG_variable`/`DW_TAG_formal_parameter` children whose location resolves against the live `ElfFrameRegs`.  For `ELF_SCOPE_GLOBALS` it shall list the CU's direct `DW_TAG_variable` children with a `DW_OP_addr` location.  Each entry is `{name, 16-bit data-space addr, type DIE offset}`; the location is decoded by a shared `eval_var_loc()` helper (DW_OP_addr / breg28 (Y) / bregx32 (SP) / fbreg (CFA)).  Returns the count (capped at `max`), or -1 with no DWARF.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-082" name="DAP Scopes &amp; Variables"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-ELF-18">
+        <text><![CDATA[`elf_type_render()` shall render the value at (`addr`, `type_off`) to a human string, fetching target bytes through a caller-supplied `ElfMemRead` callback (keeping elf_parser hardware-agnostic).  It shall peel typedef/const/volatile (`dwarf_peel_type`) and switch on the type tag: base types by `DW_AT_encoding` (signed/unsigned with sign-extension, char as `N 'c'`, boolean as true/false, 4-byte float via `%g`); pointers as `0x%0*x`; enumerations by matching `DW_AT_const_value` to an enumerator name; structures/unions inline as `{member = value, …}` and arrays as `{v0, v1, …}` recursed to a bounded depth (≤ 3, arrays capped with an ellipsis).  It shall set `*expandable` true for aggregates.  Returns 0 on success, -1 on error.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-082" name="DAP Scopes &amp; Variables"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-ELF-19">
+        <text><![CDATA[`elf_type_children()` shall list the members or elements of the aggregate at (`addr`, `type_off`) as child `ElfVar`s.  For a struct/union it shall emit one entry per `DW_TAG_member` — name, `addr + DW_AT_data_member_location` (constant or `DW_OP_plus_uconst`), and the member's type offset.  For an array it shall derive the element type, element size (`dwarf_bytesize` of the peeled element type), and count (`DW_AT_count`, else `DW_AT_upper_bound + 1` of the `DW_TAG_subrange_type`) and emit `[i]` at `addr + i*elem_size`.  Returns the count (capped at `max`), or -1 when the type is not an aggregate.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-082" name="DAP Scopes &amp; Variables"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-ELF-20">
+        <text><![CDATA[`elf_var_find()` shall resolve a variable `name` visible at a PC (local/parameter via `dwarf_getscopevar` + the frame regs, else file-scope global) to its data-space address and DWARF type DIE offset — the entry point for `evaluate` base identifiers.  Returns 0 on success, -1 when not in scope or with no DWARF.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-083" name="DAP Evaluate (Watch / REPL)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-ELF-21">
+        <text><![CDATA[`elf_type_size()` shall return the byte size of the peeled type at `type_off` (`dwarf_bytesize`), clamped to 1..4 and defaulting to 2 for an absent/unknown type, so `setVariable` writes the correct scalar width.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-084" name="DAP Memory &amp; Set Variable"/>
+        </traces>
+      </llr>
     </function>
 
     <function number="6" title="src/fsm_mapper.c — FSM State Snapshot Provider" name="fsm" source="src/fsm_mapper.c">
@@ -3275,6 +3375,35 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces>
           <trace target="HLR" ref="HLR-081" name="DAP Conditional Breakpoints"/>
           <trace target="HLR" ref="HLR-054" name="True Software Breakpoints via Flash BREAK Opcode"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-DAP-13">
+        <text><![CDATA[`dap_handle_scopes()` and `dap_handle_variables()` shall serve `scopes`/`variables`.  `dap_unwind()` (LLR-DAP-11) shall record each frame's PC and register context (`ElfFrameRegs`: CFA/Y/SP) into `s->frames[]`, indexed by `frameId`.  `scopes` shall allocate variablesReferences (a `s->varrefs[]` table, 1-based) for a Locals scope (`DAP_VR_LOCALS`, carrying the frame PC + regs), a Globals scope (`DAP_VR_GLOBALS`), and — for `frameId == 0` only — a Registers scope (`DAP_VR_REGISTERS`).  `variables` shall, by the reference's kind: list the live CPU registers (r0–r31 + SP/SREG/PC over OCD) for `DAP_VR_REGISTERS`; enumerate the scope via `elf_var_enum()` for Locals/Globals; or list aggregate children via `elf_type_children()` for `DAP_VR_AGGREGATE`.  Each variable is rendered with `elf_type_render()` through a `dap_mem_cb()` data-space read (mapped-flash via `flash_to_updi`), and an aggregate is given a fresh `DAP_VR_AGGREGATE` reference for lazy drill-down.  `dap_varref_reset()` shall invalidate the frame/varref tables on every resume (continue/step).]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-082" name="DAP Scopes &amp; Variables"/>
+          <trace target="HLR" ref="HLR-072" name="DWARF Source-Level Lookup (DAP Groundwork)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-DAP-14">
+        <text><![CDATA[`dap_handle_evaluate()` shall serve `evaluate`.  It shall map `arguments.frameId` to the recorded frame context, then `dap_resolve_expr()` shall parse a leading identifier and a chain of `.field` / `[index]` accessors: the identifier resolves via `elf_var_find()` (LLR-ELF-20), and each accessor descends through `elf_type_children()` (matching member name or array index) to a final (addr, type_off).  The value is rendered with `elf_type_render()`; the reply carries `result`, a `variablesReference` (non-zero for an aggregate), and a `memoryReference`.  An empty/unresolvable/unreadable expression shall reply `success:false` via `dap_send_error()`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-083" name="DAP Evaluate (Watch / REPL)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-DAP-15">
+        <text><![CDATA[`dap_handle_read_memory()` and `dap_handle_write_memory()` shall serve `readMemory`/`writeMemory` using in-tree base64 (`dap_b64_encode`/`dap_b64_decode`).  `readMemory` parses `memoryReference` + `offset` + `count` (capped at 1024), reads the data space via `updi_mem_read()` (mapped-flash window routed through `flash_to_updi`), and replies `{address, data}` (marking `unreadableBytes` on a short read).  `writeMemory` decodes `data` and writes it to the writable data space (`addr < 0x8000`) via `updi_mem_write()`, replying `bytesWritten`.  Both are guarded by `updi_fd >= 0`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-084" name="DAP Memory &amp; Set Variable"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-DAP-16">
+        <text><![CDATA[`dap_handle_set_variable()` shall serve `setVariable`.  It shall locate the named child of the given `variablesReference` (via `elf_type_children()` for an aggregate, else `elf_var_enum()` for a scope) to obtain its address and type, parse the new `value` (`strtol(...,0)`), and write `elf_type_size()` little-endian bytes to the writable data space (`addr < 0x8000`) via `updi_mem_write()`, then re-render the stored value into the reply.  An unknown reference/name shall reply `success:false`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-084" name="DAP Memory &amp; Set Variable"/>
         </traces>
       </llr>
     </function>
@@ -4240,7 +4369,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/elf_parser.c unit tests                                  -->
     <!-- ============================================================ -->
-    <file path="tests/test_elf.c" role="unit" count="18">
+    <file path="tests/test_elf.c" role="unit" count="20">
       <header><![CDATA[Unit tests for the elfutils-based `src/elf_parser.c`: ELF validation, avrOS sentinel symbol discovery, Harvard / mapped-flash address conversion, fail-safe degradation, deviceinfo note extraction, DWARF source-line round-trip, and handle release. Fixture ELF binaries (compiled with `-g`) are generated under `tests/fixtures/`. The former heap symtab/strtab and malloc-injection tests are retired — libelf owns that memory now.]]></header>
 
       <test name="elf_open_accepts_valid_avr_elf32_binary">
@@ -4331,6 +4460,16 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="elf_addr_to_func_resolves_enclosing_function">
         <purpose><![CDATA[On the gdb_debug_session fixture, derive PCs inside leaf() and main() from their source lines (`elf_line_to_addr()`) and assert `elf_addr_to_func()` maps them to "leaf" and "main" respectively, and returns -1 for an address outside any subprogram. Deterministic / hardware-free guard for the DAP stackTrace frame names. Per LLR-ELF-16.]]></purpose>
         <traces><trace target="LLR" ref="LLR-ELF-16"/></traces>
+      </test>
+
+      <test name="elf_value_model_enumerates_and_renders">
+        <purpose><![CDATA[On the gdb_debug_session fixture, enumerate the file-scope globals with `elf_var_enum()` and find the struct `g_cfg` and array `g_arr`; assert `elf_type_render()` marks them expandable and renders the struct inline (`{base = …`), `elf_type_children()` returns base/gain (gain at offset 2) and the array's 4 elements at a 2-byte stride, and that an all-0xFF memory stub renders the uint16 member as 65535 vs the int16 member as -1 (signed/unsigned by encoding); locals (a/b/prod/sum) enumerate at leaf. Deterministic / hardware-free guard for the DWARF value model. Per LLR-ELF-17 / LLR-ELF-18 / LLR-ELF-19.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-17"/><trace target="LLR" ref="LLR-ELF-18"/><trace target="LLR" ref="LLR-ELF-19"/></traces>
+      </test>
+
+      <test name="elf_var_find_and_type_size">
+        <purpose><![CDATA[On the gdb_debug_session fixture, assert `elf_var_find()` resolves `g_marker` (a PC inside leaf derived from its source line) to a non-zero address and type DIE offset, that `elf_type_size()` reports 2 bytes for that uint16_t type, and that an unknown name returns -1. Deterministic / hardware-free guard for the DAP evaluate / setVariable resolution. Per LLR-ELF-20 / LLR-ELF-21.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-20"/><trace target="LLR" ref="LLR-ELF-21"/></traces>
       </test>
     </file>
 
@@ -4561,8 +4700,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- Device-signature diagnostic mode tests (Phase 7)             -->
     <!-- ============================================================ -->
-    <file path="tests/test_device.c" role="unit" count="9">
+    <file path="tests/test_device.c" role="unit" count="10">
       <header><![CDATA[Unit and harness-level tests covering the `--device` one-shot diagnostic mode and the `--rsp`/`--dap` front-end selection: argument parsing, mutual exclusion (with `--load`, and between `--rsp`/`--dap`), `updi_read_device_info()` success and failure paths over a PTY, the human-readable report format, and verification that the diagnostic path bypasses the GDB listener.]]></header>
+
+      <test name="emit_vscode_config_prints_attach_launch_json">
+        <purpose><![CDATA[Capture stdout while calling `emit_vscode_config()` and assert the printed launch.json carries the `avrosdb` debug type, an `attach` request, and the default port 1234 — the `--emit-vscode-config` helper. Per LLR-MAIN-26.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-26"/></traces>
+      </test>
 
       <test name="parse_args_accepts_device_flag_without_elf_operand">
         <purpose><![CDATA[Invoke `parse_args()` with `argv = {"avrOSdb", "--device", "/dev/ttyUSB0"}` and assert `cfg.device_info == true`, `cfg.serial_device == "/dev/ttyUSB0"`, `cfg.elf_path == NULL`, and `parse_args()` returns without exiting.]]></purpose>
@@ -4817,7 +4961,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/dap.c DAP wire-transport tests (Phase 16)                -->
     <!-- ============================================================ -->
-    <file path="tests/test_dap.c" role="unit" count="21">
+    <file path="tests/test_dap.c" role="unit" count="25">
       <header><![CDATA[Unit tests for the DAP front-end: the wire transport (HLR-075) — the JSON codec (`dj_*` recursive-descent tokenizer, member/string/number accessors, escape decode, and the emission escaper) and the Content-Length message framing (`dap_read_message` / `dap_write_message`) — and the connection lifecycle dispatch (HLR-076) driven over a `socketpair` with `updi_fd = -1` so no hardware is touched. Framing is exercised over an anonymous pipe.]]></header>
 
       <test name="dj_parse_extracts_request_fields">
@@ -4900,9 +5044,29 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces><trace target="LLR" ref="LLR-DAP-09"/></traces>
       </test>
 
-      <test name="dap_scopes_returns_empty">
-        <purpose><![CDATA[Dispatch `scopes` and verify the response carries an empty `scopes` array (frame variables are Phase 19). Per LLR-DAP-09.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-DAP-09"/></traces>
+      <test name="dap_scopes_returns_locals_registers_globals">
+        <purpose><![CDATA[Dispatch `scopes` for frameId 0 and verify the response carries Locals, Registers, and Globals scopes (each with a variablesReference). Per LLR-DAP-13.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-13"/></traces>
+      </test>
+
+      <test name="dap_variables_unknown_ref_is_empty">
+        <purpose><![CDATA[Dispatch `variables` with an out-of-range reference (no ELF/target) and verify an empty `variables` array rather than an error. Per LLR-DAP-13.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-13"/></traces>
+      </test>
+
+      <test name="dap_evaluate_unresolved_is_error">
+        <purpose><![CDATA[Dispatch `evaluate` for an expression with no ELF/target and verify the response is `success:false` (the adapter never fabricates a value). Per LLR-DAP-14.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-14"/></traces>
+      </test>
+
+      <test name="dap_read_memory_responds_with_data_field">
+        <purpose><![CDATA[Dispatch `readMemory` with no target and verify the response is well-formed and carries a `data` field (base64, possibly empty/unreadable) rather than erroring. Per LLR-DAP-15.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-15"/></traces>
+      </test>
+
+      <test name="dap_set_variable_unknown_ref_errors">
+        <purpose><![CDATA[Dispatch `setVariable` with an out-of-range reference and verify the response is `success:false`. Per LLR-DAP-16.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-16"/></traces>
       </test>
 
       <test name="dap_set_breakpoints_responds_with_per_line_entries">
@@ -4929,7 +5093,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src DAP on-target acceptance harness (Neovim + nvim-dap)     -->
     <!-- ============================================================ -->
-    <file path="tests/hw/dap_acceptance.lua" role="hardware" count="8">
+    <file path="tests/hw/dap_acceptance.lua" role="hardware" count="9">
       <header><![CDATA[On-target DAP acceptance harness (the DAP analogue of the Group-G GDB harness): spawns a fresh `avrOSdb --dap` against live AVR-Dx silicon and drives it with the real nvim-dap client (headless Neovim) over TCP, applying per-case verdicts to the connection lifecycle. Manual-only (`make hw-test-dap`); never invoked by `make test`. Phase 16 covers the handshake (DAP1–DAP4); execution control, breakpoints, and variables grow this suite in Phases 17–19.]]></header>
 
       <test name="DAP1_initialize_handshake">
@@ -4965,6 +5129,11 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="DAP7_source_breakpoint_hit">
         <purpose><![CDATA[Phase-18 source breakpoints. `setBreakpoints` for a reachable source line in the loaded fixture (default `gdb_target.c:51` — the `blink()` call in the main loop; override via `DAP_BP_SOURCE`/`DAP_BP_LINE`) — verify it resolves+verifies via DWARF and installs through the shared breakpoint core — then `continue` and verify the adapter emits a `stopped` event with reason `breakpoint`, proving file:line breakpoint resolution + install + hit end-to-end on silicon. The harness reflashes `HW_DAP_ELF` first so the running firmware matches the ELF handed to the server. Per HLR-079 / LLR-DAP-10.]]></purpose>
         <traces><trace target="HLR" ref="HLR-079"/></traces>
+      </test>
+
+      <test name="DAP9_scopes_variables_lists_a_global">
+        <purpose><![CDATA[At the breakpoint, request `scopes` then `variables` on the Globals scope through the real nvim-dap client and verify the firmware global `g_counter` is listed — proving the variables request path works end to end via VS Code/Neovim (the rich per-type cases are in tests/hw/dap_vars.py). Per HLR-082 / LLR-DAP-13.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-082"/><trace target="LLR" ref="LLR-DAP-13"/></traces>
       </test>
 
       <test name="DAP8_disconnect_clean">
@@ -5023,6 +5192,43 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="DAP_K3_true_global_condition_stops">
         <purpose><![CDATA[A source breakpoint in `leaf` with the true global condition `g_marker == 49374` (a constant): after `continue` the adapter emits `stopped` with reason `breakpoint` — proving global-variable conditions (DW_OP_addr resolution) work on silicon. Per HLR-081 / LLR-DAP-12 / LLR-ELF-15.]]></purpose>
         <traces><trace target="HLR" ref="HLR-081"/><trace target="LLR" ref="LLR-DAP-12"/><trace target="LLR" ref="LLR-ELF-15"/></traces>
+      </test>
+    </file>
+
+    <file path="tests/hw/dap_vars.py" role="hardware" count="8">
+      <header><![CDATA[On-target DAP variables / evaluate / memory acceptance harness (Phase 19, the DAP analogue of GDB Group-G state inspection — G17/G22/G23). A pure-Python DAP client spawns `avrOSdb --dap` against live AVR-Dx silicon running the `gdb_debug_session` fixture, breaks inside `leaf`, and verifies scopes, variables (with struct/array expansion), per-frame locals, evaluate, read/write memory, and setVariable against the fixture's documented values. Manual-only (`make hw-test-dap-vars`) — never wired into `make test`.]]></header>
+
+      <test name="DAP_V1_scopes_locals_registers_globals">
+        <purpose><![CDATA[`scopes` for frame 0 returns Locals, Registers, and Globals scopes. Per HLR-082 / LLR-DAP-13.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-082"/><trace target="LLR" ref="LLR-DAP-13"/></traces>
+      </test>
+      <test name="DAP_V2_global_scalar_reads_back">
+        <purpose><![CDATA[Expanding the Globals scope, the scalar `g_marker` reads its constant 49374. Per HLR-082 / LLR-ELF-18.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-082"/><trace target="LLR" ref="LLR-ELF-18"/></traces>
+      </test>
+      <test name="DAP_V3_struct_expands_to_members">
+        <purpose><![CDATA[The struct global `g_cfg` carries a child reference that expands to members `base = 100` and `gain = -7` (signed/unsigned by type). Per HLR-082 / LLR-ELF-19.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-082"/><trace target="LLR" ref="LLR-ELF-19"/></traces>
+      </test>
+      <test name="DAP_V4_array_expands_to_elements">
+        <purpose><![CDATA[The array global `g_arr` expands to elements `[0..3] = 10,20,30,40` at the element stride. Per HLR-082 / LLR-ELF-19.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-082"/><trace target="LLR" ref="LLR-ELF-19"/></traces>
+      </test>
+      <test name="DAP_V5_frame_locals_read_back">
+        <purpose><![CDATA[The Locals scope of the leaf frame reports the parameters `a = 7` and `b = 2`, resolved against the frame's registers. Per HLR-082 / LLR-ELF-17.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-082"/><trace target="LLR" ref="LLR-ELF-17"/></traces>
+      </test>
+      <test name="DAP_V6_evaluate_field_and_element">
+        <purpose><![CDATA[`evaluate` resolves `g_cfg.base` (= 100), `g_arr[2]` (= 30), and `g_marker` (= 49374) — identifier + `.field` / `[index]` navigation. Per HLR-083 / LLR-DAP-14.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-083"/><trace target="LLR" ref="LLR-DAP-14"/></traces>
+      </test>
+      <test name="DAP_V7_read_memory_array_bytes">
+        <purpose><![CDATA[`readMemory` of `g_arr` returns the 8 bytes that decode (little-endian) to the u16 sequence 10,20,30,40. Per HLR-084 / LLR-DAP-15.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-084"/><trace target="LLR" ref="LLR-DAP-15"/></traces>
+      </test>
+      <test name="DAP_V8_set_variable_writes_back">
+        <purpose><![CDATA[`setVariable` writes `g_counter = 1234`; a subsequent `evaluate` reads back 1234 — proving the write reached silicon at the right address and width. Per HLR-084 / LLR-DAP-16.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-084"/><trace target="LLR" ref="LLR-DAP-16"/></traces>
       </test>
     </file>
 

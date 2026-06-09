@@ -761,11 +761,11 @@ launch script already manages the stub.
 with **no `avr-gdb` in the loop**.
 
 > [!NOTE]
-> The native DAP front-end is being built up in phases. It currently performs
-> the connection handshake — attach, stop the target at entry, list the CPU
-> thread, and disconnect; source-level stepping, breakpoints, and variable
-> inspection land in subsequent phases. The RSP path (§6.1) remains the
-> full-featured route in the meantime.
+> The native DAP front-end is full-featured: attach, execution control,
+> source / instruction / conditional breakpoints, a DWARF multi-frame call
+> stack, variables (Locals / Registers / Globals with struct & array
+> expansion), watch/REPL `evaluate`, read/write memory, and set variable. The
+> RSP path (§6.1) shares the same debug core and remains available.
 
 **One-time setup.** `make prereqs` (or just `make prereqs-nvim`) installs
 nvim-dap as a native Neovim package and installs the avrOSdb DAP config into
@@ -813,10 +813,16 @@ itself — it just points the `avrosdb` debug type at the running server's TCP
 port (`vscode.DebugAdapterServer`).
 
 > [!NOTE]
-> Same scope caveat as §6.2: the native DAP front-end currently performs the
-> connection handshake (attach → stop at entry → threads → disconnect);
-> stepping, breakpoints, and variables arrive in later phases. For full-featured
-> debugging today, use the GDB-RSP path in §6.1.
+> The native DAP front-end is now full-featured: attach, execution control
+> (continue / pause / step), source + instruction + **conditional** breakpoints,
+> a DWARF multi-frame call stack, **variables** (Locals / Registers / Globals
+> with struct & array expansion), **watch/REPL `evaluate`** (including
+> `g_cfg.base` / `g_arr[2]`), **read/write memory**, and **set variable**. The
+> GDB-RSP path (§6.1) remains available and shares the same debug core.
+
+> [!TIP]
+> `avrOSdb --emit-vscode-config` prints a ready-to-use attach `launch.json` to
+> stdout — e.g. `avrOSdb --emit-vscode-config > .vscode/launch.json`.
 
 **Install the companion extension** (one of):
 

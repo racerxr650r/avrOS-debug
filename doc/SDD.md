@@ -768,6 +768,11 @@ The symbol and string tables are **not** copied into application heap buffers �
 *   **`int elf_cfi_cfa(const ElfContext *ctx, uint32_t byte_addr, int *cfa_reg, int *cfa_offset)`** — Return the Canonical-Frame-Address rule at a PC by interpreting .debug_frame in-tree (libdw's dwarf_cfi_addrframe errors on AVR CFI): CFA = value(cfa_reg) + cfa_offset, cfa_reg = 28 (the Y pair) or 32 (SP). Drives the DAP multi-frame stackTrace. 0 on success, -1 when uncovered/unsupported.
 *   **`int elf_var_addr(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr, const char *name, uint32_t *addr, int *size, bool *is_signed)`** — Resolve a variable visible at pc to its 16-bit data-space address, size, and signedness, evaluating its DWARF location with live frame registers (dwarf_getscopes/getscopevar; DW_OP_addr globals, DW_OP_breg28/breg32/fbreg locals). Backs DAP conditional-breakpoint evaluation. 0 on success, -1 when not in scope/unsupported.
 *   **`int elf_addr_to_func(const ElfContext *ctx, uint32_t pc, char *name, size_t cap)`** — Resolve a code byte address to the enclosing function name (the DW_TAG_subprogram covering pc, via dwarf_getscopes + dwarf_diename); names the DAP stackTrace frames. 0 on success, -1 when no DWARF or pc is in no subprogram (the caller falls back to the raw address).
+*   **`int elf_var_enum(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr, int scope, ElfVar *out, int max)`** — Enumerate variables visible at pc — a frame's params+locals (ELF_SCOPE_LOCALS, addresses via fr) or the CU's file-scope globals (ELF_SCOPE_GLOBALS) — as {name, addr, type DIE offset}. Backs the DAP variables Locals/Globals scopes. Returns the count, -1 with no DWARF.
+*   **`int elf_type_render(const ElfContext *ctx, uint32_t addr, uint64_t type_off, ElfMemRead read, void *user, char *out, size_t cap, bool *expandable)`** — Render the value at (addr, type_off) by DWARF type — scalars by encoding, pointers as hex, enums by name, structs/arrays inline to a bounded depth — fetching target bytes via the ElfMemRead callback; sets *expandable for aggregates. 0 on success.
+*   **`int elf_type_children(const ElfContext *ctx, uint32_t addr, uint64_t type_off, ElfVar *out, int max)`** — List a struct/union's members or an array's elements as child ElfVars (name, address, type) for lazy DAP variables expansion. Returns the count, -1 when not an aggregate.
+*   **`int elf_var_find(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr, const char *name, uint32_t *addr, uint64_t *type_off)`** — Resolve a variable name visible at pc (local via fr, else global) to its address + type DIE offset — the DAP evaluate base-identifier entry point. 0 on success, -1 when not in scope.
+*   **`int elf_type_size(const ElfContext *ctx, uint64_t type_off)`** — Byte size of the peeled type at type_off, clamped to 1..4 (default 2) — used by DAP setVariable to write the correct scalar width.
 
 #### 6.3.3 Parsing Strategy / Algorithm
 
@@ -1198,6 +1203,8 @@ A single TCP client speaking DAP over `Content-Length: <n>\r\n\r\n<json>` framin
 
 **`ElfFrameRegs`** — the live frame registers (CFA, Y pair, SP) the stack unwinder and the conditional-expression variable resolver pass to `elf_var_addr()`.
 
+For source-level state inspection (Phase 19) `dap_session` also holds `frames[DAP_MAX_FRAMES]` (each `{pc, ElfFrameRegs}`, filled by `stackTrace` and indexed by `frameId`) and `varrefs[DAP_MAX_VARREFS]` — the `variablesReference` table (`{kind, pc, fr, addr, type_off}`, kinds Locals/Registers/Globals/Aggregate) — with `next_varref`; both are reset whenever the target resumes.
+
 
 #### 10.3.2 Key Functions
 
@@ -1225,6 +1232,11 @@ A single TCP client speaking DAP over `Content-Length: <n>\r\n\r\n<json>` framin
 *   **`static bool dap_conditional_skip(dap_session *s)`** — On a halt while running, examine every breakpoint at the live PC; if all are conditional and all conditions false, step over and auto-resume (return true); otherwise return false so dap_serve() emits the stopped event.
 *   **`static int dap_resume_over_current(dap_session *s)`** — Resume past breakpoints parked at the live PC via the GDB remove/single-step/insert dance: bp_remove() each, bp_step_over() one instruction, bp_insert() to re-arm, then updi_run().
 *   **`static int dap_target_resume(dap_session *s)`** — Resume for continue: dap_resume_over_current() when a breakpoint sits at the live PC, else a plain updi_run().
+*   **`static int dap_handle_scopes(dap_session *s, const char *msg, const dj_tok_t *t, long req_seq)`** — Per frameId, return Locals + Globals scopes (and Registers for frame 0), each with a variablesReference allocated from s->varrefs[] carrying the frame's PC + register context.
+*   **`static int dap_handle_variables(dap_session *s, const char *msg, const dj_tok_t *t, long req_seq)`** — Expand a variablesReference: live registers (DAP_VR_REGISTERS), a scope via elf_var_enum (Locals/Globals), or aggregate children via elf_type_children; renders each value with elf_type_render through dap_mem_cb, giving aggregates a child reference.
+*   **`static int dap_handle_evaluate(dap_session *s, const char *msg, const dj_tok_t *t, long req_seq)`** — Resolve a watch/REPL expression (dap_resolve_expr: ident + .field/[index]) in a frame to addr+type, render it, and reply result + variablesReference + memoryReference; success:false when unresolvable.
+*   **`static int dap_handle_read_memory(dap_session *s, const char *msg, const dj_tok_t *t, long req_seq) / dap_handle_write_memory(...)`** — readMemory/writeMemory: base64 (dap_b64_encode/decode) over the target data space (mapped-flash via flash_to_updi for reads; writes confined to the writable SRAM window below 0x8000).
+*   **`static int dap_handle_set_variable(dap_session *s, const char *msg, const dj_tok_t *t, long req_seq)`** — Locate the named child of a variablesReference (elf_type_children / elf_var_enum), parse the new scalar, and write elf_type_size() little-endian bytes via updi_mem_write; re-renders the stored value.
 
 #### 10.3.3 Parsing Strategy / Algorithm
 
@@ -1235,6 +1247,8 @@ A single TCP client speaking DAP over `Content-Length: <n>\r\n\r\n<json>` framin
 **Multi-frame stackTrace (HLR-080).** libdw's high-level CFI executor errors on AVR `.debug_frame`, so the unwinder uses the in-tree `elf_cfi_cfa()` (§6) for the per-PC CFA rule and applies AVR's fixed stack conventions to recover each caller (2-byte word return address, word-to-byte PC, Y-pair frame pointer). See User Manual Appendix B.17.
 
 **Conditional breakpoints (HLR-081).** When a breakpoint is hit, `dap_conditional_skip()` evaluates each matching `bps[]` entry's `condition` on the live target: the variable is resolved from DWARF with `elf_var_addr()` (§6) using the live frame registers, read over OCD, and compared to the literal. A false condition steps over the breakpoint and auto-resumes (the shared `bp_step_over`, §9); a true / unevaluable / unconditional hit reports the stop — a bad condition never hides a breakpoint. See User Manual Appendix B.18.
+
+**State inspection (Phase 19 — HLR-082/083/084).** `stackTrace` records each frame's register context into `s->frames[]`. `scopes` allocates `variablesReference` handles (the `s->varrefs[]` table, reset on every resume) for a Locals scope (the frame's params+locals), a Registers scope (the innermost frame's live CPU registers), and a Globals scope. `variables` expands a reference via the §6 value model — `elf_var_enum()` for a scope, `elf_type_children()` for an aggregate — rendering each value with `elf_type_render()` through the `dap_mem_cb()` data-space read. `evaluate` resolves an `ident` + `.field`/`[index]` chain (`elf_var_find()` + `elf_type_children()`) and renders it. `readMemory`/`writeMemory` move base64 over the data space; `setVariable` writes a scalar back at the variable's resolved address and `elf_type_size()` width. All target access is guarded by `updi_fd >= 0`.
 
 ### 10.4 Dependencies
 

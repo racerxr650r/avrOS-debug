@@ -164,4 +164,60 @@ int elf_var_addr(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr,
  * runtime above `main`) — the caller then falls back to the raw address. */
 int elf_addr_to_func(const ElfContext *ctx, uint32_t pc, char *name, size_t cap);
 
+/* ── DWARF value model (DAP variables / evaluate, Phase 19) ──────────────── */
+
+/* A located variable or aggregate member: its name, 16-bit data-space address,
+ * and the global DWARF offset of its declared (unpeeled) DW_AT_type DIE (0 if
+ * none).  `type_off` re-opens the type with dwarf_offdie() for rendering or
+ * member/element expansion. */
+typedef struct {
+    char     name[64];
+    uint32_t addr;
+    uint64_t type_off;
+} ElfVar;
+
+enum { ELF_SCOPE_LOCALS = 0, ELF_SCOPE_GLOBALS = 1 };
+
+/* Enumerate the variables visible at code byte address `pc` in `scope`:
+ * ELF_SCOPE_LOCALS = the parameters + locals of the lexical scopes containing
+ * `pc` (addresses resolved against the live frame registers `fr`);
+ * ELF_SCOPE_GLOBALS = the compilation unit's file-scope variables (`fr` may be
+ * NULL).  Fills up to `max` entries (those whose location resolves) and returns
+ * the count, or -1 with no DWARF. */
+int elf_var_enum(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr,
+                 int scope, ElfVar *out, int max);
+
+/* Target-memory read callback, so the renderer stays hardware-agnostic: read
+ * `len` bytes at data-space `addr` into `buf`; return 0 on success, -1 on
+ * failure. */
+typedef int (*ElfMemRead)(void *user, uint32_t addr, uint8_t *buf, int len);
+
+/* Render the value of the variable at (`addr`, `type_off`) into `out` as a
+ * human-readable string (scalars by encoding; pointers as hex; structs as
+ * `{field = v, …}`; arrays as `{v0, v1, …}` — aggregates rendered inline to a
+ * bounded depth), fetching target bytes through `read`.  Sets *expandable to
+ * true for an aggregate whose members/elements can be listed with
+ * elf_type_children().  Returns 0 on success, -1 on error. */
+int elf_type_render(const ElfContext *ctx, uint32_t addr, uint64_t type_off,
+                    ElfMemRead read, void *user,
+                    char *out, size_t cap, bool *expandable);
+
+/* Enumerate the members (struct/union) or elements (array) of the aggregate at
+ * (`addr`, `type_off`) as child ElfVars (name, address, type).  Returns the
+ * count (capped at `max`), or -1 when the type is not an aggregate. */
+int elf_type_children(const ElfContext *ctx, uint32_t addr, uint64_t type_off,
+                      ElfVar *out, int max);
+
+/* Resolve a variable `name` visible at `pc` (local/param via the frame regs
+ * `fr`, else file-scope global) to its data-space address and DWARF type DIE
+ * offset — the entry point for DAP `evaluate` watch/REPL expressions.  Returns
+ * 0 on success, -1 when not in scope or with no DWARF. */
+int elf_var_find(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr,
+                 const char *name, uint32_t *addr, uint64_t *type_off);
+
+/* Byte size of the (peeled) type at `type_off`, clamped to 1..4; defaults to 2
+ * for an absent/unknown type.  Used by DAP `setVariable` to write the right
+ * width back to a scalar. */
+int elf_type_size(const ElfContext *ctx, uint64_t type_off);
+
 #endif /* AOD_ELF_PARSER_H */

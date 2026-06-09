@@ -137,7 +137,9 @@ static void usage(const char *prog)
         "                     (the default). Mutually exclusive with --dap.\n"
         "  --dap              Serve the Debug Adapter Protocol front-end for\n"
         "                     DAP-native editors (VS Code). Mutually exclusive\n"
-        "                     with --rsp.\n",
+        "                     with --rsp.\n"
+        "  --emit-vscode-config  Print a VS Code attach launch.json for the\n"
+        "                     --dap server to stdout and exit.\n",
         prog, prog, prog, prog);
 }
 
@@ -1342,6 +1344,27 @@ MAYBE_STATIC int run_prog_mode(AppConfig *cfg)
     return 0;
 }
 
+/* --emit-vscode-config: print a ready-to-use VS Code attach `launch.json` for
+ * the `--dap` server to stdout and exit.  Needs no target or ELF — pipe it into
+ * a project's .vscode/launch.json.  The companion `avrosdb` debug-type
+ * extension (tools/vscode/avrosdb-dap/) must be installed. */
+static void emit_vscode_config(void)
+{
+    fputs(
+"{\n"
+"  \"version\": \"0.2.0\",\n"
+"  \"configurations\": [\n"
+"    {\n"
+"      \"type\": \"avrosdb\",\n"
+"      \"request\": \"attach\",\n"
+"      \"name\": \"Attach to avrOSdb (--dap)\",\n"
+"      \"host\": \"127.0.0.1\",\n"
+"      \"port\": 1234\n"
+"    }\n"
+"  ]\n"
+"}\n", stdout);
+}
+
 int MAIN_NAME(int argc, char *argv[])
 {
     AppConfig cfg;
@@ -1352,6 +1375,13 @@ int MAIN_NAME(int argc, char *argv[])
     memset(&idx,     0, sizeof idx);
     memset(&fsm_ctx, 0, sizeof fsm_ctx);
     elf_ctx.fd = -1;
+
+    /* Config-emit helper short-circuits before any device/ELF handling. */
+    for (int i = 1; i < argc; i++)
+        if (strcmp(argv[i], "--emit-vscode-config") == 0) {
+            emit_vscode_config();
+            return 0;
+        }
 
     parse_args(argc, argv, &cfg);
 

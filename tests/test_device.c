@@ -209,6 +209,20 @@ int elf_var_addr(const ElfContext *c, uint32_t pc, const ElfFrameRegs *fr,
 int elf_addr_to_func(const ElfContext *c, uint32_t pc, char *n, size_t cap)
 { (void)c; (void)pc; (void)n; (void)cap; return -1; }
 
+int elf_var_enum(const ElfContext *c, uint32_t pc, const ElfFrameRegs *fr,
+                 int sc, ElfVar *o, int m)
+{ (void)c; (void)pc; (void)fr; (void)sc; (void)o; (void)m; return 0; }
+int elf_type_render(const ElfContext *c, uint32_t a, uint64_t to,
+                    ElfMemRead rd, void *u, char *o, size_t cap, bool *ex)
+{ (void)c; (void)a; (void)to; (void)rd; (void)u; (void)cap; if(ex)*ex=false; if(o&&cap)o[0]='\0'; return -1; }
+int elf_type_children(const ElfContext *c, uint32_t a, uint64_t to, ElfVar *o, int m)
+{ (void)c; (void)a; (void)to; (void)o; (void)m; return -1; }
+
+int elf_var_find(const ElfContext *c, uint32_t pc, const ElfFrameRegs *fr,
+                 const char *n, uint32_t *a, uint64_t *to)
+{ (void)c; (void)pc; (void)fr; (void)n; (void)a; (void)to; return -1; }
+int elf_type_size(const ElfContext *c, uint64_t to){ (void)c; (void)to; return 2; }
+
 int __wrap_fsm_build_thread_list(FsmContext *c, const AvrOsSymbolIndex *i, int fd);
 int __wrap_fsm_build_thread_list(FsmContext *c, const AvrOsSymbolIndex *i, int fd)
 {
@@ -571,6 +585,40 @@ static void updi_read_device_info_reports_failed_step_on_nak(void)
 }
 
 /* ══════════════════════════════════════════════════════════════════════
+ *  --emit-vscode-config prints an attach launch.json       LLR-MAIN-26
+ * ════════════════════════════════════════════════════════════════════ */
+static void emit_vscode_config_prints_attach_launch_json(void)
+{
+    char tmpl[] = "/tmp/aod_vscfg_XXXXXX";
+    int  out_fd = mkstemp(tmpl);
+    TEST_ASSERT_TRUE(out_fd >= 0);
+    fflush(stdout);
+    int saved = dup(STDOUT_FILENO);
+    dup2(out_fd, STDOUT_FILENO);
+
+    emit_vscode_config();
+
+    fflush(stdout);
+    dup2(saved, STDOUT_FILENO);
+    close(saved);
+
+    lseek(out_fd, 0, SEEK_SET);
+    char buf[1024];
+    ssize_t n = read(out_fd, buf, sizeof(buf) - 1);
+    if (n < 0) n = 0;
+    buf[n] = '\0';
+    close(out_fd);
+    unlink(tmpl);
+
+    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(buf, "\"type\": \"avrosdb\""),
+        "launch.json missing the avrosdb debug type");
+    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(buf, "\"request\": \"attach\""),
+        "launch.json missing the attach request");
+    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(buf, "\"port\": 1234"),
+        "launch.json missing the default port");
+}
+
+/* ══════════════════════════════════════════════════════════════════════
  *  (e) run_device_mode prints the report                  LLR-MAIN-09
  * ════════════════════════════════════════════════════════════════════ */
 static void run_device_mode_prints_report_to_stdout(void)
@@ -665,6 +713,7 @@ static void device_mode_does_not_call_rsp_listen(void)
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(emit_vscode_config_prints_attach_launch_json);
     RUN_TEST(parse_args_accepts_device_flag_without_elf_operand);
     RUN_TEST(parse_args_rejects_device_combined_with_load);
     RUN_TEST(parse_args_mode_defaults_to_rsp_and_honours_dap_rsp);

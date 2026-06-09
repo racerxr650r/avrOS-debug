@@ -639,6 +639,42 @@ static void var_type_info(Dwarf_Die *var, int *size, bool *is_signed)
     }
 }
 
+/* Evaluate a variable DIE's single-op DWARF location to a 16-bit data-space
+ * address using the live frame registers — the location forms avr-gcc -O0
+ * emits: DW_OP_addr (global), DW_OP_breg28/bregx28 (Y pair), DW_OP_bregx32
+ * (SP), DW_OP_fbreg (CFA, when the subprogram frame base is call_frame_cfa).
+ * Returns 0 on success, -1 for an unsupported form or a missing register. */
+static int eval_var_loc(Dwarf_Die *var, const ElfFrameRegs *fr,
+                        bool fb_is_cfa, uint32_t *addr)
+{
+    Dwarf_Attribute la;
+    if (dwarf_attr_integrate(var, DW_AT_location, &la) == NULL) return -1;
+    Dwarf_Op *ops = NULL; size_t nops = 0;
+    if (dwarf_getlocation(&la, &ops, &nops) != 0 || ops == NULL || nops < 1)
+        return -1;
+
+    uint32_t a;
+    if (ops[0].atom == DW_OP_addr) {
+        a = (uint32_t)ops[0].number;
+    } else if (ops[0].atom == DW_OP_breg0 + 28) {
+        if (fr == NULL) return -1;
+        a = fr->y + (uint32_t)(int32_t)ops[0].number;
+    } else if (ops[0].atom == DW_OP_bregx && ops[0].number == 28) {
+        if (fr == NULL) return -1;
+        a = fr->y + (uint32_t)(int32_t)ops[0].number2;
+    } else if (ops[0].atom == DW_OP_bregx && ops[0].number == 32) {
+        if (fr == NULL) return -1;
+        a = fr->sp + (uint32_t)(int32_t)ops[0].number2;
+    } else if (ops[0].atom == DW_OP_fbreg) {
+        if (fr == NULL || !fb_is_cfa) return -1;
+        a = fr->cfa + (uint32_t)(int32_t)ops[0].number;
+    } else {
+        return -1;
+    }
+    *addr = a & 0xFFFFu;                              /* 16-bit SRAM data space  */
+    return 0;
+}
+
 /* See elf_parser.h. */
 int elf_var_addr(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr,
                  const char *name, uint32_t *addr, int *size, bool *is_signed)
@@ -659,34 +695,360 @@ int elf_var_addr(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr,
     free(scopes);                       /* `var` is an independent copy */
     if (si < 0) return -1;
 
-    Dwarf_Attribute la;
-    if (dwarf_attr_integrate(&var, DW_AT_location, &la) == NULL) return -1;
-    Dwarf_Op *ops = NULL; size_t nops = 0;
-    if (dwarf_getlocation(&la, &ops, &nops) != 0 || ops == NULL || nops < 1)
-        return -1;
-
     uint32_t a;
-    if (ops[0].atom == DW_OP_addr) {
-        a = (uint32_t)ops[0].number;                 /* global (data-space VMA) */
-    } else if (ops[0].atom == DW_OP_breg0 + 28) {    /* Y pair r28:r29 + off    */
-        if (fr == NULL) return -1;
-        a = fr->y + (uint32_t)(int32_t)ops[0].number;
-    } else if (ops[0].atom == DW_OP_bregx && ops[0].number == 28) {
-        if (fr == NULL) return -1;
-        a = fr->y + (uint32_t)(int32_t)ops[0].number2;
-    } else if (ops[0].atom == DW_OP_bregx && ops[0].number == 32) {
-        if (fr == NULL) return -1;
-        a = fr->sp + (uint32_t)(int32_t)ops[0].number2;
-    } else if (ops[0].atom == DW_OP_fbreg) {
-        if (fr == NULL || !fb_is_cfa) return -1;
-        a = fr->cfa + (uint32_t)(int32_t)ops[0].number;
-    } else {
-        return -1;                                   /* unsupported location    */
-    }
-
-    if (addr != NULL) *addr = a & 0xFFFFu;           /* 16-bit SRAM data space  */
+    if (eval_var_loc(&var, fr, fb_is_cfa, &a) != 0) return -1;
+    if (addr != NULL) *addr = a;
     var_type_info(&var, size, is_signed);
     return 0;
+}
+
+/* type_off of a DIE's DW_AT_type (the global DIE offset, 0 if none). */
+static uint64_t die_type_off(Dwarf_Die *die)
+{
+    Dwarf_Attribute ta;
+    Dwarf_Die td;
+    if (dwarf_attr_integrate(die, DW_AT_type, &ta) == NULL) return 0;
+    if (dwarf_formref_die(&ta, &td) == NULL) return 0;
+    return (uint64_t)dwarf_dieoffset(&td);
+}
+
+/* See elf_parser.h. */
+int elf_var_enum(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr,
+                 int scope, ElfVar *out, int max)
+{
+    if (ctx == NULL || ctx->dwarf == NULL || out == NULL || max <= 0) return -1;
+    Dwarf *dw = (Dwarf *)ctx->dwarf;
+
+    Dwarf_Die cu;
+    if (dwarf_addrdie(dw, (Dwarf_Addr)pc, &cu) == NULL) return -1;
+
+    int count = 0;
+
+    if (scope == ELF_SCOPE_GLOBALS) {
+        /* File-scope variables = direct DW_TAG_variable children of the CU. */
+        Dwarf_Die child;
+        if (dwarf_child(&cu, &child) != 0) return 0;
+        do {
+            if (dwarf_tag(&child) != DW_TAG_variable) continue;
+            const char *nm = dwarf_diename(&child);
+            if (nm == NULL) continue;
+            uint32_t a;
+            if (eval_var_loc(&child, NULL, false, &a) != 0) continue; /* DW_OP_addr only */
+            if (count >= max) break;
+            snprintf(out[count].name, sizeof out[count].name, "%s", nm);
+            out[count].addr     = a;
+            out[count].type_off = die_type_off(&child);
+            count++;
+        } while (dwarf_siblingof(&child, &child) == 0);
+        return count;
+    }
+
+    /* LOCALS: params + locals of every lexical scope containing the PC. */
+    Dwarf_Die *scopes = NULL;
+    int n = dwarf_getscopes(&cu, (Dwarf_Addr)pc, &scopes);
+    if (n < 1 || scopes == NULL) { free(scopes); return -1; }
+    bool fb_is_cfa = cfi_frame_base_is_cfa(scopes, n);
+
+    for (int i = 0; i < n && count < max; i++) {
+        int tag = dwarf_tag(&scopes[i]);
+        if (tag != DW_TAG_subprogram && tag != DW_TAG_lexical_block &&
+            tag != DW_TAG_inlined_subroutine)
+            continue;
+        Dwarf_Die child;
+        if (dwarf_child(&scopes[i], &child) != 0) continue;
+        do {
+            int ct = dwarf_tag(&child);
+            if (ct != DW_TAG_variable && ct != DW_TAG_formal_parameter) continue;
+            const char *nm = dwarf_diename(&child);
+            if (nm == NULL) continue;
+            uint32_t a;
+            if (eval_var_loc(&child, fr, fb_is_cfa, &a) != 0) continue;
+            if (count >= max) break;
+            snprintf(out[count].name, sizeof out[count].name, "%s", nm);
+            out[count].addr     = a;
+            out[count].type_off = die_type_off(&child);
+            count++;
+        } while (dwarf_siblingof(&child, &child) == 0);
+    }
+    free(scopes);
+    return count;
+}
+
+/* Read a little-endian unsigned integer of `size` (1..4) bytes via `read`. */
+static int read_uint(ElfMemRead read, void *user, uint32_t addr, int size,
+                     uint32_t *val)
+{
+    uint8_t b[4] = {0};
+    if (size < 1 || size > 4) return -1;
+    if (read(user, addr, b, size) != 0) return -1;
+    uint32_t v = 0;
+    for (int i = 0; i < size; i++) v |= (uint32_t)b[i] << (8 * i);
+    *val = v;
+    return 0;
+}
+
+/* Render a peeled base/pointer/enum scalar at `addr`. */
+static void render_scalar(Dwarf_Die *type, int tag, uint32_t addr,
+                          ElfMemRead read, void *user, char *out, size_t cap)
+{
+    int bs = dwarf_bytesize(type);
+    if (bs < 1 || bs > 4) bs = 2;
+
+    if (tag == DW_TAG_pointer_type) {
+        uint32_t v = 0;
+        if (read_uint(read, user, addr, bs, &v) != 0) { snprintf(out, cap, "<?>"); return; }
+        snprintf(out, cap, "0x%0*x", bs * 2, v);
+        return;
+    }
+
+    Dwarf_Word enc = 0;
+    Dwarf_Attribute ea;
+    if (dwarf_attr(type, DW_AT_encoding, &ea) != NULL)
+        (void)dwarf_formudata(&ea, &enc);
+
+    if (tag == DW_TAG_enumeration_type) {
+        uint32_t v = 0;
+        if (read_uint(read, user, addr, bs, &v) != 0) { snprintf(out, cap, "<?>"); return; }
+        /* Map to an enumerator name when one matches. */
+        Dwarf_Die e;
+        if (dwarf_child(type, &e) == 0) {
+            do {
+                if (dwarf_tag(&e) != DW_TAG_enumerator) continue;
+                Dwarf_Attribute va; Dwarf_Word cv = 0;
+                if (dwarf_attr(&e, DW_AT_const_value, &va) &&
+                    dwarf_formudata(&va, &cv) == 0 && (uint32_t)cv == v) {
+                    snprintf(out, cap, "%s (%u)", dwarf_diename(&e), v);
+                    return;
+                }
+            } while (dwarf_siblingof(&e, &e) == 0);
+        }
+        snprintf(out, cap, "%u", v);
+        return;
+    }
+
+    uint32_t raw = 0;
+    if (read_uint(read, user, addr, bs, &raw) != 0) { snprintf(out, cap, "<?>"); return; }
+
+    if (enc == DW_ATE_boolean) { snprintf(out, cap, "%s", raw ? "true" : "false"); return; }
+    if (enc == DW_ATE_float && bs == 4) {
+        float f; memcpy(&f, &raw, 4); snprintf(out, cap, "%g", (double)f); return;
+    }
+    if (enc == DW_ATE_signed || enc == DW_ATE_signed_char) {
+        long s = (long)raw;
+        if (bs < 4 && (raw & (1u << (bs * 8 - 1)))) s |= -(1L << (bs * 8));
+        if (enc == DW_ATE_signed_char && s >= 32 && s < 127)
+            snprintf(out, cap, "%ld '%c'", s, (char)s);
+        else
+            snprintf(out, cap, "%ld", s);
+        return;
+    }
+    if (enc == DW_ATE_unsigned_char && raw >= 32 && raw < 127) {
+        snprintf(out, cap, "%u '%c'", raw, (char)raw); return;
+    }
+    snprintf(out, cap, "%u", raw);                   /* unsigned / default */
+}
+
+/* Forward decl for bounded recursive aggregate rendering. */
+static void render_value(const ElfContext *ctx, uint32_t addr, uint64_t type_off,
+                         ElfMemRead read, void *user, int depth,
+                         char *out, size_t cap, bool *expandable);
+
+/* Array element type + element size + element count from an array DIE. */
+static int array_info(const ElfContext *ctx, Dwarf_Die *arr,
+                      uint64_t *elem_off, int *elem_size, int *count)
+{
+    Dwarf *dw = (Dwarf *)ctx->dwarf;
+    *elem_off = die_type_off(arr);
+    if (*elem_off == 0) return -1;
+    Dwarf_Die et, etp;
+    if (dwarf_offdie(dw, (Dwarf_Off)*elem_off, &et) == NULL) return -1;
+    if (dwarf_peel_type(&et, &etp) != 0) etp = et;
+    int es = dwarf_bytesize(&etp);
+    *elem_size = (es >= 1) ? es : 1;
+    *count = 0;
+    Dwarf_Die sub;
+    if (dwarf_child(arr, &sub) == 0) {
+        do {
+            if (dwarf_tag(&sub) != DW_TAG_subrange_type) continue;
+            Dwarf_Attribute a; Dwarf_Word w = 0;
+            if (dwarf_attr(&sub, DW_AT_count, &a) && dwarf_formudata(&a, &w) == 0)
+                *count = (int)w;
+            else if (dwarf_attr(&sub, DW_AT_upper_bound, &a) &&
+                     dwarf_formudata(&a, &w) == 0)
+                *count = (int)w + 1;
+            break;
+        } while (dwarf_siblingof(&sub, &sub) == 0);
+    }
+    return 0;
+}
+
+/* Member byte offset within its struct/union (DW_AT_data_member_location). */
+static uint32_t member_offset(Dwarf_Die *member)
+{
+    Dwarf_Attribute a;
+    if (dwarf_attr(member, DW_AT_data_member_location, &a) == NULL) return 0;
+    Dwarf_Word w = 0;
+    if (dwarf_formudata(&a, &w) == 0) return (uint32_t)w;
+    Dwarf_Op *ops = NULL; size_t nops = 0;        /* DW_OP_plus_uconst form */
+    if (dwarf_getlocation(&a, &ops, &nops) == 0 && nops == 1 &&
+        ops[0].atom == DW_OP_plus_uconst)
+        return (uint32_t)ops[0].number;
+    return 0;
+}
+
+static void render_value(const ElfContext *ctx, uint32_t addr, uint64_t type_off,
+                         ElfMemRead read, void *user, int depth,
+                         char *out, size_t cap, bool *expandable)
+{
+    if (expandable) *expandable = false;
+    if (cap == 0) return;
+    out[0] = '\0';
+    Dwarf *dw = (Dwarf *)ctx->dwarf;
+    if (type_off == 0) { snprintf(out, cap, "<void>"); return; }
+
+    Dwarf_Die td, tp;
+    if (dwarf_offdie(dw, (Dwarf_Off)type_off, &td) == NULL) { snprintf(out, cap, "<?>"); return; }
+    if (dwarf_peel_type(&td, &tp) != 0) tp = td;
+    int tag = dwarf_tag(&tp);
+
+    if (tag == DW_TAG_structure_type || tag == DW_TAG_union_type) {
+        if (expandable) *expandable = true;
+        if (depth <= 0) { snprintf(out, cap, "{...}"); return; }
+        size_t off = 0; out[off++] = '{'; out[off] = '\0';
+        Dwarf_Die m; int first = 1;
+        if (dwarf_child(&tp, &m) == 0) {
+            do {
+                if (dwarf_tag(&m) != DW_TAG_member) continue;
+                const char *mn = dwarf_diename(&m);
+                uint32_t maddr = addr + member_offset(&m);
+                char val[128];
+                render_value(ctx, maddr, die_type_off(&m), read, user,
+                             depth - 1, val, sizeof val, NULL);
+                int w = snprintf(out + off, cap - off, "%s%s = %s",
+                                 first ? "" : ", ", mn ? mn : "?", val);
+                if (w < 0 || (size_t)w >= cap - off) break;
+                off += (size_t)w; first = 0;
+            } while (dwarf_siblingof(&m, &m) == 0);
+        }
+        if (off < cap - 1) { out[off++] = '}'; out[off] = '\0'; }
+        return;
+    }
+
+    if (tag == DW_TAG_array_type) {
+        if (expandable) *expandable = true;
+        uint64_t eoff; int esz, n;
+        if (array_info(ctx, &tp, &eoff, &esz, &n) != 0 || depth <= 0) {
+            snprintf(out, cap, "{...}"); return;
+        }
+        size_t off = 0; out[off++] = '{'; out[off] = '\0';
+        int shown = n < 16 ? n : 16;
+        for (int i = 0; i < shown; i++) {
+            char val[64];
+            render_value(ctx, addr + (uint32_t)(i * esz), eoff, read, user,
+                         depth - 1, val, sizeof val, NULL);
+            int w = snprintf(out + off, cap - off, "%s%s", i ? ", " : "", val);
+            if (w < 0 || (size_t)w >= cap - off) break;
+            off += (size_t)w;
+        }
+        if (shown < n && off < cap - 6) off += (size_t)snprintf(out + off, cap - off, ", ...");
+        if (off < cap - 1) { out[off++] = '}'; out[off] = '\0'; }
+        return;
+    }
+
+    /* scalar / pointer / enum */
+    render_scalar(&tp, tag, addr, read, user, out, cap);
+}
+
+/* See elf_parser.h. */
+int elf_type_render(const ElfContext *ctx, uint32_t addr, uint64_t type_off,
+                    ElfMemRead read, void *user,
+                    char *out, size_t cap, bool *expandable)
+{
+    if (ctx == NULL || ctx->dwarf == NULL || read == NULL || out == NULL)
+        return -1;
+    render_value(ctx, addr, type_off, read, user, 3, out, cap, expandable);
+    return 0;
+}
+
+/* See elf_parser.h. */
+int elf_type_children(const ElfContext *ctx, uint32_t addr, uint64_t type_off,
+                      ElfVar *out, int max)
+{
+    if (ctx == NULL || ctx->dwarf == NULL || out == NULL || max <= 0) return -1;
+    Dwarf *dw = (Dwarf *)ctx->dwarf;
+    if (type_off == 0) return -1;
+
+    Dwarf_Die td, tp;
+    if (dwarf_offdie(dw, (Dwarf_Off)type_off, &td) == NULL) return -1;
+    if (dwarf_peel_type(&td, &tp) != 0) tp = td;
+    int tag = dwarf_tag(&tp);
+    int count = 0;
+
+    if (tag == DW_TAG_structure_type || tag == DW_TAG_union_type) {
+        Dwarf_Die m;
+        if (dwarf_child(&tp, &m) != 0) return 0;
+        do {
+            if (dwarf_tag(&m) != DW_TAG_member) continue;
+            const char *mn = dwarf_diename(&m);
+            if (count >= max) break;
+            snprintf(out[count].name, sizeof out[count].name, "%s", mn ? mn : "?");
+            out[count].addr     = addr + member_offset(&m);
+            out[count].type_off = die_type_off(&m);
+            count++;
+        } while (dwarf_siblingof(&m, &m) == 0);
+        return count;
+    }
+
+    if (tag == DW_TAG_array_type) {
+        uint64_t eoff; int esz, n;
+        if (array_info(ctx, &tp, &eoff, &esz, &n) != 0) return -1;
+        for (int i = 0; i < n && count < max; i++) {
+            snprintf(out[count].name, sizeof out[count].name, "[%d]", i);
+            out[count].addr     = addr + (uint32_t)(i * esz);
+            out[count].type_off = eoff;
+            count++;
+        }
+        return count;
+    }
+
+    return -1;                                       /* not an aggregate */
+}
+
+/* See elf_parser.h. */
+int elf_var_find(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr,
+                 const char *name, uint32_t *addr, uint64_t *type_off)
+{
+    if (ctx == NULL || ctx->dwarf == NULL || name == NULL) return -1;
+    Dwarf *dw = (Dwarf *)ctx->dwarf;
+
+    Dwarf_Die cu;
+    if (dwarf_addrdie(dw, (Dwarf_Addr)pc, &cu) == NULL) return -1;
+
+    Dwarf_Die *scopes = NULL;
+    int n = dwarf_getscopes(&cu, (Dwarf_Addr)pc, &scopes);
+    if (n < 1 || scopes == NULL) { free(scopes); return -1; }
+    bool fb_is_cfa = cfi_frame_base_is_cfa(scopes, n);
+    Dwarf_Die var;
+    int si = dwarf_getscopevar(scopes, n, name, 0, NULL, 0, 0, &var);
+    free(scopes);
+    if (si < 0) return -1;
+
+    uint32_t a;
+    if (eval_var_loc(&var, fr, fb_is_cfa, &a) != 0) return -1;
+    if (addr != NULL)     *addr = a;
+    if (type_off != NULL) *type_off = die_type_off(&var);
+    return 0;
+}
+
+/* See elf_parser.h. */
+int elf_type_size(const ElfContext *ctx, uint64_t type_off)
+{
+    if (ctx == NULL || ctx->dwarf == NULL || type_off == 0) return 2;
+    Dwarf_Die td, tp;
+    if (dwarf_offdie((Dwarf *)ctx->dwarf, (Dwarf_Off)type_off, &td) == NULL) return 2;
+    if (dwarf_peel_type(&td, &tp) != 0) tp = td;
+    int bs = dwarf_bytesize(&tp);
+    return (bs >= 1 && bs <= 4) ? bs : 2;
 }
 
 /* See elf_parser.h. */
