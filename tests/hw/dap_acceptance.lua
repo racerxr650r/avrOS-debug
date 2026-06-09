@@ -194,6 +194,31 @@ record(string.format('DAP7  source breakpoint (%s:%d) hit', BP_SRC, BP_LINE),
          or ((not ev.stopped) and 'no `stopped` event'
              or ('reason=' .. tostring(ev.reason))))
 
+-- DAP9: at the breakpoint, scopes -> variables surfaces the firmware's globals
+-- through the real nvim-dap client (the rich per-type cases live in the Python
+-- harness make hw-test-dap-vars; here we just confirm the request path works
+-- end to end).  gdb_target.c declares `volatile uint8_t g_counter`.
+local vars_done, found_counter = false, false
+if session then
+  session:request('scopes', { frameId = 0 }, function(err, resp)
+    local globals = nil
+    for _, sc in ipairs((not err and resp and resp.scopes) or {}) do
+      if sc.name == 'Globals' then globals = sc.variablesReference end
+    end
+    if not globals then vars_done = true; return end
+    session:request('variables', { variablesReference = globals },
+      function(e2, r2)
+        for _, v in ipairs((not e2 and r2 and r2.variables) or {}) do
+          if v.name == 'g_counter' then found_counter = true end
+        end
+        vars_done = true
+      end)
+  end)
+  vim.wait(4000, function() return vars_done end, 50)
+end
+record('DAP9  scopes -> variables lists a global', found_counter,
+       found_counter and '' or 'g_counter not found in Globals scope')
+
 -- DAP8: disconnect tears the session down cleanly.  nvim-dap does not always
 -- deliver the disconnect *response* callback (the adapter closes the socket as
 -- it replies), so accept clean teardown — the session object going away — as
