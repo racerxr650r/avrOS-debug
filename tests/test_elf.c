@@ -444,6 +444,78 @@ void test_elf_addr_to_func_resolves_enclosing_function(void)
     elf_close(&ctx);
 }
 
+/* ── Test 19: DWARF value model (enumerate + render + expand) ────────── *
+ * elf_var_enum() / elf_type_render() / elf_type_children() back the DAP        *
+ * `variables` request.  On the gdb_debug_session fixture the file-scope globals *
+ * include the struct `g_cfg` and array `g_arr`; an all-0xFF memory stub lets us *
+ * assert signed vs unsigned rendering deterministically without a target.      */
+static int all_ff_read(void *user, uint32_t addr, uint8_t *buf, int len)
+{ (void)user; (void)addr; for (int i = 0; i < len; i++) buf[i] = 0xFF; return 0; }
+
+void test_elf_value_model_enumerates_and_renders(void)
+{
+    ElfContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    TEST_ASSERT_EQUAL_INT(0, elf_open(DBG_SESSION_ELF, &ctx));
+
+    uint32_t leaf_pc = 0;
+    TEST_ASSERT_EQUAL_INT(0,
+        elf_line_to_addr(&ctx, "gdb_debug_session.c", LEAF_BODY_LINE, &leaf_pc));
+
+    /* Globals: find the struct g_cfg and the array g_arr by name. */
+    ElfVar g[32];
+    int ng = elf_var_enum(&ctx, leaf_pc, NULL, ELF_SCOPE_GLOBALS, g, 32);
+    TEST_ASSERT_TRUE(ng >= 4);
+    ElfVar *cfg = NULL, *arr = NULL;
+    for (int i = 0; i < ng; i++) {
+        if (strcmp(g[i].name, "g_cfg") == 0) cfg = &g[i];
+        if (strcmp(g[i].name, "g_arr") == 0) arr = &g[i];
+    }
+    TEST_ASSERT_NOT_NULL(cfg);
+    TEST_ASSERT_NOT_NULL(arr);
+
+    /* Struct render is inline + expandable; children are base then gain. */
+    char val[256]; bool ex = false;
+    TEST_ASSERT_EQUAL_INT(0,
+        elf_type_render(&ctx, cfg->addr, cfg->type_off, all_ff_read, NULL,
+                        val, sizeof val, &ex));
+    TEST_ASSERT_TRUE(ex);
+    TEST_ASSERT_EQUAL_INT(0, strncmp(val, "{base = ", 8));
+    TEST_ASSERT_NOT_NULL(strstr(val, "gain = "));
+
+    ElfVar ch[8];
+    int nc = elf_type_children(&ctx, cfg->addr, cfg->type_off, ch, 8);
+    TEST_ASSERT_EQUAL_INT(2, nc);
+    TEST_ASSERT_EQUAL_STRING("base", ch[0].name);
+    TEST_ASSERT_EQUAL_STRING("gain", ch[1].name);
+    TEST_ASSERT_EQUAL_UINT(cfg->addr + 2u, ch[1].addr);   /* gain at offset 2 */
+
+    /* base is uint16_t → 0xFFFF renders unsigned 65535; gain is int16_t → -1. */
+    char bv[32], gv[32]; bool e2;
+    elf_type_render(&ctx, ch[0].addr, ch[0].type_off, all_ff_read, NULL, bv, sizeof bv, &e2);
+    elf_type_render(&ctx, ch[1].addr, ch[1].type_off, all_ff_read, NULL, gv, sizeof gv, &e2);
+    TEST_ASSERT_EQUAL_STRING("65535", bv);
+    TEST_ASSERT_EQUAL_STRING("-1", gv);
+
+    /* Array of 4 uint16_t: 4 children "[0]".."[3]" at a 2-byte stride. */
+    int na = elf_type_children(&ctx, arr->addr, arr->type_off, ch, 8);
+    TEST_ASSERT_EQUAL_INT(4, na);
+    TEST_ASSERT_EQUAL_STRING("[0]", ch[0].name);
+    TEST_ASSERT_EQUAL_STRING("[3]", ch[3].name);
+    TEST_ASSERT_EQUAL_UINT(arr->addr + 6u, ch[3].addr);
+
+    /* Locals at leaf: parameters + locals (a, b, prod, sum) are enumerated. */
+    ElfFrameRegs fr = { 0x2010u, 0x2000u, 0x1ff0u };
+    ElfVar l[16];
+    int nl = elf_var_enum(&ctx, leaf_pc, &fr, ELF_SCOPE_LOCALS, l, 16);
+    TEST_ASSERT_TRUE(nl >= 2);
+    bool found_b = false;
+    for (int i = 0; i < nl; i++) if (strcmp(l[i].name, "b") == 0) found_b = true;
+    TEST_ASSERT_TRUE(found_b);
+
+    elf_close(&ctx);
+}
+
 /* ── Test runner ─────────────────────────────────────────────────────── */
 int main(void)
 {
@@ -466,5 +538,6 @@ int main(void)
     RUN_TEST(test_elf_cfi_cfa_extracts_avr_frame_rules);
     RUN_TEST(test_elf_var_addr_resolves_globals_and_locals);
     RUN_TEST(test_elf_addr_to_func_resolves_enclosing_function);
+    RUN_TEST(test_elf_value_model_enumerates_and_renders);
     return UNITY_END();
 }
