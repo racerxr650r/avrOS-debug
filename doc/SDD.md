@@ -606,7 +606,8 @@ TCP server socket on the configured port (default `1234`). Accepts exactly one c
 
 *   **`int rsp_send_packet(int fd, const char *payload)`** — Frame payload as an RSP packet and transmit; return 0 or -1.
 *   **`int rsp_dispatch(int fd, const char *packet, RspHandlers *h)`**
-    *   Purpose: Identify the RSP packet type from the first character (and optionally subsequent characters) of packet and invoke the matching handler in h. Returns 0 on success or -1 if the selected handler reports a write error.
+    *   Purpose: Identify the RSP packet type from the first character (and optionally subsequent characters) of packet and invoke the matching handler in h.
+    *   Return Value: 0 on success; -1 if the selected handler reports a write error.
     *   Logic:
         1.  Match the leading characters of `packet` against the handler table using a switch on `packet[0]` with secondary string comparisons for multi-character commands (`qS`, `qA`, `qf`, `qs`, `qR`, `QS`, `vC`, `Hg`, `Hc`, `Z0`, `z0`).
         2.  Invoke the matching handler function pointer from `h`, passing `fd`, `packet`, and the shared application context pointer.
@@ -970,7 +971,18 @@ Two sub-commands are supported:
 
 
 ### 8.3 Internal Structure
-#### 8.3.1 Key Functions
+#### 8.3.1 Key Data Structures
+
+`src/monitor.c` holds no persistent state of its own — it is a stateless command dispatcher that reads the target's avrOS registration tables on demand via `updi_mem_read()`. The two FLASH-resident descriptor layouts it decodes (addresses and entry counts come from the `AvrOsSymbolIndex`, §6) are:
+
+**`evntDescriptor_t`** (4 bytes, `EVNT_TABLE`, read by `cmd_events()`): a FLASH `char *name` pointer (2 bytes) and an SRAM `event_t *status` pointer (2 bytes). The name pointer is followed into the mapped-flash window for the human-readable event name; the status pointer is read from SRAM for the current 1-byte flag value.
+
+**`queDescriptor_t`** (10 bytes, `QUE_TABLE`, read by `cmd_queues()`): three pointers (queue / buffer / event, 2 bytes each) plus a 2-byte `capacity` and a 2-byte `sizeOfElement`. Only the last two fields are reported.
+
+A single fixed 512-byte stack buffer is used to assemble each command's human-readable text before it is hex-encoded into RSP `O`-packets.
+
+
+#### 8.3.2 Key Functions
 
 *   **`int monitor_dispatch(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx, const char *cmd)`**
     *   Purpose: Hex-decode the qRcmd payload, match the sub-command token, and invoke the appropriate handler.
@@ -984,6 +996,7 @@ Two sub-commands are supported:
 
 *   **`static int cmd_events(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx)`**
     *   Purpose: Iterate the avrOS `EVNT_TABLE` and report each named event's current status flag to the GDB console.
+    *   Return Value: 0 on success; -1 on a UPDI read failure.
     *   Logic:
         1.  Read `idx->event_count` consecutive `evntDescriptor_t` records (4 bytes each: `char *name`, `event_t *status`) from FLASH at `idx->event_table_addr` using `updi_mem_read()`.
         2.  For each descriptor, follow the FLASH `name` pointer to read the human-readable event name (NUL-terminated) and the SRAM `status` pointer to read the current 1-byte status value.
@@ -991,13 +1004,14 @@ Two sub-commands are supported:
 
 *   **`static int cmd_queues(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx)`**
     *   Purpose: Read each registered avrOS queue's capacity and per-element size and send a formatted table to the GDB console.
+    *   Return Value: 0 on success; -1 on a UPDI read failure.
     *   Logic:
         1.  Read `idx->queue_count` consecutive `queDescriptor_t` records (10 bytes each: queue/buffer/event pointers + 2-byte capacity + 2-byte sizeOfElement) from FLASH at `idx->queue_table_addr` using `updi_mem_read()`.
         2.  For each descriptor, extract the `capacity` and `sizeOfElement` fields and format a one-line entry.
         3.  Hex-encode and send the formatted table as RSP O-packets.
 
 
-#### 8.3.2 Parsing Strategy / Algorithm
+#### 8.3.3 Parsing Strategy / Algorithm
 
 **O-packet encoding:** All console output is delivered to the GDB client via RSP O-packets. The RSP specification requires the human-readable text to be hex-encoded: each ASCII character is converted to two hex digits. For example, the character `'A'` (0x41) is encoded as the two-character string `"41"`. `monitor_dispatch()` builds the human-readable text into a temporary 512-byte buffer, then hex-encodes it before calling `rsp_send_packet()` with the `O` prefix.
 
@@ -1102,31 +1116,27 @@ The `SW_BP_BREAK_BYTES[2] = {0x98, 0x95}` constant is the little-endian AVR `BRE
 #### 9.3.2 Key Functions
 
 *   **`int bp_insert(int updi_fd, uint32_t hw_bp_addr[2], bool hw_bp_pinned[2], RspSwBp sw_bp[], int bp_mode, bool *pc_dirty, char kind, uint32_t gdb_addr)`**
-    *   Purpose: Install a breakpoint at gdb_addr, choosing a hardware comparator or a software BREAK per the policy, with hbreak eviction. Returns BP_OK or a negative BpStatus.
+    *   Purpose: Install a breakpoint at gdb_addr, choosing a hardware comparator or a software BREAK per the policy, with hbreak eviction.
+    *   Return Value: `BP_OK` on success; `BP_ERR_DATASP` for a data-space address; `BP_ERR_SLOT` when no comparator is free in `hw-only` mode; `BP_ERR_IO` on UPDI failure.
     *   Logic:
         1.  Reject a data-space address (the breakpoint must be a code address) with `BP_ERR_DATASP`.
         2.  `kind == '1'` (hbreak / `Z1`): claim the user comparator, **evicting** an evictable `auto`-`Z0` already in it to a software `BREAK` first; pin the slot. This guarantees an explicit hardware breakpoint always wins the comparator.
         3.  `kind == '0'` in `auto` mode: prefer the free user comparator (glitch-free, sleep-safe); if it is occupied, fall back to a software `BREAK`. `sw` mode always patches flash; `hw-only` mode fails with `BP_ERR_SLOT` when the comparator is taken.
         4.  A software install patches the `BREAK` word into flash via the NVMPROG sequence (saving/restoring peripheral state and the CPU register file around the reset pulse) and records the displaced opcode in `sw_bp[]`; it sets `*pc_dirty` because the reset re-wrote `OCD.PC`.
 
-*   **`int bp_remove(int updi_fd, uint32_t hw_bp_addr[2], bool hw_bp_pinned[2], RspSwBp sw_bp[], int bp_mode, bool *pc_dirty, char kind, uint32_t gdb_addr)`**
-    *   Purpose: Remove the breakpoint at gdb_addr — clear the matching comparator slot, or un-patch the flash BREAK and restore the displaced opcode — mirroring bp_insert.
-
+*   **`int bp_remove(int updi_fd, uint32_t hw_bp_addr[2], bool hw_bp_pinned[2], RspSwBp sw_bp[], int bp_mode, bool *pc_dirty, char kind, uint32_t gdb_addr)`** — Remove the breakpoint at gdb_addr — clear the matching comparator slot, or un-patch the flash BREAK and restore the displaced opcode — mirroring bp_insert; returns BP_OK or a negative BpStatus.
 *   **`int bp_step_over(int updi_fd, RspSwBp sw_bp[], bool *pc_dirty)`**
-    *   Purpose: Execute exactly one instruction at the live PC over OCD, handling every AVR case that needs help. Returns 0 on success, -1 on UPDI error. Shared by the GDB-RSP step and the DAP conditional-breakpoint auto-resume.
+    *   Purpose: Execute exactly one instruction at the live PC over OCD, handling every AVR case that needs help. Shared by the GDB-RSP step and the DAP conditional-breakpoint auto-resume.
+    *   Return Value: 0 on success (one instruction executed or emulated); -1 on UPDI error.
     *   Logic:
         1.  Call `bp_consume_pc_skip()`; if it injected the instruction (return 1) that IS the step — return.
         2.  Read the opcode word; for a 32-bit CALL/JMP emulate the change-of-flow via `updi_ocd_emulate_cof_32bit()` and set `*pc_dirty`; for a 32-bit LDS/STS step via the reserved comparator at PC+4 (`updi_step_32bit`, RSP_HW_BP_STEP_SLOT); otherwise a plain `updi_step()`.
 
-*   **`int bp_consume_pc_skip(int updi_fd, RspSwBp sw_bp[], bool *pc_dirty)`**
-    *   Purpose: When *pc_dirty, execute the instruction at PC by opcode injection (substituting the saved original when a BREAK is patched there) so the next resume does not skip it. Leaves a 32-bit CALL/JMP to the caller's CoF emulation. Returns 1 if it injected, 0 if nothing to do, -1 on error.
-
-*   **`int bp_classify_stop(int updi_fd, const RspSwBp sw_bp[], const uint32_t hw_bp_addr[2], int hint)`**
-    *   Purpose: Read the live PC; return SC_SWBREAK if it matches a software-BREAK shadow, SC_HWBREAK if it matches the user comparator, else the caller's hint. Does not adjust the PC.
-
-*   **`int bp_snapshot_cpu(...) / int bp_restore_cpu(...)`**
-    *   Purpose: Save and restore the full CPU register file (32 GPRs, SREG, SP, PC) around the NVMPROG system-reset pulse a software-breakpoint flash patch triggers, so the program's register state survives the patch.
-
+*   **`int bp_consume_pc_skip(int updi_fd, RspSwBp sw_bp[], bool *pc_dirty)`** — When *pc_dirty, execute the instruction at PC by opcode injection (substituting the saved original when a BREAK is patched there) so the next resume does not skip it; leaves a 32-bit CALL/JMP to the caller's CoF emulation. Returns 1 if it injected, 0 if nothing to do, -1 on error.
+*   **`int bp_classify_stop(int updi_fd, const RspSwBp sw_bp[], const uint32_t hw_bp_addr[2], int hint)`** — Read the live PC and return SC_SWBREAK if it matches a software-BREAK shadow, SC_HWBREAK if it matches the user comparator, else the caller's hint; does not adjust the PC.
+*   **`int bp_snapshot_cpu(int updi_fd, uint8_t gpr[32], uint8_t *sreg, uint16_t *sp, uint32_t *pc)`** — Save the full CPU register file (32 GPRs, SREG, SP, PC) before the NVMPROG system-reset pulse a software-breakpoint flash patch triggers; 0 on success, -1 on UPDI error.
+*   **`int bp_restore_cpu(int updi_fd, const uint8_t gpr[32], uint8_t sreg, uint16_t sp, uint32_t pc)`** — Restore the CPU register file saved by bp_snapshot_cpu() after the patch so the program's register state survives the reset; 0 on success, -1 on UPDI error.
+*   **`void bp_clear_all_sw(RspSwBp sw_bp[])`** — Clear every software-breakpoint shadow entry without UPDI I/O (used by vFlashDone / reset).
 
 #### 9.3.3 Parsing Strategy / Algorithm
 
@@ -1189,31 +1199,30 @@ A single TCP client speaking DAP over `Content-Length: <n>\r\n\r\n<json>` framin
 
 #### 10.3.2 Key Functions
 
-*   **`int dap_serve(int updi_fd, int port, ElfContext *elf, const AvrOsSymbolIndex *idx, FsmContext *fsm, bool log)`**
-    *   Purpose: Accept one DAP client and run the select()-based read/dispatch loop; while the target is running, poll the OCD halt status and emit a stopped event (honouring conditional breakpoints). Returns 0 on clean disconnect.
-
-*   **`int dap_dispatch(dap_session *s, const char *msg, size_t len)`**
-    *   Purpose: Parse one DAP request and route it to its handler (initialize/attach/continue/step/threads/stackTrace/scopes/setBreakpoints/setInstructionBreakpoints/disconnect). Unknown requests are answered success:false.
-
-*   **`static int dap_handle_set_breakpoints(dap_session *s, const char *msg, const dj_tok_t *t, long req_seq)`**
-    *   Purpose: Install source breakpoints: resolve each {line[,condition]} for arguments.source.path to a code address via elf_line_to_addr(), install through bp_insert() (auto mode), replace the prior set for that source, and reply per-line {id,verified,line}.
-
-*   **`static int dap_handle_set_instruction_breakpoints(dap_session *s, const char *msg, const dj_tok_t *t, long req_seq)`**
-    *   Purpose: Install instruction breakpoints from each entry's instructionReference (+ optional offset) via bp_insert(), marking the table entry line == -1, replacing the prior instruction-breakpoint set; reply per-entry {id,verified,instructionReference}.
-
-*   **`static int dap_handle_stack_trace(dap_session *s, long req_seq) / static int dap_unwind(dap_session *s, uint32_t *pcs, int max)`**
-    *   Purpose: Return the full call stack. dap_unwind() walks frames via .debug_frame CFI (elf_cfi_cfa) plus AVR stack conventions; dap_handle_stack_trace() resolves each PC to file:line (elf_addr_to_line) into the stackFrames array.
+*   **`int dap_serve(int updi_fd, int port, ElfContext *elf, const AvrOsSymbolIndex *idx, FsmContext *fsm, bool log)`** — Accept one DAP client and run the select()-based read/dispatch loop; while the target is running, poll the OCD halt status and emit a stopped event (honouring conditional breakpoints). Returns 0 on clean disconnect.
+*   **`int dap_dispatch(dap_session *s, const char *msg, size_t len)`** — Parse one DAP request and route it to its handler (initialize/attach/continue/step/threads/stackTrace/scopes/setBreakpoints/setInstructionBreakpoints/disconnect); unknown requests are answered success:false. Returns 0 to continue, non-zero to end the session.
+*   **`static int dap_handle_set_breakpoints(dap_session *s, const char *msg, const dj_tok_t *t, long req_seq)`** — Install source breakpoints: resolve each {line[,condition]} for arguments.source.path via elf_line_to_addr(), install through bp_insert() (auto mode), replace the prior set for that source, and reply per-line {id,verified,line}.
+*   **`static int dap_handle_set_instruction_breakpoints(dap_session *s, const char *msg, const dj_tok_t *t, long req_seq)`** — Install instruction breakpoints from each entry's instructionReference (+ optional offset) via bp_insert(), marking the table entry line == -1 and replacing the prior instruction-breakpoint set; reply per-entry {id,verified,instructionReference}.
+*   **`static int dap_handle_stack_trace(dap_session *s, long req_seq)`** — Serve stackTrace: call dap_unwind(), then resolve each recovered PC to file:line via elf_addr_to_line() and format the stackFrames array (falling back to the single innermost frame with no target/DWARF).
+*   **`static int dap_unwind(dap_session *s, uint32_t *pcs, int max)`**
+    *   Purpose: Walk the call stack via .debug_frame CFI plus AVR stack conventions, filling pcs[0..n-1] (frame 0 = innermost).
+    *   Return Value: The frame count (>= 1), or 0 when the live registers cannot be read.
     *   Logic:
         1.  Read the innermost PC/SP/Y over OCD; compute `CFA = (cfa_reg==32?SP:Y) + offset` from `elf_cfi_cfa()`.
         2.  Recover the caller from target memory: the 2-byte word return address at [CFA-1, CFA] (byte PC = word << 1) and the caller's saved Y at r28@CFA-2 / r29@CFA-3; iterate with PC=caller, SP=CFA, Y=caller-Y.
         3.  Stop at a zero / out-of-FLASH return address, where no CFI covers the PC (the C-runtime frame above `main`), or at `DAP_MAX_FRAMES`.
 
-*   **`static int dap_eval_condition(dap_session *s, uint32_t pc, const ElfFrameRegs *fr, const char *cond) / static bool dap_conditional_skip(dap_session *s)`**
-    *   Purpose: Evaluate a breakpoint condition `<var> <relop> <int>` on the live target (resolve var via elf_var_addr, read over OCD, compare); dap_conditional_skip() steps over and auto-resumes when all matching breakpoints are conditional-and-false, else lets the stop be reported.
+*   **`static int dap_eval_condition(dap_session *s, uint32_t pc, const ElfFrameRegs *fr, const char *cond)`**
+    *   Purpose: Evaluate a breakpoint `condition` of the form `<var> <relop> <int>` on the live target.
+    *   Return Value: 1 (true → stop), 0 (false → resume), or -1 (cannot evaluate → caller stops, so a bad condition never hides a hit).
+    *   Logic:
+        1.  Parse `<ident> <relop> <int>` (relop one of `== != < <= > >=`; integer via `strtol(...,0)`).
+        2.  Resolve `ident` to an address/size/signedness with `elf_var_addr()` using the live frame registers; read the value over `updi_mem_read()` and sign-extend per the type.
+        3.  Apply the relational operator and return the boolean (or -1 on any parse/resolve/read failure).
 
-*   **`static int dap_resume_over_current(dap_session *s) / static int dap_target_resume(dap_session *s)`**
-    *   Purpose: Resume past a breakpoint parked at the live PC via the GDB remove/single-step/insert dance (bp_remove → bp_step_over → bp_insert → updi_run); dap_target_resume() applies it on continue when a breakpoint sits at the PC, else a plain run.
-
+*   **`static bool dap_conditional_skip(dap_session *s)`** — On a halt while running, examine every breakpoint at the live PC; if all are conditional and all conditions false, step over and auto-resume (return true); otherwise return false so dap_serve() emits the stopped event.
+*   **`static int dap_resume_over_current(dap_session *s)`** — Resume past breakpoints parked at the live PC via the GDB remove/single-step/insert dance: bp_remove() each, bp_step_over() one instruction, bp_insert() to re-arm, then updi_run().
+*   **`static int dap_target_resume(dap_session *s)`** — Resume for continue: dap_resume_over_current() when a breakpoint sits at the live PC, else a plain updi_run().
 
 #### 10.3.3 Parsing Strategy / Algorithm
 

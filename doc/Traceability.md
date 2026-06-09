@@ -61,7 +61,7 @@ Each row maps an SDD section to the HLRs that cite it in their
 | [Section 7.3.1](SDD.md#731-key-data-structures) | Key Data Structures | [`HLR-024`](HLRs.md#HLR-024), [`HLR-025`](HLRs.md#HLR-025) |
 | [Section 8.1](SDD.md#81-purpose-and-responsibilities-srcmonitorc) | Purpose and Responsibilities (src/monitor.c) | [`HLR-032`](HLRs.md#HLR-032), [`HLR-055`](HLRs.md#HLR-055) |
 | [Section 8.2.2](SDD.md#822-gdb-monitor-sub-commands) | GDB Monitor Sub-commands | [`HLR-029`](HLRs.md#HLR-029), [`HLR-030`](HLRs.md#HLR-030), [`HLR-069`](HLRs.md#HLR-069) |
-| [Section 8.3.1](SDD.md#831-key-functions-srcmonitorc) | Key Functions (src/monitor.c) | [`HLR-029`](HLRs.md#HLR-029), [`HLR-030`](HLRs.md#HLR-030), [`HLR-069`](HLRs.md#HLR-069) |
+| [Section 8.3.1](SDD.md#831-key-data-structures) | Key Data Structures | [`HLR-029`](HLRs.md#HLR-029), [`HLR-030`](HLRs.md#HLR-030), [`HLR-069`](HLRs.md#HLR-069) |
 | [Section 9.1](SDD.md#91-purpose-and-responsibilities-srcdebug_bpc) | Purpose and Responsibilities (src/debug_bp.c) | [`HLR-073`](HLRs.md#HLR-073), [`HLR-079`](HLRs.md#HLR-079), [`HLR-081`](HLRs.md#HLR-081) |
 
 ## 2. HLR → LLRs → Tests
