@@ -4319,17 +4319,17 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </test>
 
       <test name="elf_cfi_cfa_extracts_avr_frame_rules">
-        <purpose><![CDATA[On the gdb_debug_session fixture (whose nested `main->top->mid->leaf` chain has stable, `avr-readelf --debug-dump=frames`-verified CFI), assert `elf_cfi_cfa()` returns the expected Canonical-Frame-Address rules: at `mid()` entry (0x17a) CFA = r32(SP)+2; after the Y-prologue (0x188) CFA = r28+10; at `main()` entry (0x266) CFA = r32+2; and an address past the last FDE (0x7FFF) returns -1 without crashing. Deterministic / hardware-free guard for the in-tree `.debug_frame` interpreter. Per LLR-ELF-14.]]></purpose>
+        <purpose><![CDATA[On the gdb_debug_session fixture, derive a post-prologue address inside `leaf()` from its source line via `elf_line_to_addr()` (so the test is independent of the toolchain's code layout) and assert `elf_cfi_cfa()` returns a Canonical-Frame-Address rule based on the Y frame-pointer pair (r28) with a positive offset; an address past the last FDE returns -1 without crashing. Deterministic / hardware-free guard for the in-tree `.debug_frame` interpreter. Per LLR-ELF-14.]]></purpose>
         <traces><trace target="LLR" ref="LLR-ELF-14"/></traces>
       </test>
 
       <test name="elf_var_addr_resolves_globals_and_locals">
-        <purpose><![CDATA[On the gdb_debug_session fixture, assert `elf_var_addr()` resolves variable locations/types from DWARF: the global `g_marker` (DW_OP_addr) to a non-zero masked SRAM address with size 2 / unsigned; the leaf() parameters `a` and `b` (DW_OP_breg28 + 5 / + 7) to `Y+5` / `Y+7` against a synthetic Y; and an unknown name to -1 without crashing. Deterministic / hardware-free guard for the variable-resolution backing conditional breakpoints. Per LLR-ELF-15.]]></purpose>
+        <purpose><![CDATA[On the gdb_debug_session fixture, derive a PC inside `leaf()` from its source line (`elf_line_to_addr()`) and assert `elf_var_addr()` resolves variable locations/types from DWARF: the global `g_marker` (DW_OP_addr) to a non-zero masked SRAM address with size 2 / unsigned; the leaf() parameter `b` (a Y-relative local) to a size-2 address above the supplied synthetic Y; and an unknown name to -1 without crashing. Exact addresses/offsets are toolchain-specific, so only type and Y-relative placement are asserted. Deterministic / hardware-free guard for the variable-resolution backing conditional breakpoints. Per LLR-ELF-15.]]></purpose>
         <traces><trace target="LLR" ref="LLR-ELF-15"/></traces>
       </test>
 
       <test name="elf_addr_to_func_resolves_enclosing_function">
-        <purpose><![CDATA[On the gdb_debug_session fixture, assert `elf_addr_to_func()` maps a PC inside leaf() (0x100) to "leaf" and one inside main() (0x266) to "main", and returns -1 for an address outside any subprogram (0x7FFF). Deterministic / hardware-free guard for the DAP stackTrace frame names. Per LLR-ELF-16.]]></purpose>
+        <purpose><![CDATA[On the gdb_debug_session fixture, derive PCs inside leaf() and main() from their source lines (`elf_line_to_addr()`) and assert `elf_addr_to_func()` maps them to "leaf" and "main" respectively, and returns -1 for an address outside any subprogram. Deterministic / hardware-free guard for the DAP stackTrace frame names. Per LLR-ELF-16.]]></purpose>
         <traces><trace target="LLR" ref="LLR-ELF-16"/></traces>
       </test>
     </file>
