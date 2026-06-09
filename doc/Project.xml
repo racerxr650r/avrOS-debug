@@ -4736,7 +4736,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </test>
 
       <test name="DAP7_source_breakpoint_hit">
-        <purpose><![CDATA[Phase-18 source breakpoints. `setBreakpoints` for `main.c:139` (the avrOS example's `fsmDispatch()` call) — verify it resolves+verifies via DWARF and installs through the shared breakpoint core — then `continue` and verify the adapter emits a `stopped` event with reason `breakpoint`, proving file:line breakpoint resolution + install + hit end-to-end on silicon. Per HLR-079 / LLR-DAP-10.]]></purpose>
+        <purpose><![CDATA[Phase-18 source breakpoints. `setBreakpoints` for a reachable source line in the loaded fixture (default `gdb_target.c:51` — the `blink()` call in the main loop; override via `DAP_BP_SOURCE`/`DAP_BP_LINE`) — verify it resolves+verifies via DWARF and installs through the shared breakpoint core — then `continue` and verify the adapter emits a `stopped` event with reason `breakpoint`, proving file:line breakpoint resolution + install + hit end-to-end on silicon. The harness reflashes `HW_DAP_ELF` first so the running firmware matches the ELF handed to the server. Per HLR-079 / LLR-DAP-10.]]></purpose>
         <traces><trace target="HLR" ref="HLR-079"/></traces>
       </test>
 

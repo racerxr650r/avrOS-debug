@@ -647,17 +647,25 @@ hw-test-all: $(HW_TEST_BIN) $(FIXBINDIR)/all_nvm.elf all
 
 # DAP acceptance harness (Phase 16+). Spawns `avrOSdb --dap` and drives it with
 # the real nvim-dap client (headless Neovim) over TCP, asserting the connection
-# lifecycle. Non-destructive (attach only — does not reflash). Requires `nvim`
-# (and network on first run to fetch nvim-dap into tests/hw/.nvim-dap).
-HW_DAP_PORT ?= 1234
-HW_DAP_ELF  ?= $(FIXBINDIR)/gdb_target.elf
+# lifecycle + execution control + a source breakpoint hit. Reflashes HW_DAP_ELF
+# first so the firmware on the target matches the ELF handed to the server (the
+# DAP7 source breakpoint must resolve and be reachable). Requires `nvim` (and
+# network on first run to fetch nvim-dap into tests/hw/.nvim-dap).
+# DAP_BP_SOURCE / DAP_BP_LINE select the DAP7 breakpoint (default: the blink()
+# call in gdb_target.c's main loop); override them with a custom HW_DAP_ELF.
+HW_DAP_PORT    ?= 1234
+HW_DAP_ELF     ?= $(FIXBINDIR)/gdb_target.elf
+HW_DAP_BP_SRC  ?= gdb_target.c
+HW_DAP_BP_LINE ?= 51
 hw-test-dap: $(FIXBINDIR)/gdb_target.elf all
 	@if ! command -v nvim >/dev/null 2>&1; then \
 	    echo "hw-test-dap: required tool not found: nvim" >&2; \
 	    exit 1; \
 	fi
+	$(Q)$(BUILDDIR)/$(TARGET) --prog --erase $(HW_PORT) $(HW_DAP_ELF)
 	$(Q)AVROSDB_BIN='$(BUILDDIR)/$(TARGET)' HW_PORT='$(HW_PORT)' \
 	    DAP_PORT='$(HW_DAP_PORT)' DAP_ELF='$(HW_DAP_ELF)' \
+	    DAP_BP_SOURCE='$(HW_DAP_BP_SRC)' DAP_BP_LINE='$(HW_DAP_BP_LINE)' \
 	    nvim --headless -u tests/hw/dap_init.lua -l tests/hw/dap_acceptance.lua
 
 # hw-test-dap-unwind — DAP multi-frame stackTrace acceptance (Phase 18,

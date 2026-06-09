@@ -49,6 +49,11 @@ local SERIAL = os.getenv('HW_PORT')     or '/dev/ttyAMA2'
 local PORT   = tonumber(os.getenv('DAP_PORT') or '1234')
 local ELF    = os.getenv('DAP_ELF')
 if not ELF or ELF == '' then die('DAP_ELF must name an ELF for avrOSdb') end
+-- DAP7 source breakpoint target.  Defaults match the default DAP_ELF
+-- (gdb_target.elf, whose main loop calls blink() at gdb_target.c:51); override
+-- both when pointing the suite at a different firmware/ELF.
+local BP_SRC  = os.getenv('DAP_BP_SOURCE') or 'gdb_target.c'
+local BP_LINE = tonumber(os.getenv('DAP_BP_LINE') or '51')
 
 -- ── spawn the avrOSdb --dap server, wait for its listener ───────────────────
 local listening = false
@@ -165,11 +170,12 @@ record('DAP6  stackTrace frame0 -> source line', has_line,
 
 -- DAP7: a source breakpoint (file:line) resolves via DWARF, installs through
 -- the shared breakpoint core, and is hit on continue (reason `breakpoint`).
--- main.c:139 is the avrOS example's `fsmDispatch()` call in the main loop.
+-- The default target is gdb_target.c:51 — the `blink()` call in the fixture's
+-- main loop, hit every iteration (override via DAP_BP_SOURCE / DAP_BP_LINE).
 local bp_done, bp_verified = false, false
 if session then
   session:request('setBreakpoints',
-    { source = { path = 'main.c' }, breakpoints = { { line = 139 } } },
+    { source = { path = BP_SRC }, breakpoints = { { line = BP_LINE } } },
     function(err, resp)
       bp_done = true
       local b = resp and resp.breakpoints and resp.breakpoints[1]
@@ -182,7 +188,7 @@ if session then
   session:request('continue', { threadId = 1 }, function() end)
   vim.wait(8000, function() return ev.stopped end, 50)
 end
-record('DAP7  source breakpoint (main.c:139) hit',
+record(string.format('DAP7  source breakpoint (%s:%d) hit', BP_SRC, BP_LINE),
        bp_verified and ev.stopped and ev.reason == 'breakpoint',
        (not bp_verified) and 'breakpoint not verified'
          or ((not ev.stopped) and 'no `stopped` event'
