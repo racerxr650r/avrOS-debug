@@ -690,6 +690,7 @@ int elf_cfi_cfa (const ElfContext *ctx, uint32_t byte_addr,
                  int *cfa_reg, int *cfa_offset);
 int elf_var_addr(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr,
                  const char *name, uint32_t *addr, int *size, bool *is_signed);
+int elf_addr_to_func(const ElfContext *ctx, uint32_t pc, char *name, size_t cap);
 ```
 
 The `ElfContext` and `AvrOsSymbolIndex` struct definitions are also declared in `src/elf_parser.h`.  The libelf `Elf*` and libdw `Dwarf*` handles are held in `ElfContext` as opaque `void*` so consumers need no elfutils headers.  Callers must zero-initialise `AvrOsSymbolIndex` before passing it to `elf_find_avros_tables()`.]]></interface>
@@ -745,6 +746,8 @@ The symbol and string tables are **not** copied into application heap buffers �
                     summary="Return the Canonical-Frame-Address rule at a PC by interpreting .debug_frame in-tree (libdw's dwarf_cfi_addrframe errors on AVR CFI): CFA = value(cfa_reg) + cfa_offset, cfa_reg = 28 (the Y pair) or 32 (SP). Drives the DAP multi-frame stackTrace. 0 on success, -1 when uncovered/unsupported."/>
           <function signature="int elf_var_addr(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr, const char *name, uint32_t *addr, int *size, bool *is_signed)"
                     summary="Resolve a variable visible at pc to its 16-bit data-space address, size, and signedness, evaluating its DWARF location with live frame registers (dwarf_getscopes/getscopevar; DW_OP_addr globals, DW_OP_breg28/breg32/fbreg locals). Backs DAP conditional-breakpoint evaluation. 0 on success, -1 when not in scope/unsupported."/>
+          <function signature="int elf_addr_to_func(const ElfContext *ctx, uint32_t pc, char *name, size_t cap)"
+                    summary="Resolve a code byte address to the enclosing function name (the DW_TAG_subprogram covering pc, via dwarf_getscopes + dwarf_diename); names the DAP stackTrace frames. 0 on success, -1 when no DWARF or pc is in no subprogram (the caller falls back to the raw address)."/>
         </functions>
         <algorithm><![CDATA[`elf_open()` validates and loads the ELF via libelf as follows:
 
@@ -1131,7 +1134,7 @@ void dap_bp_reset(dap_session *s);
           <function signature="static int dap_handle_set_instruction_breakpoints(dap_session *s, const char *msg, const dj_tok_t *t, long req_seq)"
                     summary="Install instruction breakpoints from each entry's instructionReference (+ optional offset) via bp_insert(), marking the table entry line == -1 and replacing the prior instruction-breakpoint set; reply per-entry {id,verified,instructionReference}."/>
           <function signature="static int dap_handle_stack_trace(dap_session *s, long req_seq)"
-                    summary="Serve stackTrace: call dap_unwind(), then resolve each recovered PC to file:line via elf_addr_to_line() and format the stackFrames array (falling back to the single innermost frame with no target/DWARF)."/>
+                    summary="Serve stackTrace: call dap_unwind(), then for each recovered PC resolve the function name via elf_addr_to_func() and file:line via elf_addr_to_line() and format the stackFrames array (falling back to the single innermost frame with no target/DWARF)."/>
           <function signature="static int dap_unwind(dap_session *s, uint32_t *pcs, int max)">
             <purpose>Walk the call stack via .debug_frame CFI plus AVR stack conventions, filling pcs[0..n-1] (frame 0 = innermost).</purpose>
             <returns>The frame count (>= 1), or 0 when the live registers cannot be read.</returns>
@@ -1848,7 +1851,7 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-080" name="DAP Multi-Frame Stack Trace">
-        <text><![CDATA[The DAP front-end's `stackTrace` shall report the full call stack — not just the innermost frame — by unwinding through the target's DWARF Call-Frame-Information (`.debug_frame`).  For the halted PC and each recovered caller it shall resolve `file:line` via libdw (HLR-072) and emit a DAP stack frame with a monotonic `id`, the PC as `instructionPointerReference`, and the source location.  The unwind shall be driven by the per-PC Canonical-Frame-Address rule extracted from `.debug_frame` (CFA = value(reg) + offset, where reg is the AVR Y frame-pointer pair r28:r29 or SP=r32); libdw's high-level CFI executor (`dwarf_cfi_addrframe`) returns an error on AVR `.debug_frame`, so a minimal in-tree CFI interpreter shall provide the CFA rule.  AVR's fixed stack conventions then recover each caller: the 2-byte word return address spans [CFA-1, CFA] (code byte PC = word << 1) and the caller's saved Y pair sits just below it (callee `push r28; push r29`).  Unwinding shall stop at an invalid return address (out of the FLASH range, or where no CFI covers the PC — e.g. the C-runtime frame that called `main`), or at a bounded frame cap.  With no target or no DWARF the handler shall still return the single innermost frame so the client has a valid stack.]]></text>
+        <text><![CDATA[The DAP front-end's `stackTrace` shall report the full call stack — not just the innermost frame — by unwinding through the target's DWARF Call-Frame-Information (`.debug_frame`).  For the halted PC and each recovered caller it shall resolve `file:line` via libdw (HLR-072) and emit a DAP stack frame with a monotonic `id`, the enclosing function name (the `DW_TAG_subprogram` covering the PC, falling back to the raw address when none does), the PC as `instructionPointerReference`, and the source location.  The unwind shall be driven by the per-PC Canonical-Frame-Address rule extracted from `.debug_frame` (CFA = value(reg) + offset, where reg is the AVR Y frame-pointer pair r28:r29 or SP=r32); libdw's high-level CFI executor (`dwarf_cfi_addrframe`) returns an error on AVR `.debug_frame`, so a minimal in-tree CFI interpreter shall provide the CFA rule.  AVR's fixed stack conventions then recover each caller: the 2-byte word return address spans [CFA-1, CFA] (code byte PC = word << 1) and the caller's saved Y pair sits just below it (callee `push r28; push r29`).  Unwinding shall stop at an invalid return address (out of the FLASH range, or where no CFI covers the PC — e.g. the C-runtime frame that called `main`), or at a bounded frame cap.  With no target or no DWARF the handler shall still return the single innermost frame so the client has a valid stack.]]></text>
         <traces>
           <trace target="SDD" ref="2.2"/>
           <trace target="SDD" ref="10.1"/>
@@ -2907,6 +2910,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
           <trace target="HLR" ref="HLR-081" name="DAP Conditional Breakpoints"/>
         </traces>
       </llr>
+
+      <llr id="LLR-ELF-16">
+        <text><![CDATA[`elf_addr_to_func()` shall resolve a code byte address to the name of the enclosing function.  It shall obtain the CU via `dwarf_addrdie()` and the lexical scope chain via `dwarf_getscopes()`, find the innermost `DW_TAG_subprogram` scope, and copy its `dwarf_diename()` into the caller's `name` buffer (NUL-terminated, truncated to `cap`).  It shall return 0 on success, or -1 when the ELF lacks DWARF or `pc` is inside no subprogram (e.g. the C-runtime frame above `main`), so the DAP front-end can fall back to the raw address for the frame name.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-080" name="DAP Multi-Frame Stack Trace"/>
+        </traces>
+      </llr>
     </function>
 
     <function number="6" title="src/fsm_mapper.c — FSM State Snapshot Provider" name="fsm" source="src/fsm_mapper.c">
@@ -3253,7 +3263,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-DAP-11">
-        <text><![CDATA[`dap_handle_stack_trace()` shall return the full call stack by unwinding through `.debug_frame` CFI via a private `dap_unwind()` helper.  `dap_unwind()` shall read the innermost frame's live state — PC (`updi_ocd_read_pc`), SP (`updi_ocd_read_sp`), and the Y pair r28/r29 (`updi_ocd_read_gpr`) — then iterate: obtain the CFA rule at the current PC with `elf_cfi_cfa()` (LLR-ELF-14), compute `CFA = (cfa_reg == 32 ? SP : Y) + cfa_offset` (16-bit SRAM address), and recover the caller from target memory (`updi_mem_read`) using AVR conventions — the return-address word at [CFA-1, CFA] (high byte at CFA-1, low at CFA; caller byte PC = word << 1) and the caller's saved Y as r28@CFA-2 / r29@CFA-3.  Each iteration sets the next frame's PC = caller byte PC, SP = CFA, Y = caller Y.  It shall stop when the return word is 0, when the byte PC is outside `[0, flash_size)`, when no CFI covers the PC (`elf_cfi_cfa` returns -1 — e.g. the C-runtime frame above `main`), when the CFA fails to advance, or at `DAP_MAX_FRAMES`.  `dap_handle_stack_trace()` shall format each recovered PC with `dap_format_frame()` (`file:line` via `elf_addr_to_line()`, JSON-escaped) into `{stackFrames:[…],totalFrames:n}`, frame ids ascending from 0.  With no target or no DWARF (`dap_unwind()` returns 0) it shall fall back to the single innermost frame so the client always has a valid stack.  When `AVROSDB_DAP_UNWIND_LOG` is set, `dap_unwind()` shall emit a per-frame diagnostic to stderr.]]></text>
+        <text><![CDATA[`dap_handle_stack_trace()` shall return the full call stack by unwinding through `.debug_frame` CFI via a private `dap_unwind()` helper.  `dap_unwind()` shall read the innermost frame's live state — PC (`updi_ocd_read_pc`), SP (`updi_ocd_read_sp`), and the Y pair r28/r29 (`updi_ocd_read_gpr`) — then iterate: obtain the CFA rule at the current PC with `elf_cfi_cfa()` (LLR-ELF-14), compute `CFA = (cfa_reg == 32 ? SP : Y) + cfa_offset` (16-bit SRAM address), and recover the caller from target memory (`updi_mem_read`) using AVR conventions — the return-address word at [CFA-1, CFA] (high byte at CFA-1, low at CFA; caller byte PC = word << 1) and the caller's saved Y as r28@CFA-2 / r29@CFA-3.  Each iteration sets the next frame's PC = caller byte PC, SP = CFA, Y = caller Y.  It shall stop when the return word is 0, when the byte PC is outside `[0, flash_size)`, when no CFI covers the PC (`elf_cfi_cfa` returns -1 — e.g. the C-runtime frame above `main`), when the CFA fails to advance, or at `DAP_MAX_FRAMES`.  `dap_handle_stack_trace()` shall format each recovered PC with `dap_format_frame()` — the frame `name` is the enclosing function from `elf_addr_to_func()` (LLR-ELF-16; the raw `0x…` address when no subprogram covers it) and the source is `file:line` via `elf_addr_to_line()`, both JSON-escaped — into `{stackFrames:[…],totalFrames:n}`, frame ids ascending from 0.  With no target or no DWARF (`dap_unwind()` returns 0) it shall fall back to the single innermost frame so the client always has a valid stack.  When `AVROSDB_DAP_UNWIND_LOG` is set, `dap_unwind()` shall emit a per-frame diagnostic to stderr.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-080" name="DAP Multi-Frame Stack Trace"/>
           <trace target="HLR" ref="HLR-072" name="DWARF Source-Level Lookup (DAP Groundwork)"/>
@@ -4230,7 +4240,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/elf_parser.c unit tests                                  -->
     <!-- ============================================================ -->
-    <file path="tests/test_elf.c" role="unit" count="17">
+    <file path="tests/test_elf.c" role="unit" count="18">
       <header><![CDATA[Unit tests for the elfutils-based `src/elf_parser.c`: ELF validation, avrOS sentinel symbol discovery, Harvard / mapped-flash address conversion, fail-safe degradation, deviceinfo note extraction, DWARF source-line round-trip, and handle release. Fixture ELF binaries (compiled with `-g`) are generated under `tests/fixtures/`. The former heap symtab/strtab and malloc-injection tests are retired — libelf owns that memory now.]]></header>
 
       <test name="elf_open_accepts_valid_avr_elf32_binary">
@@ -4316,6 +4326,11 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="elf_var_addr_resolves_globals_and_locals">
         <purpose><![CDATA[On the gdb_debug_session fixture, assert `elf_var_addr()` resolves variable locations/types from DWARF: the global `g_marker` (DW_OP_addr) to a non-zero masked SRAM address with size 2 / unsigned; the leaf() parameters `a` and `b` (DW_OP_breg28 + 5 / + 7) to `Y+5` / `Y+7` against a synthetic Y; and an unknown name to -1 without crashing. Deterministic / hardware-free guard for the variable-resolution backing conditional breakpoints. Per LLR-ELF-15.]]></purpose>
         <traces><trace target="LLR" ref="LLR-ELF-15"/></traces>
+      </test>
+
+      <test name="elf_addr_to_func_resolves_enclosing_function">
+        <purpose><![CDATA[On the gdb_debug_session fixture, assert `elf_addr_to_func()` maps a PC inside leaf() (0x100) to "leaf" and one inside main() (0x266) to "main", and returns -1 for an address outside any subprogram (0x7FFF). Deterministic / hardware-free guard for the DAP stackTrace frame names. Per LLR-ELF-16.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-16"/></traces>
       </test>
     </file>
 
@@ -4958,7 +4973,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </test>
     </file>
 
-    <file path="tests/hw/dap_unwind.py" role="hardware" count="5">
+    <file path="tests/hw/dap_unwind.py" role="hardware" count="6">
       <header><![CDATA[On-target DAP multi-frame stackTrace acceptance harness (Phase 18, the DAP analogue of GDB G18). A pure-Python DAP client spawns `avrOSdb --dap` against live AVR-Dx silicon running the `gdb_debug_session` fixture (`main->top->mid->leaf` nested call chain), breaks inside `leaf` via an instruction breakpoint, and verifies the DWARF-CFI unwinder reports the full call chain. The expected per-frame functions and the break address are derived from the ELF (`avr-nm -S` / `avr-objdump`) at runtime, so the test survives a fixture recompile. Manual-only (`make hw-test-dap-unwind`) — never wired into `make test`.]]></header>
 
       <test name="DAP_U1_instr_bp_at_leaf_verified">
@@ -4984,6 +4999,11 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="DAP_U5_frames_resolve_source_lines">
         <purpose><![CDATA[Each chain frame resolves to a source line (`line > 0`) via DWARF, confirming the unwound caller PCs map to real source through `elf_addr_to_line()`. Per HLR-080 / HLR-072.]]></purpose>
         <traces><trace target="HLR" ref="HLR-080"/><trace target="HLR" ref="HLR-072"/></traces>
+      </test>
+
+      <test name="DAP_U6_frames_named_for_function">
+        <purpose><![CDATA[Each of the first four stack frames carries the name of its function — `leaf`, `mid`, `top`, `main` — proving the adapter resolves the enclosing subprogram via `elf_addr_to_func()` for the frame name (not the raw PC). Per HLR-080 / LLR-ELF-16.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-080"/><trace target="LLR" ref="LLR-ELF-16"/></traces>
       </test>
     </file>
 

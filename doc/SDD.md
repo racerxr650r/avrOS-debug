@@ -714,6 +714,7 @@ int elf_cfi_cfa (const ElfContext *ctx, uint32_t byte_addr,
                  int *cfa_reg, int *cfa_offset);
 int elf_var_addr(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr,
                  const char *name, uint32_t *addr, int *size, bool *is_signed);
+int elf_addr_to_func(const ElfContext *ctx, uint32_t pc, char *name, size_t cap);
 ```
 
 The `ElfContext` and `AvrOsSymbolIndex` struct definitions are also declared in `src/elf_parser.h`.  The libelf `Elf*` and libdw `Dwarf*` handles are held in `ElfContext` as opaque `void*` so consumers need no elfutils headers.  Callers must zero-initialise `AvrOsSymbolIndex` before passing it to `elf_find_avros_tables()`.
@@ -766,6 +767,7 @@ The symbol and string tables are **not** copied into application heap buffers �
 *   **`int elf_line_to_addr(const ElfContext *ctx, const char *file, int line, uint32_t *byte_addr)`** — Resolve file:line (basename match) to the first code byte address via libdw line tables; 0 on success, -1 when no DWARF or no match.
 *   **`int elf_cfi_cfa(const ElfContext *ctx, uint32_t byte_addr, int *cfa_reg, int *cfa_offset)`** — Return the Canonical-Frame-Address rule at a PC by interpreting .debug_frame in-tree (libdw's dwarf_cfi_addrframe errors on AVR CFI): CFA = value(cfa_reg) + cfa_offset, cfa_reg = 28 (the Y pair) or 32 (SP). Drives the DAP multi-frame stackTrace. 0 on success, -1 when uncovered/unsupported.
 *   **`int elf_var_addr(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr, const char *name, uint32_t *addr, int *size, bool *is_signed)`** — Resolve a variable visible at pc to its 16-bit data-space address, size, and signedness, evaluating its DWARF location with live frame registers (dwarf_getscopes/getscopevar; DW_OP_addr globals, DW_OP_breg28/breg32/fbreg locals). Backs DAP conditional-breakpoint evaluation. 0 on success, -1 when not in scope/unsupported.
+*   **`int elf_addr_to_func(const ElfContext *ctx, uint32_t pc, char *name, size_t cap)`** — Resolve a code byte address to the enclosing function name (the DW_TAG_subprogram covering pc, via dwarf_getscopes + dwarf_diename); names the DAP stackTrace frames. 0 on success, -1 when no DWARF or pc is in no subprogram (the caller falls back to the raw address).
 
 #### 6.3.3 Parsing Strategy / Algorithm
 
@@ -1203,7 +1205,7 @@ A single TCP client speaking DAP over `Content-Length: <n>\r\n\r\n<json>` framin
 *   **`int dap_dispatch(dap_session *s, const char *msg, size_t len)`** — Parse one DAP request and route it to its handler (initialize/attach/continue/step/threads/stackTrace/scopes/setBreakpoints/setInstructionBreakpoints/disconnect); unknown requests are answered success:false. Returns 0 to continue, non-zero to end the session.
 *   **`static int dap_handle_set_breakpoints(dap_session *s, const char *msg, const dj_tok_t *t, long req_seq)`** — Install source breakpoints: resolve each {line[,condition]} for arguments.source.path via elf_line_to_addr(), install through bp_insert() (auto mode), replace the prior set for that source, and reply per-line {id,verified,line}.
 *   **`static int dap_handle_set_instruction_breakpoints(dap_session *s, const char *msg, const dj_tok_t *t, long req_seq)`** — Install instruction breakpoints from each entry's instructionReference (+ optional offset) via bp_insert(), marking the table entry line == -1 and replacing the prior instruction-breakpoint set; reply per-entry {id,verified,instructionReference}.
-*   **`static int dap_handle_stack_trace(dap_session *s, long req_seq)`** — Serve stackTrace: call dap_unwind(), then resolve each recovered PC to file:line via elf_addr_to_line() and format the stackFrames array (falling back to the single innermost frame with no target/DWARF).
+*   **`static int dap_handle_stack_trace(dap_session *s, long req_seq)`** — Serve stackTrace: call dap_unwind(), then for each recovered PC resolve the function name via elf_addr_to_func() and file:line via elf_addr_to_line() and format the stackFrames array (falling back to the single innermost frame with no target/DWARF).
 *   **`static int dap_unwind(dap_session *s, uint32_t *pcs, int max)`**
     *   Purpose: Walk the call stack via .debug_frame CFI plus AVR stack conventions, filling pcs[0..n-1] (frame 0 = innermost).
     *   Return Value: The frame count (>= 1), or 0 when the live registers cannot be read.

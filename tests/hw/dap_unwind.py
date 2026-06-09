@@ -194,6 +194,13 @@ def main() -> int:
                " ".join(f"#{i}:{frames[i].get('line')}"
                         for i in range(min(4, len(frames)))))
 
+        # Frames 0..3 should be named for their function (DWARF subprogram).
+        names_ok = all(i < len(frames) and frames[i].get("name") == chain[i]
+                       for i in range(4))
+        record("DAP-U6  frames named leaf/mid/top/main", names_ok,
+               " ".join(f"#{i}:{frames[i].get('name')}"
+                        for i in range(min(4, len(frames)))))
+
         dap.send("disconnect", {})
         time.sleep(0.3)
         sock.close()

@@ -688,3 +688,32 @@ int elf_var_addr(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr,
     var_type_info(&var, size, is_signed);
     return 0;
 }
+
+/* See elf_parser.h. */
+int elf_addr_to_func(const ElfContext *ctx, uint32_t pc, char *name, size_t cap)
+{
+    if (ctx == NULL || ctx->dwarf == NULL || name == NULL || cap == 0)
+        return -1;
+
+    Dwarf_Die cu;
+    if (dwarf_addrdie((Dwarf *)ctx->dwarf, (Dwarf_Addr)pc, &cu) == NULL)
+        return -1;
+
+    Dwarf_Die *scopes = NULL;
+    int n = dwarf_getscopes(&cu, (Dwarf_Addr)pc, &scopes);
+    if (n < 1 || scopes == NULL) { free(scopes); return -1; }
+
+    const char *fn = NULL;
+    for (int i = 0; i < n; i++) {
+        if (dwarf_tag(&scopes[i]) == DW_TAG_subprogram) {
+            fn = dwarf_diename(&scopes[i]);
+            break;
+        }
+    }
+    free(scopes);
+    if (fn == NULL) return -1;
+
+    strncpy(name, fn, cap - 1);
+    name[cap - 1] = '\0';
+    return 0;
+}

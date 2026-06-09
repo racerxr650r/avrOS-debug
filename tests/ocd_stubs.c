@@ -45,3 +45,6 @@ int elf_cfi_cfa(const ElfContext *c, uint32_t a, int *reg, int *off)
 int elf_var_addr(const ElfContext *c, uint32_t pc, const ElfFrameRegs *fr,
                  const char *n, uint32_t *a, int *sz, bool *sg)
 { (void)c; (void)pc; (void)fr; (void)n; (void)a; (void)sz; (void)sg; return -1; }
+
+int elf_addr_to_func(const ElfContext *c, uint32_t pc, char *n, size_t cap)
+{ (void)c; (void)pc; (void)n; (void)cap; return -1; }

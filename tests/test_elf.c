@@ -414,6 +414,29 @@ void test_elf_var_addr_resolves_globals_and_locals(void)
     elf_close(&ctx);
 }
 
+/* ── Test 18: DWARF function-name resolution ─────────────────────────── *
+ * elf_addr_to_func() maps a code byte address to the enclosing subprogram     *
+ * name (the DAP stackTrace frame name).  On the gdb_debug_session fixture a    *
+ * PC inside leaf() resolves to "leaf" and one inside main() to "main"; an      *
+ * address outside any subprogram returns -1.                                   */
+void test_elf_addr_to_func_resolves_enclosing_function(void)
+{
+    ElfContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    TEST_ASSERT_EQUAL_INT(0, elf_open(FIXTURE_DIR "/gdb_debug_session.elf", &ctx));
+
+    char fn[64] = {0};
+    TEST_ASSERT_EQUAL_INT(0, elf_addr_to_func(&ctx, 0x100, fn, sizeof fn));
+    TEST_ASSERT_EQUAL_STRING("leaf", fn);
+    TEST_ASSERT_EQUAL_INT(0, elf_addr_to_func(&ctx, 0x266, fn, sizeof fn));
+    TEST_ASSERT_EQUAL_STRING("main", fn);
+
+    /* An address past the last function has no subprogram → -1, no crash. */
+    TEST_ASSERT_EQUAL_INT(-1, elf_addr_to_func(&ctx, 0x7FFFu, fn, sizeof fn));
+
+    elf_close(&ctx);
+}
+
 /* ── Test runner ─────────────────────────────────────────────────────── */
 int main(void)
 {
@@ -435,5 +458,6 @@ int main(void)
     RUN_TEST(test_elf_dwarf_accessors_round_trip);
     RUN_TEST(test_elf_cfi_cfa_extracts_avr_frame_rules);
     RUN_TEST(test_elf_var_addr_resolves_globals_and_locals);
+    RUN_TEST(test_elf_addr_to_func_resolves_enclosing_function);
     return UNITY_END();
 }

@@ -514,6 +514,16 @@ static int dap_emit_stopped(dap_session *s, const char *reason)
 static void dap_format_frame(dap_session *s, int id, uint32_t pc,
                              char *out, size_t cap)
 {
+    /* Frame name: the enclosing function (DWARF), falling back to the raw PC
+     * hex when no subprogram covers it (e.g. the C runtime above main). */
+    char fname[128], nesc[260];
+    if (s->elf != NULL &&
+        elf_addr_to_func(s->elf, pc, fname, sizeof fname) == 0) {
+        dj_escape(fname, nesc, sizeof nesc);
+    } else {
+        (void)snprintf(nesc, sizeof nesc, "0x%06lx", (unsigned long)pc);
+    }
+
     char file[256];
     int  line = 0;
     if (s->elf != NULL &&
@@ -524,15 +534,15 @@ static void dap_format_frame(dap_session *s, int id, uint32_t pc,
         dj_escape(file, pesc, sizeof pesc);
         dj_escape(base, besc, sizeof besc);
         (void)snprintf(out, cap,
-            "{\"id\":%d,\"name\":\"0x%06lx\",\"line\":%d,\"column\":1,"
+            "{\"id\":%d,\"name\":\"%s\",\"line\":%d,\"column\":1,"
             "\"instructionPointerReference\":\"0x%lx\","
             "\"source\":{\"name\":\"%s\",\"path\":\"%s\"}}",
-            id, (unsigned long)pc, line, (unsigned long)pc, besc, pesc);
+            id, nesc, line, (unsigned long)pc, besc, pesc);
     } else {
         (void)snprintf(out, cap,
-            "{\"id\":%d,\"name\":\"0x%06lx\",\"line\":0,\"column\":1,"
+            "{\"id\":%d,\"name\":\"%s\",\"line\":0,\"column\":1,"
             "\"instructionPointerReference\":\"0x%lx\"}",
-            id, (unsigned long)pc, (unsigned long)pc);
+            id, nesc, (unsigned long)pc);
     }
 }
 
@@ -643,7 +653,7 @@ static int dap_handle_stack_trace(dap_session *s, long req_seq)
     int w = snprintf(body, sizeof body, "{\"stackFrames\":[");
     if (w > 0) off = (size_t)w;
     for (int i = 0; i < n; i++) {
-        char frame[1024];
+        char frame[1600];   /* fits id + function name + escaped file:line */
         dap_format_frame(s, i, pcs[i], frame, sizeof frame);
         w = snprintf(body + off, sizeof body - off, "%s%s", i ? "," : "", frame);
         if (w < 0 || (size_t)w >= sizeof body - off) break;

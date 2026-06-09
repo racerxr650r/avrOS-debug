@@ -206,6 +206,9 @@ int elf_var_addr(const ElfContext *c, uint32_t pc, const ElfFrameRegs *fr,
                  const char *n, uint32_t *a, int *sz, bool *sg)
 { (void)c; (void)pc; (void)fr; (void)n; (void)a; (void)sz; (void)sg; return -1; }
 
+int elf_addr_to_func(const ElfContext *c, uint32_t pc, char *n, size_t cap)
+{ (void)c; (void)pc; (void)n; (void)cap; return -1; }
+
 int __wrap_fsm_build_thread_list(FsmContext *c, const AvrOsSymbolIndex *i, int fd);
 int __wrap_fsm_build_thread_list(FsmContext *c, const AvrOsSymbolIndex *i, int fd)
 {

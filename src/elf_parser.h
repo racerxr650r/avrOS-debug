@@ -157,4 +157,11 @@ typedef struct {
 int elf_var_addr(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr,
                  const char *name, uint32_t *addr, int *size, bool *is_signed);
 
+/* Resolve a code-space byte address to the name of the enclosing function
+ * (the DWARF DW_TAG_subprogram whose range covers `pc`).  On success returns 0
+ * and copies the NUL-terminated, `cap`-truncated name into `name`.  Returns -1
+ * when the ELF lacks DWARF or `pc` is not inside any subprogram (e.g. the C
+ * runtime above `main`) — the caller then falls back to the raw address. */
+int elf_addr_to_func(const ElfContext *ctx, uint32_t pc, char *name, size_t cap);
+
 #endif /* AOD_ELF_PARSER_H */
