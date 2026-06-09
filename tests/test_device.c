@@ -585,6 +585,40 @@ static void updi_read_device_info_reports_failed_step_on_nak(void)
 }
 
 /* ══════════════════════════════════════════════════════════════════════
+ *  --emit-vscode-config prints an attach launch.json       LLR-MAIN-26
+ * ════════════════════════════════════════════════════════════════════ */
+static void emit_vscode_config_prints_attach_launch_json(void)
+{
+    char tmpl[] = "/tmp/aod_vscfg_XXXXXX";
+    int  out_fd = mkstemp(tmpl);
+    TEST_ASSERT_TRUE(out_fd >= 0);
+    fflush(stdout);
+    int saved = dup(STDOUT_FILENO);
+    dup2(out_fd, STDOUT_FILENO);
+
+    emit_vscode_config();
+
+    fflush(stdout);
+    dup2(saved, STDOUT_FILENO);
+    close(saved);
+
+    lseek(out_fd, 0, SEEK_SET);
+    char buf[1024];
+    ssize_t n = read(out_fd, buf, sizeof(buf) - 1);
+    if (n < 0) n = 0;
+    buf[n] = '\0';
+    close(out_fd);
+    unlink(tmpl);
+
+    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(buf, "\"type\": \"avrosdb\""),
+        "launch.json missing the avrosdb debug type");
+    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(buf, "\"request\": \"attach\""),
+        "launch.json missing the attach request");
+    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(buf, "\"port\": 1234"),
+        "launch.json missing the default port");
+}
+
+/* ══════════════════════════════════════════════════════════════════════
  *  (e) run_device_mode prints the report                  LLR-MAIN-09
  * ════════════════════════════════════════════════════════════════════ */
 static void run_device_mode_prints_report_to_stdout(void)
@@ -679,6 +713,7 @@ static void device_mode_does_not_call_rsp_listen(void)
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(emit_vscode_config_prints_attach_launch_json);
     RUN_TEST(parse_args_accepts_device_flag_without_elf_operand);
     RUN_TEST(parse_args_rejects_device_combined_with_load);
     RUN_TEST(parse_args_mode_defaults_to_rsp_and_honours_dap_rsp);

@@ -516,6 +516,33 @@ void test_elf_value_model_enumerates_and_renders(void)
     elf_close(&ctx);
 }
 
+/* ── Test 20: evaluate-path variable + type-size resolution ──────────── *
+ * elf_var_find() (the DAP `evaluate` base-identifier resolver) and             *
+ * elf_type_size() (the `setVariable` write width).  On the fixture, g_marker   *
+ * resolves to a non-zero address and a 2-byte type; an unknown name returns -1.*/
+void test_elf_var_find_and_type_size(void)
+{
+    ElfContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    TEST_ASSERT_EQUAL_INT(0, elf_open(DBG_SESSION_ELF, &ctx));
+
+    uint32_t leaf_pc = 0;
+    TEST_ASSERT_EQUAL_INT(0,
+        elf_line_to_addr(&ctx, "gdb_debug_session.c", LEAF_BODY_LINE, &leaf_pc));
+
+    uint32_t addr = 0; uint64_t type_off = 0;
+    TEST_ASSERT_EQUAL_INT(0,
+        elf_var_find(&ctx, leaf_pc, NULL, "g_marker", &addr, &type_off));
+    TEST_ASSERT_NOT_EQUAL(0u, addr);
+    TEST_ASSERT_NOT_EQUAL(0u, type_off);
+    TEST_ASSERT_EQUAL_INT(2, elf_type_size(&ctx, type_off));   /* uint16_t */
+
+    TEST_ASSERT_EQUAL_INT(-1,
+        elf_var_find(&ctx, leaf_pc, NULL, "no_such_var", &addr, &type_off));
+
+    elf_close(&ctx);
+}
+
 /* ── Test runner ─────────────────────────────────────────────────────── */
 int main(void)
 {
@@ -539,5 +566,6 @@ int main(void)
     RUN_TEST(test_elf_var_addr_resolves_globals_and_locals);
     RUN_TEST(test_elf_addr_to_func_resolves_enclosing_function);
     RUN_TEST(test_elf_value_model_enumerates_and_renders);
+    RUN_TEST(test_elf_var_find_and_type_size);
     return UNITY_END();
 }

@@ -221,7 +221,7 @@ Role: **unit**. **97 test(s).**
 
 ### 3.4. [tests/test_elf.c](../tests/test_elf.c)
 
-Role: **unit**. **18 test(s).**
+Role: **unit**. **20 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -243,6 +243,8 @@ Role: **unit**. **18 test(s).**
 | 16 | <a id="elf_cfi_cfa_extracts_avr_frame_rules"></a>`elf_cfi_cfa_extracts_avr_frame_rules` | `LLR-ELF-14` | On the gdb_debug_session fixture, derive a post-prologue address inside `leaf()` from its source line via `elf_line_to_addr()` (so the test is independent of the toolchain's code layout) and assert `elf_cfi_cfa()` returns a Canonical-Frame-Address rule based on the Y frame-pointer pair (r28) with a positive offset; an address past the last FDE returns -1 without crashing. Deterministic / hardware-free guard for the in-tree `.debug_frame` interpreter. Per LLR-ELF-14. |
 | 17 | <a id="elf_var_addr_resolves_globals_and_locals"></a>`elf_var_addr_resolves_globals_and_locals` | `LLR-ELF-15` | On the gdb_debug_session fixture, derive a PC inside `leaf()` from its source line (`elf_line_to_addr()`) and assert `elf_var_addr()` resolves variable locations/types from DWARF: the global `g_marker` (DW_OP_addr) to a non-zero masked SRAM address with size 2 / unsigned; the leaf() parameter `b` (a Y-relative local) to a size-2 address above the supplied synthetic Y; and an unknown name to -1 without crashing. Exact addresses/offsets are toolchain-specific, so only type and Y-relative placement are asserted. Deterministic / hardware-free guard for the variable-resolution backing conditional breakpoints. Per LLR-ELF-15. |
 | 18 | <a id="elf_addr_to_func_resolves_enclosing_function"></a>`elf_addr_to_func_resolves_enclosing_function` | `LLR-ELF-16` | On the gdb_debug_session fixture, derive PCs inside leaf() and main() from their source lines (`elf_line_to_addr()`) and assert `elf_addr_to_func()` maps them to "leaf" and "main" respectively, and returns -1 for an address outside any subprogram. Deterministic / hardware-free guard for the DAP stackTrace frame names. Per LLR-ELF-16. |
+| 19 | <a id="elf_value_model_enumerates_and_renders"></a>`elf_value_model_enumerates_and_renders` | `LLR-ELF-17`, `LLR-ELF-18`, `LLR-ELF-19` | On the gdb_debug_session fixture, enumerate the file-scope globals with `elf_var_enum()` and find the struct `g_cfg` and array `g_arr`; assert `elf_type_render()` marks them expandable and renders the struct inline (`{base = …`), `elf_type_children()` returns base/gain (gain at offset 2) and the array's 4 elements at a 2-byte stride, and that an all-0xFF memory stub renders the uint16 member as 65535 vs the int16 member as -1 (signed/unsigned by encoding); locals (a/b/prod/sum) enumerate at leaf. Deterministic / hardware-free guard for the DWARF value model. Per LLR-ELF-17 / LLR-ELF-18 / LLR-ELF-19. |
+| 20 | <a id="elf_var_find_and_type_size"></a>`elf_var_find_and_type_size` | `LLR-ELF-20`, `LLR-ELF-21` | On the gdb_debug_session fixture, assert `elf_var_find()` resolves `g_marker` (a PC inside leaf derived from its source line) to a non-zero address and type DIE offset, that `elf_type_size()` reports 2 bytes for that uint16_t type, and that an unknown name returns -1. Deterministic / hardware-free guard for the DAP evaluate / setVariable resolution. Per LLR-ELF-20 / LLR-ELF-21. |
 
 ### 3.5. [tests/test_fsm.c](../tests/test_fsm.c)
 
@@ -311,19 +313,20 @@ Role: **integration**. **8 test(s).**
 
 ### 3.9. [tests/test_device.c](../tests/test_device.c)
 
-Role: **unit**. **9 test(s).**
+Role: **unit**. **10 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
-| 1 | <a id="parse_args_accepts_device_flag_without_elf_operand"></a>`parse_args_accepts_device_flag_without_elf_operand` | `LLR-MAIN-08` | Invoke `parse_args()` with `argv = {"avrOSdb", "--device", "/dev/ttyUSB0"}` and assert `cfg.device_info == true`, `cfg.serial_device == "/dev/ttyUSB0"`, `cfg.elf_path == NULL`, and `parse_args()` returns without exiting. |
-| 2 | <a id="parse_args_rejects_device_combined_with_load"></a>`parse_args_rejects_device_combined_with_load` | `LLR-MAIN-08` | Fork a subprocess that calls `parse_args()` with `--device --load /dev/ttyUSB0 fw.elf`; assert the child exits with status 1 and that captured stderr contains `"--device is mutually exclusive with --load"`. |
-| 3 | <a id="parse_args_mode_defaults_to_rsp_and_honours_dap_rsp"></a>`parse_args_mode_defaults_to_rsp_and_honours_dap_rsp` | `LLR-MAIN-24` | Invoke `parse_args()` three ways and assert `cfg.dap_mode`: with no mode flag it is `false` (default RSP); with `--dap` it is `true`; with `--rsp` it is `false`. |
-| 4 | <a id="parse_args_rejects_rsp_combined_with_dap"></a>`parse_args_rejects_rsp_combined_with_dap` | `LLR-MAIN-24` | Fork a subprocess that calls `parse_args()` with `--rsp --dap /dev/ttyUSB0 fw.elf`; assert the child exits with status 1 and that captured stderr contains `"--rsp and --dap are mutually exclusive"`. |
-| 5 | <a id="updi_read_device_info_returns_sigrow_and_asi_bytes"></a>`updi_read_device_info_returns_sigrow_and_asi_bytes` | `LLR-UPDI-13` | Open a PTY pair; in a helper thread script the slave end to echo half-duplex bytes and respond to a SIGROW DEVICEID read at `0x1100`-`0x1102` with canned signature `0x1E 0x97 0x0A`, a SYSCFG.REVID read at `0x0F01` returning `0xA6`, a SIGROW.SERNUM read at `0x1110`-`0x111F` returning a canned 16-byte serial number, and to LDCS reads of SYS_STATUS / KEY_STATUS / STATUSB. Call `updi_read_device_info()` and assert all struct fields match the canned values and that the function returns 0 with `info.fail_op == NULL`. |
-| 6 | <a id="updi_read_device_info_reports_failed_step_on_nak"></a>`updi_read_device_info_reports_failed_step_on_nak` | `LLR-UPDI-13` | Drive the PTY harness to return an unexpected byte in place of the SIGROW response. Assert `updi_read_device_info()` returns -1, `info.fail_op` equals the string `"sigrow"`, and `info.fail_errno` is negative. |
-| 7 | <a id="parse_args_sleep_flag_disables_debug_in_sleep"></a>`parse_args_sleep_flag_disables_debug_in_sleep` | `LLR-MAIN-25` | Verify `parse_args()` defaults `cfg.debug_in_sleep` to true and that passing `--sleep` sets it false (HLR-077 / LLR-MAIN-25). |
-| 8 | <a id="run_device_mode_prints_report_to_stdout"></a>`run_device_mode_prints_report_to_stdout` | `LLR-MAIN-09` | Capture `stdout` from `run_device_mode()` driven by the PTY harness with signature `0x1E 0x97 0x0A`. Assert the captured output contains the literal lines `Serial device:`, `Baud rate:`, `Signature:`, `Family:`, `Revision:`, `Serial:`, and `UPDI status:` (case-sensitive prefix match). |
-| 9 | <a id="device_mode_does_not_call_rsp_listen"></a>`device_mode_does_not_call_rsp_listen` | `LLR-MAIN-09` | Link the test binary with a stub `rsp_listen()` that flags a global. Invoke `run_device_mode()` to completion and assert the flag remains clear, proving the diagnostic path bypasses GDB listener startup. |
+| 1 | <a id="emit_vscode_config_prints_attach_launch_json"></a>`emit_vscode_config_prints_attach_launch_json` | `LLR-MAIN-26` | Capture stdout while calling `emit_vscode_config()` and assert the printed launch.json carries the `avrosdb` debug type, an `attach` request, and the default port 1234 — the `--emit-vscode-config` helper. Per LLR-MAIN-26. |
+| 2 | <a id="parse_args_accepts_device_flag_without_elf_operand"></a>`parse_args_accepts_device_flag_without_elf_operand` | `LLR-MAIN-08` | Invoke `parse_args()` with `argv = {"avrOSdb", "--device", "/dev/ttyUSB0"}` and assert `cfg.device_info == true`, `cfg.serial_device == "/dev/ttyUSB0"`, `cfg.elf_path == NULL`, and `parse_args()` returns without exiting. |
+| 3 | <a id="parse_args_rejects_device_combined_with_load"></a>`parse_args_rejects_device_combined_with_load` | `LLR-MAIN-08` | Fork a subprocess that calls `parse_args()` with `--device --load /dev/ttyUSB0 fw.elf`; assert the child exits with status 1 and that captured stderr contains `"--device is mutually exclusive with --load"`. |
+| 4 | <a id="parse_args_mode_defaults_to_rsp_and_honours_dap_rsp"></a>`parse_args_mode_defaults_to_rsp_and_honours_dap_rsp` | `LLR-MAIN-24` | Invoke `parse_args()` three ways and assert `cfg.dap_mode`: with no mode flag it is `false` (default RSP); with `--dap` it is `true`; with `--rsp` it is `false`. |
+| 5 | <a id="parse_args_rejects_rsp_combined_with_dap"></a>`parse_args_rejects_rsp_combined_with_dap` | `LLR-MAIN-24` | Fork a subprocess that calls `parse_args()` with `--rsp --dap /dev/ttyUSB0 fw.elf`; assert the child exits with status 1 and that captured stderr contains `"--rsp and --dap are mutually exclusive"`. |
+| 6 | <a id="updi_read_device_info_returns_sigrow_and_asi_bytes"></a>`updi_read_device_info_returns_sigrow_and_asi_bytes` | `LLR-UPDI-13` | Open a PTY pair; in a helper thread script the slave end to echo half-duplex bytes and respond to a SIGROW DEVICEID read at `0x1100`-`0x1102` with canned signature `0x1E 0x97 0x0A`, a SYSCFG.REVID read at `0x0F01` returning `0xA6`, a SIGROW.SERNUM read at `0x1110`-`0x111F` returning a canned 16-byte serial number, and to LDCS reads of SYS_STATUS / KEY_STATUS / STATUSB. Call `updi_read_device_info()` and assert all struct fields match the canned values and that the function returns 0 with `info.fail_op == NULL`. |
+| 7 | <a id="updi_read_device_info_reports_failed_step_on_nak"></a>`updi_read_device_info_reports_failed_step_on_nak` | `LLR-UPDI-13` | Drive the PTY harness to return an unexpected byte in place of the SIGROW response. Assert `updi_read_device_info()` returns -1, `info.fail_op` equals the string `"sigrow"`, and `info.fail_errno` is negative. |
+| 8 | <a id="parse_args_sleep_flag_disables_debug_in_sleep"></a>`parse_args_sleep_flag_disables_debug_in_sleep` | `LLR-MAIN-25` | Verify `parse_args()` defaults `cfg.debug_in_sleep` to true and that passing `--sleep` sets it false (HLR-077 / LLR-MAIN-25). |
+| 9 | <a id="run_device_mode_prints_report_to_stdout"></a>`run_device_mode_prints_report_to_stdout` | `LLR-MAIN-09` | Capture `stdout` from `run_device_mode()` driven by the PTY harness with signature `0x1E 0x97 0x0A`. Assert the captured output contains the literal lines `Serial device:`, `Baud rate:`, `Signature:`, `Family:`, `Revision:`, `Serial:`, and `UPDI status:` (case-sensitive prefix match). |
+| 10 | <a id="device_mode_does_not_call_rsp_listen"></a>`device_mode_does_not_call_rsp_listen` | `LLR-MAIN-09` | Link the test binary with a stub `rsp_listen()` that flags a global. Invoke `run_device_mode()` to completion and assert the flag remains clear, proving the diagnostic path bypasses GDB listener startup. |
 
 ### 3.10. [tests/hw/hw_test.c](../tests/hw/hw_test.c)
 
@@ -379,7 +382,7 @@ Role: **hardware**. **1 test(s).**
 
 ### 3.12. [tests/test_dap.c](../tests/test_dap.c)
 
-Role: **unit**. **21 test(s).**
+Role: **unit**. **25 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -399,15 +402,19 @@ Role: **unit**. **21 test(s).**
 | 14 | <a id="dap_pause_emits_stopped_pause"></a>`dap_pause_emits_stopped_pause` | `LLR-DAP-08` | Dispatch `pause` and verify a `success:true` response followed by a `stopped` event with `reason:"pause"`. Per LLR-DAP-08. |
 | 15 | <a id="dap_step_emits_stopped_step"></a>`dap_step_emits_stopped_step` | `LLR-DAP-08` | For each of `next`, `stepIn`, `stepOut`, dispatch the request and verify a `success:true` response followed by a `stopped` event with `reason:"step"`. Per LLR-DAP-08. |
 | 16 | <a id="dap_stack_trace_returns_one_frame"></a>`dap_stack_trace_returns_one_frame` | `LLR-DAP-09` | Dispatch `stackTrace` (no target/DWARF) and verify the response carries a `stackFrames` array with a single frame `id:0` and `totalFrames:1`. Per LLR-DAP-09. |
-| 17 | <a id="dap_scopes_returns_empty"></a>`dap_scopes_returns_empty` | `LLR-DAP-09` | Dispatch `scopes` and verify the response carries an empty `scopes` array (frame variables are Phase 19). Per LLR-DAP-09. |
-| 18 | <a id="dap_set_breakpoints_responds_with_per_line_entries"></a>`dap_set_breakpoints_responds_with_per_line_entries` | `LLR-DAP-10` | Dispatch `setBreakpoints` with two source breakpoints (`{line:139}`, `{line:141,condition:"n==3"}`) and no ELF/target; verify the response carries a `breakpoints` array with per-line entries (`id:1`/`line:139`, `id:2`/`line:141`), that both entries are recorded in the session table with the condition captured, and that `next_bp_id` advanced to 3. Per LLR-DAP-10. |
-| 19 | <a id="dap_set_breakpoints_replaces_prior_set_for_source"></a>`dap_set_breakpoints_replaces_prior_set_for_source` | `LLR-DAP-10` | Dispatch `setBreakpoints` for `main.c` with two lines, then again with one line; verify the second call replaces the source's set wholesale — only the single new breakpoint remains in the session table. Per LLR-DAP-10. |
-| 20 | <a id="dap_set_instruction_breakpoints_responds_with_refs"></a>`dap_set_instruction_breakpoints_responds_with_refs` | `LLR-DAP-10` | Dispatch `setInstructionBreakpoints` with two entries (`instructionReference:"0x40c"`, and `"0x400"` with `offset:4`) and no target; verify the response carries per-entry `{id,verified,instructionReference}`, that the addresses resolve (0x40c; 0x400+4=0x404), and that the table entries are marked as instruction breakpoints (`line == -1`). Per LLR-DAP-10. |
-| 21 | <a id="dap_serve_runs_handshake_to_disconnect"></a>`dap_serve_runs_handshake_to_disconnect` | `LLR-DAP-05` | Drive `dap_serve()` end-to-end without hardware: a stubbed `rsp_accept()` hands it a pre-connected socketpair end whose request stream is pre-loaded with `initialize` then `disconnect`. Verify the accept/select/read/dispatch loop processes both (emitting the initialize response, the `initialized` event, and the disconnect response) and returns 0 when the client disconnects. |
+| 17 | <a id="dap_scopes_returns_locals_registers_globals"></a>`dap_scopes_returns_locals_registers_globals` | `LLR-DAP-13` | Dispatch `scopes` for frameId 0 and verify the response carries Locals, Registers, and Globals scopes (each with a variablesReference). Per LLR-DAP-13. |
+| 18 | <a id="dap_variables_unknown_ref_is_empty"></a>`dap_variables_unknown_ref_is_empty` | `LLR-DAP-13` | Dispatch `variables` with an out-of-range reference (no ELF/target) and verify an empty `variables` array rather than an error. Per LLR-DAP-13. |
+| 19 | <a id="dap_evaluate_unresolved_is_error"></a>`dap_evaluate_unresolved_is_error` | `LLR-DAP-14` | Dispatch `evaluate` for an expression with no ELF/target and verify the response is `success:false` (the adapter never fabricates a value). Per LLR-DAP-14. |
+| 20 | <a id="dap_read_memory_responds_with_data_field"></a>`dap_read_memory_responds_with_data_field` | `LLR-DAP-15` | Dispatch `readMemory` with no target and verify the response is well-formed and carries a `data` field (base64, possibly empty/unreadable) rather than erroring. Per LLR-DAP-15. |
+| 21 | <a id="dap_set_variable_unknown_ref_errors"></a>`dap_set_variable_unknown_ref_errors` | `LLR-DAP-16` | Dispatch `setVariable` with an out-of-range reference and verify the response is `success:false`. Per LLR-DAP-16. |
+| 22 | <a id="dap_set_breakpoints_responds_with_per_line_entries"></a>`dap_set_breakpoints_responds_with_per_line_entries` | `LLR-DAP-10` | Dispatch `setBreakpoints` with two source breakpoints (`{line:139}`, `{line:141,condition:"n==3"}`) and no ELF/target; verify the response carries a `breakpoints` array with per-line entries (`id:1`/`line:139`, `id:2`/`line:141`), that both entries are recorded in the session table with the condition captured, and that `next_bp_id` advanced to 3. Per LLR-DAP-10. |
+| 23 | <a id="dap_set_breakpoints_replaces_prior_set_for_source"></a>`dap_set_breakpoints_replaces_prior_set_for_source` | `LLR-DAP-10` | Dispatch `setBreakpoints` for `main.c` with two lines, then again with one line; verify the second call replaces the source's set wholesale — only the single new breakpoint remains in the session table. Per LLR-DAP-10. |
+| 24 | <a id="dap_set_instruction_breakpoints_responds_with_refs"></a>`dap_set_instruction_breakpoints_responds_with_refs` | `LLR-DAP-10` | Dispatch `setInstructionBreakpoints` with two entries (`instructionReference:"0x40c"`, and `"0x400"` with `offset:4`) and no target; verify the response carries per-entry `{id,verified,instructionReference}`, that the addresses resolve (0x40c; 0x400+4=0x404), and that the table entries are marked as instruction breakpoints (`line == -1`). Per LLR-DAP-10. |
+| 25 | <a id="dap_serve_runs_handshake_to_disconnect"></a>`dap_serve_runs_handshake_to_disconnect` | `LLR-DAP-05` | Drive `dap_serve()` end-to-end without hardware: a stubbed `rsp_accept()` hands it a pre-connected socketpair end whose request stream is pre-loaded with `initialize` then `disconnect`. Verify the accept/select/read/dispatch loop processes both (emitting the initialize response, the `initialized` event, and the disconnect response) and returns 0 when the client disconnects. |
 
 ### 3.13. [tests/hw/dap_acceptance.lua](../tests/hw/dap_acceptance.lua)
 
-Role: **hardware**. **8 test(s).**
+Role: **hardware**. **9 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -418,7 +425,8 @@ Role: **hardware**. **8 test(s).**
 | 5 | <a id="DAP5_step_stopped"></a>`DAP5_step_stopped` | — | Phase-17 execution control. From the halted target, issue `stepIn` and verify the adapter emits a `stopped` event with reason `step`. Per HLR-078 / LLR-DAP-08. |
 | 6 | <a id="DAP6_stacktrace_source_line"></a>`DAP6_stacktrace_source_line` | — | Phase-17 shallow stackTrace. Issue `stackTrace` and verify frame 0 resolves the live PC to a source line (numeric `line > 0`) via DWARF, with a `source` object — proving the OCD PC read + libdw line lookup work end-to-end on silicon. Per HLR-078 / LLR-DAP-09. |
 | 7 | <a id="DAP7_source_breakpoint_hit"></a>`DAP7_source_breakpoint_hit` | — | Phase-18 source breakpoints. `setBreakpoints` for a reachable source line in the loaded fixture (default `gdb_target.c:51` — the `blink()` call in the main loop; override via `DAP_BP_SOURCE`/`DAP_BP_LINE`) — verify it resolves+verifies via DWARF and installs through the shared breakpoint core — then `continue` and verify the adapter emits a `stopped` event with reason `breakpoint`, proving file:line breakpoint resolution + install + hit end-to-end on silicon. The harness reflashes `HW_DAP_ELF` first so the running firmware matches the ELF handed to the server. Per HLR-079 / LLR-DAP-10. |
-| 8 | <a id="DAP8_disconnect_clean"></a>`DAP8_disconnect_clean` | — | Issue a `disconnect` request and verify the session tears down cleanly (installed breakpoints removed, target resumed) — accepting either the disconnect response or the session object going away, since nvim-dap does not always deliver the response callback as the adapter closes the socket. Per HLR-076 / HLR-079. |
+| 8 | <a id="DAP9_scopes_variables_lists_a_global"></a>`DAP9_scopes_variables_lists_a_global` | `LLR-DAP-13` | At the breakpoint, request `scopes` then `variables` on the Globals scope through the real nvim-dap client and verify the firmware global `g_counter` is listed — proving the variables request path works end to end via VS Code/Neovim (the rich per-type cases are in tests/hw/dap_vars.py). Per HLR-082 / LLR-DAP-13. |
+| 9 | <a id="DAP8_disconnect_clean"></a>`DAP8_disconnect_clean` | — | Issue a `disconnect` request and verify the session tears down cleanly (installed breakpoints removed, target resumed) — accepting either the disconnect response or the session object going away, since nvim-dap does not always deliver the response callback as the adapter closes the socket. Per HLR-076 / HLR-079. |
 
 ### 3.14. [tests/hw/dap_unwind.py](../tests/hw/dap_unwind.py)
 
@@ -442,6 +450,21 @@ Role: **hardware**. **3 test(s).**
 | 1 | <a id="DAP_K1_false_local_condition_skips"></a>`DAP_K1_false_local_condition_skips` | `LLR-DAP-12`, `LLR-ELF-15` | A source breakpoint in `leaf` with the always-false local condition `b == 99` (b is only ever 2 or 3): after `continue` the target keeps running and NO breakpoint stop arrives within the window — proving the adapter reads the local over DWARF/OCD, evaluates the condition false, steps over and auto-resumes. Per HLR-081 / LLR-DAP-12 / LLR-ELF-15. |
 | 2 | <a id="DAP_K2_true_local_condition_stops"></a>`DAP_K2_true_local_condition_stops` | `LLR-DAP-12` | A source breakpoint in `leaf` with the true local condition `b == 2` (hit on the `leaf(7,2)` call): after `continue` the adapter emits `stopped` with reason `breakpoint` — proving a true local condition stops. Per HLR-081 / LLR-DAP-12. |
 | 3 | <a id="DAP_K3_true_global_condition_stops"></a>`DAP_K3_true_global_condition_stops` | `LLR-DAP-12`, `LLR-ELF-15` | A source breakpoint in `leaf` with the true global condition `g_marker == 49374` (a constant): after `continue` the adapter emits `stopped` with reason `breakpoint` — proving global-variable conditions (DW_OP_addr resolution) work on silicon. Per HLR-081 / LLR-DAP-12 / LLR-ELF-15. |
+
+### 3.16. [tests/hw/dap_vars.py](../tests/hw/dap_vars.py)
+
+Role: **hardware**. **8 test(s).**
+
+| # | Test | Verifies | Purpose |
+| - | ---- | -------- | ------- |
+| 1 | <a id="DAP_V1_scopes_locals_registers_globals"></a>`DAP_V1_scopes_locals_registers_globals` | `LLR-DAP-13` | `scopes` for frame 0 returns Locals, Registers, and Globals scopes. Per HLR-082 / LLR-DAP-13. |
+| 2 | <a id="DAP_V2_global_scalar_reads_back"></a>`DAP_V2_global_scalar_reads_back` | `LLR-ELF-18` | Expanding the Globals scope, the scalar `g_marker` reads its constant 49374. Per HLR-082 / LLR-ELF-18. |
+| 3 | <a id="DAP_V3_struct_expands_to_members"></a>`DAP_V3_struct_expands_to_members` | `LLR-ELF-19` | The struct global `g_cfg` carries a child reference that expands to members `base = 100` and `gain = -7` (signed/unsigned by type). Per HLR-082 / LLR-ELF-19. |
+| 4 | <a id="DAP_V4_array_expands_to_elements"></a>`DAP_V4_array_expands_to_elements` | `LLR-ELF-19` | The array global `g_arr` expands to elements `[0..3] = 10,20,30,40` at the element stride. Per HLR-082 / LLR-ELF-19. |
+| 5 | <a id="DAP_V5_frame_locals_read_back"></a>`DAP_V5_frame_locals_read_back` | `LLR-ELF-17` | The Locals scope of the leaf frame reports the parameters `a = 7` and `b = 2`, resolved against the frame's registers. Per HLR-082 / LLR-ELF-17. |
+| 6 | <a id="DAP_V6_evaluate_field_and_element"></a>`DAP_V6_evaluate_field_and_element` | `LLR-DAP-14` | `evaluate` resolves `g_cfg.base` (= 100), `g_arr[2]` (= 30), and `g_marker` (= 49374) — identifier + `.field` / `[index]` navigation. Per HLR-083 / LLR-DAP-14. |
+| 7 | <a id="DAP_V7_read_memory_array_bytes"></a>`DAP_V7_read_memory_array_bytes` | `LLR-DAP-15` | `readMemory` of `g_arr` returns the 8 bytes that decode (little-endian) to the u16 sequence 10,20,30,40. Per HLR-084 / LLR-DAP-15. |
+| 8 | <a id="DAP_V8_set_variable_writes_back"></a>`DAP_V8_set_variable_writes_back` | `LLR-DAP-16` | `setVariable` writes `g_counter = 1234`; a subsequent `evaluate` reads back 1234 — proving the write reached silicon at the right address and width. Per HLR-084 / LLR-DAP-16. |
 
 ## 4. LLR Coverage Matrix
 
@@ -473,6 +496,7 @@ verified by code review — see
 | `LLR-MAIN-23` | `main` | `HLR-068` | `test_parse_args_log_rsp_sets_flag` |
 | `LLR-MAIN-24` | `main` | `HLR-074` | `parse_args_mode_defaults_to_rsp_and_honours_dap_rsp`, `parse_args_rejects_rsp_combined_with_dap` |
 | `LLR-MAIN-25` | `main` | `HLR-077` | `parse_args_sleep_flag_disables_debug_in_sleep` |
+| `LLR-MAIN-26` | `main` | `HLR-085` | `emit_vscode_config_prints_attach_launch_json` |
 | `LLR-MAIN-22` | `main` | `HLR-065` | `test_sig_handler_records_signo_in_g_shutdown_signal`, `test_event_loop_clears_disconnect_reason_after_drain` |
 | `LLR-UPDI-01` | `updi` | `HLR-006` | `updi_open_sets_8e2_raw_half_duplex_via_termios`, `updi_open_returns_minus1_on_device_open_failure` |
 | `LLR-UPDI-02` | `updi` | `HLR-006`, `HLR-036` | `updi_open_asserts_wake_byte_then_stcs_ctrlb`, `updi_open_restores_session_baud_after_break` |
@@ -571,6 +595,11 @@ verified by code review — see
 | `LLR-ELF-14` | `elf` | `HLR-080` | `elf_cfi_cfa_extracts_avr_frame_rules`, `DAP_U4_frames_map_to_call_chain` |
 | `LLR-ELF-15` | `elf` | `HLR-081` | `elf_var_addr_resolves_globals_and_locals`, `DAP_K1_false_local_condition_skips`, `DAP_K3_true_global_condition_stops` |
 | `LLR-ELF-16` | `elf` | `HLR-080` | `elf_addr_to_func_resolves_enclosing_function`, `DAP_U6_frames_named_for_function` |
+| `LLR-ELF-17` | `elf` | `HLR-082` | `elf_value_model_enumerates_and_renders`, `DAP_V5_frame_locals_read_back` |
+| `LLR-ELF-18` | `elf` | `HLR-082` | `elf_value_model_enumerates_and_renders`, `DAP_V2_global_scalar_reads_back` |
+| `LLR-ELF-19` | `elf` | `HLR-082` | `elf_value_model_enumerates_and_renders`, `DAP_V3_struct_expands_to_members`, `DAP_V4_array_expands_to_elements` |
+| `LLR-ELF-20` | `elf` | `HLR-083` | `elf_var_find_and_type_size` |
+| `LLR-ELF-21` | `elf` | `HLR-084` | `elf_var_find_and_type_size` |
 | `LLR-FSM-01` | `fsm` | `HLR-024` | `fsm_build_thread_list_reads_fsm_table_from_flash_via_updi`, `fsm_build_thread_list_returns_minus1_on_updi_failure` |
 | `LLR-FSM-03` | `fsm` | `HLR-025` | `fsm_build_thread_list_sets_active_thread_from_current_fsm_ptr`, `fsm_build_thread_list_sets_active_id_0_when_no_entry_matches` |
 | `LLR-MON-01` | `monitor` | `HLR-029` | `monitor_dispatch_hex_decodes_cmd_before_prefix_matching`, `monitor_dispatch_treats_invalid_hex_sequence_as_unrecognised`, `D6_rsp_monitor_info_verb` |
@@ -612,7 +641,11 @@ verified by code review — see
 | `LLR-DAP-06` | `dap` | `HLR-076` | `dap_initialize_handshake`, `dap_unknown_request_returns_error` |
 | `LLR-DAP-07` | `dap` | `HLR-076` | `dap_initialize_handshake`, `dap_configuration_done_emits_stopped_entry`, `dap_disconnect_closes_session`, `dap_unknown_request_returns_error` |
 | `LLR-DAP-08` | `dap` | `HLR-078` | `dap_continue_responds_and_emits_continued`, `dap_pause_emits_stopped_pause`, `dap_step_emits_stopped_step` |
-| `LLR-DAP-09` | `dap` | `HLR-078`, `HLR-072` | `dap_stack_trace_returns_one_frame`, `dap_scopes_returns_empty` |
+| `LLR-DAP-09` | `dap` | `HLR-078`, `HLR-072` | `dap_stack_trace_returns_one_frame` |
 | `LLR-DAP-10` | `dap` | `HLR-079`, `HLR-054` | `dap_set_breakpoints_responds_with_per_line_entries`, `dap_set_breakpoints_replaces_prior_set_for_source`, `dap_set_instruction_breakpoints_responds_with_refs` |
 | `LLR-DAP-11` | `dap` | `HLR-080`, `HLR-072` | `DAP_U4_frames_map_to_call_chain` |
 | `LLR-DAP-12` | `dap` | `HLR-081`, `HLR-054` | `DAP_K1_false_local_condition_skips`, `DAP_K2_true_local_condition_stops`, `DAP_K3_true_global_condition_stops` |
+| `LLR-DAP-13` | `dap` | `HLR-082`, `HLR-072` | `dap_scopes_returns_locals_registers_globals`, `dap_variables_unknown_ref_is_empty`, `DAP9_scopes_variables_lists_a_global`, `DAP_V1_scopes_locals_registers_globals` |
+| `LLR-DAP-14` | `dap` | `HLR-083` | `dap_evaluate_unresolved_is_error`, `DAP_V6_evaluate_field_and_element` |
+| `LLR-DAP-15` | `dap` | `HLR-084` | `dap_read_memory_responds_with_data_field`, `DAP_V7_read_memory_array_bytes` |
+| `LLR-DAP-16` | `dap` | `HLR-084` | `dap_set_variable_unknown_ref_errors`, `DAP_V8_set_variable_writes_back` |
