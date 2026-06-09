@@ -1015,6 +1015,43 @@ int elf_type_children(const ElfContext *ctx, uint32_t addr, uint64_t type_off,
 }
 
 /* See elf_parser.h. */
+int elf_var_find(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr,
+                 const char *name, uint32_t *addr, uint64_t *type_off)
+{
+    if (ctx == NULL || ctx->dwarf == NULL || name == NULL) return -1;
+    Dwarf *dw = (Dwarf *)ctx->dwarf;
+
+    Dwarf_Die cu;
+    if (dwarf_addrdie(dw, (Dwarf_Addr)pc, &cu) == NULL) return -1;
+
+    Dwarf_Die *scopes = NULL;
+    int n = dwarf_getscopes(&cu, (Dwarf_Addr)pc, &scopes);
+    if (n < 1 || scopes == NULL) { free(scopes); return -1; }
+    bool fb_is_cfa = cfi_frame_base_is_cfa(scopes, n);
+    Dwarf_Die var;
+    int si = dwarf_getscopevar(scopes, n, name, 0, NULL, 0, 0, &var);
+    free(scopes);
+    if (si < 0) return -1;
+
+    uint32_t a;
+    if (eval_var_loc(&var, fr, fb_is_cfa, &a) != 0) return -1;
+    if (addr != NULL)     *addr = a;
+    if (type_off != NULL) *type_off = die_type_off(&var);
+    return 0;
+}
+
+/* See elf_parser.h. */
+int elf_type_size(const ElfContext *ctx, uint64_t type_off)
+{
+    if (ctx == NULL || ctx->dwarf == NULL || type_off == 0) return 2;
+    Dwarf_Die td, tp;
+    if (dwarf_offdie((Dwarf *)ctx->dwarf, (Dwarf_Off)type_off, &td) == NULL) return 2;
+    if (dwarf_peel_type(&td, &tp) != 0) tp = td;
+    int bs = dwarf_bytesize(&tp);
+    return (bs >= 1 && bs <= 4) ? bs : 2;
+}
+
+/* See elf_parser.h. */
 int elf_addr_to_func(const ElfContext *ctx, uint32_t pc, char *name, size_t cap)
 {
     if (ctx == NULL || ctx->dwarf == NULL || name == NULL || cap == 0)

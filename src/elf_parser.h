@@ -208,4 +208,16 @@ int elf_type_render(const ElfContext *ctx, uint32_t addr, uint64_t type_off,
 int elf_type_children(const ElfContext *ctx, uint32_t addr, uint64_t type_off,
                       ElfVar *out, int max);
 
+/* Resolve a variable `name` visible at `pc` (local/param via the frame regs
+ * `fr`, else file-scope global) to its data-space address and DWARF type DIE
+ * offset — the entry point for DAP `evaluate` watch/REPL expressions.  Returns
+ * 0 on success, -1 when not in scope or with no DWARF. */
+int elf_var_find(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr,
+                 const char *name, uint32_t *addr, uint64_t *type_off);
+
+/* Byte size of the (peeled) type at `type_off`, clamped to 1..4; defaults to 2
+ * for an absent/unknown type.  Used by DAP `setVariable` to write the right
+ * width back to a scalar. */
+int elf_type_size(const ElfContext *ctx, uint64_t type_off);
+
 #endif /* AOD_ELF_PARSER_H */

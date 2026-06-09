@@ -433,7 +433,9 @@ int dap_write_message(int fd, const char *body, size_t len)
 
 /* ── Response / event builders ────────────────────────────────────────────── */
 
-#define DAP_OUT_MAX 2048u   /* outgoing handshake messages are small */
+#define DAP_OUT_MAX 16384u  /* fits the largest responses: a Registers scope
+                             * (~35 vars), a deep stackTrace, or a wide
+                             * variables/array expansion */
 
 static long dap_next_seq(dap_session *s) { return ++s->out_seq; }
 
@@ -818,6 +820,241 @@ static int dap_handle_variables(dap_session *s, const char *msg,
     return dap_send_response(s, req_seq, "variables", true, body);
 }
 
+/* ── evaluate / memory / setVariable (Phase 19) ──────────────────────────── */
+
+static const char DAP_B64[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static size_t dap_b64_encode(const uint8_t *in, size_t n, char *out, size_t cap)
+{
+    size_t o = 0;
+    for (size_t i = 0; i < n; i += 3) {
+        uint32_t v = (uint32_t)in[i] << 16;
+        if (i + 1 < n) v |= (uint32_t)in[i + 1] << 8;
+        if (i + 2 < n) v |= in[i + 2];
+        char c[4] = { DAP_B64[(v >> 18) & 63], DAP_B64[(v >> 12) & 63],
+                      (i + 1 < n) ? DAP_B64[(v >> 6) & 63] : '=',
+                      (i + 2 < n) ? DAP_B64[v & 63] : '=' };
+        if (o + 4 >= cap) break;
+        for (int k = 0; k < 4; k++) out[o++] = c[k];
+    }
+    if (o < cap) out[o] = '\0';
+    return o;
+}
+
+static int dap_b64_val(char c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static size_t dap_b64_decode(const char *in, uint8_t *out, size_t cap)
+{
+    int q[4], qi = 0; size_t o = 0;
+    for (const char *p = in; *p; p++) {
+        if (*p == '=') break;
+        int v = dap_b64_val(*p);
+        if (v < 0) continue;
+        q[qi++] = v;
+        if (qi == 4) {
+            if (o < cap) out[o++] = (uint8_t)((q[0] << 2) | (q[1] >> 4));
+            if (o < cap) out[o++] = (uint8_t)(((q[1] & 15) << 4) | (q[2] >> 2));
+            if (o < cap) out[o++] = (uint8_t)(((q[2] & 3) << 6) | q[3]);
+            qi = 0;
+        }
+    }
+    if (qi >= 2 && o < cap) out[o++] = (uint8_t)((q[0] << 2) | (q[1] >> 4));
+    if (qi >= 3 && o < cap) out[o++] = (uint8_t)(((q[1] & 15) << 4) | (q[2] >> 2));
+    return o;
+}
+
+/* Resolve an `evaluate` expression — `ident` then a chain of `.field` /
+ * `[index]` — at the given frame to (addr, type_off).  Returns 0 on success. */
+static int dap_resolve_expr(dap_session *s, uint32_t pc, const ElfFrameRegs *fr,
+                            const char *expr, uint32_t *addr, uint64_t *type_off)
+{
+    const char *p = expr;
+    while (*p == ' ' || *p == '\t') p++;
+    char id[64]; int k = 0;
+    if (!(isalpha((unsigned char)*p) || *p == '_')) return -1;
+    while ((isalnum((unsigned char)*p) || *p == '_') && k < 63) id[k++] = *p++;
+    id[k] = '\0';
+
+    uint32_t a; uint64_t to;
+    if (s->elf == NULL || elf_var_find(s->elf, pc, fr, id, &a, &to) != 0) return -1;
+
+    while (*p) {
+        ElfVar ch[64];
+        if (*p == '.') {
+            p++;
+            char fn[64]; int j = 0;
+            while ((isalnum((unsigned char)*p) || *p == '_') && j < 63) fn[j++] = *p++;
+            fn[j] = '\0';
+            int nc = elf_type_children(s->elf, a, to, ch, 64), hit = 0;
+            for (int i = 0; i < nc; i++)
+                if (strcmp(ch[i].name, fn) == 0) { a = ch[i].addr; to = ch[i].type_off; hit = 1; break; }
+            if (!hit) return -1;
+        } else if (*p == '[') {
+            p++;
+            long idx = strtol(p, (char **)&p, 0);
+            if (*p == ']') p++;
+            int nc = elf_type_children(s->elf, a, to, ch, 64);
+            if (idx < 0 || idx >= nc) return -1;
+            a = ch[idx].addr; to = ch[idx].type_off;
+        } else if (*p == ' ' || *p == '\t') {
+            p++;
+        } else {
+            return -1;
+        }
+    }
+    *addr = a; *type_off = to;
+    return 0;
+}
+
+/* `evaluate`: render a watch/REPL variable expression in a frame's context. */
+static int dap_handle_evaluate(dap_session *s, const char *msg,
+                               const dj_tok_t *t, long req_seq)
+{
+    int  args = dj_member(msg, t, 0, "arguments");
+    char expr[160] = {0};
+    long frame_id = 0;
+    if (args >= 0) {
+        int em = dj_member(msg, t, args, "expression");
+        if (em >= 0) dj_strcpy(msg, t, em, expr, sizeof expr);
+        int fm = dj_member(msg, t, args, "frameId");
+        if (fm >= 0) (void)dj_long(msg, t, fm, &frame_id);
+    }
+    if (frame_id < 0 || frame_id >= s->nframes) frame_id = 0;
+    uint32_t     pc = (s->nframes > 0) ? s->frames[frame_id].pc : 0;
+    ElfFrameRegs fr = (s->nframes > 0) ? s->frames[frame_id].fr
+                                       : (ElfFrameRegs){0, 0, 0};
+
+    uint32_t addr = 0; uint64_t type_off = 0;
+    if (expr[0] == '\0' ||
+        dap_resolve_expr(s, pc, &fr, expr, &addr, &type_off) != 0)
+        return dap_send_error(s, req_seq, "evaluate",
+                              "not available") < 0 ? -1 : 0;
+
+    char val[320]; bool ex = false;
+    if (elf_type_render(s->elf, addr, type_off, dap_mem_cb, s,
+                        val, sizeof val, &ex) != 0)
+        return dap_send_error(s, req_seq, "evaluate", "unreadable") < 0 ? -1 : 0;
+    int ref = ex ? dap_varref_alloc(s, DAP_VR_AGGREGATE, 0, NULL, addr, type_off) : 0;
+
+    char ve[640], body[800];
+    dj_escape(val, ve, sizeof ve);
+    snprintf(body, sizeof body,
+        "{\"result\":\"%s\",\"variablesReference\":%d,\"memoryReference\":\"0x%x\"}",
+        ve, ref, addr);
+    return dap_send_response(s, req_seq, "evaluate", true, body);
+}
+
+/* Parse a memoryReference ("0x….." / decimal) into a data-space address. */
+static uint32_t dap_parse_memref(const char *ref) { return (uint32_t)strtoul(ref, NULL, 0); }
+
+/* `readMemory`: base64 of `count` bytes from `memoryReference` + `offset`. */
+static int dap_handle_read_memory(dap_session *s, const char *msg,
+                                  const dj_tok_t *t, long req_seq)
+{
+    int  args = dj_member(msg, t, 0, "arguments");
+    char ref[40] = {0}; long offset = 0, count = 0;
+    if (args >= 0) {
+        int rm = dj_member(msg, t, args, "memoryReference");
+        if (rm >= 0) dj_strcpy(msg, t, rm, ref, sizeof ref);
+        int om = dj_member(msg, t, args, "offset");  if (om >= 0) (void)dj_long(msg, t, om, &offset);
+        int cm = dj_member(msg, t, args, "count");   if (cm >= 0) (void)dj_long(msg, t, cm, &count);
+    }
+    uint32_t addr = dap_parse_memref(ref) + (uint32_t)offset;
+    if (count < 0) count = 0;
+    if (count > 1024) count = 1024;
+
+    uint8_t buf[1024];
+    int got = 0;
+    if (s->updi_fd >= 0 && count > 0) {
+        uint32_t a = (addr >= 0x8000u) ? flash_to_updi(addr) : (addr & 0xffffu);
+        if (updi_mem_read(s->updi_fd, a, buf, (size_t)count) >= 0) got = (int)count;
+    }
+    char b64[1400];
+    dap_b64_encode(buf, (size_t)got, b64, sizeof b64);
+    char body[1600];
+    snprintf(body, sizeof body,
+        "{\"address\":\"0x%x\",\"data\":\"%s\"%s}", addr, b64,
+        got < count ? ",\"unreadableBytes\":1" : "");
+    return dap_send_response(s, req_seq, "readMemory", true, body);
+}
+
+/* `writeMemory`: write base64 `data` to `memoryReference` + `offset`. */
+static int dap_handle_write_memory(dap_session *s, const char *msg,
+                                   const dj_tok_t *t, long req_seq)
+{
+    int  args = dj_member(msg, t, 0, "arguments");
+    char ref[40] = {0}, data[1400] = {0}; long offset = 0;
+    if (args >= 0) {
+        int rm = dj_member(msg, t, args, "memoryReference");
+        if (rm >= 0) dj_strcpy(msg, t, rm, ref, sizeof ref);
+        int om = dj_member(msg, t, args, "offset"); if (om >= 0) (void)dj_long(msg, t, om, &offset);
+        int dm = dj_member(msg, t, args, "data");   if (dm >= 0) dj_strcpy(msg, t, dm, data, sizeof data);
+    }
+    uint32_t addr = dap_parse_memref(ref) + (uint32_t)offset;
+    uint8_t buf[1024];
+    size_t  n = dap_b64_decode(data, buf, sizeof buf);
+    bool ok = false;
+    if (s->updi_fd >= 0 && n > 0 && addr < 0x8000u)
+        ok = (updi_mem_write(s->updi_fd, addr & 0xffffu, buf, n) >= 0);
+    char body[64];
+    snprintf(body, sizeof body, "{\"bytesWritten\":%zu}", ok ? n : (size_t)0);
+    return dap_send_response(s, req_seq, "writeMemory", ok, body);
+}
+
+/* `setVariable`: write a scalar back to a child of a Locals/Globals/aggregate
+ * reference, named `name`, parsed from `value` (decimal or 0x-hex). */
+static int dap_handle_set_variable(dap_session *s, const char *msg,
+                                   const dj_tok_t *t, long req_seq)
+{
+    int  args = dj_member(msg, t, 0, "arguments");
+    long vref = 0; char name[64] = {0}, value[64] = {0};
+    if (args >= 0) {
+        int vm = dj_member(msg, t, args, "variablesReference");
+        if (vm >= 0) (void)dj_long(msg, t, vm, &vref);
+        int nm = dj_member(msg, t, args, "name");  if (nm >= 0) dj_strcpy(msg, t, nm, name, sizeof name);
+        int lm = dj_member(msg, t, args, "value"); if (lm >= 0) dj_strcpy(msg, t, lm, value, sizeof value);
+    }
+    if (vref < 1 || vref >= DAP_MAX_VARREFS || s->elf == NULL)
+        return dap_send_error(s, req_seq, "setVariable", "no such variable") < 0 ? -1 : 0;
+
+    /* Locate the named child in the reference to get its address + type. */
+    ElfVar vs[64]; int nv; int kind = s->varrefs[vref].kind;
+    if (kind == DAP_VR_AGGREGATE)
+        nv = elf_type_children(s->elf, s->varrefs[vref].addr, s->varrefs[vref].type_off, vs, 64);
+    else
+        nv = elf_var_enum(s->elf, s->varrefs[vref].pc, &s->varrefs[vref].fr,
+                          kind == DAP_VR_GLOBALS ? ELF_SCOPE_GLOBALS : ELF_SCOPE_LOCALS, vs, 64);
+    ElfVar *target = NULL;
+    for (int i = 0; i < nv; i++) if (strcmp(vs[i].name, name) == 0) { target = &vs[i]; break; }
+    if (target == NULL)
+        return dap_send_error(s, req_seq, "setVariable", "no such variable") < 0 ? -1 : 0;
+
+    /* Write the new scalar little-endian, at the type's byte width. */
+    long newval = strtol(value, NULL, 0);
+    int  wsize  = elf_type_size(s->elf, target->type_off);
+    uint8_t b[4];
+    for (int i = 0; i < wsize; i++) b[i] = (uint8_t)((newval >> (8 * i)) & 0xff);
+    bool ok = (s->updi_fd >= 0 && target->addr < 0x8000u &&
+               updi_mem_write(s->updi_fd, target->addr & 0xffffu, b, (size_t)wsize) >= 0);
+
+    char val[320]; bool ex = false;
+    if (ok) elf_type_render(s->elf, target->addr, target->type_off, dap_mem_cb, s, val, sizeof val, &ex);
+    else    snprintf(val, sizeof val, "<write failed>");
+    char ve[640], body[720];
+    dj_escape(val, ve, sizeof ve);
+    snprintf(body, sizeof body, "{\"value\":\"%s\",\"variablesReference\":0}", ve);
+    return dap_send_response(s, req_seq, "setVariable", ok, body);
+}
+
 /* ── Breakpoints (Phase 18) ───────────────────────────────────────────────── */
 
 void dap_bp_reset(dap_session *s)
@@ -1180,7 +1417,11 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
          * Phase 17–19 features. */
         if (dap_send_response(s, req_seq, cmd, true,
                 "{\"supportsConfigurationDoneRequest\":true,"
-                "\"supportsInstructionBreakpoints\":true}") < 0)
+                "\"supportsInstructionBreakpoints\":true,"
+                "\"supportsEvaluateForHovers\":true,"
+                "\"supportsReadMemoryRequest\":true,"
+                "\"supportsWriteMemoryRequest\":true,"
+                "\"supportsSetVariable\":true}") < 0)
             return -1;
         return dap_send_event(s, "initialized", NULL) < 0 ? -1 : 0;
     }
@@ -1262,6 +1503,18 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
 
     if (strcmp(cmd, "variables") == 0)
         return dap_handle_variables(s, msg, t, req_seq) < 0 ? -1 : 0;
+
+    if (strcmp(cmd, "evaluate") == 0)
+        return dap_handle_evaluate(s, msg, t, req_seq) < 0 ? -1 : 0;
+
+    if (strcmp(cmd, "readMemory") == 0)
+        return dap_handle_read_memory(s, msg, t, req_seq) < 0 ? -1 : 0;
+
+    if (strcmp(cmd, "writeMemory") == 0)
+        return dap_handle_write_memory(s, msg, t, req_seq) < 0 ? -1 : 0;
+
+    if (strcmp(cmd, "setVariable") == 0)
+        return dap_handle_set_variable(s, msg, t, req_seq) < 0 ? -1 : 0;
 
     if (strcmp(cmd, "disconnect") == 0 || strcmp(cmd, "terminate") == 0) {
         /* Remove all installed breakpoints from silicon before resuming, so

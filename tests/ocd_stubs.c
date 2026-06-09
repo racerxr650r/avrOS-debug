@@ -18,6 +18,8 @@
 int updi_enter_debug(int fd) { (void)fd; return 0; }
 int updi_mem_read(int fd, uint32_t a, uint8_t *b, size_t n)
 { (void)fd; (void)a; if (b) for (size_t i = 0; i < n; i++) b[i] = 0; return 0; }
+int updi_mem_write(int fd, uint32_t a, const uint8_t *b, size_t n)
+{ (void)fd; (void)a; (void)b; (void)n; return 0; }
 int updi_nvm_flash_patch(int fd, uint32_t a, const uint8_t *b, size_t n)
 { (void)fd; (void)a; (void)b; (void)n; return 0; }
 int updi_ocd_set_hw_bp(int fd, int slot, uint32_t a) { (void)fd; (void)slot; (void)a; return 0; }
@@ -57,3 +59,8 @@ int elf_type_render(const ElfContext *c, uint32_t a, uint64_t to,
 { (void)c; (void)a; (void)to; (void)rd; (void)u; (void)cap; if(ex)*ex=false; if(o&&cap)o[0]='\0'; return -1; }
 int elf_type_children(const ElfContext *c, uint32_t a, uint64_t to, ElfVar *o, int m)
 { (void)c; (void)a; (void)to; (void)o; (void)m; return -1; }
+
+int elf_var_find(const ElfContext *c, uint32_t pc, const ElfFrameRegs *fr,
+                 const char *n, uint32_t *a, uint64_t *to)
+{ (void)c; (void)pc; (void)fr; (void)n; (void)a; (void)to; return -1; }
+int elf_type_size(const ElfContext *c, uint64_t to){ (void)c; (void)to; return 2; }

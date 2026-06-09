@@ -388,6 +388,63 @@ void test_dap_variables_unknown_ref_is_empty(void)
     close(sp[0]); close(sp[1]);
 }
 
+/* `evaluate` with no ELF/target cannot resolve the expression → success:false. */
+void test_dap_evaluate_unresolved_is_error(void)
+{
+    int sp[2];
+    TEST_ASSERT_EQUAL_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sp));
+    dap_session s = { sp[1], -1, NULL, NULL, NULL, false, 0 };
+
+    const char *req = "{\"seq\":17,\"command\":\"evaluate\","
+                      "\"arguments\":{\"expression\":\"g_marker\",\"context\":\"watch\"}}";
+    TEST_ASSERT_EQUAL_INT(0, dap_dispatch(&s, req, strlen(req)));
+
+    char buf[512]; size_t len;
+    TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"command\":\"evaluate\""));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"success\":false"));
+
+    close(sp[0]); close(sp[1]);
+}
+
+/* `readMemory` with no target replies with an (empty) data field, not an error. */
+void test_dap_read_memory_responds_with_data_field(void)
+{
+    int sp[2];
+    TEST_ASSERT_EQUAL_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sp));
+    dap_session s = { sp[1], -1, NULL, NULL, NULL, false, 0 };
+
+    const char *req = "{\"seq\":18,\"command\":\"readMemory\","
+                      "\"arguments\":{\"memoryReference\":\"0x4000\",\"count\":4}}";
+    TEST_ASSERT_EQUAL_INT(0, dap_dispatch(&s, req, strlen(req)));
+
+    char buf[512]; size_t len;
+    TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"command\":\"readMemory\""));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"data\":"));
+
+    close(sp[0]); close(sp[1]);
+}
+
+/* `setVariable` on an out-of-range reference → success:false. */
+void test_dap_set_variable_unknown_ref_errors(void)
+{
+    int sp[2];
+    TEST_ASSERT_EQUAL_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sp));
+    dap_session s = { sp[1], -1, NULL, NULL, NULL, false, 0 };
+
+    const char *req = "{\"seq\":19,\"command\":\"setVariable\",\"arguments\":"
+                      "{\"variablesReference\":99,\"name\":\"x\",\"value\":\"1\"}}";
+    TEST_ASSERT_EQUAL_INT(0, dap_dispatch(&s, req, strlen(req)));
+
+    char buf[512]; size_t len;
+    TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"command\":\"setVariable\""));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"success\":false"));
+
+    close(sp[0]); close(sp[1]);
+}
+
 /* ── Phase 18: source breakpoints ─────────────────────────────────────────── */
 
 void test_dap_set_breakpoints_responds_with_per_line_entries(void)
@@ -538,6 +595,9 @@ int main(void)
     RUN_TEST(test_dap_stack_trace_returns_one_frame);
     RUN_TEST(test_dap_scopes_returns_locals_registers_globals);
     RUN_TEST(test_dap_variables_unknown_ref_is_empty);
+    RUN_TEST(test_dap_evaluate_unresolved_is_error);
+    RUN_TEST(test_dap_read_memory_responds_with_data_field);
+    RUN_TEST(test_dap_set_variable_unknown_ref_errors);
     RUN_TEST(test_dap_set_breakpoints_responds_with_per_line_entries);
     RUN_TEST(test_dap_set_breakpoints_replaces_prior_set_for_source);
     RUN_TEST(test_dap_set_instruction_breakpoints_responds_with_refs);

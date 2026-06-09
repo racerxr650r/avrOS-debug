@@ -218,6 +218,11 @@ int elf_type_render(const ElfContext *c, uint32_t a, uint64_t to,
 int elf_type_children(const ElfContext *c, uint32_t a, uint64_t to, ElfVar *o, int m)
 { (void)c; (void)a; (void)to; (void)o; (void)m; return -1; }
 
+int elf_var_find(const ElfContext *c, uint32_t pc, const ElfFrameRegs *fr,
+                 const char *n, uint32_t *a, uint64_t *to)
+{ (void)c; (void)pc; (void)fr; (void)n; (void)a; (void)to; return -1; }
+int elf_type_size(const ElfContext *c, uint64_t to){ (void)c; (void)to; return 2; }
+
 int __wrap_fsm_build_thread_list(FsmContext *c, const AvrOsSymbolIndex *i, int fd);
 int __wrap_fsm_build_thread_list(FsmContext *c, const AvrOsSymbolIndex *i, int fd)
 {
