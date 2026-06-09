@@ -221,7 +221,7 @@ Role: **unit**. **97 test(s).**
 
 ### 3.4. [tests/test_elf.c](../tests/test_elf.c)
 
-Role: **unit**. **15 test(s).**
+Role: **unit**. **16 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -240,6 +240,7 @@ Role: **unit**. **15 test(s).**
 | 13 | <a id="elf_open_extracts_device_name_from_deviceinfo_note"></a>`elf_open_extracts_device_name_from_deviceinfo_note` | `LLR-ELF-09` | After `elf_open()` on every AVR fixture (all built for AVR128DA28), verify `ctx.device_name` equals `"avr128da28"` — the lowercase part-name string extracted from the `.note.gnu.avr.deviceinfo` ELF note via libelf section data. |
 | 14 | <a id="elf_open_leaves_device_name_empty_when_note_absent"></a>`elf_open_leaves_device_name_empty_when_note_absent` | `LLR-ELF-09` | Copy the full fixture to a temp path and zero every `"avr<digit>"` ASCII triplet so the deviceinfo heuristic finds nothing, then `elf_open()` the rewritten ELF and verify it still returns 0 and `ctx.device_name` is the empty string. Proves the note-extraction step is non-fatal on inputs that lack the note. |
 | 15 | <a id="elf_dwarf_accessors_round_trip"></a>`elf_dwarf_accessors_round_trip` | `LLR-ELF-11`, `LLR-ELF-12`, `LLR-ELF-13` | On a `-g` fixture, verify `elf_dwarf_available()` returns 1; map the entry-point code address to a source `file:line` via `elf_addr_to_line()` (when it resolves, assert line > 0 and a non-empty file, and that `elf_line_to_addr()` returns a real address for that `file:line`); and verify `elf_addr_to_line()` on an address far outside any CU returns -1 without crashing. |
+| 16 | <a id="elf_cfi_cfa_extracts_avr_frame_rules"></a>`elf_cfi_cfa_extracts_avr_frame_rules` | `LLR-ELF-14` | On the gdb_debug_session fixture (whose nested `main->top->mid->leaf` chain has stable, `avr-readelf --debug-dump=frames`-verified CFI), assert `elf_cfi_cfa()` returns the expected Canonical-Frame-Address rules: at `mid()` entry (0x17a) CFA = r32(SP)+2; after the Y-prologue (0x188) CFA = r28+10; at `main()` entry (0x266) CFA = r32+2; and an address past the last FDE (0x7FFF) returns -1 without crashing. Deterministic / hardware-free guard for the in-tree `.debug_frame` interpreter. Per LLR-ELF-14. |
 
 ### 3.5. [tests/test_fsm.c](../tests/test_fsm.c)
 
@@ -417,6 +418,18 @@ Role: **hardware**. **8 test(s).**
 | 7 | <a id="DAP7_source_breakpoint_hit"></a>`DAP7_source_breakpoint_hit` | — | Phase-18 source breakpoints. `setBreakpoints` for `main.c:139` (the avrOS example's `fsmDispatch()` call) — verify it resolves+verifies via DWARF and installs through the shared breakpoint core — then `continue` and verify the adapter emits a `stopped` event with reason `breakpoint`, proving file:line breakpoint resolution + install + hit end-to-end on silicon. Per HLR-079 / LLR-DAP-10. |
 | 8 | <a id="DAP8_disconnect_clean"></a>`DAP8_disconnect_clean` | — | Issue a `disconnect` request and verify the session tears down cleanly (installed breakpoints removed, target resumed) — accepting either the disconnect response or the session object going away, since nvim-dap does not always deliver the response callback as the adapter closes the socket. Per HLR-076 / HLR-079. |
 
+### 3.14. [tests/hw/dap_unwind.py](../tests/hw/dap_unwind.py)
+
+Role: **hardware**. **5 test(s).**
+
+| # | Test | Verifies | Purpose |
+| - | ---- | -------- | ------- |
+| 1 | <a id="DAP_U1_instr_bp_at_leaf_verified"></a>`DAP_U1_instr_bp_at_leaf_verified` | — | `setInstructionBreakpoints` at a post-prologue address inside `leaf` returns a verified breakpoint, installed through the shared core on silicon. Per LLR-DAP-10. |
+| 2 | <a id="DAP_U2_continue_to_breakpoint"></a>`DAP_U2_continue_to_breakpoint` | — | `continue` from reset runs the `main->top->mid->leaf` chain and halts at the `leaf` instruction breakpoint, emitting `stopped` with reason `breakpoint`. Per HLR-079. |
+| 3 | <a id="DAP_U3_stacktrace_depth"></a>`DAP_U3_stacktrace_depth` | — | `stackTrace` at the `leaf` stop returns at least four frames — proving the CFI unwinder walks past frame 0. Per HLR-080 / LLR-DAP-11. |
+| 4 | <a id="DAP_U4_frames_map_to_call_chain"></a>`DAP_U4_frames_map_to_call_chain` | `LLR-DAP-11`, `LLR-ELF-14` | Each of the first four stack frames' PCs falls inside the expected function of the call chain (`leaf`, `mid`, `top`, `main`), checked against the functions' address ranges from `avr-nm -S` — proving the recovered return addresses are correct, not just non-empty. Per HLR-080 / LLR-DAP-11 / LLR-ELF-14. |
+| 5 | <a id="DAP_U5_frames_resolve_source_lines"></a>`DAP_U5_frames_resolve_source_lines` | — | Each chain frame resolves to a source line (`line > 0`) via DWARF, confirming the unwound caller PCs map to real source through `elf_addr_to_line()`. Per HLR-080 / HLR-072. |
+
 ## 4. LLR Coverage Matrix
 
 Every LLR in [LLRs.md](LLRs.md) and the test(s) that verify it.
@@ -542,6 +555,7 @@ verified by code review — see
 | `LLR-ELF-11` | `elf` | `HLR-072` | `elf_dwarf_accessors_round_trip` |
 | `LLR-ELF-12` | `elf` | `HLR-072` | `elf_dwarf_accessors_round_trip` |
 | `LLR-ELF-13` | `elf` | `HLR-072` | `elf_dwarf_accessors_round_trip` |
+| `LLR-ELF-14` | `elf` | `HLR-080` | `elf_cfi_cfa_extracts_avr_frame_rules`, `DAP_U4_frames_map_to_call_chain` |
 | `LLR-FSM-01` | `fsm` | `HLR-024` | `fsm_build_thread_list_reads_fsm_table_from_flash_via_updi`, `fsm_build_thread_list_returns_minus1_on_updi_failure` |
 | `LLR-FSM-03` | `fsm` | `HLR-025` | `fsm_build_thread_list_sets_active_thread_from_current_fsm_ptr`, `fsm_build_thread_list_sets_active_id_0_when_no_entry_matches` |
 | `LLR-MON-01` | `monitor` | `HLR-029` | `monitor_dispatch_hex_decodes_cmd_before_prefix_matching`, `monitor_dispatch_treats_invalid_hex_sequence_as_unrecognised`, `D6_rsp_monitor_info_verb` |
@@ -585,3 +599,4 @@ verified by code review — see
 | `LLR-DAP-08` | `dap` | `HLR-078` | `dap_continue_responds_and_emits_continued`, `dap_pause_emits_stopped_pause`, `dap_step_emits_stopped_step` |
 | `LLR-DAP-09` | `dap` | `HLR-078`, `HLR-072` | `dap_stack_trace_returns_one_frame`, `dap_scopes_returns_empty` |
 | `LLR-DAP-10` | `dap` | `HLR-079`, `HLR-054` | `dap_set_breakpoints_responds_with_per_line_entries`, `dap_set_breakpoints_replaces_prior_set_for_source`, `dap_set_instruction_breakpoints_responds_with_refs` |
+| `LLR-DAP-11` | `dap` | `HLR-080`, `HLR-072` | `DAP_U4_frames_map_to_call_chain` |

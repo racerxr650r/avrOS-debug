@@ -124,4 +124,16 @@ int elf_addr_to_line(const ElfContext *ctx, uint32_t byte_addr,
 int elf_line_to_addr(const ElfContext *ctx, const char *file, int line,
                      uint32_t *byte_addr);
 
+/* Call-Frame-Information rule for the (canonical) frame address (CFA) at a
+ * code-space byte address.  On success returns 0 and stores the DWARF register
+ * whose value forms the CFA base in *cfa_reg (AVR: 28 = the Y frame-pointer
+ * pair r28:r29, or 32 = SP) and the signed byte offset added to it in
+ * *cfa_offset, so CFA = value(cfa_reg) + cfa_offset.  Returns -1 when the ELF
+ * lacks `.debug_frame`, `addr` is not covered by an FDE, or the CFA rule is not
+ * the simple register+offset form avr-gcc emits.  This is the per-PC half of a
+ * stack unwind; the return-address and saved-frame-pointer recovery (AVR's
+ * 2-byte word return address, word<->byte PC) live in the caller's unwinder. */
+int elf_cfi_cfa(const ElfContext *ctx, uint32_t byte_addr,
+                int *cfa_reg, int *cfa_offset);
+
 #endif /* AOD_ELF_PARSER_H */

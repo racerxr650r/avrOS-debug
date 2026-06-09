@@ -387,3 +387,216 @@ int elf_line_to_addr(const ElfContext *ctx, const char *want_file,
     }
     return -1;
 }
+
+/* ── .debug_frame CFI (CFA-rule) parser ──────────────────────────────────────
+ *
+ * libdw's high-level CFI executor (dwarf_cfi_addrframe) returns UNKNOWN_ERROR
+ * on AVR `.debug_frame` — GDB likewise ships its own CFI interpreter rather
+ * than relying on libdw for this target.  The CFA-defining slice of the CFI
+ * instruction set is tiny, so we run our own minimal state machine: enough to
+ * recover CFA = value(cfa_reg) + cfa_offset at a PC.  Register-save rules
+ * (DW_CFA_offset &c.) are parsed only far enough to skip their operands — the
+ * return-address / saved-frame-pointer recovery lives in the unwinder, which
+ * applies AVR's fixed stack conventions. */
+
+static uint64_t cfi_uleb(const uint8_t **pp, const uint8_t *end)
+{
+    uint64_t v = 0; int s = 0; const uint8_t *p = *pp;
+    while (p < end) {
+        uint8_t b = *p++;
+        v |= (uint64_t)(b & 0x7f) << s;
+        s += 7;
+        if (!(b & 0x80)) break;
+    }
+    *pp = p;
+    return v;
+}
+
+static int64_t cfi_sleb(const uint8_t **pp, const uint8_t *end)
+{
+    int64_t v = 0; int s = 0; uint8_t b = 0; const uint8_t *p = *pp;
+    while (p < end) {
+        b = *p++;
+        v |= (int64_t)(b & 0x7f) << s;
+        s += 7;
+        if (!(b & 0x80)) break;
+    }
+    if (s < 64 && (b & 0x40)) v |= -((int64_t)1 << s);
+    *pp = p;
+    return v;
+}
+
+static uint32_t cfi_read_n(const uint8_t **pp, unsigned n)
+{
+    const uint8_t *p = *pp; uint32_t v = 0;
+    for (unsigned i = 0; i < n; i++) v |= (uint32_t)p[i] << (8 * i);
+    *pp += n;
+    return v;
+}
+
+typedef struct {
+    uint8_t        code_align;     /* code alignment factor (ULEB)            */
+    int8_t         addr_size;      /* address size in bytes (4 on AVR ELF32)  */
+    const uint8_t *insn, *insn_end;/* initial instruction range               */
+} CfiCie;
+
+/* Run the CIE-initial then FDE instructions, advancing `loc` until the next
+ * advance would pass `pc`; track only the CFA rule.  Returns 0 if a CFA rule
+ * was established by then, -1 otherwise. */
+static int cfi_run(const CfiCie *cie, const uint8_t *fde, const uint8_t *fde_end,
+                   uint32_t init_loc, uint32_t pc, int *cfa_reg, int *cfa_offset)
+{
+    uint32_t loc = init_loc;
+    int reg = -1; long off = 0; bool have = false;
+
+    for (int pass = 0; pass < 2; pass++) {
+        const uint8_t *p   = pass ? fde : cie->insn;
+        const uint8_t *end = pass ? fde_end : cie->insn_end;
+        while (p < end) {
+            uint8_t op = *p++;
+            uint8_t hi = op & 0xc0, lo = op & 0x3f;
+            if (hi == DW_CFA_advance_loc) {
+                if (loc + (uint32_t)lo * cie->code_align > pc) goto done;
+                loc += (uint32_t)lo * cie->code_align;
+            } else if (hi == DW_CFA_offset) {           /* reg=lo, ULEB off  */
+                (void)cfi_uleb(&p, end);
+            } else if (hi == DW_CFA_restore) {           /* reg=lo, no operand*/
+                /* nothing */
+            } else switch (lo) {                         /* hi == 0 (extended)*/
+                case DW_CFA_nop: break;
+                case DW_CFA_set_loc: {
+                    uint32_t a = cfi_read_n(&p, (unsigned)cie->addr_size);
+                    if (a > pc) goto done;
+                    loc = a;
+                    break; }
+                case DW_CFA_advance_loc1: case DW_CFA_advance_loc2:
+                case DW_CFA_advance_loc4: {
+                    unsigned n = (lo == DW_CFA_advance_loc1) ? 1u
+                               : (lo == DW_CFA_advance_loc2) ? 2u : 4u;
+                    uint32_t d = cfi_read_n(&p, n) * cie->code_align;
+                    if (loc + d > pc) goto done;
+                    loc += d;
+                    break; }
+                case DW_CFA_def_cfa:
+                    reg = (int)cfi_uleb(&p, end);
+                    off = (long)cfi_uleb(&p, end); have = true; break;
+                case DW_CFA_def_cfa_register:
+                    reg = (int)cfi_uleb(&p, end); have = true; break;
+                case DW_CFA_def_cfa_offset:
+                    off = (long)cfi_uleb(&p, end); break;
+                case DW_CFA_def_cfa_sf:
+                    reg = (int)cfi_uleb(&p, end);
+                    off = (long)cfi_sleb(&p, end); have = true; break;
+                case DW_CFA_def_cfa_offset_sf:
+                    off = (long)cfi_sleb(&p, end); break;
+                /* register-save / misc rules: consume operands, ignore */
+                case DW_CFA_offset_extended:
+                case DW_CFA_register:
+                case DW_CFA_val_offset:
+                    (void)cfi_uleb(&p, end); (void)cfi_uleb(&p, end); break;
+                case DW_CFA_offset_extended_sf:
+                case DW_CFA_val_offset_sf:
+                    (void)cfi_uleb(&p, end); (void)cfi_sleb(&p, end); break;
+                case DW_CFA_restore_extended:
+                case DW_CFA_undefined:
+                case DW_CFA_same_value:
+                    (void)cfi_uleb(&p, end); break;
+                case DW_CFA_remember_state:
+                case DW_CFA_restore_state:
+                    break;  /* AVR prologues don't alter the CFA across these */
+                case DW_CFA_expression: case DW_CFA_val_expression: {
+                    (void)cfi_uleb(&p, end);
+                    uint64_t len = cfi_uleb(&p, end); p += len; break; }
+                case DW_CFA_def_cfa_expression: {
+                    uint64_t len = cfi_uleb(&p, end); p += len;
+                    have = false; reg = -1; break; }  /* unsupported CFA form */
+                default: goto done;  /* unknown opcode — stop conservatively */
+            }
+        }
+    }
+done:
+    if (!have || reg < 0) return -1;
+    if (cfa_reg    != NULL) *cfa_reg    = reg;
+    if (cfa_offset != NULL) *cfa_offset = (int)off;
+    return 0;
+}
+
+/* Locate and parse the CIE at section offset `cie_off`; fill *out.  Returns 0
+ * on success. */
+static int cfi_parse_cie(const uint8_t *base, size_t size, size_t cie_off,
+                         CfiCie *out)
+{
+    if (cie_off + 4 > size) return -1;
+    const uint8_t *p = base + cie_off;
+    uint32_t len = cfi_read_n(&p, 4);
+    if (len == 0xffffffffu || len == 0) return -1;       /* 64-bit DWARF: n/a */
+    const uint8_t *end = p + len;
+    if (end > base + size) return -1;
+    (void)cfi_read_n(&p, 4);                              /* CIE_id (0xffff…) */
+    uint8_t version = *p++;
+    const char *aug = (const char *)p;
+    while (p < end && *p) p++;                            /* augmentation str */
+    if (p < end) p++;                                     /* NUL              */
+    out->addr_size = 4;                                   /* AVR ELF32        */
+    if (version >= 4) { out->addr_size = (int8_t)*p++; p++; /* addr+seg size  */ }
+    out->code_align = (uint8_t)cfi_uleb(&p, end);
+    (void)cfi_sleb(&p, end);                              /* data align factor*/
+    if (version == 1) p++;                                /* RA reg (1 byte)  */
+    else (void)cfi_uleb(&p, end);                         /* RA reg (ULEB)    */
+    if (aug[0] == 'z') return -1;       /* augmentation data present: skip CIE*/
+    out->insn = p; out->insn_end = end;
+    return 0;
+}
+
+/* See elf_parser.h. */
+int elf_cfi_cfa(const ElfContext *ctx, uint32_t byte_addr,
+                int *cfa_reg, int *cfa_offset)
+{
+    if (ctx == NULL || ctx->elf == NULL)
+        return -1;
+
+    Elf     *e = (Elf *)ctx->elf;
+    size_t   shstrndx = 0;
+    if (elf_getshdrstrndx(e, &shstrndx) != 0)
+        return -1;
+
+    Elf_Data *data = NULL;
+    Elf_Scn  *scn  = NULL;
+    while ((scn = elf_nextscn(e, scn)) != NULL) {
+        GElf_Shdr sh;
+        if (gelf_getshdr(scn, &sh) == NULL) continue;
+        const char *nm = elf_strptr(e, shstrndx, sh.sh_name);
+        if (nm != NULL && strcmp(nm, ".debug_frame") == 0) {
+            data = elf_getdata(scn, NULL);
+            break;
+        }
+    }
+    if (data == NULL || data->d_buf == NULL || data->d_size == 0)
+        return -1;
+
+    const uint8_t *base = data->d_buf;
+    size_t         size = data->d_size;
+
+    /* Walk entries; on the FDE covering byte_addr, parse its CIE and run. */
+    size_t off = 0;
+    while (off + 8 <= size) {
+        const uint8_t *p   = base + off;
+        uint32_t       len = cfi_read_n(&p, 4);
+        if (len == 0xffffffffu || len == 0) break;       /* 64-bit / padding */
+        size_t entry_end = (size_t)(p - base) + len;
+        if (entry_end > size) break;
+        uint32_t cie_id = cfi_read_n(&p, 4);
+        if (cie_id != 0xffffffffu) {                      /* FDE              */
+            CfiCie cie;
+            if (cfi_parse_cie(base, size, (size_t)cie_id, &cie) == 0) {
+                uint32_t init_loc = cfi_read_n(&p, (unsigned)cie.addr_size);
+                uint32_t range    = cfi_read_n(&p, (unsigned)cie.addr_size);
+                if (byte_addr >= init_loc && byte_addr < init_loc + range)
+                    return cfi_run(&cie, p, base + entry_end, init_loc,
+                                   byte_addr, cfa_reg, cfa_offset);
+            }
+        }
+        off = entry_end;
+    }
+    return -1;
+}

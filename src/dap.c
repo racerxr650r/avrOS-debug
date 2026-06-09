@@ -507,46 +507,149 @@ static int dap_emit_stopped(dap_session *s, const char *reason)
     return dap_send_event(s, "stopped", body);
 }
 
-/* Phase 17: shallow `stackTrace` — frame 0 only.  Reads the live PC over OCD
- * and resolves it to `file:line` via libdw (elf_addr_to_line).  Deeper frames
- * (DWARF CFI unwinding) and real function names are Phase 18.  With no target
- * (updi_fd < 0, unit tests) or no DWARF, it still returns one frame so the
- * client has a valid stack. */
-static int dap_handle_stack_trace(dap_session *s, long req_seq)
+/* Format one DAP stackFrame object into `out`.  Resolves `pc` to file:line via
+ * libdw when a DWARF-bearing ELF is attached; otherwise emits a frame with no
+ * source (line 0) so the client still has a valid entry. */
+static void dap_format_frame(dap_session *s, int id, uint32_t pc,
+                             char *out, size_t cap)
 {
-    uint32_t pc = 0;
-    char     file[256];
-    int      line = 0;
-    bool     have_src = false;
-
-    if (s->updi_fd >= 0 && updi_ocd_read_pc(s->updi_fd, &pc) == 0 &&
-        s->elf != NULL &&
-        elf_addr_to_line(s->elf, pc, file, sizeof file, &line) == 0)
-        have_src = true;
-
-    char frame[1024];
-    if (have_src) {
-        char        pesc[600];
+    char file[256];
+    int  line = 0;
+    if (s->elf != NULL &&
+        elf_addr_to_line(s->elf, pc, file, sizeof file, &line) == 0) {
         const char *base = strrchr(file, '/');
         base = base ? base + 1 : file;
-        char besc[200];
+        char pesc[600], besc[200];
         dj_escape(file, pesc, sizeof pesc);
         dj_escape(base, besc, sizeof besc);
-        (void)snprintf(frame, sizeof frame,
-            "{\"id\":0,\"name\":\"0x%06lx\",\"line\":%d,\"column\":1,"
+        (void)snprintf(out, cap,
+            "{\"id\":%d,\"name\":\"0x%06lx\",\"line\":%d,\"column\":1,"
             "\"instructionPointerReference\":\"0x%lx\","
             "\"source\":{\"name\":\"%s\",\"path\":\"%s\"}}",
-            (unsigned long)pc, line, (unsigned long)pc, besc, pesc);
+            id, (unsigned long)pc, line, (unsigned long)pc, besc, pesc);
     } else {
-        (void)snprintf(frame, sizeof frame,
-            "{\"id\":0,\"name\":\"0x%06lx\",\"line\":0,\"column\":1,"
+        (void)snprintf(out, cap,
+            "{\"id\":%d,\"name\":\"0x%06lx\",\"line\":0,\"column\":1,"
             "\"instructionPointerReference\":\"0x%lx\"}",
-            (unsigned long)pc, (unsigned long)pc);
+            id, (unsigned long)pc, (unsigned long)pc);
+    }
+}
+
+#define DAP_MAX_FRAMES 32
+
+/* Phase 18: multi-frame stack unwind via .debug_frame CFI + the live target.
+ *
+ * For each frame we get the CFA rule (CFA = value(cfa_reg) + offset) from
+ * elf_cfi_cfa(), where cfa_reg is the Y frame-pointer pair r28:r29 (28) or SP
+ * (32).  AVR's fixed stack conventions then give the caller:
+ *   - the 2-byte word return address sits just below the CFA (a `call` pushes
+ *     the word PC); the code-space byte PC is that word << 1;
+ *   - the caller's Y was saved by the callee prologue (push r28; push r29), so
+ *     r28 (Y-low) is the byte just under the return address and r29 (Y-high)
+ *     one lower still.
+ * The caller's SP at its call site is the CFA.  We stop at an invalid return
+ * address (0, odd-of-range), when the CFA stops advancing, or at DAP_MAX_FRAMES.
+ * The exact byte offsets are AVR-silicon conventions, locked against avr-gdb's
+ * backtrace on the gdb_debug_session fixture (DAP9, doc/UserManual Appendix B).
+ *
+ * Fills pcs[0..n-1] (frame 0 = innermost) and returns n (>= 1), or 0 if the
+ * live registers can't be read. */
+static int dap_unwind(dap_session *s, uint32_t *pcs, int max)
+{
+    uint32_t pc = 0, y;
+    uint16_t sp16 = 0;
+    uint8_t  r28 = 0, r29 = 0;
+
+    if (s->updi_fd < 0 || s->elf == NULL) return 0;
+    if (updi_ocd_read_pc (s->updi_fd, &pc)      != 0) return 0;
+    if (updi_ocd_read_sp (s->updi_fd, &sp16)    != 0) return 0;
+    if (updi_ocd_read_gpr(s->updi_fd, 28, &r28) != 0) return 0;
+    if (updi_ocd_read_gpr(s->updi_fd, 29, &r29) != 0) return 0;
+
+    uint32_t sp = sp16;
+    y = (uint32_t)r28 | ((uint32_t)r29 << 8);
+
+    uint32_t flash_size = s->elf->flash_size;
+    const bool dbg = getenv("AVROSDB_DAP_UNWIND_LOG") != NULL;
+
+    int n = 0;
+    pcs[n++] = pc;
+    uint32_t prev_cfa = 0;
+    while (n < max) {
+        int cfa_reg = 0, cfa_off = 0;
+        if (elf_cfi_cfa(s->elf, pc, &cfa_reg, &cfa_off) != 0) break;
+        uint32_t base = (cfa_reg == 32) ? sp : y;
+        uint32_t cfa  = (base + (uint32_t)cfa_off) & 0xffffu;
+
+        uint32_t ra_word = 0, caller_y = 0;
+        /* Return-address word spans [CFA-1, CFA] — the CIE's "RA at cfa-1" — as
+         * the 2-byte word PC a `call` pushed, high byte at CFA-1, low at CFA. */
+        {
+            uint8_t rb[2];
+            if (updi_mem_read(s->updi_fd, (cfa - 1u) & 0xffffu, rb, 2) < 0) break;
+            ra_word = (uint32_t)rb[1] | ((uint32_t)rb[0] << 8);
+        }
+        /* Caller's saved Y: the callee prologue did `push r28; push r29`, so
+         * r28 (Y-low) lands at CFA-2 and r29 (Y-high) at CFA-3. */
+        {
+            uint8_t yb[2];
+            if (updi_mem_read(s->updi_fd, (cfa - 3u) & 0xffffu, yb, 2) >= 0)
+                caller_y = (uint32_t)yb[1] | ((uint32_t)yb[0] << 8);
+        }
+
+        if (dbg) {
+            uint8_t win[10];
+            (void)updi_mem_read(s->updi_fd, (cfa - 6u) & 0xffffu, win, sizeof win);
+            fprintf(stderr,
+                "[unwind] f%d pc=0x%04x cfa=r%d+%d=0x%04x  win[cfa-6..+3]="
+                "%02x %02x %02x %02x %02x %02x|%02x %02x %02x %02x  "
+                "ra_word@cfa=0x%04x->pc=0x%04x  caller_y=0x%04x\n",
+                n - 1, pc, cfa_reg, cfa_off, cfa,
+                win[0],win[1],win[2],win[3],win[4],win[5],win[6],win[7],win[8],win[9],
+                ra_word, ra_word << 1, caller_y);
+        }
+
+        uint32_t ra_byte = ra_word << 1;   /* AVR word PC -> byte address */
+        if (ra_word == 0) break;
+        if (flash_size != 0 && ra_byte >= flash_size) break;
+        if (cfa == prev_cfa) break;        /* no progress — bail */
+
+        prev_cfa = cfa;
+        pc = ra_byte;
+        sp = cfa;
+        y  = caller_y;
+        pcs[n++] = pc;
+    }
+    return n;
+}
+
+/* Phase 17 → 18: `stackTrace`.  Frame 0 from the live PC; deeper frames via
+ * DWARF CFI unwinding (dap_unwind).  With no target (updi_fd < 0, unit tests)
+ * or no DWARF it still returns one frame so the client has a valid stack. */
+static int dap_handle_stack_trace(dap_session *s, long req_seq)
+{
+    uint32_t pcs[DAP_MAX_FRAMES];
+    int n = dap_unwind(s, pcs, DAP_MAX_FRAMES);
+    if (n <= 0) {
+        uint32_t pc = 0;
+        (void)(s->updi_fd >= 0 && updi_ocd_read_pc(s->updi_fd, &pc) == 0);
+        pcs[0] = pc;
+        n = 1;
     }
 
-    char body[1100];
-    (void)snprintf(body, sizeof body,
-                   "{\"stackFrames\":[%s],\"totalFrames\":1}", frame);
+    char body[4096];
+    size_t off = 0;
+    int w = snprintf(body, sizeof body, "{\"stackFrames\":[");
+    if (w > 0) off = (size_t)w;
+    for (int i = 0; i < n; i++) {
+        char frame[1024];
+        dap_format_frame(s, i, pcs[i], frame, sizeof frame);
+        w = snprintf(body + off, sizeof body - off, "%s%s", i ? "," : "", frame);
+        if (w < 0 || (size_t)w >= sizeof body - off) break;
+        off += (size_t)w;
+    }
+    (void)snprintf(body + off, sizeof body - off,
+                   "],\"totalFrames\":%d}", n);
     return dap_send_response(s, req_seq, "stackTrace", true, body);
 }
 

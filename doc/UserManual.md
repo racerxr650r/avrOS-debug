@@ -1411,7 +1411,49 @@ or the read fails or returns garbage:
 > hardware failures after a struct change, suspect a stale object before the
 > logic.
 
-### B.17 Further reading
+### B.17 Multi-frame stack unwinding (DWARF CFI on AVR)
+
+A full backtrace (GDB's `bt`, the DAP `stackTrace`) needs to walk from the
+halted frame up through its callers. The robust way is the target's **DWARF
+Call-Frame-Information** (`.debug_frame`), which records, per code range, how to
+compute the **Canonical Frame Address (CFA)** and where each saved register
+lives. Two AVR-specific realities shape the implementation in `avrOSdb`:
+
+1. **libdw cannot execute AVR CFI.** elfutils' high-level walker
+   (`dwarf_cfi_addrframe()`) returns `UNKNOWN_ERROR` on a valid AVR
+   `.debug_frame` PC — GDB itself ships its own CFI interpreter rather than
+   relying on libdw for this. So `elf_cfi_cfa()` parses `.debug_frame` directly:
+   it locates the section with libelf, walks the CIE/FDE entries, and runs a
+   minimal CFI state machine (`DW_CFA_def_cfa*`, `advance_loc`, operand-skipping
+   of the register-save opcodes) up to the requested PC to recover the CFA rule.
+
+2. **The CFA rule and the saved-register layout are AVR conventions.** The rule
+   is `CFA = value(reg) + offset`, where avr-gcc uses DWARF register **r28** to
+   mean the **16-bit Y frame-pointer pair** `r28:r29` and **r32** to mean SP. At
+   a function's entry the rule is `SP + 2` (just the pushed return address);
+   after the Y-prologue (`push r28; push r29; … ; Y = SP`) it becomes
+   `r28 + frame_size`. From the CFA, the caller is recovered with fixed offsets
+   that were **locked against the known `main→top→mid→leaf` call chain** on
+   silicon (they don't fall out of the DWARF offsets cleanly because of AVR's
+   word-addressed PC and post-decrement push):
+
+   | Quantity | Location | Reconstruction |
+   | -------- | -------- | -------------- |
+   | Return-address word | `[CFA-1, CFA]` | high byte at `CFA-1`, low at `CFA` |
+   | Caller code PC (byte) | — | `return_word << 1` (PC is word-addressed) |
+   | Caller's saved Y | `r28 @ CFA-2`, `r29 @ CFA-3` | `Y = mem[CFA-2] | mem[CFA-3] << 8` |
+   | Caller's SP at its call | — | the callee's CFA |
+
+The unwinder (`dap_unwind()` in `src/dap.c`) reads the innermost PC/SP/Y over
+OCD, then iterates: get the CFA rule, read the return word and caller Y from
+target SRAM, and repeat with `PC = caller`, `SP = CFA`, `Y = caller Y`. It stops
+at a zero/out-of-FLASH return address, at a PC no FDE covers (the C-runtime
+frame that called `main`), or at a frame cap. Set `AVROSDB_DAP_UNWIND_LOG=1` to
+dump each frame's CFA and the surrounding stack bytes — the same way `--log-rsp`
+exposes the GDB wire. `make hw-test-dap-unwind` validates the whole chain end to
+end on hardware (the DAP analogue of the GDB G18 backtrace test).
+
+### B.18 Further reading
 
 - [`doc/reference/guesswork.md`](reference/guesswork.md) — the reverse-engineering
   lab notebook, including the FF-bomb register-mapping method and the full v0/v1

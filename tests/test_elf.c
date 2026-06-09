@@ -338,6 +338,41 @@ void test_elf_dwarf_accessors_round_trip(void)
     elf_close(&ctx);
 }
 
+/* ── Test 16: .debug_frame CFA-rule extraction ───────────────────────── *
+ * elf_cfi_cfa() runs our minimal CFI interpreter over .debug_frame.  The     *
+ * gdb_debug_session fixture's nested call chain has stable, hand-verified     *
+ * CFA rules: at a function entry the CFA is SP (r32) + 2, and after the       *
+ * Y-frame-pointer prologue it becomes r28 + frame_offset.  These match        *
+ * `avr-readelf --debug-dump=frames`.                                          */
+void test_elf_cfi_cfa_extracts_avr_frame_rules(void)
+{
+    ElfContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    TEST_ASSERT_EQUAL_INT(0, elf_open(FIXTURE_DIR "/gdb_debug_session.elf", &ctx));
+
+    int reg = -1, off = -999;
+
+    /* mid() entry (0x17a): CFA = SP(r32) + 2 (just the pushed return addr). */
+    TEST_ASSERT_EQUAL_INT(0, elf_cfi_cfa(&ctx, 0x17a, &reg, &off));
+    TEST_ASSERT_EQUAL_INT(32, reg);
+    TEST_ASSERT_EQUAL_INT(2,  off);
+
+    /* mid() post-prologue (0x188): CFA = Y(r28) + 10. */
+    TEST_ASSERT_EQUAL_INT(0, elf_cfi_cfa(&ctx, 0x188, &reg, &off));
+    TEST_ASSERT_EQUAL_INT(28, reg);
+    TEST_ASSERT_EQUAL_INT(10, off);
+
+    /* main() entry (0x266): CFA = SP(r32) + 2. */
+    TEST_ASSERT_EQUAL_INT(0, elf_cfi_cfa(&ctx, 0x266, &reg, &off));
+    TEST_ASSERT_EQUAL_INT(32, reg);
+    TEST_ASSERT_EQUAL_INT(2,  off);
+
+    /* An address past the last FDE has no rule — returns -1, never crashes. */
+    TEST_ASSERT_EQUAL_INT(-1, elf_cfi_cfa(&ctx, 0x7FFFu, &reg, &off));
+
+    elf_close(&ctx);
+}
+
 /* ── Test runner ─────────────────────────────────────────────────────── */
 int main(void)
 {
@@ -357,5 +392,6 @@ int main(void)
     RUN_TEST(test_elf_open_extracts_device_name_from_deviceinfo_note);
     RUN_TEST(test_elf_open_leaves_device_name_empty_when_note_absent);
     RUN_TEST(test_elf_dwarf_accessors_round_trip);
+    RUN_TEST(test_elf_cfi_cfa_extracts_avr_frame_rules);
     return UNITY_END();
 }
