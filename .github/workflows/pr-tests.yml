@@ -22,7 +22,7 @@ jobs:
       - name: Bootstrap container
         run: |
           apt-get update -q
-          apt-get install -y --no-install-recommends sudo git ca-certificates
+          apt-get install -y --no-install-recommends make sudo git ca-certificates
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -173,7 +173,7 @@ jobs:
       - name: Bootstrap container
         run: |
           apt-get update -q
-          apt-get install -y --no-install-recommends sudo git ca-certificates
+          apt-get install -y --no-install-recommends make sudo git ca-certificates
 
       - name: Checkout
         uses: actions/checkout@v4
