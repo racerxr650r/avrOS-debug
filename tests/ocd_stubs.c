@@ -31,6 +31,8 @@ int updi_ocd_write_sp(int fd, uint16_t v) { (void)fd; (void)v; return 0; }
 int updi_ocd_write_pc(int fd, uint32_t a) { (void)fd; (void)a; return 0; }
 int updi_ocd_stabilize_pc_after_write(int fd) { (void)fd; return 0; }
 int updi_ocd_step_inject_word0(int fd, uint16_t w) { (void)fd; (void)w; return 0; }
+int updi_step_32bit(int fd, int slot, uint32_t tgt, bool hoj) { (void)fd; (void)slot; (void)tgt; (void)hoj; return 0; }
+int updi_ocd_emulate_cof_32bit(int fd, uint32_t ret, uint32_t tgt) { (void)fd; (void)ret; (void)tgt; return 0; }
 int updi_save_peripherals(int fd, uint8_t *b) { (void)fd; (void)b; return 0; }
 int updi_restore_peripherals(int fd, const uint8_t *b) { (void)fd; (void)b; return 0; }
 
@@ -39,3 +41,7 @@ int elf_line_to_addr(const ElfContext *c, const char *f, int line, uint32_t *a)
 
 int elf_cfi_cfa(const ElfContext *c, uint32_t a, int *reg, int *off)
 { (void)c; (void)a; (void)reg; (void)off; return -1; } /* no CFI in unit tests */
+
+int elf_var_addr(const ElfContext *c, uint32_t pc, const ElfFrameRegs *fr,
+                 const char *n, uint32_t *a, int *sz, bool *sg)
+{ (void)c; (void)pc; (void)fr; (void)n; (void)a; (void)sz; (void)sg; return -1; }

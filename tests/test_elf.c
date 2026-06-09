@@ -373,6 +373,47 @@ void test_elf_cfi_cfa_extracts_avr_frame_rules(void)
     elf_close(&ctx);
 }
 
+/* ── Test 17: DWARF variable address/type resolution ─────────────────── *
+ * elf_var_addr() resolves a name visible at a PC to its data-space address    *
+ * and type, evaluating the DWARF location with live frame registers.  On the  *
+ * gdb_debug_session fixture: the global `g_marker` (DW_OP_addr) resolves to a  *
+ * masked SRAM address with a 2-byte unsigned type; the leaf() parameters `a`  *
+ * and `b` (DW_OP_breg28 + 5 / + 7) resolve relative to the supplied Y pair;   *
+ * an unknown name returns -1.                                                 */
+void test_elf_var_addr_resolves_globals_and_locals(void)
+{
+    ElfContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    TEST_ASSERT_EQUAL_INT(0, elf_open(FIXTURE_DIR "/gdb_debug_session.elf", &ctx));
+
+    uint32_t addr = 0;
+    int      size = 0;
+    bool     sg   = true;
+
+    /* Global g_marker — file scope, DW_OP_addr. PC inside leaf still finds it
+     * by searching outward to the CU. */
+    TEST_ASSERT_EQUAL_INT(0,
+        elf_var_addr(&ctx, 0x100, NULL, "g_marker", &addr, &size, &sg));
+    TEST_ASSERT_NOT_EQUAL(0u, addr);
+    TEST_ASSERT_EQUAL_INT(2, size);
+    TEST_ASSERT_FALSE(sg);                 /* volatile uint16_t */
+
+    /* Locals a (Y+5) and b (Y+7) of leaf, relative to a synthetic Y. */
+    ElfFrameRegs fr = { 0x2010u, 0x2000u, 0x1ff0u };
+    TEST_ASSERT_EQUAL_INT(0,
+        elf_var_addr(&ctx, 0x100, &fr, "a", &addr, &size, &sg));
+    TEST_ASSERT_EQUAL_UINT(0x2005u, addr);
+    TEST_ASSERT_EQUAL_INT(0,
+        elf_var_addr(&ctx, 0x100, &fr, "b", &addr, &size, &sg));
+    TEST_ASSERT_EQUAL_UINT(0x2007u, addr);
+
+    /* Unknown name → -1, no crash. */
+    TEST_ASSERT_EQUAL_INT(-1,
+        elf_var_addr(&ctx, 0x100, &fr, "no_such_var", &addr, &size, &sg));
+
+    elf_close(&ctx);
+}
+
 /* ── Test runner ─────────────────────────────────────────────────────── */
 int main(void)
 {
@@ -393,5 +434,6 @@ int main(void)
     RUN_TEST(test_elf_open_leaves_device_name_empty_when_note_absent);
     RUN_TEST(test_elf_dwarf_accessors_round_trip);
     RUN_TEST(test_elf_cfi_cfa_extracts_avr_frame_rules);
+    RUN_TEST(test_elf_var_addr_resolves_globals_and_locals);
     return UNITY_END();
 }

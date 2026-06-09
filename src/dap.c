@@ -12,6 +12,7 @@
 #include "dap.h"
 #include "gdb_rsp.h"   /* rsp_accept / rsp_close — shared TCP transport helpers */
 
+#include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
@@ -857,6 +858,138 @@ static int dap_emit_stopped_breakpoint(dap_session *s)
     return dap_send_event(s, "stopped", body);
 }
 
+/* ── Conditional breakpoints + breakpoint-aware resume ────────────────────── */
+
+/* Read the innermost frame's live PC and the register values a variable's DWARF
+ * location may reference (Y pair, SP, and the CFA via .debug_frame). */
+static int dap_frame0(dap_session *s, uint32_t *pc, ElfFrameRegs *fr)
+{
+    uint16_t sp16 = 0;
+    uint8_t  r28 = 0, r29 = 0;
+    if (s->updi_fd < 0 || s->elf == NULL) return -1;
+    if (updi_ocd_read_pc (s->updi_fd, pc)       != 0) return -1;
+    if (updi_ocd_read_sp (s->updi_fd, &sp16)    != 0) return -1;
+    if (updi_ocd_read_gpr(s->updi_fd, 28, &r28) != 0) return -1;
+    if (updi_ocd_read_gpr(s->updi_fd, 29, &r29) != 0) return -1;
+    fr->y  = (uint32_t)r28 | ((uint32_t)r29 << 8);
+    fr->sp = sp16;
+    fr->cfa = 0;
+    int reg = 0, off = 0;
+    if (elf_cfi_cfa(s->elf, *pc, &reg, &off) == 0)
+        fr->cfa = ((reg == 32 ? fr->sp : fr->y) + (uint32_t)off) & 0xffffu;
+    return 0;
+}
+
+/* Evaluate a DAP breakpoint `condition` of the form `<ident> <op> <int>`
+ * (op one of == != < <= > >=) against the live target: resolve `ident` to a
+ * variable (local or global) via DWARF, read its value over OCD, and compare to
+ * the integer literal.  Returns 1 (true -> stop), 0 (false -> resume), or -1
+ * (cannot evaluate -> caller stops, so a bad condition never hides a hit). */
+static int dap_eval_condition(dap_session *s, uint32_t pc,
+                              const ElfFrameRegs *fr, const char *cond)
+{
+    const char *p = cond;
+    while (*p == ' ' || *p == '\t') p++;
+
+    char ident[64];
+    int  k = 0;
+    if (!(isalpha((unsigned char)*p) || *p == '_')) return -1;
+    while ((isalnum((unsigned char)*p) || *p == '_') && k < 63) ident[k++] = *p++;
+    ident[k] = '\0';
+    while (*p == ' ' || *p == '\t') p++;
+
+    char op[3] = {0};
+    if      (p[0] == '=' && p[1] == '=') { op[0]='='; op[1]='='; p += 2; }
+    else if (p[0] == '!' && p[1] == '=') { op[0]='!'; op[1]='='; p += 2; }
+    else if (p[0] == '<' && p[1] == '=') { op[0]='<'; op[1]='='; p += 2; }
+    else if (p[0] == '>' && p[1] == '=') { op[0]='>'; op[1]='='; p += 2; }
+    else if (p[0] == '<')                { op[0]='<';            p += 1; }
+    else if (p[0] == '>')                { op[0]='>';            p += 1; }
+    else return -1;
+    while (*p == ' ' || *p == '\t') p++;
+
+    char *end = NULL;
+    long  rhs = strtol(p, &end, 0);
+    if (end == p) return -1;
+
+    uint32_t addr = 0;
+    int      size = 2;
+    bool     sg   = false;
+    if (elf_var_addr(s->elf, pc, fr, ident, &addr, &size, &sg) != 0) return -1;
+
+    uint8_t buf[4] = {0};
+    if (updi_mem_read(s->updi_fd, addr & 0xffffu, buf, (size_t)size) < 0) return -1;
+    long lhs = 0;
+    for (int i = 0; i < size; i++) lhs |= (long)buf[i] << (8 * i);
+    if (sg && size < 4 && (lhs & (1L << (size * 8 - 1))))
+        lhs |= -(1L << (size * 8));     /* sign-extend a signed sub-word */
+
+    if (!strcmp(op, "==")) return lhs == rhs;
+    if (!strcmp(op, "!=")) return lhs != rhs;
+    if (!strcmp(op, "<"))  return lhs <  rhs;
+    if (!strcmp(op, "<=")) return lhs <= rhs;
+    if (!strcmp(op, ">"))  return lhs >  rhs;
+    if (!strcmp(op, ">=")) return lhs >= rhs;
+    return -1;
+}
+
+/* Step over every breakpoint installed at the current PC and resume — the GDB
+ * remove/single-step/insert dance — so a conditional breakpoint whose condition
+ * was false (or a plain resume parked on a breakpoint) does not immediately
+ * re-trigger.  Returns 0 on success. */
+static int dap_resume_over_current(dap_session *s)
+{
+    uint32_t pc = 0;
+    if (updi_ocd_read_pc(s->updi_fd, &pc) != 0) return -1;
+    for (int i = 0; i < DAP_MAX_BREAKPOINTS; i++)
+        if (s->bps[i].in_use && s->bps[i].verified && s->bps[i].addr == pc)
+            (void)bp_remove(s->updi_fd, s->hw_bp_addr, s->hw_bp_pinned,
+                            s->sw_bp, s->bp_mode, &s->pc_dirty, '0', pc);
+    if (bp_step_over(s->updi_fd, s->sw_bp, &s->pc_dirty) < 0) return -1;
+    for (int i = 0; i < DAP_MAX_BREAKPOINTS; i++)
+        if (s->bps[i].in_use && s->bps[i].verified && s->bps[i].addr == pc)
+            (void)bp_insert(s->updi_fd, s->hw_bp_addr, s->hw_bp_pinned,
+                            s->sw_bp, s->bp_mode, &s->pc_dirty, '0', pc);
+    return updi_run(s->updi_fd) < 0 ? -1 : 0;
+}
+
+/* Resume the target for `continue`: step over a breakpoint parked at the live
+ * PC if there is one, else a plain run. */
+static int dap_target_resume(dap_session *s)
+{
+    if (s->updi_fd < 0) return 0;
+    uint32_t pc = 0;
+    if (updi_ocd_read_pc(s->updi_fd, &pc) == 0)
+        for (int i = 0; i < DAP_MAX_BREAKPOINTS; i++)
+            if (s->bps[i].in_use && s->bps[i].verified && s->bps[i].addr == pc)
+                return dap_resume_over_current(s);
+    return updi_run(s->updi_fd) < 0 ? -1 : 0;
+}
+
+/* Called when the target halts while running.  If every breakpoint at the live
+ * PC is conditional and all conditions are false, step over and auto-resume —
+ * returning true (the caller keeps polling).  Returns false (the caller emits
+ * `stopped`) for a spontaneous halt, an unconditional breakpoint, or any
+ * condition that is true or cannot be evaluated. */
+static bool dap_conditional_skip(dap_session *s)
+{
+    if (s->updi_fd < 0) return false;
+    uint32_t      pc = 0;
+    ElfFrameRegs  fr = {0, 0, 0};
+    if (dap_frame0(s, &pc, &fr) != 0) return false;
+
+    bool any = false, stop = false;
+    for (int i = 0; i < DAP_MAX_BREAKPOINTS; i++) {
+        if (!(s->bps[i].in_use && s->bps[i].verified && s->bps[i].addr == pc))
+            continue;
+        any = true;
+        if (s->bps[i].condition[0] == '\0') { stop = true; continue; }
+        if (dap_eval_condition(s, pc, &fr, s->bps[i].condition) != 0) stop = true;
+    }
+    if (!any || stop) return false;
+    return dap_resume_over_current(s) == 0;
+}
+
 /* ── Request dispatch ─────────────────────────────────────────────────────── */
 
 int dap_dispatch(dap_session *s, const char *msg, size_t len)
@@ -924,7 +1057,7 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
                 "{\"threadId\":1,\"allThreadsContinued\":true}") < 0)
             return -1;
         if (s->updi_fd >= 0) {
-            if (updi_run(s->updi_fd) == 0)
+            if (dap_target_resume(s) == 0)
                 s->running = true;   /* dap_serve() polls for the halt */
             else
                 return dap_emit_stopped(s, "breakpoint") < 0 ? -1 : 0;
@@ -1034,8 +1167,15 @@ int dap_serve(int listen_fd, int updi_fd,
             if (s.running && updi_fd >= 0) {
                 int h = updi_ocd_poll_halted(updi_fd, 1);
                 if (h == 0) {
-                    s.running = false;
-                    if (dap_emit_stopped_breakpoint(&s) < 0) { rc = -1; break; }
+                    /* A conditional breakpoint whose condition is false is
+                     * stepped over and the target auto-resumed (still
+                     * running); otherwise report the stop. */
+                    if (dap_conditional_skip(&s)) {
+                        /* resumed — keep polling */
+                    } else {
+                        s.running = false;
+                        if (dap_emit_stopped_breakpoint(&s) < 0) { rc = -1; break; }
+                    }
                 } else if (h < 0) {
                     fprintf(stderr, "avrOSdb: DAP target poll error\n");
                     rc = -1; break;

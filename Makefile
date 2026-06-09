@@ -577,7 +577,7 @@ $(HW_TEST_BIN): $(HW_TEST_SRC) $(BUILDDIR)/updi.o
 	$(Q)$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $^ $(LUTIL)
 	@echo "  LD  $@"
 
-.PHONY: hw-test hw-test-nvm hw-test-rsp hw-test-gdb hw-test-all hw-test-dap hw-test-dap-unwind
+.PHONY: hw-test hw-test-nvm hw-test-rsp hw-test-gdb hw-test-all hw-test-dap hw-test-dap-unwind hw-test-dap-cond
 hw-test: $(HW_TEST_BIN)
 	$(Q)$(HW_ENV) $(HW_TEST_BIN)
 
@@ -670,6 +670,17 @@ hw-test-dap-unwind: $(GDB_DBG_SESSION_ELF) all
 	$(Q)AVROSDB_BIN='$(BUILDDIR)/$(TARGET)' HW_PORT='$(HW_PORT)' \
 	    DAP_PORT='$(HW_DAP_PORT)' \
 	    python3 tests/hw/dap_unwind.py --port '$(HW_PORT)' \
+	        --dap-port '$(HW_DAP_PORT)' --elf '$(GDB_DBG_SESSION_ELF)'
+
+# hw-test-dap-cond — DAP conditional-breakpoint acceptance (Phase 18, HLR-081).
+# Spawns avrOSdb --dap against the gdb_debug_session fixture and verifies the
+# adapter evaluates DAP `condition`s on the live target (local + global vars,
+# true/false/auto-resume).  Pure-Python DAP client (no nvim).
+hw-test-dap-cond: $(GDB_DBG_SESSION_ELF) all
+	$(Q)$(BUILDDIR)/$(TARGET) --prog --erase $(HW_PORT) $(GDB_DBG_SESSION_ELF)
+	$(Q)AVROSDB_BIN='$(BUILDDIR)/$(TARGET)' HW_PORT='$(HW_PORT)' \
+	    DAP_PORT='$(HW_DAP_PORT)' \
+	    python3 tests/hw/dap_cond.py --port '$(HW_PORT)' \
 	        --dap-port '$(HW_DAP_PORT)' --elf '$(GDB_DBG_SESSION_ELF)'
 
 # ── check-tools target ────────────────────────────────────────────────────────

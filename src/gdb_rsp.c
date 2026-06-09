@@ -872,96 +872,13 @@ static int dh_step(int fd, const char *pkt, void *vctx)
      * neither shadow matches.                                       */
     ctx->last_stop_cause = SC_NONE;
 
-    /* If a prior SW-BP flash patch left OCD.PC freshly written, the single
-     * step must execute the instruction at PC via injection (immune to the
-     * fresh-PC-write skip).  consume_pc_skip() does exactly one instruction
-     * when it returns 1 — that IS this step, so report the stop and return.
-     * A direct 32-bit CALL/JMP returns 0 and falls through to the normal
-     * change-of-flow step path below.                                     */
-    {
-        int cs = bp_consume_pc_skip(ctx->updi_fd, ctx->sw_bp, &ctx->pc_dirty);
-        if (cs < 0) return reply_err(fd, "E01");
-        if (cs == 1) {
-            fsm_invalidate(ctx->fsm);
-            if (ctx->fsm) {
-                (void)fsm_build_thread_list(ctx->fsm, ctx->idx, ctx->updi_fd);
-            }
-            ctx->last_stop_cause = bp_classify_stop(ctx->updi_fd, ctx->sw_bp, ctx->hw_bp_addr,SC_STEP);
-            return dh_halt_reason(fd, "?", vctx);
-        }
-    }
-
-    /* Detect if current instruction is 32-bit (AVR UPDI hardware stepper errata workaround) */
-    uint32_t pc_byte = 0;
-    if (updi_ocd_read_pc(ctx->updi_fd, &pc_byte) < 0) return reply_err(fd, "E01");
-
-    uint8_t opcode[4] = {0};
-    if (updi_mem_read(ctx->updi_fd, pc_byte | UPDI_FLASH_BASE, opcode, 4) < 0) return reply_err(fd, "E01");
-
-    uint16_t w0 = (uint16_t)opcode[0] | ((uint16_t)opcode[1] << 8);
-    uint16_t w1 = (uint16_t)opcode[2] | ((uint16_t)opcode[3] << 8);
-
-    bool is_32bit = false;
-    bool is_call_32bit = false;     /* direct 32-bit CALL — needs return push */
-    bool is_jmp_32bit  = false;     /* direct 32-bit JMP  — no return push    */
-    uint32_t target_pc = pc_byte + 4;
-
-    if ((w0 & 0xFE0F) == 0x9000 || (w0 & 0xFE0F) == 0x9200) {
-        /* LDS or STS — 32-bit non-CoF: HW-BP@PC+4 workaround is fine. */
-        is_32bit = true;
-    } else if ((w0 & 0xFE0E) == 0x940E) {
-        /* CALL k  (1001 010k kkkk 111k) */
-        uint32_t k = (uint32_t)w1
-                   | (((uint32_t)w0 & 0x0001u) << 16)
-                   | ((((uint32_t)w0 & 0x01F0u) >> 4) << 17);
-        target_pc = k * 2u;
-        is_32bit = true;
-        is_call_32bit = true;
-    } else if ((w0 & 0xFE0E) == 0x940C) {
-        /* JMP k   (1001 010k kkkk 110k) */
-        uint32_t k = (uint32_t)w1
-                   | (((uint32_t)w0 & 0x0001u) << 16)
-                   | ((((uint32_t)w0 & 0x01F0u) >> 4) << 17);
-        target_pc = k * 2u;
-        is_32bit = true;
-        is_jmp_32bit = true;
-    }
-    bool halt_on_jump = is_call_32bit || is_jmp_32bit;
-
-    if (is_32bit) {
-        /* HLR-062 (issue #40): for direct 32-bit CoF (CALL/JMP) the
-         * AVR-Dx OCD comparator and OCD_CTRL1_JMP both fail to halt
-         * on the very first change-of-flow after RUN.  Emulate
-         * entirely via OCD primitives instead — push return address
-         * for CALL, then set OCD PC = target and settle the pipeline.
-         * Plain HW-BP@PC+4 (via updi_step_32bit) is still correct for
-         * the 32-bit non-CoF case (LDS/STS).                          */
-        if (is_call_32bit) {
-            if (updi_ocd_emulate_cof_32bit(ctx->updi_fd,
-                                           pc_byte + 4u, target_pc) < 0)
-                return reply_err(fd, "E01");
-            /* emulate_cof wrote a fresh OCD.PC at the CoF target.  A fresh PC
-             * write makes the silicon skip the instruction at PC on the next
-             * *run* (a subsequent step is fine — see B.8).  GDB's source
-             * `step` into a function is `s`(this CoF) then `c` to the first
-             * line, and that `c` would skip the callee's first prologue
-             * instruction (`push r28`), corrupting the saved caller frame and
-             * every unwound caller value (Group-G G19).  Mark the PC dirty so
-             * the next resume injects that instruction instead of skipping. */
-            ctx->pc_dirty = true;
-        } else if (is_jmp_32bit) {
-            if (updi_ocd_emulate_cof_32bit(ctx->updi_fd,
-                                           0u, target_pc) < 0)
-                return reply_err(fd, "E01");
-            ctx->pc_dirty = true;   /* fresh-PC-write skip — see above */
-        } else {
-            if (updi_step_32bit(ctx->updi_fd, RSP_HW_BP_STEP_SLOT,
-                                target_pc, halt_on_jump) < 0)
-                return reply_err(fd, "E01");
-        }
-    } else {
-        if (updi_step(ctx->updi_fd) < 0) return reply_err(fd, "E01");
-    }
+    /* Execute exactly one instruction over OCD — the shared core handles the
+     * fresh-PC/patched-BREAK injection, 32-bit CALL/JMP CoF emulation (which
+     * sets pc_dirty so the next resume injects the skipped instruction — see
+     * B.8 / Group-G G19), the 32-bit LDS/STS HW-BP@PC+4 step, and the ordinary
+     * 16-bit step.  (HLR-062, issue #40.) */
+    if (bp_step_over(ctx->updi_fd, ctx->sw_bp, &ctx->pc_dirty) < 0)
+        return reply_err(fd, "E01");
 
     fsm_invalidate(ctx->fsm);
     if (ctx->fsm) {

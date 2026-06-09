@@ -600,3 +600,91 @@ int elf_cfi_cfa(const ElfContext *ctx, uint32_t byte_addr,
     }
     return -1;
 }
+
+/* Does the subprogram scope (if any) among `scopes` use DW_OP_call_frame_cfa as
+ * its frame base?  Needed to resolve DW_OP_fbreg locals against the CFA. */
+static bool cfi_frame_base_is_cfa(Dwarf_Die *scopes, int n)
+{
+    for (int i = 0; i < n; i++) {
+        if (dwarf_tag(&scopes[i]) != DW_TAG_subprogram) continue;
+        Dwarf_Attribute a;
+        if (dwarf_attr(&scopes[i], DW_AT_frame_base, &a) == NULL) return false;
+        Dwarf_Op *ops = NULL; size_t nops = 0;
+        if (dwarf_getlocation(&a, &ops, &nops) == 0 && nops == 1 &&
+            ops[0].atom == DW_OP_call_frame_cfa)
+            return true;
+        return false;
+    }
+    return false;
+}
+
+/* Fill *size / *is_signed from a variable DIE's DW_AT_type (peeling typedef /
+ * const / volatile). Defaults to 2 bytes / unsigned when the type is absent. */
+static void var_type_info(Dwarf_Die *var, int *size, bool *is_signed)
+{
+    if (size != NULL)      *size = 2;
+    if (is_signed != NULL) *is_signed = false;
+    Dwarf_Attribute ta;
+    Dwarf_Die type, peeled;
+    if (dwarf_attr_integrate(var, DW_AT_type, &ta) == NULL) return;
+    if (dwarf_formref_die(&ta, &type) == NULL) return;
+    if (dwarf_peel_type(&type, &peeled) != 0) return;
+    int bs = dwarf_bytesize(&peeled);
+    if (bs >= 1 && bs <= 4 && size != NULL) *size = bs;
+    Dwarf_Attribute ea;
+    if (dwarf_attr(&peeled, DW_AT_encoding, &ea) != NULL && is_signed != NULL) {
+        Dwarf_Word enc = 0;
+        if (dwarf_formudata(&ea, &enc) == 0)
+            *is_signed = (enc == DW_ATE_signed || enc == DW_ATE_signed_char);
+    }
+}
+
+/* See elf_parser.h. */
+int elf_var_addr(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr,
+                 const char *name, uint32_t *addr, int *size, bool *is_signed)
+{
+    if (ctx == NULL || ctx->dwarf == NULL || name == NULL) return -1;
+    Dwarf *dw = (Dwarf *)ctx->dwarf;
+
+    Dwarf_Die cu;
+    if (dwarf_addrdie(dw, (Dwarf_Addr)pc, &cu) == NULL) return -1;
+
+    Dwarf_Die *scopes = NULL;
+    int n = dwarf_getscopes(&cu, (Dwarf_Addr)pc, &scopes);
+    if (n < 1 || scopes == NULL) { free(scopes); return -1; }
+
+    bool      fb_is_cfa = cfi_frame_base_is_cfa(scopes, n);
+    Dwarf_Die var;
+    int       si = dwarf_getscopevar(scopes, n, name, 0, NULL, 0, 0, &var);
+    free(scopes);                       /* `var` is an independent copy */
+    if (si < 0) return -1;
+
+    Dwarf_Attribute la;
+    if (dwarf_attr_integrate(&var, DW_AT_location, &la) == NULL) return -1;
+    Dwarf_Op *ops = NULL; size_t nops = 0;
+    if (dwarf_getlocation(&la, &ops, &nops) != 0 || ops == NULL || nops < 1)
+        return -1;
+
+    uint32_t a;
+    if (ops[0].atom == DW_OP_addr) {
+        a = (uint32_t)ops[0].number;                 /* global (data-space VMA) */
+    } else if (ops[0].atom == DW_OP_breg0 + 28) {    /* Y pair r28:r29 + off    */
+        if (fr == NULL) return -1;
+        a = fr->y + (uint32_t)(int32_t)ops[0].number;
+    } else if (ops[0].atom == DW_OP_bregx && ops[0].number == 28) {
+        if (fr == NULL) return -1;
+        a = fr->y + (uint32_t)(int32_t)ops[0].number2;
+    } else if (ops[0].atom == DW_OP_bregx && ops[0].number == 32) {
+        if (fr == NULL) return -1;
+        a = fr->sp + (uint32_t)(int32_t)ops[0].number2;
+    } else if (ops[0].atom == DW_OP_fbreg) {
+        if (fr == NULL || !fb_is_cfa) return -1;
+        a = fr->cfa + (uint32_t)(int32_t)ops[0].number;
+    } else {
+        return -1;                                   /* unsupported location    */
+    }
+
+    if (addr != NULL) *addr = a & 0xFFFFu;           /* 16-bit SRAM data space  */
+    var_type_info(&var, size, is_signed);
+    return 0;
+}

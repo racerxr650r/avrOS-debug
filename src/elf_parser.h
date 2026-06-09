@@ -18,6 +18,7 @@
 #ifndef AOD_ELF_PARSER_H
 #define AOD_ELF_PARSER_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -135,5 +136,25 @@ int elf_line_to_addr(const ElfContext *ctx, const char *file, int line,
  * 2-byte word return address, word<->byte PC) live in the caller's unwinder. */
 int elf_cfi_cfa(const ElfContext *ctx, uint32_t byte_addr,
                 int *cfa_reg, int *cfa_offset);
+
+/* Live frame register values an AVR variable's DWARF location may reference. */
+typedef struct {
+    uint32_t cfa;  /* canonical frame address (DW_OP_fbreg / call_frame_cfa)   */
+    uint32_t y;    /* Y frame-pointer pair r28:r29 (DW_OP_breg28)              */
+    uint32_t sp;   /* stack pointer (DW_OP_breg32)                             */
+} ElfFrameRegs;
+
+/* Resolve a variable `name` visible at code byte address `pc` to its 16-bit
+ * data-space address and size, evaluating its DWARF location with the live
+ * frame registers `fr`.  Searches the lexical scopes containing `pc` (locals,
+ * parameters) then file/global scope.  Supports the location forms avr-gcc -O0
+ * emits: DW_OP_addr (globals), DW_OP_breg28/breg32 + offset (Y-/SP-relative
+ * locals), and DW_OP_fbreg + offset when the enclosing subprogram's frame base
+ * is DW_OP_call_frame_cfa.  On success returns 0 and fills *addr (masked to the
+ * 16-bit SRAM data space), *size (1/2/4 bytes, clamped), and *is_signed.
+ * Returns -1 with no DWARF, when `name` is not in scope, or for an unsupported
+ * location/type form.  `fr` may be NULL if only globals are expected. */
+int elf_var_addr(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr,
+                 const char *name, uint32_t *addr, int *size, bool *is_signed);
 
 #endif /* AOD_ELF_PARSER_H */

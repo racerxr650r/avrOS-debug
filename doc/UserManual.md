@@ -1453,7 +1453,42 @@ dump each frame's CFA and the surrounding stack bytes — the same way `--log-rs
 exposes the GDB wire. `make hw-test-dap-unwind` validates the whole chain end to
 end on hardware (the DAP analogue of the GDB G18 backtrace test).
 
-### B.18 Further reading
+### B.18 Conditional breakpoints (variable resolution + auto-resume)
+
+A DAP source breakpoint may carry a `condition`; `avrOSdb` evaluates it **on the
+target** each time the breakpoint is hit and resumes transparently when it is
+false, so the editor only stops when the condition holds. Two pieces make this
+work on AVR:
+
+1. **Resolving the variable.** The condition grammar is `<var> <relop> <int>`
+   (`==  !=  <  <=  >  >=`). `elf_var_addr()` finds `<var>` in the DWARF scopes
+   covering the halted PC (`dwarf_getscopes` / `dwarf_getscopevar`, which searches
+   locals and parameters first, then file scope) and decodes its location. At
+   `-O0` avr-gcc emits the forms this handles directly:
+   - a **global** as `DW_OP_addr` → the absolute data-space address;
+   - a **local / parameter** as `DW_OP_breg28 + off` → `Y + off` (the live Y
+     frame-pointer pair r28:r29), or `DW_OP_fbreg + off` → `CFA + off` when the
+     function's frame base is `DW_OP_call_frame_cfa` (the CFA comes from the same
+     `.debug_frame` machinery as the backtrace, B.17).
+
+   The value is read over OCD (`updi_mem_read`), sign-extended per the DWARF type
+   (`DW_AT_byte_size` / `DW_AT_encoding`), and compared to the literal.
+
+2. **Stepping over to auto-resume.** When the condition is false the server must
+   get past the breakpoint and run on — GDB's classic *remove → single-step →
+   insert → run* dance: `bp_remove()` every breakpoint at the PC, `bp_step_over()`
+   one instruction, `bp_insert()` to re-arm, then `updi_run()`. `bp_step_over()`
+   is the shared single-step core (extracted from the GDB-RSP `dh_step`), so it is
+   correct for a HW-comparator or SW-`BREAK` breakpoint and for 16-bit, 32-bit
+   LDS/STS, and 32-bit CALL/JMP instructions alike. A condition that is **true**,
+   that **cannot be evaluated** (unknown variable, unsupported form, UPDI error),
+   or an **unconditional** breakpoint at the same address always stops — a bad
+   condition must never hide a hit.
+
+`make hw-test-dap-cond` validates this on silicon against the `gdb_debug_session`
+fixture (`leaf if b == 99` skips, `b == 2` stops, `g_marker == 49374` stops).
+
+### B.19 Further reading
 
 - [`doc/reference/guesswork.md`](reference/guesswork.md) — the reverse-engineering
   lab notebook, including the FF-bomb register-mapping method and the full v0/v1

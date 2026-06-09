@@ -221,7 +221,7 @@ Role: **unit**. **97 test(s).**
 
 ### 3.4. [tests/test_elf.c](../tests/test_elf.c)
 
-Role: **unit**. **16 test(s).**
+Role: **unit**. **17 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -241,6 +241,7 @@ Role: **unit**. **16 test(s).**
 | 14 | <a id="elf_open_leaves_device_name_empty_when_note_absent"></a>`elf_open_leaves_device_name_empty_when_note_absent` | `LLR-ELF-09` | Copy the full fixture to a temp path and zero every `"avr<digit>"` ASCII triplet so the deviceinfo heuristic finds nothing, then `elf_open()` the rewritten ELF and verify it still returns 0 and `ctx.device_name` is the empty string. Proves the note-extraction step is non-fatal on inputs that lack the note. |
 | 15 | <a id="elf_dwarf_accessors_round_trip"></a>`elf_dwarf_accessors_round_trip` | `LLR-ELF-11`, `LLR-ELF-12`, `LLR-ELF-13` | On a `-g` fixture, verify `elf_dwarf_available()` returns 1; map the entry-point code address to a source `file:line` via `elf_addr_to_line()` (when it resolves, assert line > 0 and a non-empty file, and that `elf_line_to_addr()` returns a real address for that `file:line`); and verify `elf_addr_to_line()` on an address far outside any CU returns -1 without crashing. |
 | 16 | <a id="elf_cfi_cfa_extracts_avr_frame_rules"></a>`elf_cfi_cfa_extracts_avr_frame_rules` | `LLR-ELF-14` | On the gdb_debug_session fixture (whose nested `main->top->mid->leaf` chain has stable, `avr-readelf --debug-dump=frames`-verified CFI), assert `elf_cfi_cfa()` returns the expected Canonical-Frame-Address rules: at `mid()` entry (0x17a) CFA = r32(SP)+2; after the Y-prologue (0x188) CFA = r28+10; at `main()` entry (0x266) CFA = r32+2; and an address past the last FDE (0x7FFF) returns -1 without crashing. Deterministic / hardware-free guard for the in-tree `.debug_frame` interpreter. Per LLR-ELF-14. |
+| 17 | <a id="elf_var_addr_resolves_globals_and_locals"></a>`elf_var_addr_resolves_globals_and_locals` | `LLR-ELF-15` | On the gdb_debug_session fixture, assert `elf_var_addr()` resolves variable locations/types from DWARF: the global `g_marker` (DW_OP_addr) to a non-zero masked SRAM address with size 2 / unsigned; the leaf() parameters `a` and `b` (DW_OP_breg28 + 5 / + 7) to `Y+5` / `Y+7` against a synthetic Y; and an unknown name to -1 without crashing. Deterministic / hardware-free guard for the variable-resolution backing conditional breakpoints. Per LLR-ELF-15. |
 
 ### 3.5. [tests/test_fsm.c](../tests/test_fsm.c)
 
@@ -430,6 +431,16 @@ Role: **hardware**. **5 test(s).**
 | 4 | <a id="DAP_U4_frames_map_to_call_chain"></a>`DAP_U4_frames_map_to_call_chain` | `LLR-DAP-11`, `LLR-ELF-14` | Each of the first four stack frames' PCs falls inside the expected function of the call chain (`leaf`, `mid`, `top`, `main`), checked against the functions' address ranges from `avr-nm -S` — proving the recovered return addresses are correct, not just non-empty. Per HLR-080 / LLR-DAP-11 / LLR-ELF-14. |
 | 5 | <a id="DAP_U5_frames_resolve_source_lines"></a>`DAP_U5_frames_resolve_source_lines` | — | Each chain frame resolves to a source line (`line > 0`) via DWARF, confirming the unwound caller PCs map to real source through `elf_addr_to_line()`. Per HLR-080 / HLR-072. |
 
+### 3.15. [tests/hw/dap_cond.py](../tests/hw/dap_cond.py)
+
+Role: **hardware**. **3 test(s).**
+
+| # | Test | Verifies | Purpose |
+| - | ---- | -------- | ------- |
+| 1 | <a id="DAP_K1_false_local_condition_skips"></a>`DAP_K1_false_local_condition_skips` | `LLR-DAP-12`, `LLR-ELF-15` | A source breakpoint in `leaf` with the always-false local condition `b == 99` (b is only ever 2 or 3): after `continue` the target keeps running and NO breakpoint stop arrives within the window — proving the adapter reads the local over DWARF/OCD, evaluates the condition false, steps over and auto-resumes. Per HLR-081 / LLR-DAP-12 / LLR-ELF-15. |
+| 2 | <a id="DAP_K2_true_local_condition_stops"></a>`DAP_K2_true_local_condition_stops` | `LLR-DAP-12` | A source breakpoint in `leaf` with the true local condition `b == 2` (hit on the `leaf(7,2)` call): after `continue` the adapter emits `stopped` with reason `breakpoint` — proving a true local condition stops. Per HLR-081 / LLR-DAP-12. |
+| 3 | <a id="DAP_K3_true_global_condition_stops"></a>`DAP_K3_true_global_condition_stops` | `LLR-DAP-12`, `LLR-ELF-15` | A source breakpoint in `leaf` with the true global condition `g_marker == 49374` (a constant): after `continue` the adapter emits `stopped` with reason `breakpoint` — proving global-variable conditions (DW_OP_addr resolution) work on silicon. Per HLR-081 / LLR-DAP-12 / LLR-ELF-15. |
+
 ## 4. LLR Coverage Matrix
 
 Every LLR in [LLRs.md](LLRs.md) and the test(s) that verify it.
@@ -556,6 +567,7 @@ verified by code review — see
 | `LLR-ELF-12` | `elf` | `HLR-072` | `elf_dwarf_accessors_round_trip` |
 | `LLR-ELF-13` | `elf` | `HLR-072` | `elf_dwarf_accessors_round_trip` |
 | `LLR-ELF-14` | `elf` | `HLR-080` | `elf_cfi_cfa_extracts_avr_frame_rules`, `DAP_U4_frames_map_to_call_chain` |
+| `LLR-ELF-15` | `elf` | `HLR-081` | `elf_var_addr_resolves_globals_and_locals`, `DAP_K1_false_local_condition_skips`, `DAP_K3_true_global_condition_stops` |
 | `LLR-FSM-01` | `fsm` | `HLR-024` | `fsm_build_thread_list_reads_fsm_table_from_flash_via_updi`, `fsm_build_thread_list_returns_minus1_on_updi_failure` |
 | `LLR-FSM-03` | `fsm` | `HLR-025` | `fsm_build_thread_list_sets_active_thread_from_current_fsm_ptr`, `fsm_build_thread_list_sets_active_id_0_when_no_entry_matches` |
 | `LLR-MON-01` | `monitor` | `HLR-029` | `monitor_dispatch_hex_decodes_cmd_before_prefix_matching`, `monitor_dispatch_treats_invalid_hex_sequence_as_unrecognised`, `D6_rsp_monitor_info_verb` |
@@ -600,3 +612,4 @@ verified by code review — see
 | `LLR-DAP-09` | `dap` | `HLR-078`, `HLR-072` | `dap_stack_trace_returns_one_frame`, `dap_scopes_returns_empty` |
 | `LLR-DAP-10` | `dap` | `HLR-079`, `HLR-054` | `dap_set_breakpoints_responds_with_per_line_entries`, `dap_set_breakpoints_replaces_prior_set_for_source`, `dap_set_instruction_breakpoints_responds_with_refs` |
 | `LLR-DAP-11` | `dap` | `HLR-080`, `HLR-072` | `DAP_U4_frames_map_to_call_chain` |
+| `LLR-DAP-12` | `dap` | `HLR-081`, `HLR-054` | `DAP_K1_false_local_condition_skips`, `DAP_K2_true_local_condition_stops`, `DAP_K3_true_global_condition_stops` |

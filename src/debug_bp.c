@@ -260,6 +260,72 @@ int bp_consume_pc_skip(int updi_fd, RspSwBp sw_bp[], bool *pc_dirty)
     return 1;
 }
 
+int bp_step_over(int updi_fd, RspSwBp sw_bp[], bool *pc_dirty)
+{
+    /* A pending fresh-PC-write / patched-BREAK is executed via injection;
+     * consume_pc_skip() does exactly one instruction when it returns 1 — that
+     * IS this step.  A direct 32-bit CALL/JMP returns 0 and falls through to
+     * the change-of-flow path below. */
+    int cs = bp_consume_pc_skip(updi_fd, sw_bp, pc_dirty);
+    if (cs < 0) return -1;
+    if (cs == 1) return 0;
+
+    /* Detect a 32-bit instruction (AVR UPDI hardware-stepper errata). */
+    uint32_t pc_byte = 0;
+    if (updi_ocd_read_pc(updi_fd, &pc_byte) < 0) return -1;
+
+    uint8_t opcode[4] = {0};
+    if (updi_mem_read(updi_fd, pc_byte | UPDI_FLASH_BASE, opcode, 4) < 0) return -1;
+
+    uint16_t w0 = (uint16_t)opcode[0] | ((uint16_t)opcode[1] << 8);
+    uint16_t w1 = (uint16_t)opcode[2] | ((uint16_t)opcode[3] << 8);
+
+    bool     is_32bit      = false;
+    bool     is_call_32bit = false;     /* direct 32-bit CALL — needs return push */
+    bool     is_jmp_32bit  = false;     /* direct 32-bit JMP  — no return push    */
+    uint32_t target_pc     = pc_byte + 4;
+
+    if ((w0 & 0xFE0F) == 0x9000 || (w0 & 0xFE0F) == 0x9200) {
+        is_32bit = true;                /* LDS / STS (32-bit non-CoF) */
+    } else if ((w0 & 0xFE0E) == 0x940E) {
+        uint32_t k = (uint32_t)w1
+                   | (((uint32_t)w0 & 0x0001u) << 16)
+                   | ((((uint32_t)w0 & 0x01F0u) >> 4) << 17);
+        target_pc = k * 2u; is_32bit = true; is_call_32bit = true;
+    } else if ((w0 & 0xFE0E) == 0x940C) {
+        uint32_t k = (uint32_t)w1
+                   | (((uint32_t)w0 & 0x0001u) << 16)
+                   | ((((uint32_t)w0 & 0x01F0u) >> 4) << 17);
+        target_pc = k * 2u; is_32bit = true; is_jmp_32bit = true;
+    }
+    bool halt_on_jump = is_call_32bit || is_jmp_32bit;
+
+    if (is_32bit) {
+        /* HLR-062 (issue #40): direct 32-bit CoF (CALL/JMP) is missed by the
+         * OCD comparator / OCD_CTRL1_JMP on the first change-of-flow after a
+         * RUN, so emulate it over OCD primitives.  emulate_cof writes a fresh
+         * OCD.PC at the target → mark pc_dirty so the next resume injects the
+         * skipped instruction (Appendix B.8, Group-G G19).  Plain HW-BP@PC+4
+         * (updi_step_32bit) remains correct for the non-CoF LDS/STS case. */
+        if (is_call_32bit) {
+            if (updi_ocd_emulate_cof_32bit(updi_fd, pc_byte + 4u, target_pc) < 0)
+                return -1;
+            *pc_dirty = true;
+        } else if (is_jmp_32bit) {
+            if (updi_ocd_emulate_cof_32bit(updi_fd, 0u, target_pc) < 0)
+                return -1;
+            *pc_dirty = true;
+        } else {
+            if (updi_step_32bit(updi_fd, RSP_HW_BP_STEP_SLOT, target_pc,
+                                halt_on_jump) < 0)
+                return -1;
+        }
+    } else {
+        if (updi_step(updi_fd) < 0) return -1;
+    }
+    return 0;
+}
+
 void bp_clear_all_sw(RspSwBp sw_bp[])
 {
     for (int i = 0; i < RSP_MAX_SW_BREAKPOINTS; i++) {

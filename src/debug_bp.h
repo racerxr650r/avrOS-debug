@@ -126,6 +126,18 @@ int bp_classify_stop(int updi_fd, const RspSwBp sw_bp[],
  * Returns 1 when it injected a step, 0 when nothing to do, -1 on error. */
 int bp_consume_pc_skip(int updi_fd, RspSwBp sw_bp[], bool *pc_dirty);
 
+/* Single-step the instruction at the live PC, over OCD, handling every AVR
+ * case the silicon needs help with: a pending fresh-PC-write / patched-`BREAK`
+ * (via bp_consume_pc_skip injection), a direct 32-bit CALL/JMP (emulated as a
+ * change-of-flow, leaving `*pc_dirty` set so the next resume injects the
+ * skipped instruction), a 32-bit LDS/STS (stepped via the reserved comparator
+ * RSP_HW_BP_STEP_SLOT at PC+4), and the ordinary 16-bit instruction (a plain
+ * OCD step).  Executes exactly one instruction.  Returns 0 on success, -1 on a
+ * UPDI error.  (The caller classifies the resulting stop and rebuilds any FSM
+ * view.)  This is the shared core of the GDB-RSP `s`/`vCont;s` step and the
+ * DAP conditional-breakpoint auto-resume. */
+int bp_step_over(int updi_fd, RspSwBp sw_bp[], bool *pc_dirty);
+
 /* Clear every SW-BP shadow entry without UPDI I/O (vFlashDone / reset). */
 void bp_clear_all_sw(RspSwBp sw_bp[]);
 
