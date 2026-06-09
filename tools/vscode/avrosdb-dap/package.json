@@ -4,6 +4,12 @@
   "description": "Debug AVR-Dx targets in VS Code via `avrOSdb --dap` — one F5 starts the server and attaches, with an avrOS activity-bar view for state machines, events, and queues.",
   "version": "0.3.0",
   "publisher": "avrOS",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/racerxr650r/avrOS-debug.git",
+    "directory": "tools/vscode/avrosdb-dap"
+  },
   "engines": { "vscode": "^1.66.0" },
   "categories": ["Debuggers"],
   "main": "./extension.js",
