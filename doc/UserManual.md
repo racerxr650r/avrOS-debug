@@ -833,7 +833,7 @@ target host).
 ```bash
 # Package a .vsix and install it (needs Node tooling: @vscode/vsce or npx)
 make package-vscode
-code --install-extension dist/avrosdb-dap-<version>.vsix
+code --install-extension dist/avrosdb-dap-0.3.0.vsix   # named for the extension version
 
 # …or, for development: open the folder in VS Code and press F5
 code tools/vscode/avrosdb-dap

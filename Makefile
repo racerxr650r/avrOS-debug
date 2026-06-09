@@ -808,10 +808,13 @@ bundle-brew: $(BUILDDIR)/$(TARGET) $(MANPAGE)
 # .vsix in dist/.  Requires Node tooling: `vsce` (@vscode/vsce) on PATH, or
 # `npx` to fetch it on demand.  Manual/dev-only — Node is not a build or CI
 # dependency of avrOSdb itself, so this target is never invoked by `make` or
-# `make test`.  Install the extension with:
-#   code --install-extension dist/avrosdb-dap-$(VERSION).vsix
+# `make test`.  The .vsix is named after the extension's own version (from its
+# package.json), independent of the project $(VERSION), so the artefact name is
+# stable across commits.  Install the extension with:
+#   code --install-extension dist/avrosdb-dap-<ver>.vsix
 VSCODE_EXT_DIR := tools/vscode/avrosdb-dap
-VSIX_FILE      := $(DISTDIR)/avrosdb-dap-$(VERSION).vsix
+VSCODE_EXT_VER := $(shell sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' $(VSCODE_EXT_DIR)/package.json | head -1)
+VSIX_FILE      := $(DISTDIR)/avrosdb-dap-$(VSCODE_EXT_VER).vsix
 .PHONY: package-vscode
 package-vscode:
 	@mkdir -p $(DISTDIR)
