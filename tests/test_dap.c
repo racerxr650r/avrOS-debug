@@ -347,19 +347,43 @@ void test_dap_stack_trace_returns_one_frame(void)
     close(sp[0]); close(sp[1]);
 }
 
-void test_dap_scopes_returns_empty(void)
+void test_dap_scopes_returns_locals_registers_globals(void)
 {
     int sp[2];
     TEST_ASSERT_EQUAL_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sp));
     dap_session s = { sp[1], -1, NULL, NULL, NULL, false, 0 };
 
-    const char *req = "{\"seq\":15,\"command\":\"scopes\"}";
+    const char *req = "{\"seq\":15,\"command\":\"scopes\","
+                      "\"arguments\":{\"frameId\":0}}";
     TEST_ASSERT_EQUAL_INT(0, dap_dispatch(&s, req, strlen(req)));
 
     char buf[512]; size_t len;
     TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
     TEST_ASSERT_NOT_NULL(strstr(buf, "\"command\":\"scopes\""));
-    TEST_ASSERT_NOT_NULL(strstr(buf, "\"scopes\":[]"));
+    /* Frame 0 carries Locals, Registers (the live CPU), and Globals scopes. */
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"name\":\"Locals\""));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"name\":\"Registers\""));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"name\":\"Globals\""));
+
+    close(sp[0]); close(sp[1]);
+}
+
+/* `variables` on an out-of-range reference (no ELF/target) returns an empty
+ * list rather than erroring — the unit-test path. */
+void test_dap_variables_unknown_ref_is_empty(void)
+{
+    int sp[2];
+    TEST_ASSERT_EQUAL_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sp));
+    dap_session s = { sp[1], -1, NULL, NULL, NULL, false, 0 };
+
+    const char *req = "{\"seq\":16,\"command\":\"variables\","
+                      "\"arguments\":{\"variablesReference\":99}}";
+    TEST_ASSERT_EQUAL_INT(0, dap_dispatch(&s, req, strlen(req)));
+
+    char buf[512]; size_t len;
+    TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"command\":\"variables\""));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"variables\":[]"));
 
     close(sp[0]); close(sp[1]);
 }
@@ -512,7 +536,8 @@ int main(void)
     RUN_TEST(test_dap_pause_emits_stopped_pause);
     RUN_TEST(test_dap_step_emits_stopped_step);
     RUN_TEST(test_dap_stack_trace_returns_one_frame);
-    RUN_TEST(test_dap_scopes_returns_empty);
+    RUN_TEST(test_dap_scopes_returns_locals_registers_globals);
+    RUN_TEST(test_dap_variables_unknown_ref_is_empty);
     RUN_TEST(test_dap_set_breakpoints_responds_with_per_line_entries);
     RUN_TEST(test_dap_set_breakpoints_replaces_prior_set_for_source);
     RUN_TEST(test_dap_set_instruction_breakpoints_responds_with_refs);

@@ -96,6 +96,13 @@ int dap_write_message(int fd, const char *body, size_t len);
  * socketpair without the accept loop or hardware (set `updi_fd = -1` to skip
  * the UPDI side effects). */
 #define DAP_MAX_BREAKPOINTS 64
+#define DAP_MAX_FRAMES      32
+#define DAP_MAX_VARREFS    256
+
+/* variablesReference kinds (Phase 19). */
+enum { DAP_VR_NONE = 0, DAP_VR_LOCALS, DAP_VR_REGISTERS, DAP_VR_GLOBALS,
+       DAP_VR_AGGREGATE };
+
 typedef struct {
     int                     fd;       /* connected DAP client socket            */
     int                     updi_fd;  /* target UPDI link (-1 in unit tests)    */
@@ -127,6 +134,21 @@ typedef struct {
         char     condition[128];     /* DAP condition expression ("" = none)   */
     } bps[DAP_MAX_BREAKPOINTS];
     int                     next_bp_id;
+
+    /* Phase 19: per-frame register contexts (filled by `stackTrace`, indexed by
+     * `frameId` on `scopes`) and the `variablesReference` table used to expand
+     * scopes / structs / arrays lazily.  Both are reset whenever the target is
+     * resumed (continue/step), since frame and variable handles go stale then. */
+    struct { uint32_t pc; ElfFrameRegs fr; } frames[DAP_MAX_FRAMES];
+    int                     nframes;
+    struct {
+        int          kind;       /* DAP_VR_*                                   */
+        uint32_t     pc;         /* frame PC (locals / globals CU context)     */
+        ElfFrameRegs fr;         /* frame registers (locals)                   */
+        uint32_t     addr;       /* aggregate base address                     */
+        uint64_t     type_off;   /* aggregate DWARF type DIE offset            */
+    } varrefs[DAP_MAX_VARREFS];
+    int                     next_varref;  /* 1-based; index 0 reserved (= none)*/
 } dap_session;
 
 /* Reset a dap_session's breakpoint state to empty (HW comparator shadow

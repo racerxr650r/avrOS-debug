@@ -546,31 +546,30 @@ static void dap_format_frame(dap_session *s, int id, uint32_t pc,
     }
 }
 
-#define DAP_MAX_FRAMES 32
-
-/* Phase 18: multi-frame stack unwind via .debug_frame CFI + the live target.
+/* Phase 18/19: multi-frame stack unwind via .debug_frame CFI + the live target.
  *
  * For each frame we get the CFA rule (CFA = value(cfa_reg) + offset) from
  * elf_cfi_cfa(), where cfa_reg is the Y frame-pointer pair r28:r29 (28) or SP
  * (32).  AVR's fixed stack conventions then give the caller:
- *   - the 2-byte word return address sits just below the CFA (a `call` pushes
- *     the word PC); the code-space byte PC is that word << 1;
+ *   - the 2-byte word return address sits at [CFA-1, CFA] (a `call` pushes the
+ *     word PC); the code-space byte PC is that word << 1;
  *   - the caller's Y was saved by the callee prologue (push r28; push r29), so
- *     r28 (Y-low) is the byte just under the return address and r29 (Y-high)
- *     one lower still.
+ *     r28 (Y-low) lands at CFA-2 and r29 (Y-high) at CFA-3.
  * The caller's SP at its call site is the CFA.  We stop at an invalid return
- * address (0, odd-of-range), when the CFA stops advancing, or at DAP_MAX_FRAMES.
- * The exact byte offsets are AVR-silicon conventions, locked against avr-gdb's
- * backtrace on the gdb_debug_session fixture (DAP9, doc/UserManual Appendix B).
+ * address, where no CFI covers the PC (the C-runtime frame above main), when
+ * the CFA stops advancing, or at DAP_MAX_FRAMES.  The byte offsets are AVR
+ * conventions locked against avr-gdb (Appendix B.17).
  *
- * Fills pcs[0..n-1] (frame 0 = innermost) and returns n (>= 1), or 0 if the
- * live registers can't be read. */
-static int dap_unwind(dap_session *s, uint32_t *pcs, int max)
+ * Fills s->frames[0..n-1] (frame 0 = innermost) with each frame's PC and its
+ * register context (CFA / Y / SP — consumed by `scopes`), sets s->nframes, and
+ * returns n (>= 1), or 0 if the live registers can't be read. */
+static int dap_unwind(dap_session *s)
 {
     uint32_t pc = 0, y;
     uint16_t sp16 = 0;
     uint8_t  r28 = 0, r29 = 0;
 
+    s->nframes = 0;
     if (s->updi_fd < 0 || s->elf == NULL) return 0;
     if (updi_ocd_read_pc (s->updi_fd, &pc)      != 0) return 0;
     if (updi_ocd_read_sp (s->updi_fd, &sp16)    != 0) return 0;
@@ -580,72 +579,66 @@ static int dap_unwind(dap_session *s, uint32_t *pcs, int max)
     uint32_t sp = sp16;
     y = (uint32_t)r28 | ((uint32_t)r29 << 8);
 
-    uint32_t flash_size = s->elf->flash_size;
+    uint32_t   flash_size = s->elf->flash_size;
     const bool dbg = getenv("AVROSDB_DAP_UNWIND_LOG") != NULL;
 
-    int n = 0;
-    pcs[n++] = pc;
+    int      n = 0;
     uint32_t prev_cfa = 0;
-    while (n < max) {
-        int cfa_reg = 0, cfa_off = 0;
-        if (elf_cfi_cfa(s->elf, pc, &cfa_reg, &cfa_off) != 0) break;
-        uint32_t base = (cfa_reg == 32) ? sp : y;
-        uint32_t cfa  = (base + (uint32_t)cfa_off) & 0xffffu;
+    for (;;) {
+        if (n >= DAP_MAX_FRAMES) break;
 
-        uint32_t ra_word = 0, caller_y = 0;
-        /* Return-address word spans [CFA-1, CFA] — the CIE's "RA at cfa-1" — as
-         * the 2-byte word PC a `call` pushed, high byte at CFA-1, low at CFA. */
-        {
-            uint8_t rb[2];
-            if (updi_mem_read(s->updi_fd, (cfa - 1u) & 0xffffu, rb, 2) < 0) break;
-            ra_word = (uint32_t)rb[1] | ((uint32_t)rb[0] << 8);
-        }
-        /* Caller's saved Y: the callee prologue did `push r28; push r29`, so
-         * r28 (Y-low) lands at CFA-2 and r29 (Y-high) at CFA-3. */
-        {
-            uint8_t yb[2];
-            if (updi_mem_read(s->updi_fd, (cfa - 3u) & 0xffffu, yb, 2) >= 0)
-                caller_y = (uint32_t)yb[1] | ((uint32_t)yb[0] << 8);
-        }
+        int  cfa_reg = 0, cfa_off = 0;
+        bool have_cfa = (elf_cfi_cfa(s->elf, pc, &cfa_reg, &cfa_off) == 0);
+        uint32_t cfa = have_cfa
+            ? (((cfa_reg == 32 ? sp : y) + (uint32_t)cfa_off) & 0xffffu) : 0;
 
-        if (dbg) {
-            uint8_t win[10];
-            (void)updi_mem_read(s->updi_fd, (cfa - 6u) & 0xffffu, win, sizeof win);
-            fprintf(stderr,
-                "[unwind] f%d pc=0x%04x cfa=r%d+%d=0x%04x  win[cfa-6..+3]="
-                "%02x %02x %02x %02x %02x %02x|%02x %02x %02x %02x  "
-                "ra_word@cfa=0x%04x->pc=0x%04x  caller_y=0x%04x\n",
-                n - 1, pc, cfa_reg, cfa_off, cfa,
-                win[0],win[1],win[2],win[3],win[4],win[5],win[6],win[7],win[8],win[9],
-                ra_word, ra_word << 1, caller_y);
-        }
+        /* Record this frame and its register context. */
+        s->frames[n].pc     = pc;
+        s->frames[n].fr.cfa = cfa;
+        s->frames[n].fr.y   = y;
+        s->frames[n].fr.sp  = sp;
+        n++;
+        if (!have_cfa) break;            /* no CFI here — outermost reachable */
 
-        uint32_t ra_byte = ra_word << 1;   /* AVR word PC -> byte address */
+        uint8_t rb[2], yb[2];
+        if (updi_mem_read(s->updi_fd, (cfa - 1u) & 0xffffu, rb, 2) < 0) break;
+        uint32_t ra_word  = (uint32_t)rb[1] | ((uint32_t)rb[0] << 8);
+        uint32_t caller_y = 0;
+        if (updi_mem_read(s->updi_fd, (cfa - 3u) & 0xffffu, yb, 2) >= 0)
+            caller_y = (uint32_t)yb[1] | ((uint32_t)yb[0] << 8);
+        uint32_t ra_byte = ra_word << 1;
+
+        if (dbg)
+            fprintf(stderr, "[unwind] f%d pc=0x%04x cfa=r%d+%d=0x%04x "
+                    "ra=0x%04x->0x%04x cy=0x%04x\n", n - 1, pc, cfa_reg, cfa_off,
+                    cfa, ra_word, ra_byte, caller_y);
+
         if (ra_word == 0) break;
         if (flash_size != 0 && ra_byte >= flash_size) break;
-        if (cfa == prev_cfa) break;        /* no progress — bail */
+        if (cfa == prev_cfa) break;      /* no progress — bail */
 
         prev_cfa = cfa;
         pc = ra_byte;
         sp = cfa;
         y  = caller_y;
-        pcs[n++] = pc;
     }
+    s->nframes = n;
     return n;
 }
 
-/* Phase 17 → 18: `stackTrace`.  Frame 0 from the live PC; deeper frames via
- * DWARF CFI unwinding (dap_unwind).  With no target (updi_fd < 0, unit tests)
- * or no DWARF it still returns one frame so the client has a valid stack. */
+/* Phase 17 → 18/19: `stackTrace`.  Frame 0 from the live PC; deeper frames via
+ * DWARF CFI unwinding (dap_unwind), recording each frame's register context for
+ * `scopes`.  With no target (updi_fd < 0, unit tests) or no DWARF it still
+ * returns one frame so the client has a valid stack. */
 static int dap_handle_stack_trace(dap_session *s, long req_seq)
 {
-    uint32_t pcs[DAP_MAX_FRAMES];
-    int n = dap_unwind(s, pcs, DAP_MAX_FRAMES);
+    int n = dap_unwind(s);
     if (n <= 0) {
         uint32_t pc = 0;
         (void)(s->updi_fd >= 0 && updi_ocd_read_pc(s->updi_fd, &pc) == 0);
-        pcs[0] = pc;
-        n = 1;
+        s->frames[0].pc = pc;
+        s->frames[0].fr.cfa = s->frames[0].fr.y = s->frames[0].fr.sp = 0;
+        s->nframes = n = 1;
     }
 
     char body[4096];
@@ -654,7 +647,7 @@ static int dap_handle_stack_trace(dap_session *s, long req_seq)
     if (w > 0) off = (size_t)w;
     for (int i = 0; i < n; i++) {
         char frame[1600];   /* fits id + function name + escaped file:line */
-        dap_format_frame(s, i, pcs[i], frame, sizeof frame);
+        dap_format_frame(s, i, s->frames[i].pc, frame, sizeof frame);
         w = snprintf(body + off, sizeof body - off, "%s%s", i ? "," : "", frame);
         if (w < 0 || (size_t)w >= sizeof body - off) break;
         off += (size_t)w;
@@ -662,6 +655,167 @@ static int dap_handle_stack_trace(dap_session *s, long req_seq)
     (void)snprintf(body + off, sizeof body - off,
                    "],\"totalFrames\":%d}", n);
     return dap_send_response(s, req_seq, "stackTrace", true, body);
+}
+
+/* ── Scopes & Variables (Phase 19) ────────────────────────────────────────── */
+
+/* elf_type_render memory-read callback over the target data space: SRAM/IO are
+ * the low 16-bit data addresses; the mapped-flash window (data >= 0x8000, where
+ * avr-gcc places `.rodata`) is routed through the UPDI flash mirror. */
+static int dap_mem_cb(void *user, uint32_t addr, uint8_t *buf, int len)
+{
+    dap_session *s = (dap_session *)user;
+    if (s->updi_fd < 0) return -1;
+    uint32_t a = (addr >= 0x8000u) ? flash_to_updi(addr) : (addr & 0xffffu);
+    return updi_mem_read(s->updi_fd, a, buf, (size_t)len) < 0 ? -1 : 0;
+}
+
+/* Allocate a variablesReference (1-based); returns 0 when the table is full
+ * (DAP treats 0 as "no children"). */
+static int dap_varref_alloc(dap_session *s, int kind, uint32_t pc,
+                            const ElfFrameRegs *fr, uint32_t addr,
+                            uint64_t type_off)
+{
+    if (s->next_varref < 1) s->next_varref = 1;
+    if (s->next_varref >= DAP_MAX_VARREFS) return 0;
+    int r = s->next_varref++;
+    s->varrefs[r].kind     = kind;
+    s->varrefs[r].pc       = pc;
+    s->varrefs[r].addr     = addr;
+    s->varrefs[r].type_off = type_off;
+    if (fr) s->varrefs[r].fr = *fr;
+    else    s->varrefs[r].fr.cfa = s->varrefs[r].fr.y = s->varrefs[r].fr.sp = 0;
+    return r;
+}
+
+/* Invalidate all frame + variable handles (the target moved). */
+static void dap_varref_reset(dap_session *s) { s->next_varref = 1; s->nframes = 0; }
+
+/* Format one DAP Variable object for `v` (render its value; allocate a child
+ * variablesReference when it is an aggregate). */
+static int dap_format_var(dap_session *s, const ElfVar *v, char *out, size_t cap)
+{
+    char val[320];
+    bool expandable = false;
+    if (s->elf == NULL ||
+        elf_type_render(s->elf, v->addr, v->type_off, dap_mem_cb, s,
+                        val, sizeof val, &expandable) != 0)
+        snprintf(val, sizeof val, "<unavailable>");
+    int ref = expandable
+        ? dap_varref_alloc(s, DAP_VR_AGGREGATE, 0, NULL, v->addr, v->type_off) : 0;
+    char ne[140], ve[640];
+    dj_escape(v->name, ne, sizeof ne);
+    dj_escape(val, ve, sizeof ve);
+    return snprintf(out, cap,
+        "{\"name\":\"%s\",\"value\":\"%s\",\"variablesReference\":%d,"
+        "\"memoryReference\":\"0x%x\"}", ne, ve, ref, v->addr);
+}
+
+/* `scopes`: per frame, a Locals scope, a Registers scope (innermost frame only
+ * — the live CPU registers), and a Globals scope.  Each carries a
+ * variablesReference the client expands with `variables`. */
+static int dap_handle_scopes(dap_session *s, const char *msg,
+                             const dj_tok_t *t, long req_seq)
+{
+    long frame_id = 0;
+    int  args = dj_member(msg, t, 0, "arguments");
+    int  fm   = (args >= 0) ? dj_member(msg, t, args, "frameId") : -1;
+    if (fm >= 0) (void)dj_long(msg, t, fm, &frame_id);
+    if (frame_id < 0 || frame_id >= s->nframes) frame_id = 0;
+
+    uint32_t     pc = (s->nframes > 0) ? s->frames[frame_id].pc : 0;
+    ElfFrameRegs fr = (s->nframes > 0) ? s->frames[frame_id].fr
+                                       : (ElfFrameRegs){0, 0, 0};
+
+    int locals  = dap_varref_alloc(s, DAP_VR_LOCALS,  pc, &fr,  0, 0);
+    int globals = dap_varref_alloc(s, DAP_VR_GLOBALS, pc, NULL, 0, 0);
+    int regs    = (frame_id == 0)
+        ? dap_varref_alloc(s, DAP_VR_REGISTERS, pc, NULL, 0, 0) : 0;
+
+    char   body[512];
+    size_t off = (size_t)snprintf(body, sizeof body,
+        "{\"scopes\":[{\"name\":\"Locals\",\"variablesReference\":%d,"
+        "\"presentationHint\":\"locals\",\"expensive\":false}", locals);
+    if (regs)
+        off += (size_t)snprintf(body + off, sizeof body - off,
+            ",{\"name\":\"Registers\",\"variablesReference\":%d,"
+            "\"presentationHint\":\"registers\",\"expensive\":false}", regs);
+    off += (size_t)snprintf(body + off, sizeof body - off,
+        ",{\"name\":\"Globals\",\"variablesReference\":%d,\"expensive\":false}]}",
+        globals);
+    return dap_send_response(s, req_seq, "scopes", true, body);
+}
+
+/* Append the live-register list (r0–r31, SP, SREG, PC) to `body`. */
+static size_t dap_append_registers(dap_session *s, char *body, size_t cap,
+                                   size_t off, int *first)
+{
+    for (int i = 0; i < 32; i++) {
+        uint8_t rv = 0;
+        if (s->updi_fd >= 0) (void)updi_ocd_read_gpr(s->updi_fd, (uint8_t)i, &rv);
+        int w = snprintf(body + off, cap - off,
+            "%s{\"name\":\"r%d\",\"value\":\"0x%02x\",\"variablesReference\":0}",
+            *first ? "" : ",", i, rv);
+        if (w < 0 || (size_t)w >= cap - off) return off;
+        off += (size_t)w; *first = 0;
+    }
+    uint16_t sp = 0; uint8_t sreg = 0; uint32_t pc = 0;
+    if (s->updi_fd >= 0) {
+        (void)updi_ocd_read_sp(s->updi_fd, &sp);
+        (void)updi_ocd_read_sreg(s->updi_fd, &sreg);
+        (void)updi_ocd_read_pc(s->updi_fd, &pc);
+    }
+    int w = snprintf(body + off, cap - off,
+        ",{\"name\":\"SP\",\"value\":\"0x%04x\",\"variablesReference\":0}"
+        ",{\"name\":\"SREG\",\"value\":\"0x%02x\",\"variablesReference\":0}"
+        ",{\"name\":\"PC\",\"value\":\"0x%06x\",\"variablesReference\":0}",
+        sp, sreg, pc);
+    if (w > 0 && (size_t)w < cap - off) off += (size_t)w;
+    return off;
+}
+
+/* `variables`: expand a scope (Locals/Registers/Globals) or an aggregate
+ * (struct/union members, array elements) named by `variablesReference`. */
+static int dap_handle_variables(dap_session *s, const char *msg,
+                                const dj_tok_t *t, long req_seq)
+{
+    long vref = 0;
+    int  args = dj_member(msg, t, 0, "arguments");
+    int  vm   = (args >= 0) ? dj_member(msg, t, args, "variablesReference") : -1;
+    if (vm >= 0) (void)dj_long(msg, t, vm, &vref);
+
+    char   body[8192];
+    size_t off   = (size_t)snprintf(body, sizeof body, "{\"variables\":[");
+    int    first = 1;
+
+    if (vref >= 1 && vref < DAP_MAX_VARREFS) {
+        int kind = s->varrefs[vref].kind;
+        if (kind == DAP_VR_REGISTERS) {
+            off = dap_append_registers(s, body, sizeof body, off, &first);
+        } else if (s->elf != NULL) {
+            ElfVar vs[64];
+            int nv;
+            if (kind == DAP_VR_AGGREGATE)
+                nv = elf_type_children(s->elf, s->varrefs[vref].addr,
+                                       s->varrefs[vref].type_off, vs, 64);
+            else
+                nv = elf_var_enum(s->elf, s->varrefs[vref].pc, &s->varrefs[vref].fr,
+                                  kind == DAP_VR_GLOBALS ? ELF_SCOPE_GLOBALS
+                                                         : ELF_SCOPE_LOCALS,
+                                  vs, 64);
+            for (int i = 0; i < nv; i++) {
+                char e[960];
+                int  w = dap_format_var(s, &vs[i], e, sizeof e);
+                if (w < 0) continue;
+                int pw = snprintf(body + off, sizeof body - off, "%s%s",
+                                  first ? "" : ",", e);
+                if (pw < 0 || (size_t)pw >= sizeof body - off) break;
+                off += (size_t)pw; first = 0;
+            }
+        }
+    }
+    (void)snprintf(body + off, sizeof body - off, "]}");
+    return dap_send_response(s, req_seq, "variables", true, body);
 }
 
 /* ── Breakpoints (Phase 18) ───────────────────────────────────────────────── */
@@ -1066,6 +1220,7 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
         if (dap_send_event(s, "continued",
                 "{\"threadId\":1,\"allThreadsContinued\":true}") < 0)
             return -1;
+        dap_varref_reset(s);         /* frame/var handles go stale on resume */
         if (s->updi_fd >= 0) {
             if (dap_target_resume(s) == 0)
                 s->running = true;   /* dap_serve() polls for the halt */
@@ -1090,6 +1245,7 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
      * correct source line via the shallow stackTrace.                      */
     if (strcmp(cmd, "next") == 0 || strcmp(cmd, "stepIn") == 0 ||
         strcmp(cmd, "stepOut") == 0) {
+        dap_varref_reset(s);         /* frame/var handles go stale on step */
         if (s->updi_fd >= 0)
             (void)updi_step(s->updi_fd);
         s->running = false;
@@ -1102,9 +1258,10 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
         return dap_handle_stack_trace(s, req_seq) < 0 ? -1 : 0;
 
     if (strcmp(cmd, "scopes") == 0)
-        /* Frame scopes (locals/registers) carry variables — Phase 19. */
-        return dap_send_response(s, req_seq, cmd, true,
-                "{\"scopes\":[]}") < 0 ? -1 : 0;
+        return dap_handle_scopes(s, msg, t, req_seq) < 0 ? -1 : 0;
+
+    if (strcmp(cmd, "variables") == 0)
+        return dap_handle_variables(s, msg, t, req_seq) < 0 ? -1 : 0;
 
     if (strcmp(cmd, "disconnect") == 0 || strcmp(cmd, "terminate") == 0) {
         /* Remove all installed breakpoints from silicon before resuming, so

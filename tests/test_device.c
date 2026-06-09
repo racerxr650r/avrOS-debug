@@ -209,6 +209,15 @@ int elf_var_addr(const ElfContext *c, uint32_t pc, const ElfFrameRegs *fr,
 int elf_addr_to_func(const ElfContext *c, uint32_t pc, char *n, size_t cap)
 { (void)c; (void)pc; (void)n; (void)cap; return -1; }
 
+int elf_var_enum(const ElfContext *c, uint32_t pc, const ElfFrameRegs *fr,
+                 int sc, ElfVar *o, int m)
+{ (void)c; (void)pc; (void)fr; (void)sc; (void)o; (void)m; return 0; }
+int elf_type_render(const ElfContext *c, uint32_t a, uint64_t to,
+                    ElfMemRead rd, void *u, char *o, size_t cap, bool *ex)
+{ (void)c; (void)a; (void)to; (void)rd; (void)u; (void)cap; if(ex)*ex=false; if(o&&cap)o[0]='\0'; return -1; }
+int elf_type_children(const ElfContext *c, uint32_t a, uint64_t to, ElfVar *o, int m)
+{ (void)c; (void)a; (void)to; (void)o; (void)m; return -1; }
+
 int __wrap_fsm_build_thread_list(FsmContext *c, const AvrOsSymbolIndex *i, int fd);
 int __wrap_fsm_build_thread_list(FsmContext *c, const AvrOsSymbolIndex *i, int fd)
 {
