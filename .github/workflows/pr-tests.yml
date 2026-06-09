@@ -8,15 +8,26 @@ jobs:
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest
+    # Run inside Debian 13 (trixie) so the AVR toolchain matches the developer /
+    # hardware environment (avr-gcc 14.2 + avr-libc 2.2 with native AVR-Dx
+    # support).  ubuntu-latest's distro gcc-avr is 5.x, whose different DWARF
+    # line tables break the fixture-derived DWARF tests.
+    container: debian:trixie
     permissions:
       pull-requests: write   # post / update the PR comment
 
     steps:
+      # Install deps before checkout so git is present in the container.
+      # Root in the container — no sudo; avr-libc 2.2 covers AVR-Dx so no DFP.
+      - name: Install build dependencies
+        run: |
+          apt-get update -q
+          apt-get install -y --no-install-recommends \
+            make gcc binutils gcc-avr binutils-avr avr-libc \
+            libdw-dev libelf-dev git ca-certificates
+
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install build dependencies
-        run: make prereqs
 
       # Run every test suite; write per-suite output to build/test-results/.
       # continue-on-error keeps subsequent steps running so we always post a
@@ -150,21 +161,23 @@ jobs:
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
+    # Same Debian-trixie toolchain as the unit-tests job (see note above).
+    container: debian:trixie
     permissions:
       pull-requests: write   # post / update the PR comment
 
     steps:
+      # Install deps before checkout so git is present in the container.
+      - name: Install build dependencies
+        run: |
+          apt-get update -q
+          apt-get install -y --no-install-recommends \
+            make gcc binutils gcc-avr binutils-avr avr-libc \
+            libdw-dev libelf-dev gcovr git ca-certificates
+          gcovr --version
+
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install build dependencies
-        run: make prereqs
-
-      - name: Install gcovr
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcovr
-          gcovr --version
 
       # Build with --coverage, run every unit test suite, and emit
       # line + branch coverage reports under build/coverage/. The
