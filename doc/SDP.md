@@ -1176,6 +1176,51 @@ This is not a fixable detail — it is a **model mismatch**. avrOS is a cooperat
 - **bp-mode `auto`:** in the default `auto` mode a single FLASH breakpoint runs on the HW comparator (no LED glitch, fires after sleep); a second concurrent breakpoint falls back to the peripheral-preserved SW patch; `monitor bp-mode sw`/`hw-only`/`auto` toggle the policy.
 - **Gate:** `make` 0 warnings; `make test` all pass; `python3 tools/lint_project.py` 0/0.
 
+### Phase 21 — VS Code avrOS Debug View (activity bar) + turnkey install/launch
+
+> **Status: 🔲 Planned — branch `phase-21-vscode-avros-debug-view` (GitHub issue TBD).** Builds on the feature-complete Phase 16–19 DAP front-end and the Phase-19 `avrosdb-dap` companion extension (which already self-starts the server for an F5 launch). Promotes that minimal extension into a first-class avrOS debugging surface.
+
+**Motivation.** Today state inspection lives in VS Code's stock *Run and Debug* view, and the avrOS runtime objects that are the whole reason this debugger exists — the cooperative **state machines**, **events**, and **queues** — are invisible in the GUI (reachable only via `monitor avros …` on the GDB-RSP path). This phase adds a dedicated **avrOS** activity-bar view that presents the standard debug state *and* avrOS introspection together, and makes setup turnkey: the extension installs/locates `avrOSdb` and configures VS Code to launch-and-attach on **F5** with no hand-written `launch.json`.
+
+**Scope summary.**
+
+| # | Area | Deliverable | File(s) |
+| - | ---- | ----------- | ------- |
+| 1 | avrOSdb introspection over DAP | Custom DAP requests `avrosdb/fsmList`, `avrosdb/eventList`, `avrosdb/queueList` returning the avrOS FSM / event / queue tables as JSON, reusing the `AvrOsSymbolIndex`/`FsmContext` already on `dap_session` and the FSM/monitor table readers (degrade to empty lists when the ELF has no avrOS tables) | `src/dap.c`, shared readers from `src/fsm_mapper.c` / `src/monitor.c` |
+| 2 | Activity-bar container | An avrOS icon in the activity bar opening an **avrOS Debug** view container in the primary side bar | `tools/vscode/avrosdb-dap/package.json`, `media/` icon |
+| 3 | Debug sub-views | **VARIABLES**, **CALL STACK**, **BREAKPOINTS** `TreeView`s that mirror the Run-and-Debug view by proxying the active `avrosdb` session (`customRequest('scopes'/'variables'/'stackTrace')` + the `vscode.debug.breakpoints` API), refreshing on the `stopped` event and frame selection; expand structs/arrays and set values route back through the session | extension |
+| 4 | avrOS sub-views | **STATE MACHINES**, **EVENTS**, **QUEUES** `TreeView`s backed by the §1 custom requests — per-FSM current state, per-event status, per-queue capacity/usage — refreshing on stop and on a manual refresh, operating like the §3 views | extension |
+| 5 | Turnkey install + F5 | A `DebugConfigurationProvider` that auto-provides/resolves the `avrosdb` launch config (program/serial/elf, prompting when unset) so F5 works with no `launch.json`; a first-run step that locates `avrOSdb` (PATH → configured path → offer to `make`/install); workspace settings for serial/elf/program | extension, `package.json` |
+| 6 | Build / package / docs | A build+package step for the extension (`vsce`, e.g. a `make vscode-ext` target); User-Manual §6.3 rewrite with the new view + first-run flow | `Makefile`, `doc/UserManual.md` |
+| 7 | Spec + tests | HLR-086/087/088 + LLRs (LLR-DAP-17.. for the custom requests; shared FSM/MON readers); STP host `test_dap` cases + a hardware introspection case | `doc/Project.xml`, `tests/` |
+
+**Implementation steps.**
+
+*avrOSdb side (must land first — it is the data source and carries the automated tests):*
+1. Factor the avrOS table readers so the DAP front-end can call them without the RSP `monitor` O-packet plumbing (mirror the Phase-18 `debug_bp` extraction): an FSM list (name / current-state / handler / priority / active, from `fsm_mapper`) and event/queue lists (from the `monitor` `EVNT_TABLE`/`QUE_TABLE` readers).
+2. Add the three custom DAP request handlers in `dap_dispatch()` returning JSON arrays; guard on `idx`/`fsm` present and on `updi_fd >= 0` so they degrade to empty lists (unit-testable over a socketpair).
+3. Host `test_dap` cases (well-formed body; empty without symbols/target) and a hardware `tests/hw/dap_introspect.py` (+ `make hw-test-dap-introspect`) asserting `avrosdb/fsmList` lists the example app's FSM(s), matching `monitor avros tasks`.
+
+*Extension side:*
+4. Contribute the activity-bar view container + six views; an avrOS icon asset.
+5. Implement the debug-proxy `TreeDataProvider`s (Variables/Call Stack/Breakpoints) over the active session's custom requests + breakpoints API, wired to `onDidChangeActiveDebugSession` / `onDidReceiveDebugSessionCustomEvent` / the stop event.
+6. Implement the introspection `TreeDataProvider`s (State Machines/Events/Queues) over the §1–2 custom requests, with refresh-on-stop and a manual refresh command.
+7. Add the `DebugConfigurationProvider` (turnkey F5, no `launch.json`) and the install/locate-avrOSdb first-run flow + settings.
+8. Build/package target + docs.
+
+**Per-test / fixture notes.** The DAP introspection requests are exercised against `gdb_target.elf` — the avrOS example with FSM/event/queue tables already used by Group-G G10 and the `monitor` tests — on hardware, and with stubbed readers in host `test_dap`. The extension's `TreeView`s are GUI surfaces that the headless nvim/Python harnesses cannot drive, so their acceptance is a **documented manual checklist** (with screenshots); the automated coverage lives on the avrOSdb side (the `avrosdb/*List` requests). New host tests derive any addresses from source lines (Phase-18 portability lesson); hardware cases never enter `make test`.
+
+**Open questions / risks.**
+- VS Code does not let an extension *re-parent* the built-in Variables/Call Stack/Breakpoints views into a custom container, so §3 re-implements them as proxy trees over DAP — full fidelity to the native views (inline edit, drag, hover) is approximated; document the gaps.
+- There is no `monitor` channel over DAP, so avrOS introspection needs the new custom-request contract (§1) — pin the JSON schema in the spec and keep the RSP `monitor` and DAP paths sharing one reader.
+- Extension UI has no headless automated-test path; rely on the avrOSdb-side tests plus a manual VS Code acceptance checklist.
+
+**Acceptance.**
+- Selecting the avrOS activity-bar icon shows the **avrOS Debug** container with VARIABLES, CALL STACK, BREAKPOINTS, STATE MACHINES, EVENTS, and QUEUES views.
+- During an `avrosdb` session the first three mirror the stock Run-and-Debug view (update on stop, expand aggregates, set values); the avrOS three list the running application's state machines / events / queues with live values and refresh on stop.
+- **F5** with no hand-written `launch.json` starts `avrOSdb` and attaches (the extension supplies the config); a first run locates or installs `avrOSdb`.
+- **Gate:** `make` 0 warnings; `make test` all pass; `python3 tools/lint_project.py` 0/0; the new `avrosdb/*List` requests covered by host + hardware tests.
+
 ## 9. Risks & Open Questions
 
 *   **Half-duplex echo cancellation in UPDI tests.** Every byte transmitted over the UPDI UART is echoed back on the RX line by the hardware. PTY pairs do not auto-echo, so the PTY test harness must explicitly write back the echo bytes before injecting each simulated AVR response. If this is omitted, UPDI functions will block waiting to drain echoes that never arrive, causing PTY tests to time out even though the production logic is correct.
