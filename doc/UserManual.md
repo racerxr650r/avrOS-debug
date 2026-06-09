@@ -831,16 +831,21 @@ target host).
 **Install the companion extension** (one of):
 
 ```bash
-# Development Host: open the folder in VS Code and press F5
+# Package a .vsix and install it (needs Node tooling: @vscode/vsce or npx)
+make package-vscode
+code --install-extension dist/avrosdb-dap-<version>.vsix
+
+# …or, for development: open the folder in VS Code and press F5
 code tools/vscode/avrosdb-dap
 
 # …or install it for all workspaces by copying it into the extensions dir
-cp -r tools/vscode/avrosdb-dap ~/.vscode/extensions/avrosdb-dap-0.2.0
+cp -r tools/vscode/avrosdb-dap ~/.vscode/extensions/avrosdb-dap-0.3.0
 #   (VS Code Remote-SSH: use ~/.vscode-server/extensions/ on the remote host)
 ```
 
-Reload VS Code after copying. The extension contributes the `avrosdb` debug type
-with a self-starting *launch* configuration (and an *attach* alternative).
+Reload VS Code after installing. The extension contributes the `avrosdb` debug
+type with a self-starting *launch* configuration (and an *attach* alternative),
+a **turnkey F5** flow, and an **avrOS Debug View** in the activity bar.
 
 **Add a launch configuration** — copy
 [`tools/vscode/launch.json`](../tools/vscode/launch.json) to your project's
@@ -880,6 +885,39 @@ For a target on a remote Pi, run VS Code over Remote-SSH (the `launch` config
 then spawns avrOSdb on the Pi), or start avrOSdb on the Pi yourself and use the
 `attach` config with a forwarded port — e.g. `ssh -L 1234:localhost:1234 pi`,
 keeping `"host": "127.0.0.1"`.
+
+#### Zero-config F5 (turnkey)
+
+You can skip `launch.json` entirely. With the extension installed, pressing
+**F5** in a workspace with no debug configuration offers the **avrOSdb (--dap)**
+debugger and starts with a sensible default (`build/avrOSdb`, `/dev/ttyAMA2`,
+`firmware.elf`, port 1234). If the `avrOSdb` binary is not found at
+`build/avrOSdb`, the extension offers to **build it** (`make`) or fall back to
+`avrOSdb` on your `PATH`, then spawns the server and attaches. Edit the paths in
+`launch.json` (or use `--emit-vscode-config`) once your serial port and ELF
+differ from the defaults.
+
+#### avrOS Debug View (activity bar)
+
+The extension adds an **avrOS** icon to the activity bar. Selecting it opens a
+side bar with six views that populate while an `avrosdb` debug session is
+stopped:
+
+| View | Source | Shows |
+| ---- | ------ | ----- |
+| **Variables** | DAP `scopes`/`variables` | Locals / Registers / Globals of the current frame, with struct & array drill-down — the same data as the Run-and-Debug *Variables* view |
+| **Call Stack** | DAP `stackTrace` | The DWARF-unwound call stack, frame names and `file:line` |
+| **Breakpoints** | workspace breakpoints | Every source/function breakpoint and its condition |
+| **State Machines** | `avrosdb/fsmList` | Each avrOS FSM task, its current state, and whether it is the active task |
+| **Events** | `avrosdb/eventList` | Each registered avrOS event and its status flag |
+| **Queues** | `avrosdb/queueList` | Each avrOS queue's capacity and element size |
+
+The first three mirror the built-in Run-and-Debug side bar (VS Code does not let
+those views be moved, so the extension re-renders them here); the last three are
+the avrOS-specific introspection that `avrOSdb --dap` exposes through custom
+requests — the DAP analogue of `monitor avros tasks|events|queues` on the
+GDB-RSP path (§6.1). The views refresh automatically each time the target halts;
+the **↻** title-bar button forces a manual refresh.
 
 > [!TIP]
 > Prefer a no-extension quick test? Start `avrOSdb --dap --port 1234 …` yourself

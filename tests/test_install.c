@@ -334,6 +334,115 @@ static void test_make_bundle_produces_homebrew_formula(void)
     free(buf);
 }
 
+/* Read an entire text file into a freshly malloc'd, NUL-terminated buffer.
+ * Returns NULL (and asserts) on failure; caller frees. */
+static char *slurp(const char *path)
+{
+    FILE *fp = fopen(path, "r");
+    TEST_ASSERT_NOT_NULL_MESSAGE(fp, path);
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    char *buf = malloc((size_t)sz + 1);
+    TEST_ASSERT_NOT_NULL(buf);
+    size_t got = fread(buf, 1, (size_t)sz, fp);
+    buf[got] = '\0';
+    fclose(fp);
+    return buf;
+}
+
+/* ── (i) LLR-INST-09 — VS Code extension declares the avrOS Debug View ── */
+static void test_vscode_extension_declares_avros_debug_view(void)
+{
+    const char *pkg = "tools/vscode/avrosdb-dap/package.json";
+    TEST_ASSERT_TRUE_MESSAGE(file_exists(pkg),
+        "VS Code extension package.json must exist");
+    char *buf = slurp(pkg);
+
+    /* The activity-bar container and all six contributed views. */
+    static const char *const required[] = {
+        "\"viewsContainers\"", "\"activitybar\"", "\"avrosDebug\"",
+        "\"avrosVariables\"", "\"avrosCallStack\"", "\"avrosBreakpoints\"",
+        "\"avrosStateMachines\"", "\"avrosEvents\"", "\"avrosQueues\"",
+        "media/avros.svg",
+    };
+    for (size_t i = 0; i < sizeof required / sizeof required[0]; ++i) {
+        char msg[160];
+        snprintf(msg, sizeof msg,
+                 "extension package.json missing avrOS Debug View token: %s",
+                 required[i]);
+        TEST_ASSERT_NOT_NULL_MESSAGE(strstr(buf, required[i]), msg);
+    }
+    free(buf);
+
+    /* The activity-bar icon asset must be present. */
+    TEST_ASSERT_TRUE_MESSAGE(
+        file_exists("tools/vscode/avrosdb-dap/media/avros.svg"),
+        "activity-bar icon media/avros.svg must exist");
+
+    /* extension.js must drive the three avrOS introspection custom requests. */
+    char *ext = slurp("tools/vscode/avrosdb-dap/extension.js");
+    static const char *const reqs[] = {
+        "avrosdb/fsmList", "avrosdb/eventList", "avrosdb/queueList",
+        "registerTreeDataProvider",
+    };
+    for (size_t i = 0; i < sizeof reqs / sizeof reqs[0]; ++i) {
+        char msg[160];
+        snprintf(msg, sizeof msg,
+                 "extension.js missing avrOS introspection token: %s", reqs[i]);
+        TEST_ASSERT_NOT_NULL_MESSAGE(strstr(ext, reqs[i]), msg);
+    }
+
+    /* If a JS engine is available, syntax-check extension.js. */
+    if (tool_available("node")) {
+        TEST_ASSERT_EQUAL_INT_MESSAGE(0,
+            run_shell("node --check tools/vscode/avrosdb-dap/extension.js "
+                      ">/dev/null 2>&1"),
+            "extension.js must pass `node --check`");
+    } else {
+        TEST_MESSAGE("node(1) not installed; skipping extension.js syntax check");
+    }
+    free(ext);
+}
+
+/* ── (j) LLR-INST-10 — extension supplies a turnkey launch configuration ── */
+static void test_vscode_extension_provides_turnkey_launch_config(void)
+{
+    char *pkg = slurp("tools/vscode/avrosdb-dap/package.json");
+    /* A self-starting launch config (request:"launch" + program/serial/elf)
+     * so one F5 spawns avrOSdb and attaches. */
+    static const char *const fields[] = {
+        "\"request\": \"launch\"", "\"program\"", "\"serial\"", "\"elf\"",
+        "initialConfigurations",
+    };
+    for (size_t i = 0; i < sizeof fields / sizeof fields[0]; ++i) {
+        char msg[160];
+        snprintf(msg, sizeof msg,
+                 "extension package.json missing turnkey launch field: %s",
+                 fields[i]);
+        TEST_ASSERT_NOT_NULL_MESSAGE(strstr(pkg, fields[i]), msg);
+    }
+    free(pkg);
+
+    /* extension.js must register the turnkey machinery: a config provider that
+     * fills defaults, the spawn-on-launch adapter factory, and a build/locate
+     * fallback for the avrOSdb binary. */
+    char *ext = slurp("tools/vscode/avrosdb-dap/extension.js");
+    static const char *const hooks[] = {
+        "registerDebugConfigurationProvider",
+        "registerDebugAdapterDescriptorFactory",
+        "resolveDebugConfiguration",
+        "listening on",
+    };
+    for (size_t i = 0; i < sizeof hooks / sizeof hooks[0]; ++i) {
+        char msg[160];
+        snprintf(msg, sizeof msg,
+                 "extension.js missing turnkey hook: %s", hooks[i]);
+        TEST_ASSERT_NOT_NULL_MESSAGE(strstr(ext, hooks[i]), msg);
+    }
+    free(ext);
+}
+
 /* ── runner ─────────────────────────────────────────────────────────── */
 int main(void)
 {
@@ -346,5 +455,7 @@ int main(void)
     RUN_TEST(test_make_bundle_produces_deb_package);
     RUN_TEST(test_make_bundle_produces_rpm_package);
     RUN_TEST(test_make_bundle_produces_homebrew_formula);
+    RUN_TEST(test_vscode_extension_declares_avros_debug_view);
+    RUN_TEST(test_vscode_extension_provides_turnkey_launch_config);
     return UNITY_END();
 }

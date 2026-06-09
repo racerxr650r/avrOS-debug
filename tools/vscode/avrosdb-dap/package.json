@@ -1,14 +1,64 @@
 {
   "name": "avrosdb-dap",
   "displayName": "avrOSdb (DAP)",
-  "description": "Debug AVR-Dx targets in VS Code via `avrOSdb --dap` — launch the server and attach, or attach to a running one.",
-  "version": "0.2.0",
+  "description": "Debug AVR-Dx targets in VS Code via `avrOSdb --dap` — one F5 starts the server and attaches, with an avrOS activity-bar view for state machines, events, and queues.",
+  "version": "0.3.0",
   "publisher": "avrOS",
   "engines": { "vscode": "^1.66.0" },
   "categories": ["Debuggers"],
   "main": "./extension.js",
-  "activationEvents": ["onDebugResolve:avrosdb"],
+  "activationEvents": [
+    "onDebugResolve:avrosdb",
+    "onDebugInitialConfigurations",
+    "onView:avrosStateMachines",
+    "onView:avrosEvents",
+    "onView:avrosQueues",
+    "onView:avrosVariables",
+    "onView:avrosCallStack",
+    "onView:avrosBreakpoints"
+  ],
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "avrosDebug",
+          "title": "avrOS",
+          "icon": "media/avros.svg"
+        }
+      ]
+    },
+    "views": {
+      "avrosDebug": [
+        { "id": "avrosVariables", "name": "Variables" },
+        { "id": "avrosCallStack", "name": "Call Stack" },
+        { "id": "avrosBreakpoints", "name": "Breakpoints" },
+        { "id": "avrosStateMachines", "name": "State Machines" },
+        { "id": "avrosEvents", "name": "Events" },
+        { "id": "avrosQueues", "name": "Queues" }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "avrosStateMachines",
+        "contents": "No avrOS debug session.\nStart debugging (F5) with the avrOSdb (--dap) configuration to inspect the target's avrOS state machines, events, and queues.\n[Start Debugging](command:workbench.action.debug.start)"
+      }
+    ],
+    "commands": [
+      {
+        "command": "avrosdb.refresh",
+        "title": "avrOS: Refresh Debug View",
+        "icon": "$(refresh)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        { "command": "avrosdb.refresh", "when": "view == avrosStateMachines", "group": "navigation" },
+        { "command": "avrosdb.refresh", "when": "view == avrosEvents", "group": "navigation" },
+        { "command": "avrosdb.refresh", "when": "view == avrosQueues", "group": "navigation" },
+        { "command": "avrosdb.refresh", "when": "view == avrosVariables", "group": "navigation" },
+        { "command": "avrosdb.refresh", "when": "view == avrosCallStack", "group": "navigation" }
+      ]
+    },
     "debuggers": [
       {
         "type": "avrosdb",

@@ -802,6 +802,29 @@ bundle-brew: $(BUILDDIR)/$(TARGET) $(MANPAGE)
 	@mkdir -p $(DISTDIR)
 	$(Q)printf 'class Avrosdb < Formula\n  desc "UPDI-to-GDB debug stub with avrOS FSM awareness"\n  homepage "https://github.com/racerxr650r/avrOS-debug"\n  url "https://github.com/racerxr650r/avrOS-debug/archive/refs/tags/v%s.tar.gz"\n  sha256 "0000000000000000000000000000000000000000000000000000000000000000"\n  version "%s"\n  license "MIT"\n\n  def install\n    system "make"\n    bin.install "build/avrOSdb"\n    man1.install "doc/avrOSdb.1"\n  end\n\n  test do\n    assert_match "avrOSdb", shell_output("#{bin}/avrOSdb --help 2>&1", 1)\n  end\nend\n' $(VERSION) $(VERSION) > $(BREW_FILE)
 	@echo "  BUNDLE  $(BREW_FILE)"
+
+# ── package-vscode target ────────────────────────────────────────────────────
+# Package the VS Code companion extension (tools/vscode/avrosdb-dap) into a
+# .vsix in dist/.  Requires Node tooling: `vsce` (@vscode/vsce) on PATH, or
+# `npx` to fetch it on demand.  Manual/dev-only — Node is not a build or CI
+# dependency of avrOSdb itself, so this target is never invoked by `make` or
+# `make test`.  Install the extension with:
+#   code --install-extension dist/avrosdb-dap-$(VERSION).vsix
+VSCODE_EXT_DIR := tools/vscode/avrosdb-dap
+VSIX_FILE      := $(DISTDIR)/avrosdb-dap-$(VERSION).vsix
+.PHONY: package-vscode
+package-vscode:
+	@mkdir -p $(DISTDIR)
+	@command -v vsce >/dev/null 2>&1 || command -v npx >/dev/null 2>&1 || { \
+	    echo "ERROR: need 'vsce' (npm i -g @vscode/vsce) or 'npx' on PATH"; exit 1; }
+	$(Q)cd $(VSCODE_EXT_DIR) && \
+	    if command -v vsce >/dev/null 2>&1; then \
+	        vsce package --out "$(abspath $(VSIX_FILE))"; \
+	    else \
+	        npx --yes @vscode/vsce package --out "$(abspath $(VSIX_FILE))"; \
+	    fi
+	@echo "  BUNDLE  $(VSIX_FILE)"
+
 # ── prereqs target ───────────────────────────────────────────────────────────
 # Install all development prerequisites (Debian/Ubuntu; requires sudo).
 # Installs host build tools via apt, then downloads and installs the

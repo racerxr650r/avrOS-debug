@@ -1803,6 +1803,21 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="SDD" ref="2.2"/>
         </traces>
       </hlr>
+
+      <hlr id="HLR-087" name="VS Code avrOS Debug View">
+        <text><![CDATA[The project shall provide a VS Code companion extension (`tools/vscode/avrosdb-dap`) that contributes an **avrOS** activity-bar view container presenting avrOS application-debug information while an `avrosdb` DAP session is stopped. The container shall hold six tree views: **Variables**, **Call Stack**, and **Breakpoints** that mirror the built-in Run-and-Debug side bar by re-rendering the active session's DAP data (scopes/variables, stackTrace, and the workspace breakpoint set — VS Code does not permit its built-in views to be re-parented into another container); and **State Machines**, **Events**, and **Queues** that present the avrOS-specific introspection the server exposes through the custom requests of HLR-086 (`avrosdb/fsmList`, `avrosdb/eventList`, `avrosdb/queueList`) — the DAP analogue of `monitor avros tasks|events|queues` on the GDB-RSP path. The views shall refresh when the target halts (on the DAP `stopped` event) and offer a manual refresh command; with no active `avrosdb` session they shall be empty. The extension shall ship a single-colour activity-bar icon and shall be packageable into an installable `.vsix`.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+          <trace target="SDD" ref="10.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-088" name="VS Code Turnkey Debug Configuration">
+        <text><![CDATA[The VS Code companion extension shall provide a turnkey debug flow so a user can start debugging with no prior `launch.json`. A `DebugConfigurationProvider` for the `avrosdb` type shall, on F5, supply a ready-to-run `launch` configuration (defaults `program = ${workspaceFolder}/build/avrOSdb`, `serial = /dev/ttyAMA2`, `elf = ${workspaceFolder}/firmware.elf`, `port = 1234`) and shall resolve an empty configuration to that default. Before the session starts it shall locate the `avrOSdb` binary; when the binary is absent at the configured path it shall offer to build it (`make`) or fall back to `avrOSdb` on `PATH`, aborting the launch when neither is available. On a `launch` request the extension shall spawn `avrOSdb --dap --port <port> <serial> <elf>`, wait for its `listening on` banner, attach over TCP, and terminate the spawned server when the session ends (the spawn-and-attach behaviour introduced with the launch-config helper, HLR-085). The Makefile shall provide a `package-vscode` target that packages the extension into `dist/avrosdb-dap-$(VERSION).vsix` using `vsce`/`npx`; Node tooling is a manual/development dependency only and shall never be required by `make` or `make test`.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+        </traces>
+      </hlr>
     </section>
 
     <section number="9" title="Diagnostics and Bring-up">
@@ -3280,6 +3295,20 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
           <trace target="HLR" ref="HLR-043" name="Distribution Package Bundle"/>
         </traces>
       </llr>
+
+      <llr id="LLR-INST-09">
+        <text><![CDATA[The VS Code companion extension (`tools/vscode/avrosdb-dap`) shall, in `package.json`, contribute a `viewsContainers.activitybar` entry `avrosDebug` (title "avrOS", icon `media/avros.svg`) and six `views` under it: `avrosVariables`, `avrosCallStack`, `avrosBreakpoints`, `avrosStateMachines`, `avrosEvents`, `avrosQueues`. `extension.js` shall register a `TreeDataProvider` for each (`registerTreeDataProvider`): the State Machines / Events / Queues providers shall populate from `session.customRequest("avrosdb/fsmList" | "avrosdb/eventList" | "avrosdb/queueList")` on the active `avrosdb` session; the Variables provider shall proxy `threads`→`stackTrace`→`scopes`→`variables` with lazy aggregate expansion; the Call Stack provider shall proxy `threads`→`stackTrace`; and the Breakpoints provider shall list `vscode.debug.breakpoints`. A `DebugAdapterTracker` shall refresh the views on the DAP `stopped` event and clear the stack/variables snapshots on `continued`; an `avrosdb.refresh` command shall force a manual refresh. The activity-bar icon asset `media/avros.svg` shall be present in the extension.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-087" name="VS Code avrOS Debug View"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-INST-10">
+        <text><![CDATA[`extension.js` shall register (`registerDebugConfigurationProvider`) a `DebugConfigurationProvider` for the `avrosdb` type whose `provideDebugConfigurations()` returns a self-starting `launch` configuration and whose `resolveDebugConfiguration()` seeds that default for an empty config and resolves the `avrOSdb` binary path — building it with `make` or falling back to `PATH` when it is absent, aborting the launch when unresolved. A `DebugAdapterDescriptorFactory` (`registerDebugAdapterDescriptorFactory`) shall, for a `launch` request, spawn `avrOSdb --dap --port <port> <serial> <elf>`, wait for the `listening on` banner (with a timeout fallback), connect via `DebugAdapterServer`, and kill the spawned server when the session terminates. The Makefile shall provide a `package-vscode` target that builds `dist/avrosdb-dap-$(VERSION).vsix` via `vsce`/`npx`, requiring no Node tooling from `make` or `make test`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-088" name="VS Code Turnkey Debug Configuration"/>
+        </traces>
+      </llr>
     </function>
 
     <function number="9" title="tests/hw/hw_test.c — On-Target Hardware Integration Test Harness" name="hwtest" source="tests/hw/hw_test.c">
@@ -4746,7 +4775,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- Installation and documentation tests                         -->
     <!-- ============================================================ -->
-    <file path="tests/test_install.c" role="integration" count="8">
+    <file path="tests/test_install.c" role="integration" count="10">
       <header><![CDATA[Verification tests for the Makefile install/uninstall targets, the `check-tools` pre-flight target, and the Unix man page. Tests fork a subprocess or invoke `make` directly and inspect the resulting file-system state or exit codes.]]></header>
 
       <test name="check_tools_exits_nonzero_when_required_tool_is_absent">
@@ -4787,6 +4816,15 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="make_bundle_produces_homebrew_formula">
         <purpose><![CDATA[Run `make bundle VERSION=0.1.0` and verify that `dist/avrOSdb.rb` exists, is valid Ruby syntax (parseable by `ruby -c`), and contains the required fields: `desc`, `url`, `sha256`, `version`, and an `install` block.]]></purpose>
         <traces><trace target="LLR" ref="LLR-INST-08"/></traces>
+      </test>
+
+      <test name="test_vscode_extension_declares_avros_debug_view">
+        <purpose><![CDATA[Statically verify the VS Code companion extension declares the avrOS Debug View: `tools/vscode/avrosdb-dap/package.json` contributes the `avrosDebug` activity-bar container, all six views (`avrosVariables`/`avrosCallStack`/`avrosBreakpoints`/`avrosStateMachines`/`avrosEvents`/`avrosQueues`) and the `media/avros.svg` icon (which must exist on disk); `extension.js` references the three introspection custom requests (`avrosdb/fsmList|eventList|queueList`) and `registerTreeDataProvider`. When `node` is available, `extension.js` additionally passes `node --check`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-INST-09"/></traces>
+      </test>
+      <test name="test_vscode_extension_provides_turnkey_launch_config">
+        <purpose><![CDATA[Statically verify the extension's turnkey debug flow: `package.json` declares an `initialConfigurations` entry with `request:"launch"` plus `program`/`serial`/`elf`, and `extension.js` registers the configuration provider and adapter-descriptor factory (`registerDebugConfigurationProvider`, `registerDebugAdapterDescriptorFactory`, `resolveDebugConfiguration`) and waits for the server's `listening on` banner.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-INST-10"/></traces>
       </test>
     </file>
 

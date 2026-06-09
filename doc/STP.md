@@ -298,7 +298,7 @@ Role: **integration**. **4 test(s).**
 
 ### 3.8. [tests/test_install.c](../tests/test_install.c)
 
-Role: **integration**. **8 test(s).**
+Role: **integration**. **10 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -310,6 +310,8 @@ Role: **integration**. **8 test(s).**
 | 6 | <a id="make_bundle_produces_deb_package"></a>`make_bundle_produces_deb_package` | `LLR-INST-06` | Run `make bundle VERSION=0.1.0` and verify that `dist/avrOSdb_0.1.0_amd64.deb` exists, that `dpkg-deb --info` exits 0, and that `dpkg-deb --contents` lists both `./usr/bin/avrOSdb` and `./usr/share/man/man1/avrOSdb.1`. |
 | 7 | <a id="make_bundle_produces_rpm_package"></a>`make_bundle_produces_rpm_package` | `LLR-INST-07` | Run `make bundle VERSION=0.1.0` and verify that `dist/avrOSdb-0.1.0-1.x86_64.rpm` exists and that `rpm -qp --list` exits 0 and lists both `/usr/bin/avrOSdb` and `/usr/share/man/man1/avrOSdb.1`. |
 | 8 | <a id="make_bundle_produces_homebrew_formula"></a>`make_bundle_produces_homebrew_formula` | `LLR-INST-08` | Run `make bundle VERSION=0.1.0` and verify that `dist/avrOSdb.rb` exists, is valid Ruby syntax (parseable by `ruby -c`), and contains the required fields: `desc`, `url`, `sha256`, `version`, and an `install` block. |
+| 9 | <a id="test_vscode_extension_declares_avros_debug_view"></a>`test_vscode_extension_declares_avros_debug_view` | `LLR-INST-09` | Statically verify the VS Code companion extension declares the avrOS Debug View: `tools/vscode/avrosdb-dap/package.json` contributes the `avrosDebug` activity-bar container, all six views (`avrosVariables`/`avrosCallStack`/`avrosBreakpoints`/`avrosStateMachines`/`avrosEvents`/`avrosQueues`) and the `media/avros.svg` icon (which must exist on disk); `extension.js` references the three introspection custom requests (`avrosdb/fsmList|eventList|queueList`) and `registerTreeDataProvider`. When `node` is available, `extension.js` additionally passes `node --check`. |
+| 10 | <a id="test_vscode_extension_provides_turnkey_launch_config"></a>`test_vscode_extension_provides_turnkey_launch_config` | `LLR-INST-10` | Statically verify the extension's turnkey debug flow: `package.json` declares an `initialConfigurations` entry with `request:"launch"` plus `program`/`serial`/`elf`, and `extension.js` registers the configuration provider and adapter-descriptor factory (`registerDebugConfigurationProvider`, `registerDebugAdapterDescriptorFactory`, `resolveDebugConfiguration`) and waits for the server's `listening on` banner. |
 
 ### 3.9. [tests/test_device.c](../tests/test_device.c)
 
@@ -638,6 +640,8 @@ verified by code review — see
 | `LLR-INST-06` | `inst` | `HLR-043` | `make_bundle_produces_deb_package` |
 | `LLR-INST-07` | `inst` | `HLR-043` | `make_bundle_produces_rpm_package` |
 | `LLR-INST-08` | `inst` | `HLR-043` | `make_bundle_produces_homebrew_formula` |
+| `LLR-INST-09` | `inst` | `HLR-087` | `test_vscode_extension_declares_avros_debug_view` |
+| `LLR-INST-10` | `inst` | `HLR-088` | `test_vscode_extension_provides_turnkey_launch_config` |
 | `LLR-HWTEST-01` | `hwtest` | `HLR-045` | `A1_port_open_and_cold_start_handshake` |
 | `LLR-HWTEST-02` | `hwtest` | `HLR-045`, `HLR-044` | `A1_port_open_and_cold_start_handshake`, `A2_read_device_info`, `A3_deviceid_matches_expected`, `A4_signature_non_zero_non_ff`, `A5_revid_non_zero`, `A6_sernum_non_zero_non_ff`, `A7_nvmprog_bit_clear` |
 | `LLR-HWTEST-03` | `hwtest` | `HLR-045`, `HLR-011` | `B0_sram_single_byte_round_trip`, `B1_sram_64_byte_round_trip`, `B1a_sigrow_read_repeatability`, `B1b_sram_constant_0xAA_round_trip`, `B1c_sram_write_once_read_twice`, `B2_sram_600_byte_round_trip`, `B3_flash_24bit_addressing_smoke` |
