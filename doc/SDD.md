@@ -82,13 +82,15 @@ Phase 10 work shall continue to honour the layered architecture (§2.1) and the 
 *   Section 6: Detailed design for [src/elf_parser.c](../src/elf_parser.c).
 *   Section 7: Detailed design for [src/fsm_mapper.c](../src/fsm_mapper.c).
 *   Section 8: Detailed design for [src/monitor.c](../src/monitor.c).
-*   Section 9: Data Dictionary.
-*   Section 10: Traceability.
+*   Section 9: Detailed design for [src/debug_bp.c](../src/debug_bp.c).
+*   Section 10: Detailed design for [src/dap.c](../src/dap.c).
+*   Section 11: Data Dictionary.
+*   Section 12: Traceability.
 
 ## 2. System Overview
 
 ### 2.1 System Architecture
-`avrOSdb` is a single-process C99 application. Responsibilities are divided into seven source modules arranged in four protocol layers; each layer depends only on the layers below it, and no upward calls are permitted. The protocol layer hosts two interchangeable client-facing front-ends over a shared protocol-agnostic debug core (HLR-073, `src/debug_core.h`): the GDB-RSP server (`src/gdb_rsp.c`) and the DAP server (`src/dap.c`), selected at startup by `--rsp` (default) / `--dap`. This layering is a hard design rule — see §2.2 "Layered Architecture" — and is enforced by review and by the `.h` dependency graph (the lower layers' headers must not `#include` any header from a higher layer).
+`avrOSdb` is a single-process C99 application. Responsibilities are divided into eight source modules arranged in four protocol layers; each layer depends only on the layers below it, and no upward calls are permitted. The protocol layer hosts two interchangeable client-facing front-ends over a shared protocol-agnostic debug core (HLR-073, `src/debug_core.h` / `src/debug_bp.c`): the GDB-RSP server (`src/gdb_rsp.c`, §5) and the DAP server (`src/dap.c`, §10), selected at startup by `--rsp` (default) / `--dap`, both calling the shared breakpoint core (`src/debug_bp.c`, §9). This layering is a hard design rule — see §2.2 "Layered Architecture" — and is enforced by review and by the `.h` dependency graph (the lower layers' headers must not `#include` any header from a higher layer). This layering is a hard design rule — see §2.2 "Layered Architecture" — and is enforced by review and by the `.h` dependency graph (the lower layers' headers must not `#include` any header from a higher layer).
 
 **Layer stack (top to bottom):**
 
@@ -637,6 +639,8 @@ TCP server socket on the configured port (default `1234`). Accepts exactly one c
 
 (The previous 96-byte software-breakpoint table has been removed; the two hardware-breakpoint shadow slots now live in `RspContext.hw_bp_addr[]` and are session-scoped.)
 
+**Breakpoints and stepping via the shared core (§9).** The breakpoint policy itself — the comparator arbiter, the software-`BREAK` model, and the single-step-over of every AVR instruction class — lives in `src/debug_bp.c`, not here. `dh_insert_bp`/`dh_remove_bp` are thin wrappers over `bp_insert`/`bp_remove`, `dh_step` delegates the actual single step to `bp_step_over()`, and `dh_continue` calls `bp_consume_pc_skip()` before resuming. `src/gdb_rsp.c` retains only the RSP packet translation around those core calls (and exports the shared TCP transport `rsp_accept`/`rsp_close`, which the DAP server reuses).
+
 Total static BSS in `src/gdb_rsp.c`: approximately 4.2 KiB.
 
 **TCP socket options applied by `rsp_listen()`:**
@@ -702,6 +706,13 @@ int elf_addr_to_line(const ElfContext *ctx, uint32_t byte_addr,
 int elf_line_to_addr(const ElfContext *ctx, const char *file, int line,
                      uint32_t *byte_addr);
     /* Both return 0 on success, -1 when the ELF carries no DWARF or no match. */
+
+/* DAP stack-unwind + conditional-breakpoint support (Phase 18). */
+typedef struct { uint32_t cfa, y, sp; } ElfFrameRegs;
+int elf_cfi_cfa (const ElfContext *ctx, uint32_t byte_addr,
+                 int *cfa_reg, int *cfa_offset);
+int elf_var_addr(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr,
+                 const char *name, uint32_t *addr, int *size, bool *is_signed);
 ```
 
 The `ElfContext` and `AvrOsSymbolIndex` struct definitions are also declared in `src/elf_parser.h`.  The libelf `Elf*` and libdw `Dwarf*` handles are held in `ElfContext` as opaque `void*` so consumers need no elfutils headers.  Callers must zero-initialise `AvrOsSymbolIndex` before passing it to `elf_find_avros_tables()`.
@@ -752,6 +763,8 @@ The symbol and string tables are **not** copied into application heap buffers �
 *   **`int elf_dwarf_available(void)`** — Return 1 — libdw is always linked (elfutils is required).
 *   **`int elf_addr_to_line(const ElfContext *ctx, uint32_t byte_addr, char *file, size_t file_cap, int *line)`** — Map a code byte address to source file:line via libdw (dwarf_addrdie + dwarf_getsrc_die); 0 on success, -1 when no DWARF or no line-table entry.
 *   **`int elf_line_to_addr(const ElfContext *ctx, const char *file, int line, uint32_t *byte_addr)`** — Resolve file:line (basename match) to the first code byte address via libdw line tables; 0 on success, -1 when no DWARF or no match.
+*   **`int elf_cfi_cfa(const ElfContext *ctx, uint32_t byte_addr, int *cfa_reg, int *cfa_offset)`** — Return the Canonical-Frame-Address rule at a PC by interpreting .debug_frame in-tree (libdw's dwarf_cfi_addrframe errors on AVR CFI): CFA = value(cfa_reg) + cfa_offset, cfa_reg = 28 (the Y pair) or 32 (SP). Drives the DAP multi-frame stackTrace. 0 on success, -1 when uncovered/unsupported.
+*   **`int elf_var_addr(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr, const char *name, uint32_t *addr, int *size, bool *is_signed)`** — Resolve a variable visible at pc to its 16-bit data-space address, size, and signedness, evaluating its DWARF location with live frame registers (dwarf_getscopes/getscopevar; DW_OP_addr globals, DW_OP_breg28/breg32/fbreg locals). Backs DAP conditional-breakpoint evaluation. 0 on success, -1 when not in scope/unsupported.
 
 #### 6.3.3 Parsing Strategy / Algorithm
 
@@ -780,6 +793,10 @@ The boundary symbols `__start_<NAME>` and `__stop_<NAME>` are emitted by the avr
 **Memory:** the symbol and string tables are owned by libelf (typically `mmap`'d from the file), not copied into application heap, so `elf_open()` performs no large allocations of its own. The libelf `Elf*`, libdw `Dwarf*`, and the fd are released by `elf_close()`.
 
 **Parse complexity:** libelf parses the container; `elf_find_avros_tables()` performs a single O(sym_count) linear scan of the first `SHT_SYMTAB` with 8 string comparisons per symbol entry.
+
+**DWARF stack-unwind support (`elf_cfi_cfa`).** libdw's high-level CFI executor (`dwarf_cfi_addrframe`) returns `UNKNOWN_ERROR` on AVR `.debug_frame` — GDB itself ships its own CFI interpreter for the same reason — so `elf_cfi_cfa()` parses the section directly: it locates `.debug_frame` via libelf, walks the CIE/FDE entries, and on the FDE covering the PC runs a minimal CFI state machine over the CIE-initial then FDE instructions (the CFA-defining opcodes plus operand-skipping of the register-save forms) to recover `CFA = value(cfa_reg) + cfa_offset`. avr-gcc encodes `cfa_reg` 28 as the 16-bit Y frame-pointer pair and 32 as SP. This is the per-PC half of the DAP stack unwind (§10); the AVR return-address/saved-Y recovery lives in `dap_unwind()`.
+
+**DWARF variable resolution (`elf_var_addr`).** For DAP conditional breakpoints, `elf_var_addr()` resolves a variable visible at a PC to its data-space address, size, and signedness: it obtains the CU (`dwarf_addrdie`), the lexical scope chain (`dwarf_getscopes`), and the matching DIE (`dwarf_getscopevar`, which searches locals/parameters then file scope), then decodes the single-operation location forms avr-gcc -O0 emits — `DW_OP_addr` (globals), `DW_OP_breg28`/`bregx 28` (the Y pair) and `bregx 32` (SP), and `DW_OP_fbreg` (against the CFA when the subprogram frame base is `DW_OP_call_frame_cfa`) — using the caller-supplied live `ElfFrameRegs`. Size/signedness come from the peeled `DW_AT_type` (`dwarf_peel_type` + `dwarf_bytesize` + `DW_AT_encoding`).
 
 **Test approach for `src/elf_parser.c`:** Unit-testable using pre-built AVR ELF fixtures (compiled with `-g` so DWARF is present). Test cases cover: magic/class validation rejection, `EM_AVR` check, correct `flash_base` / `sram_base` extraction, all 7 avrOS sentinel symbols found with correct address conversions, FLASH-table LMA translation vs. raw SRAM VMA, partial symbol set (graceful degradation), deviceinfo name extraction (present and absent), DWARF source-line round-trip, and `elf_close()` resource-release correctness. The former `malloc`-injection test is retired — libelf owns the allocations now.
 
@@ -1020,7 +1037,208 @@ typedef struct {
 
 *   **Unrecognized sub-command** Return a human-readable error message to the GDB console output packet.
 *   **UPDI read failure** Report partial data alongside an error message to the GDB console; do not abort the server.
-## 9. Data Dictionary
+
+## 9. Detailed Design for [src/debug_bp.c](../src/debug_bp.c)
+
+### 9.1 Purpose and Responsibilities
+[src/debug_bp.c](../src/debug_bp.c) is the protocol-agnostic **breakpoint core** shared by both client front-ends (HLR-073): it owns the AVR-Dx breakpoint policy — the hardware OCD-comparator arbiter, the true software-breakpoint (`BREAK` opcode) model, the single-step-over of every AVR instruction class, and the silicon work-arounds that surround them (the NVMPROG-reset peripheral save/restore and the fresh-`OCD.PC`-write instruction skip). It contains no wire-protocol formatting; the GDB-RSP server (`src/gdb_rsp.c`) and the DAP server (`src/dap.c`) call it with their own breakpoint state and translate its results into RSP packets or DAP responses respectively. It was extracted (behaviour-preserving) from the breakpoint policy that lived inside `src/gdb_rsp.c` through Phase 17.
+
+*   Arbitrate the two AVR-Dx PC comparators: one user hardware-breakpoint slot plus one slot reserved for the 32-bit step-over, with eviction so an explicit `hbreak` always wins the comparator.
+*   Install and remove breakpoints in either mode — a hardware comparator or a software `BREAK` (0x9598) flash patch — selected by the `auto`/`sw`/`hw-only` policy.
+*   Single-step the instruction at the live PC over OCD, handling 16-bit, 32-bit LDS/STS, and 32-bit CALL/JMP change-of-flow, plus the fresh-PC/patched-`BREAK` injection case.
+*   Classify why the CPU halted (software vs hardware breakpoint vs other) without adjusting the PC.
+
+### 9.2 External Interfaces
+#### 9.2.1 Public C API (src/debug_bp.h)
+
+The core is parameterised on the caller's breakpoint state (the same fields live in both `RspContext` and `dap_session`), so it holds no global state of its own:
+
+```c
+/* Policy + shadow types */
+#define RSP_HW_BP_USER_SLOTS  1      /* comparator 0 = the sole user HW slot   */
+#define RSP_HW_BP_STEP_SLOT   1      /* comparator 1 = reserved 32-bit step-over*/
+#define HW_BP_SLOT_EMPTY      0xFFFFFFFFu
+#define RSP_MAX_SW_BREAKPOINTS 64
+enum { RSP_BP_MODE_SW, RSP_BP_MODE_HW_ONLY, RSP_BP_MODE_AUTO };
+typedef struct { bool in_use; uint32_t addr; uint8_t orig[2]; } RspSwBp;
+enum RspStopCause { SC_NONE, SC_SWBREAK, SC_HWBREAK, SC_STEP, SC_INTR };
+typedef enum { BP_OK = 0, BP_ERR_IO = -1, BP_ERR_SLOT = -2, BP_ERR_DATASP = -3 } BpStatus;
+
+/* Install / remove (kind '0' = auto/SW-preferring, '1' = hbreak) */
+int  bp_insert(int updi_fd, uint32_t hw_bp_addr[2], bool hw_bp_pinned[2],
+               RspSwBp sw_bp[], int bp_mode, bool *pc_dirty,
+               char kind, uint32_t gdb_addr);
+int  bp_remove(int updi_fd, uint32_t hw_bp_addr[2], bool hw_bp_pinned[2],
+               RspSwBp sw_bp[], int bp_mode, bool *pc_dirty,
+               char kind, uint32_t gdb_addr);
+
+/* Resume / step helpers */
+int  bp_step_over(int updi_fd, RspSwBp sw_bp[], bool *pc_dirty);
+int  bp_consume_pc_skip(int updi_fd, RspSwBp sw_bp[], bool *pc_dirty);
+int  bp_classify_stop(int updi_fd, const RspSwBp sw_bp[],
+                      const uint32_t hw_bp_addr[2], int hint);
+void bp_clear_all_sw(RspSwBp sw_bp[]);
+
+/* CPU register-file snapshot/restore around the NVMPROG reset */
+int  bp_snapshot_cpu(int updi_fd, uint8_t gpr[32], uint8_t *sreg,
+                     uint16_t *sp, uint32_t *pc);
+int  bp_restore_cpu (int updi_fd, const uint8_t gpr[32], uint8_t sreg,
+                     uint16_t sp, uint32_t pc);
+```
+
+
+### 9.3 Internal Structure
+#### 9.3.1 Key Data Structures
+
+**`RspSwBp sw_bp[RSP_MAX_SW_BREAKPOINTS]`** — the software-breakpoint shadow table (caller-owned). Each in-use slot records the breakpoint `addr` and the original 2 opcode bytes (`orig`) displaced by the patched `BREAK`, so the instruction can be restored on removal or injected for a step-over.
+
+**`uint32_t hw_bp_addr[2]` / `bool hw_bp_pinned[2]`** — the hardware-comparator shadow (caller-owned). Index 0 is the user slot; index 1 is the reserved step-over slot. `hw_bp_pinned[i]` marks a slot installed by an explicit `hbreak` (`Z1`), which is non-evictable.
+
+**`bool pc_dirty`** — caller-owned flag set when a flash patch (or a 32-bit CoF emulation) has freshly written `OCD.PC`; the next resume must execute the instruction at PC by injection rather than letting the silicon skip it (see §9.3.3).
+
+The `SW_BP_BREAK_BYTES[2] = {0x98, 0x95}` constant is the little-endian AVR `BREAK` opcode word patched into flash for a software breakpoint.
+
+
+#### 9.3.2 Key Functions
+
+*   **`int bp_insert(int updi_fd, uint32_t hw_bp_addr[2], bool hw_bp_pinned[2], RspSwBp sw_bp[], int bp_mode, bool *pc_dirty, char kind, uint32_t gdb_addr)`**
+    *   Purpose: Install a breakpoint at gdb_addr, choosing a hardware comparator or a software BREAK per the policy, with hbreak eviction. Returns BP_OK or a negative BpStatus.
+    *   Logic:
+        1.  Reject a data-space address (the breakpoint must be a code address) with `BP_ERR_DATASP`.
+        2.  `kind == '1'` (hbreak / `Z1`): claim the user comparator, **evicting** an evictable `auto`-`Z0` already in it to a software `BREAK` first; pin the slot. This guarantees an explicit hardware breakpoint always wins the comparator.
+        3.  `kind == '0'` in `auto` mode: prefer the free user comparator (glitch-free, sleep-safe); if it is occupied, fall back to a software `BREAK`. `sw` mode always patches flash; `hw-only` mode fails with `BP_ERR_SLOT` when the comparator is taken.
+        4.  A software install patches the `BREAK` word into flash via the NVMPROG sequence (saving/restoring peripheral state and the CPU register file around the reset pulse) and records the displaced opcode in `sw_bp[]`; it sets `*pc_dirty` because the reset re-wrote `OCD.PC`.
+
+*   **`int bp_remove(int updi_fd, uint32_t hw_bp_addr[2], bool hw_bp_pinned[2], RspSwBp sw_bp[], int bp_mode, bool *pc_dirty, char kind, uint32_t gdb_addr)`**
+    *   Purpose: Remove the breakpoint at gdb_addr — clear the matching comparator slot, or un-patch the flash BREAK and restore the displaced opcode — mirroring bp_insert.
+
+*   **`int bp_step_over(int updi_fd, RspSwBp sw_bp[], bool *pc_dirty)`**
+    *   Purpose: Execute exactly one instruction at the live PC over OCD, handling every AVR case that needs help. Returns 0 on success, -1 on UPDI error. Shared by the GDB-RSP step and the DAP conditional-breakpoint auto-resume.
+    *   Logic:
+        1.  Call `bp_consume_pc_skip()`; if it injected the instruction (return 1) that IS the step — return.
+        2.  Read the opcode word; for a 32-bit CALL/JMP emulate the change-of-flow via `updi_ocd_emulate_cof_32bit()` and set `*pc_dirty`; for a 32-bit LDS/STS step via the reserved comparator at PC+4 (`updi_step_32bit`, RSP_HW_BP_STEP_SLOT); otherwise a plain `updi_step()`.
+
+*   **`int bp_consume_pc_skip(int updi_fd, RspSwBp sw_bp[], bool *pc_dirty)`**
+    *   Purpose: When *pc_dirty, execute the instruction at PC by opcode injection (substituting the saved original when a BREAK is patched there) so the next resume does not skip it. Leaves a 32-bit CALL/JMP to the caller's CoF emulation. Returns 1 if it injected, 0 if nothing to do, -1 on error.
+
+*   **`int bp_classify_stop(int updi_fd, const RspSwBp sw_bp[], const uint32_t hw_bp_addr[2], int hint)`**
+    *   Purpose: Read the live PC; return SC_SWBREAK if it matches a software-BREAK shadow, SC_HWBREAK if it matches the user comparator, else the caller's hint. Does not adjust the PC.
+
+*   **`int bp_snapshot_cpu(...) / int bp_restore_cpu(...)`**
+    *   Purpose: Save and restore the full CPU register file (32 GPRs, SREG, SP, PC) around the NVMPROG system-reset pulse a software-breakpoint flash patch triggers, so the program's register state survives the patch.
+
+
+#### 9.3.3 Parsing Strategy / Algorithm
+
+**Comparator arbiter (HLR-055 / HLR-016).** The AVR-Dx OCD exposes two PC comparators, but comparator 1 proved unreliable as a *general* user breakpoint on a free `continue` (the same address fires on comparator 0 yet is missed on comparator 1 — see User Manual Appendix B.11). The core therefore treats comparator 0 as the **sole** user hardware slot and reserves comparator 1 (`RSP_HW_BP_STEP_SLOT`) exclusively for the brief, controlled 32-bit step-over. Any second simultaneous user breakpoint becomes a software `BREAK`. An `hbreak` (`Z1`) is *pinned* and evicts an evictable `auto`-`Z0` from the comparator to a software `BREAK`, so the explicit hardware request always wins the slot.
+
+**Software breakpoints (HLR-054).** A software breakpoint patches the 2-byte `BREAK` opcode (0x9598) into flash via the NVMPROG controller, shadowing the displaced bytes in `sw_bp[]`. Entering NVMPROG pulses a system reset, which both wipes peripheral state and re-writes `OCD.PC`; `bp_insert`/`bp_remove` therefore snapshot and restore the CPU register file (and Phase-20 peripheral window) around the patch.
+
+**Fresh-PC-write skip (User Manual Appendix B.8).** A fresh `OCD.PC` write — from the NVMPROG reset, or from `updi_ocd_emulate_cof_32bit()` — makes the silicon skip the instruction at PC on the next *run* (a step settles fine). The core records this in `*pc_dirty`; the next resume calls `bp_consume_pc_skip()` to execute that one instruction by injection (substituting the original opcode when a `BREAK` is patched there) so nothing is silently dropped. This is what fixed the long-standing source-`step`-into-a-function frame corruption (Group-G G19): `bp_step_over` sets `pc_dirty` after a 32-bit CoF emulation precisely so the following `continue` injects the callee's first prologue instruction.
+
+**Single-step decode.** `bp_step_over()` is the one place that knows how to advance past any AVR instruction: 16-bit (a plain OCD step), 32-bit LDS/STS (a hardware breakpoint at PC+4 on the reserved comparator), and 32-bit CALL/JMP (full OCD emulation, since the comparator misses the first change-of-flow after a run). Both `dh_step()` in the RSP server and `dap_resume_over_current()` in the DAP server delegate to it.
+
+### 9.4 Dependencies
+
+*   `src/updi.c` — all OCD/NVM primitives: `updi_mem_read`, `updi_nvm_flash_patch`, `updi_ocd_read/write_pc/sp/sreg/gpr`, `updi_ocd_set/clear_hw_bp`, `updi_ocd_step_inject_word0`, `updi_step`, `updi_step_32bit`, `updi_ocd_emulate_cof_32bit`, `updi_save/restore_peripherals`.
+
+### 9.5 Error Handling and Logging
+
+*   **UPDI I/O failure** Return `BP_ERR_IO` (-1); the calling front-end maps it to an RSP `E01` / a DAP `verified:false` or error.
+*   **No comparator available in hw-only mode** Return `BP_ERR_SLOT` (-2).
+*   **Breakpoint requested at a data-space address** Return `BP_ERR_DATASP` (-3).
+
+## 10. Detailed Design for [src/dap.c](../src/dap.c)
+
+### 10.1 Purpose and Responsibilities
+[src/dap.c](../src/dap.c) implements the **Debug Adapter Protocol (DAP) server** — the second client-facing front-end (selected by `--dap`), a peer of the GDB-RSP server over the same shared debug core. It accepts a single DAP client (VS Code, or Neovim/nvim-dap) on a TCP port, decodes `Content-Length`-framed JSON-RPC messages, dispatches DAP requests, and emits DAP responses and events. Like the RSP server it owns wire framing only: execution control, breakpoints, ELF/DWARF lookup, and the breakpoint policy all come from the lower layers (`src/debug_bp.c`, `src/elf_parser.c`, `src/updi.c`).
+
+*   Frame and codec DAP messages: a self-contained recursive-descent JSON tokenizer/accessor (`dj_*`) and `Content-Length` message framing — no third-party JSON dependency.
+*   Serve the DAP lifecycle (`initialize`/`launch`/`attach`/`configurationDone`/`disconnect`/`terminate`), execution control (`continue`/`pause`/`next`/`stepIn`/`stepOut`), `threads`, and stop events.
+*   Serve source and instruction breakpoints (`setBreakpoints`/`setInstructionBreakpoints`) through the shared breakpoint core, including conditional breakpoints evaluated on the live target.
+*   Serve a multi-frame `stackTrace` by unwinding the target's DWARF Call-Frame-Information.
+
+### 10.2 External Interfaces
+#### 10.2.1 Public C API (src/dap.h)
+
+```c
+int  dap_serve(int updi_fd, int port, ElfContext *elf,
+               const AvrOsSymbolIndex *idx, FsmContext *fsm, bool log);
+int  dap_dispatch(dap_session *s, const char *msg, size_t len);
+int  dap_read_message (int fd, char *buf, size_t cap, size_t *out_len);
+int  dap_write_message(int fd, const char *body, size_t len);
+void dap_bp_reset(dap_session *s);
+```
+
+`dap_serve()` is the `--dap` analogue of the RSP `event_loop()`; `dap_dispatch()` is the per-message handler (driven over a socketpair in unit tests, no hardware). The transport (`rsp_accept`/`rsp_close`) is shared with the RSP server.
+
+#### 10.2.2 DAP Network Interface
+
+A single TCP client speaking DAP over `Content-Length: <n>\r\n\r\n<json>` framing (the same framing VS Code and nvim-dap use). The adapter advertises `supportsConfigurationDoneRequest` and `supportsInstructionBreakpoints` in its `initialize` response.
+
+
+### 10.3 Internal Structure
+#### 10.3.1 Key Data Structures
+
+**`dap_session`** — all per-connection DAP state: the client fd, the target `updi_fd`, the `ElfContext`/`AvrOsSymbolIndex`/`FsmContext` pointers, a `running` flag, and the breakpoint state. The breakpoint state mirrors the RSP context so the shared core can be called directly: `uint32_t hw_bp_addr[2]; bool hw_bp_pinned[2]; RspSwBp sw_bp[RSP_MAX_SW_BREAKPOINTS]; int bp_mode; bool pc_dirty;` plus a DAP-facing table `bps[DAP_MAX_BREAKPOINTS]` (each `{int id; uint32_t addr; int line; bool verified, in_use; char source[256]; char condition[128];}`, where `line == -1` marks an instruction breakpoint) and a `next_bp_id` counter.
+
+**`dj_tok_t`** — one node of the in-tree JSON tokenizer's flat token array (type, span, child/next links), produced by `dj_parse()` and navigated with `dj_member()`/`dj_strcpy()`/`dj_long()`.
+
+**`ElfFrameRegs`** — the live frame registers (CFA, Y pair, SP) the stack unwinder and the conditional-expression variable resolver pass to `elf_var_addr()`.
+
+
+#### 10.3.2 Key Functions
+
+*   **`int dap_serve(int updi_fd, int port, ElfContext *elf, const AvrOsSymbolIndex *idx, FsmContext *fsm, bool log)`**
+    *   Purpose: Accept one DAP client and run the select()-based read/dispatch loop; while the target is running, poll the OCD halt status and emit a stopped event (honouring conditional breakpoints). Returns 0 on clean disconnect.
+
+*   **`int dap_dispatch(dap_session *s, const char *msg, size_t len)`**
+    *   Purpose: Parse one DAP request and route it to its handler (initialize/attach/continue/step/threads/stackTrace/scopes/setBreakpoints/setInstructionBreakpoints/disconnect). Unknown requests are answered success:false.
+
+*   **`static int dap_handle_set_breakpoints(dap_session *s, const char *msg, const dj_tok_t *t, long req_seq)`**
+    *   Purpose: Install source breakpoints: resolve each {line[,condition]} for arguments.source.path to a code address via elf_line_to_addr(), install through bp_insert() (auto mode), replace the prior set for that source, and reply per-line {id,verified,line}.
+
+*   **`static int dap_handle_set_instruction_breakpoints(dap_session *s, const char *msg, const dj_tok_t *t, long req_seq)`**
+    *   Purpose: Install instruction breakpoints from each entry's instructionReference (+ optional offset) via bp_insert(), marking the table entry line == -1, replacing the prior instruction-breakpoint set; reply per-entry {id,verified,instructionReference}.
+
+*   **`static int dap_handle_stack_trace(dap_session *s, long req_seq) / static int dap_unwind(dap_session *s, uint32_t *pcs, int max)`**
+    *   Purpose: Return the full call stack. dap_unwind() walks frames via .debug_frame CFI (elf_cfi_cfa) plus AVR stack conventions; dap_handle_stack_trace() resolves each PC to file:line (elf_addr_to_line) into the stackFrames array.
+    *   Logic:
+        1.  Read the innermost PC/SP/Y over OCD; compute `CFA = (cfa_reg==32?SP:Y) + offset` from `elf_cfi_cfa()`.
+        2.  Recover the caller from target memory: the 2-byte word return address at [CFA-1, CFA] (byte PC = word << 1) and the caller's saved Y at r28@CFA-2 / r29@CFA-3; iterate with PC=caller, SP=CFA, Y=caller-Y.
+        3.  Stop at a zero / out-of-FLASH return address, where no CFI covers the PC (the C-runtime frame above `main`), or at `DAP_MAX_FRAMES`.
+
+*   **`static int dap_eval_condition(dap_session *s, uint32_t pc, const ElfFrameRegs *fr, const char *cond) / static bool dap_conditional_skip(dap_session *s)`**
+    *   Purpose: Evaluate a breakpoint condition `<var> <relop> <int>` on the live target (resolve var via elf_var_addr, read over OCD, compare); dap_conditional_skip() steps over and auto-resumes when all matching breakpoints are conditional-and-false, else lets the stop be reported.
+
+*   **`static int dap_resume_over_current(dap_session *s) / static int dap_target_resume(dap_session *s)`**
+    *   Purpose: Resume past a breakpoint parked at the live PC via the GDB remove/single-step/insert dance (bp_remove → bp_step_over → bp_insert → updi_run); dap_target_resume() applies it on continue when a breakpoint sits at the PC, else a plain run.
+
+
+#### 10.3.3 Parsing Strategy / Algorithm
+
+**Lifecycle.** `dap_dispatch()` answers `initialize` with the capability set + an `initialized` event, treats `launch`/`attach` as an attach, halts at `configurationDone` with a `stopped`/`entry` event, reports the single live CPU as the sole `threads` entry, and on `disconnect`/`terminate` removes every installed breakpoint before resuming the target so detach leaves it running free. All target side effects are guarded by `updi_fd >= 0`, so the dispatch is unit-testable over a socketpair with no hardware.
+
+**Breakpoints.** Source and instruction breakpoints install through the shared core (`bp_insert`/`bp_remove`, §9) — exactly the HW-comparator arbiter + SW-`BREAK` model the RSP server uses. A hit while running surfaces as a `stopped` event whose `hitBreakpointIds` list every `bps[]` entry matching the live PC.
+
+**Multi-frame stackTrace (HLR-080).** libdw's high-level CFI executor errors on AVR `.debug_frame`, so the unwinder uses the in-tree `elf_cfi_cfa()` (§6) for the per-PC CFA rule and applies AVR's fixed stack conventions to recover each caller (2-byte word return address, word-to-byte PC, Y-pair frame pointer). See User Manual Appendix B.17.
+
+**Conditional breakpoints (HLR-081).** When a breakpoint is hit, `dap_conditional_skip()` evaluates each matching `bps[]` entry's `condition` on the live target: the variable is resolved from DWARF with `elf_var_addr()` (§6) using the live frame registers, read over OCD, and compared to the literal. A false condition steps over the breakpoint and auto-resumes (the shared `bp_step_over`, §9); a true / unevaluable / unconditional hit reports the stop — a bad condition never hides a breakpoint. See User Manual Appendix B.18.
+
+### 10.4 Dependencies
+
+*   `src/debug_bp.c` — the breakpoint arbiter and single-step core (`bp_insert`/`bp_remove`/`bp_step_over`/…).
+*   `src/elf_parser.c` — `elf_line_to_addr`, `elf_addr_to_line`, `elf_cfi_cfa`, `elf_var_addr`.
+*   `src/gdb_rsp.c` — the shared TCP transport helpers `rsp_accept()`/`rsp_close()`.
+*   `src/updi.c` — OCD execution control and memory/register reads (`updi_run`/`updi_halt`/`updi_step`/`updi_ocd_*`/`updi_mem_read`).
+
+### 10.5 Error Handling and Logging
+
+*   **Unknown / unsupported request** Reply with `success:false` and the command name; never abort the session.
+*   **Breakpoint line/instruction unresolved or install failed** Reply the breakpoint with `verified:false`; the client shows it as pending.
+*   **Condition cannot be evaluated** Treat as a stop (report the hit) rather than silently skipping — a bad condition must never hide a breakpoint.
+*   **Message framing / read error** Log and tear down the connection; the server returns to accept the next client.
+## 11. Data Dictionary
 
 *   **`AppConfig`** (defined in [src/main.c](../src/main.c)) — Application-wide configuration populated by parse_args().
 
@@ -1197,7 +1415,7 @@ Errors are propagated upward through the module stack without retrying:
 | `src/gdb_rsp.c` | Socket error, checksum mismatch | NAK on mismatch; close socket on disconnect; send `E` packet on UPDI errors. |
 | `src/monitor.c` | UPDI read failure | Send partial output with error message as O-packet; return -1 but do not abort server. |
 | `src/main.c` | Fatal startup error | `exit(1)` with message to stderr. Mid-session UPDI loss: close client, await next connection. |
-## 10. Traceability
+## 12. Traceability
 
 The following table maps the high-level requirements in
 [doc/HLRs.md](HLRs.md) and the low-level requirements in
@@ -1212,6 +1430,8 @@ should be reconciled against the latest revisions of those documents.)
 | ELF Parsing and Symbol Resolution | §6 (src/elf_parser.c) |
 | FSM State Snapshot | §7 (src/fsm_mapper.c) |
 | System Introspection | §8 (src/monitor.c) |
+| Shared Breakpoint Core | §9 (src/debug_bp.c) |
+| DAP Server | §10 (src/dap.c) |
 | Flash Programming | §4 (src/updi.c) |
 | Console Bridge | §4 (src/updi.c) |
 ---
