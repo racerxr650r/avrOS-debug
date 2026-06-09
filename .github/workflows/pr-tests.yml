@@ -17,17 +17,20 @@ jobs:
       pull-requests: write   # post / update the PR comment
 
     steps:
-      # Install deps before checkout so git is present in the container.
-      # Root in the container — no sudo; avr-libc 2.2 covers AVR-Dx so no DFP.
-      - name: Install build dependencies
+      # Bootstrap the bits `make prereqs` and actions/checkout need (the
+      # container runs as root, so install sudo for prereqs' apt calls).
+      - name: Bootstrap container
         run: |
           apt-get update -q
-          apt-get install -y --no-install-recommends \
-            make gcc binutils gcc-avr binutils-avr avr-libc \
-            libdw-dev libelf-dev git ca-certificates
+          apt-get install -y --no-install-recommends sudo git ca-certificates
 
       - name: Checkout
         uses: actions/checkout@v4
+
+      # The canonical, single-source dev setup: installs the AVR toolchain,
+      # libdw/libelf, and the AVR-Dx DFP the fixtures' memory layout depends on.
+      - name: Install build dependencies
+        run: make prereqs
 
       # Run every test suite; write per-suite output to build/test-results/.
       # continue-on-error keeps subsequent steps running so we always post a
@@ -167,17 +170,21 @@ jobs:
       pull-requests: write   # post / update the PR comment
 
     steps:
-      # Install deps before checkout so git is present in the container.
-      - name: Install build dependencies
+      - name: Bootstrap container
         run: |
           apt-get update -q
-          apt-get install -y --no-install-recommends \
-            make gcc binutils gcc-avr binutils-avr avr-libc \
-            libdw-dev libelf-dev gcovr git ca-certificates
-          gcovr --version
+          apt-get install -y --no-install-recommends sudo git ca-certificates
 
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: make prereqs
+
+      - name: Install gcovr
+        run: |
+          apt-get install -y --no-install-recommends gcovr
+          gcovr --version
 
       # Build with --coverage, run every unit test suite, and emit
       # line + branch coverage reports under build/coverage/. The
