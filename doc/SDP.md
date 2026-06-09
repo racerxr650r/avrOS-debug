@@ -1178,7 +1178,7 @@ This is not a fixable detail — it is a **model mismatch**. avrOS is a cooperat
 
 ### Phase 21 — VS Code avrOS Debug View (activity bar) + turnkey install/launch
 
-> **Status: 🔲 Planned — branch `phase-21-vscode-avros-debug-view` (GitHub issue TBD).** Builds on the feature-complete Phase 16–19 DAP front-end and the Phase-19 `avrosdb-dap` companion extension (which already self-starts the server for an F5 launch). Promotes that minimal extension into a first-class avrOS debugging surface.
+> **Status: 🔲 In progress — issue [#62](https://github.com/racerxr650r/avrOS-debug/issues/62), branch `62-phase-21-vscode-avros-debug-view`.** Builds on the feature-complete Phase 16–19 DAP front-end and the Phase-19 `avrosdb-dap` companion extension (which already self-starts the server for an F5 launch). Promotes that minimal extension into a first-class avrOS debugging surface.
 
 **Motivation.** Today state inspection lives in VS Code's stock *Run and Debug* view, and the avrOS runtime objects that are the whole reason this debugger exists — the cooperative **state machines**, **events**, and **queues** — are invisible in the GUI (reachable only via `monitor avros …` on the GDB-RSP path). This phase adds a dedicated **avrOS** activity-bar view that presents the standard debug state *and* avrOS introspection together, and makes setup turnkey: the extension installs/locates `avrOSdb` and configures VS Code to launch-and-attach on **F5** with no hand-written `launch.json`.
 

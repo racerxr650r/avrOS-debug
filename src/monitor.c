@@ -11,6 +11,7 @@
 #include "gdb_rsp.h"
 #include "updi.h"
 #include "fsm_mapper.h"
+#include "avros.h"      /* avros_read_events/queues — shared table readers */
 
 #include <stddef.h>
 #include <stdint.h>
@@ -84,34 +85,6 @@ static int send_text_as_o_packet(int rsp_fd, const char *text, size_t text_len)
     return rsp_send_packet(rsp_fd, pkt);
 }
 
-/* Read a NUL-terminated string from the target starting at GDB-AVR
- * byte address `addr` via background UPDI reads.  String literals on
- * AVR-Dx live in the mapped-flash window (>= 0x8000); we route through
- * UPDI's flash mirror so the chip resolves FLMAP transparently.
- * Returns the number of payload bytes copied into `out` (excluding
- * NUL), or -1 on UPDI failure.  Always NUL-terminates when len >= 1. */
-static int read_target_string(int updi_fd, uint32_t addr,
-                              char *out, size_t out_max)
-{
-    if (out_max == 0) return -1;
-    uint32_t base = flash_to_updi(addr);
-    size_t n = 0;
-    while (n + 1u < out_max) {
-        uint8_t b;
-        if (updi_mem_read(updi_fd, base + (uint32_t)n, &b, 1u) < 0) return -1;
-        if (b == 0u) break;
-        if (!isprint((unsigned char)b)) b = '?';
-        out[n++] = (char)b;
-    }
-    out[n] = '\0';
-    return (int)n;
-}
-
-static uint16_t le16(const uint8_t *p)
-{
-    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
-}
-
 /* ── sub-command: events ─────────────────────────────────────────────── */
 
 static int cmd_events(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx)
@@ -121,45 +94,19 @@ static int cmd_events(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx)
         return send_text_as_o_packet(rsp_fd, msg, strlen(msg));
     }
 
-    static uint8_t descr[EVNT_DESCR_SIZE * 256u];
-    size_t total = (size_t)idx->event_count * EVNT_DESCR_SIZE;
-    if (updi_mem_read(updi_fd, flash_to_updi(idx->event_table_addr),
-                      descr, total) < 0) {
-        return -1;
-    }
+    static AvrosEvent ev[256];
+    int ne = avros_read_events(idx, updi_fd, ev, (int)(sizeof ev / sizeof ev[0]));
+    if (ne < 0) return -1;
 
     char text[MON_TEXT_BUF_SIZE];
     size_t off = 0;
-
-    for (uint8_t i = 0; i < idx->event_count; ++i) {
-        const uint8_t *d = &descr[i * EVNT_DESCR_SIZE];
-        uint16_t name_ptr   = le16(&d[0]);
-        uint16_t status_ptr = le16(&d[2]);
-
-        char name[MON_NAME_MAX];
-        if (name_ptr == 0u) {
-            snprintf(name, sizeof name, "<null>");
-        } else if (read_target_string(updi_fd, name_ptr + idx->flash_lma_off,
-                                      name, sizeof name) < 0) {
-            return -1;
-        }
-
-        uint8_t status = 0u;
-        if (status_ptr != 0u &&
-            updi_mem_read(updi_fd, status_ptr, &status, 1u) < 0) {
-            return -1;
-        }
-
+    for (int i = 0; i < ne; ++i) {
         int n = snprintf(text + off, sizeof text - off,
-                         "  %s: 0x%02X\n", name, status);
+                         "  %s: 0x%02X\n", ev[i].name, ev[i].status);
         if (n < 0) return -1;
-        if ((size_t)n >= sizeof text - off) {
-            off = sizeof text - 1u;
-            break;
-        }
+        if ((size_t)n >= sizeof text - off) { off = sizeof text - 1u; break; }
         off += (size_t)n;
     }
-
     return send_text_as_o_packet(rsp_fd, text, off);
 }
 
@@ -172,33 +119,21 @@ static int cmd_queues(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx)
         return send_text_as_o_packet(rsp_fd, msg, strlen(msg));
     }
 
-    static uint8_t descr[QUE_DESCR_SIZE * 256u];
-    size_t total = (size_t)idx->queue_count * QUE_DESCR_SIZE;
-    if (updi_mem_read(updi_fd, flash_to_updi(idx->queue_table_addr),
-                      descr, total) < 0) {
-        return -1;
-    }
+    static AvrosQueue q[256];
+    int nq = avros_read_queues(idx, updi_fd, q, (int)(sizeof q / sizeof q[0]));
+    if (nq < 0) return -1;
 
     char text[MON_TEXT_BUF_SIZE];
     size_t off = 0;
-
-    for (uint8_t i = 0; i < idx->queue_count; ++i) {
-        const uint8_t *d = &descr[i * QUE_DESCR_SIZE];
-        /* layout: queue*(2) buffer*(2) event*(2) capacity(2) sizeOfElement(2) */
-        uint16_t capacity = le16(&d[6]);
-        uint16_t elem_sz  = le16(&d[8]);
-
+    for (int i = 0; i < nq; ++i) {
         int n = snprintf(text + off, sizeof text - off,
                          "  queue[%u]: capacity=%u sizeOfElement=%u\n",
-                         (unsigned)i, (unsigned)capacity, (unsigned)elem_sz);
+                         (unsigned)i, (unsigned)q[i].capacity,
+                         (unsigned)q[i].elem_size);
         if (n < 0) return -1;
-        if ((size_t)n >= sizeof text - off) {
-            off = sizeof text - 1u;
-            break;
-        }
+        if ((size_t)n >= sizeof text - off) { off = sizeof text - 1u; break; }
         off += (size_t)n;
     }
-
     return send_text_as_o_packet(rsp_fd, text, off);
 }
 

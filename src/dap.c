@@ -11,6 +11,8 @@
  */
 #include "dap.h"
 #include "gdb_rsp.h"   /* rsp_accept / rsp_close — shared TCP transport helpers */
+#include "fsm_mapper.h" /* fsm_build_thread_list — avrosdb/fsmList */
+#include "avros.h"      /* avros_read_events/queues — avrosdb/eventList/queueList */
 
 #include <ctype.h>
 #include <errno.h>
@@ -1055,6 +1057,88 @@ static int dap_handle_set_variable(dap_session *s, const char *msg,
     return dap_send_response(s, req_seq, "setVariable", ok, body);
 }
 
+/* ── avrOS introspection custom requests (Phase 21) ──────────────────────────
+ *
+ * `avrosdb/fsmList`, `avrosdb/eventList`, `avrosdb/queueList` surface the avrOS
+ * runtime tables (the same data as `monitor avros tasks/events/queues`) as JSON
+ * for the VS Code avrOS view.  They reuse the shared FSM/monitor readers and
+ * the symbol index / FSM context already on the session; with no target or no
+ * avrOS tables they return an empty list (never an error).  Non-intrusive —
+ * background UPDI reads, no CPU halt. */
+
+static int dap_handle_fsm_list(dap_session *s, long req_seq)
+{
+    char   body[4096];
+    size_t off   = (size_t)snprintf(body, sizeof body, "{\"fsms\":[");
+    int    first = 1;
+    if (s->updi_fd >= 0 && s->idx != NULL && s->fsm != NULL &&
+        fsm_build_thread_list(s->fsm, s->idx, s->updi_fd) >= 0) {
+        for (int i = 0; i < s->fsm->thread_count; i++) {
+            const FsmThread *t = &s->fsm->threads[i];
+            char ne[80], se[80];
+            dj_escape(t->name, ne, sizeof ne);
+            dj_escape(t->state_name, se, sizeof se);
+            int w = snprintf(body + off, sizeof body - off,
+                "%s{\"id\":%d,\"name\":\"%s\",\"state\":\"%s\",\"active\":%s}",
+                first ? "" : ",", t->gdb_id, ne, se,
+                t->is_active ? "true" : "false");
+            if (w < 0 || (size_t)w >= sizeof body - off) break;
+            off += (size_t)w; first = 0;
+        }
+    }
+    (void)snprintf(body + off, sizeof body - off, "]}");
+    return dap_send_response(s, req_seq, "avrosdb/fsmList", true, body);
+}
+
+static int dap_handle_event_list(dap_session *s, long req_seq)
+{
+    AvrosEvent ev[256];
+    int n = (s->updi_fd >= 0 && s->idx != NULL)
+        ? avros_read_events(s->idx, s->updi_fd, ev,
+                            (int)(sizeof ev / sizeof ev[0])) : 0;
+    if (n < 0) n = 0;
+
+    char   body[4096];
+    size_t off = (size_t)snprintf(body, sizeof body, "{\"events\":[");
+    for (int i = 0; i < n; i++) {
+        char ne[80];
+        dj_escape(ev[i].name, ne, sizeof ne);
+        int w;
+        if (ev[i].has_status)
+            w = snprintf(body + off, sizeof body - off,
+                "%s{\"name\":\"%s\",\"status\":%u}", i ? "," : "", ne,
+                ev[i].status);
+        else
+            w = snprintf(body + off, sizeof body - off,
+                "%s{\"name\":\"%s\",\"status\":null}", i ? "," : "", ne);
+        if (w < 0 || (size_t)w >= sizeof body - off) break;
+        off += (size_t)w;
+    }
+    (void)snprintf(body + off, sizeof body - off, "]}");
+    return dap_send_response(s, req_seq, "avrosdb/eventList", true, body);
+}
+
+static int dap_handle_queue_list(dap_session *s, long req_seq)
+{
+    AvrosQueue q[256];
+    int n = (s->updi_fd >= 0 && s->idx != NULL)
+        ? avros_read_queues(s->idx, s->updi_fd, q,
+                            (int)(sizeof q / sizeof q[0])) : 0;
+    if (n < 0) n = 0;
+
+    char   body[4096];
+    size_t off = (size_t)snprintf(body, sizeof body, "{\"queues\":[");
+    for (int i = 0; i < n; i++) {
+        int w = snprintf(body + off, sizeof body - off,
+            "%s{\"id\":%d,\"capacity\":%u,\"elemSize\":%u}",
+            i ? "," : "", i, q[i].capacity, q[i].elem_size);
+        if (w < 0 || (size_t)w >= sizeof body - off) break;
+        off += (size_t)w;
+    }
+    (void)snprintf(body + off, sizeof body - off, "]}");
+    return dap_send_response(s, req_seq, "avrosdb/queueList", true, body);
+}
+
 /* ── Breakpoints (Phase 18) ───────────────────────────────────────────────── */
 
 void dap_bp_reset(dap_session *s)
@@ -1515,6 +1599,14 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
 
     if (strcmp(cmd, "setVariable") == 0)
         return dap_handle_set_variable(s, msg, t, req_seq) < 0 ? -1 : 0;
+
+    /* avrOS introspection custom requests (Phase 21). */
+    if (strcmp(cmd, "avrosdb/fsmList") == 0)
+        return dap_handle_fsm_list(s, req_seq) < 0 ? -1 : 0;
+    if (strcmp(cmd, "avrosdb/eventList") == 0)
+        return dap_handle_event_list(s, req_seq) < 0 ? -1 : 0;
+    if (strcmp(cmd, "avrosdb/queueList") == 0)
+        return dap_handle_queue_list(s, req_seq) < 0 ? -1 : 0;
 
     if (strcmp(cmd, "disconnect") == 0 || strcmp(cmd, "terminate") == 0) {
         /* Remove all installed breakpoints from silicon before resuming, so

@@ -151,6 +151,7 @@ SRCS     := $(SRCDIR)/main.c \
              $(SRCDIR)/updi.c \
              $(SRCDIR)/elf_parser.c \
              $(SRCDIR)/fsm_mapper.c \
+             $(SRCDIR)/avros.c \
              $(SRCDIR)/monitor.c \
              $(SRCDIR)/debug_bp.c \
              $(SRCDIR)/gdb_rsp.c \
@@ -223,7 +224,8 @@ TEST_WRAP_test_elf  :=
 TEST_EXTRA_LDFLAGS_test_elf :=
 
 # test_dap  (DAP transport: JSON codec + Content-Length framing)
-TEST_SRCS_test_dap  := $(TESTDIR)/test_dap.c $(SRCDIR)/dap.c $(SRCDIR)/debug_bp.c $(TESTDIR)/ocd_stubs.c
+TEST_SRCS_test_dap  := $(TESTDIR)/test_dap.c $(SRCDIR)/dap.c $(SRCDIR)/debug_bp.c \
+                       $(SRCDIR)/fsm_mapper.c $(SRCDIR)/avros.c $(TESTDIR)/ocd_stubs.c
 TEST_WRAP_test_dap  :=
 TEST_EXTRA_LDFLAGS_test_dap :=
 
@@ -240,6 +242,7 @@ TEST_EXTRA_LDFLAGS_test_fsm :=
 # test_monitor
 TEST_SRCS_test_monitor := $(TESTDIR)/test_monitor.c \
                            $(SRCDIR)/monitor.c \
+                           $(SRCDIR)/avros.c \
                            $(SRCDIR)/elf_parser.c
 TEST_WRAP_test_monitor  := updi_mem_read rsp_send_packet \
                             updi_enter_debug updi_halt updi_run \
@@ -255,6 +258,7 @@ TEST_SRCS_test_rsp := $(TESTDIR)/test_rsp.c \
                        $(SRCDIR)/gdb_rsp.c \
                        $(SRCDIR)/debug_bp.c \
                        $(SRCDIR)/fsm_mapper.c \
+                       $(SRCDIR)/avros.c \
                        $(SRCDIR)/monitor.c
 TEST_WRAP_test_rsp  := updi_mem_read updi_mem_write updi_halt updi_run updi_step \
 					   updi_step_32bit \
@@ -278,7 +282,8 @@ TEST_EXTRA_LDFLAGS_test_rsp :=
 
 # test_main — test_main.c #includes src/main.c so it can reach the
 # static parse_args() / event_loop() / load_flash_segments() helpers.
-TEST_SRCS_test_main := $(TESTDIR)/test_main.c $(SRCDIR)/dap.c $(SRCDIR)/debug_bp.c $(TESTDIR)/ocd_stubs.c
+TEST_SRCS_test_main := $(TESTDIR)/test_main.c $(SRCDIR)/dap.c $(SRCDIR)/debug_bp.c \
+                       $(SRCDIR)/avros.c $(TESTDIR)/ocd_stubs.c
 TEST_WRAP_test_main  := updi_open updi_close updi_console_poll \
                         updi_select_device updi_get_device \
                         updi_nvm_write_flash updi_nvm_flash_patch \
@@ -310,7 +315,8 @@ TEST_EXTRA_LDFLAGS_test_install :=
 # updi.c is linked in real so updi_read_device_info exercises the PTY
 # harness; updi_open / updi_close are wrapped to substitute a pre-opened
 # PTY slave fd.
-TEST_SRCS_test_device := $(TESTDIR)/test_device.c $(SRCDIR)/updi.c $(SRCDIR)/dap.c $(SRCDIR)/debug_bp.c
+TEST_SRCS_test_device := $(TESTDIR)/test_device.c $(SRCDIR)/updi.c $(SRCDIR)/dap.c $(SRCDIR)/debug_bp.c \
+                         $(SRCDIR)/avros.c
 TEST_WRAP_test_device  := select updi_open updi_close \
                           updi_nvm_write_flash updi_console_poll \
                           updi_probe_baud updi_nvm_read \
@@ -577,7 +583,7 @@ $(HW_TEST_BIN): $(HW_TEST_SRC) $(BUILDDIR)/updi.o
 	$(Q)$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $^ $(LUTIL)
 	@echo "  LD  $@"
 
-.PHONY: hw-test hw-test-nvm hw-test-rsp hw-test-gdb hw-test-all hw-test-dap hw-test-dap-unwind hw-test-dap-cond hw-test-dap-vars
+.PHONY: hw-test hw-test-nvm hw-test-rsp hw-test-gdb hw-test-all hw-test-dap hw-test-dap-unwind hw-test-dap-cond hw-test-dap-vars hw-test-dap-introspect
 hw-test: $(HW_TEST_BIN)
 	$(Q)$(HW_ENV) $(HW_TEST_BIN)
 
@@ -690,6 +696,18 @@ hw-test-dap-cond: $(GDB_DBG_SESSION_ELF) all
 	    DAP_PORT='$(HW_DAP_PORT)' \
 	    python3 tests/hw/dap_cond.py --port '$(HW_PORT)' \
 	        --dap-port '$(HW_DAP_PORT)' --elf '$(GDB_DBG_SESSION_ELF)'
+
+# hw-test-dap-introspect — DAP avrOS introspection acceptance (Phase 21).
+# Spawns avrOSdb --dap against the avros_full fixture (whose FSM/event/queue
+# table sections hold one descriptor each) and verifies the avrosdb/fsmList,
+# eventList, queueList custom requests read the tables off silicon.
+HW_INTROSPECT_ELF ?= $(FIXBINDIR)/avros_full.elf
+hw-test-dap-introspect: $(HW_INTROSPECT_ELF) all
+	$(Q)$(BUILDDIR)/$(TARGET) --prog --erase $(HW_PORT) $(HW_INTROSPECT_ELF)
+	$(Q)AVROSDB_BIN='$(BUILDDIR)/$(TARGET)' HW_PORT='$(HW_PORT)' \
+	    DAP_PORT='$(HW_DAP_PORT)' \
+	    python3 tests/hw/dap_introspect.py --port '$(HW_PORT)' \
+	        --dap-port '$(HW_DAP_PORT)' --elf '$(HW_INTROSPECT_ELF)'
 
 # hw-test-dap-vars — DAP variables / evaluate / memory acceptance (Phase 19,
 # the DAP analogue of GDB Group-G state inspection).  Spawns avrOSdb --dap
