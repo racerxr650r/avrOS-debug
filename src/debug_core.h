@@ -33,5 +33,6 @@
 #include "elf_parser.h"  /* ELF symbols + flash translation + DWARF lookup     */
 #include "fsm_mapper.h"  /* avrOS FSM task introspection snapshots             */
 #include "monitor.h"     /* `monitor` command dispatch                         */
+#include "debug_bp.h"    /* HW/SW breakpoint arbiter + stop-cause classifier   */
 
 #endif /* AOD_DEBUG_CORE_H */

@@ -9,6 +9,8 @@
 
 #include "elf_parser.h"
 #include "fsm_mapper.h"
+#include "debug_bp.h"    /* shared breakpoint core: bp-mode, RspSwBp, BpStatus,
+                          * RSP_MAX_SW_BREAKPOINTS, HW_BP_SLOT_EMPTY, SC_* … */
 
 typedef struct {
     uint32_t flash_base;  uint32_t flash_size;
@@ -22,35 +24,11 @@ typedef struct {
 
 
 #define RSP_PACKET_MAX      2048
-/* AVR-Dx OCD provides exactly two hardware breakpoint comparators
- * (BP0, BP1).  Both Z0 (software) and Z1 (hardware) GDB requests are
- * routed to the same two slots — see src/gdb_rsp.c dh_insert_bp.    */
-#define RSP_MAX_BREAKPOINTS 2
 
-/* HLR-055: monitor bp-mode values. */
-#define RSP_BP_MODE_SW       0
-#define RSP_BP_MODE_HW_ONLY  1
-/* HLR-055: `auto` (the default) — a Z0 in FLASH is installed on the free
- * user HW comparator when one is available (no flash write ⇒ no NVMPROG
- * system-reset glitch, and the breakpoint survives target SLEEP), and
- * falls back to the unbounded SW FLASH-BREAK patch (peripheral-preserved,
- * HLR-077) only once the single user comparator is occupied.            */
-#define RSP_BP_MODE_AUTO     2
-
-/* HLR-054: maximum number of simultaneous software breakpoints.  The
- * AVR architecture imposes no inherent limit (every two-byte FLASH
- * word can be patched independently) but the shadow table is a
- * fixed-size array to keep the RspContext POD-like and avoid heap
- * allocations on the fast path.  64 simultaneous SW BPs is well
- * beyond typical GDB use.                                            */
-#define RSP_MAX_SW_BREAKPOINTS 64
-
-/* HLR-054: per-session shadow entry for one software breakpoint. */
-typedef struct {
-    uint32_t addr;          /* GDB-side byte address (FLASH window)   */
-    uint8_t  orig[2];       /* original 2-byte opcode, little-endian  */
-    bool     in_use;
-} RspSwBp;
+/* Breakpoint policy constants and the SW-BP shadow type (RSP_MAX_BREAKPOINTS,
+ * RSP_BP_MODE_*, RSP_MAX_SW_BREAKPOINTS, RspSwBp) now live in the shared
+ * breakpoint core, debug_bp.h (included above), so the RSP and DAP front-ends
+ * share one definition.                                                     */
 
 struct RspHandlers;
 
@@ -69,6 +47,12 @@ typedef struct {
      * it (designated initialiser leaves both = 0, then handler init
      * marks them empty on first use).                                */
     uint32_t                  hw_bp_addr[2];
+    /* Per-comparator pin flag for the two-comparator arbiter (debug_bp.c):
+     * true  = pinned by an explicit `hbreak` (Z1) or `hw-only` Z0;
+     * false = an evictable `auto`-mode Z0 that merely preferred HW.  When a
+     * Z1 needs a comparator and both are taken, an evictable slot is
+     * converted to a SW breakpoint so the explicit HW breakpoint wins.  */
+    bool                      hw_bp_pinned[2];
     /* HLR-055: monitor verbs.  `allow_erase` mirrors the --allow-erase
      * CLI flag and gates `monitor erase` / `monitor chip-erase`.
      * `bp_mode` is 0 = "sw" (true SW BPs via FLASH BREAK, HLR-054),

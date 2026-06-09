@@ -12,6 +12,7 @@
 #include "dap.h"
 #include "gdb_rsp.h"   /* rsp_accept / rsp_close — shared TCP transport helpers */
 
+#include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
@@ -507,47 +508,496 @@ static int dap_emit_stopped(dap_session *s, const char *reason)
     return dap_send_event(s, "stopped", body);
 }
 
-/* Phase 17: shallow `stackTrace` — frame 0 only.  Reads the live PC over OCD
- * and resolves it to `file:line` via libdw (elf_addr_to_line).  Deeper frames
- * (DWARF CFI unwinding) and real function names are Phase 18.  With no target
- * (updi_fd < 0, unit tests) or no DWARF, it still returns one frame so the
- * client has a valid stack. */
-static int dap_handle_stack_trace(dap_session *s, long req_seq)
+/* Format one DAP stackFrame object into `out`.  Resolves `pc` to file:line via
+ * libdw when a DWARF-bearing ELF is attached; otherwise emits a frame with no
+ * source (line 0) so the client still has a valid entry. */
+static void dap_format_frame(dap_session *s, int id, uint32_t pc,
+                             char *out, size_t cap)
 {
-    uint32_t pc = 0;
-    char     file[256];
-    int      line = 0;
-    bool     have_src = false;
-
-    if (s->updi_fd >= 0 && updi_ocd_read_pc(s->updi_fd, &pc) == 0 &&
-        s->elf != NULL &&
-        elf_addr_to_line(s->elf, pc, file, sizeof file, &line) == 0)
-        have_src = true;
-
-    char frame[1024];
-    if (have_src) {
-        char        pesc[600];
-        const char *base = strrchr(file, '/');
-        base = base ? base + 1 : file;
-        char besc[200];
-        dj_escape(file, pesc, sizeof pesc);
-        dj_escape(base, besc, sizeof besc);
-        (void)snprintf(frame, sizeof frame,
-            "{\"id\":0,\"name\":\"0x%06lx\",\"line\":%d,\"column\":1,"
-            "\"instructionPointerReference\":\"0x%lx\","
-            "\"source\":{\"name\":\"%s\",\"path\":\"%s\"}}",
-            (unsigned long)pc, line, (unsigned long)pc, besc, pesc);
+    /* Frame name: the enclosing function (DWARF), falling back to the raw PC
+     * hex when no subprogram covers it (e.g. the C runtime above main). */
+    char fname[128], nesc[260];
+    if (s->elf != NULL &&
+        elf_addr_to_func(s->elf, pc, fname, sizeof fname) == 0) {
+        dj_escape(fname, nesc, sizeof nesc);
     } else {
-        (void)snprintf(frame, sizeof frame,
-            "{\"id\":0,\"name\":\"0x%06lx\",\"line\":0,\"column\":1,"
-            "\"instructionPointerReference\":\"0x%lx\"}",
-            (unsigned long)pc, (unsigned long)pc);
+        (void)snprintf(nesc, sizeof nesc, "0x%06lx", (unsigned long)pc);
     }
 
-    char body[1100];
-    (void)snprintf(body, sizeof body,
-                   "{\"stackFrames\":[%s],\"totalFrames\":1}", frame);
+    char file[256];
+    int  line = 0;
+    if (s->elf != NULL &&
+        elf_addr_to_line(s->elf, pc, file, sizeof file, &line) == 0) {
+        const char *base = strrchr(file, '/');
+        base = base ? base + 1 : file;
+        char pesc[600], besc[200];
+        dj_escape(file, pesc, sizeof pesc);
+        dj_escape(base, besc, sizeof besc);
+        (void)snprintf(out, cap,
+            "{\"id\":%d,\"name\":\"%s\",\"line\":%d,\"column\":1,"
+            "\"instructionPointerReference\":\"0x%lx\","
+            "\"source\":{\"name\":\"%s\",\"path\":\"%s\"}}",
+            id, nesc, line, (unsigned long)pc, besc, pesc);
+    } else {
+        (void)snprintf(out, cap,
+            "{\"id\":%d,\"name\":\"%s\",\"line\":0,\"column\":1,"
+            "\"instructionPointerReference\":\"0x%lx\"}",
+            id, nesc, (unsigned long)pc);
+    }
+}
+
+#define DAP_MAX_FRAMES 32
+
+/* Phase 18: multi-frame stack unwind via .debug_frame CFI + the live target.
+ *
+ * For each frame we get the CFA rule (CFA = value(cfa_reg) + offset) from
+ * elf_cfi_cfa(), where cfa_reg is the Y frame-pointer pair r28:r29 (28) or SP
+ * (32).  AVR's fixed stack conventions then give the caller:
+ *   - the 2-byte word return address sits just below the CFA (a `call` pushes
+ *     the word PC); the code-space byte PC is that word << 1;
+ *   - the caller's Y was saved by the callee prologue (push r28; push r29), so
+ *     r28 (Y-low) is the byte just under the return address and r29 (Y-high)
+ *     one lower still.
+ * The caller's SP at its call site is the CFA.  We stop at an invalid return
+ * address (0, odd-of-range), when the CFA stops advancing, or at DAP_MAX_FRAMES.
+ * The exact byte offsets are AVR-silicon conventions, locked against avr-gdb's
+ * backtrace on the gdb_debug_session fixture (DAP9, doc/UserManual Appendix B).
+ *
+ * Fills pcs[0..n-1] (frame 0 = innermost) and returns n (>= 1), or 0 if the
+ * live registers can't be read. */
+static int dap_unwind(dap_session *s, uint32_t *pcs, int max)
+{
+    uint32_t pc = 0, y;
+    uint16_t sp16 = 0;
+    uint8_t  r28 = 0, r29 = 0;
+
+    if (s->updi_fd < 0 || s->elf == NULL) return 0;
+    if (updi_ocd_read_pc (s->updi_fd, &pc)      != 0) return 0;
+    if (updi_ocd_read_sp (s->updi_fd, &sp16)    != 0) return 0;
+    if (updi_ocd_read_gpr(s->updi_fd, 28, &r28) != 0) return 0;
+    if (updi_ocd_read_gpr(s->updi_fd, 29, &r29) != 0) return 0;
+
+    uint32_t sp = sp16;
+    y = (uint32_t)r28 | ((uint32_t)r29 << 8);
+
+    uint32_t flash_size = s->elf->flash_size;
+    const bool dbg = getenv("AVROSDB_DAP_UNWIND_LOG") != NULL;
+
+    int n = 0;
+    pcs[n++] = pc;
+    uint32_t prev_cfa = 0;
+    while (n < max) {
+        int cfa_reg = 0, cfa_off = 0;
+        if (elf_cfi_cfa(s->elf, pc, &cfa_reg, &cfa_off) != 0) break;
+        uint32_t base = (cfa_reg == 32) ? sp : y;
+        uint32_t cfa  = (base + (uint32_t)cfa_off) & 0xffffu;
+
+        uint32_t ra_word = 0, caller_y = 0;
+        /* Return-address word spans [CFA-1, CFA] — the CIE's "RA at cfa-1" — as
+         * the 2-byte word PC a `call` pushed, high byte at CFA-1, low at CFA. */
+        {
+            uint8_t rb[2];
+            if (updi_mem_read(s->updi_fd, (cfa - 1u) & 0xffffu, rb, 2) < 0) break;
+            ra_word = (uint32_t)rb[1] | ((uint32_t)rb[0] << 8);
+        }
+        /* Caller's saved Y: the callee prologue did `push r28; push r29`, so
+         * r28 (Y-low) lands at CFA-2 and r29 (Y-high) at CFA-3. */
+        {
+            uint8_t yb[2];
+            if (updi_mem_read(s->updi_fd, (cfa - 3u) & 0xffffu, yb, 2) >= 0)
+                caller_y = (uint32_t)yb[1] | ((uint32_t)yb[0] << 8);
+        }
+
+        if (dbg) {
+            uint8_t win[10];
+            (void)updi_mem_read(s->updi_fd, (cfa - 6u) & 0xffffu, win, sizeof win);
+            fprintf(stderr,
+                "[unwind] f%d pc=0x%04x cfa=r%d+%d=0x%04x  win[cfa-6..+3]="
+                "%02x %02x %02x %02x %02x %02x|%02x %02x %02x %02x  "
+                "ra_word@cfa=0x%04x->pc=0x%04x  caller_y=0x%04x\n",
+                n - 1, pc, cfa_reg, cfa_off, cfa,
+                win[0],win[1],win[2],win[3],win[4],win[5],win[6],win[7],win[8],win[9],
+                ra_word, ra_word << 1, caller_y);
+        }
+
+        uint32_t ra_byte = ra_word << 1;   /* AVR word PC -> byte address */
+        if (ra_word == 0) break;
+        if (flash_size != 0 && ra_byte >= flash_size) break;
+        if (cfa == prev_cfa) break;        /* no progress — bail */
+
+        prev_cfa = cfa;
+        pc = ra_byte;
+        sp = cfa;
+        y  = caller_y;
+        pcs[n++] = pc;
+    }
+    return n;
+}
+
+/* Phase 17 → 18: `stackTrace`.  Frame 0 from the live PC; deeper frames via
+ * DWARF CFI unwinding (dap_unwind).  With no target (updi_fd < 0, unit tests)
+ * or no DWARF it still returns one frame so the client has a valid stack. */
+static int dap_handle_stack_trace(dap_session *s, long req_seq)
+{
+    uint32_t pcs[DAP_MAX_FRAMES];
+    int n = dap_unwind(s, pcs, DAP_MAX_FRAMES);
+    if (n <= 0) {
+        uint32_t pc = 0;
+        (void)(s->updi_fd >= 0 && updi_ocd_read_pc(s->updi_fd, &pc) == 0);
+        pcs[0] = pc;
+        n = 1;
+    }
+
+    char body[4096];
+    size_t off = 0;
+    int w = snprintf(body, sizeof body, "{\"stackFrames\":[");
+    if (w > 0) off = (size_t)w;
+    for (int i = 0; i < n; i++) {
+        char frame[1600];   /* fits id + function name + escaped file:line */
+        dap_format_frame(s, i, pcs[i], frame, sizeof frame);
+        w = snprintf(body + off, sizeof body - off, "%s%s", i ? "," : "", frame);
+        if (w < 0 || (size_t)w >= sizeof body - off) break;
+        off += (size_t)w;
+    }
+    (void)snprintf(body + off, sizeof body - off,
+                   "],\"totalFrames\":%d}", n);
     return dap_send_response(s, req_seq, "stackTrace", true, body);
+}
+
+/* ── Breakpoints (Phase 18) ───────────────────────────────────────────────── */
+
+void dap_bp_reset(dap_session *s)
+{
+    s->hw_bp_addr[0] = s->hw_bp_addr[1] = HW_BP_SLOT_EMPTY;
+    s->hw_bp_pinned[0] = s->hw_bp_pinned[1] = false;
+    bp_clear_all_sw(s->sw_bp);
+    s->bp_mode  = RSP_BP_MODE_AUTO;
+    s->pc_dirty = false;
+    for (int i = 0; i < DAP_MAX_BREAKPOINTS; i++) s->bps[i].in_use = false;
+    s->next_bp_id = 1;
+}
+
+/* Uninstall + drop every DAP breakpoint whose source path equals `path`
+ * (setBreakpoints replaces the full set for one source per call). */
+static void dap_bp_clear_source(dap_session *s, const char *path)
+{
+    for (int i = 0; i < DAP_MAX_BREAKPOINTS; i++) {
+        if (!s->bps[i].in_use || strcmp(s->bps[i].source, path) != 0) continue;
+        if (s->bps[i].verified && s->updi_fd >= 0)
+            (void)bp_remove(s->updi_fd, s->hw_bp_addr, s->hw_bp_pinned,
+                            s->sw_bp, s->bp_mode, &s->pc_dirty,
+                            '0', s->bps[i].addr);
+        s->bps[i].in_use = false;
+    }
+}
+
+static int dap_bp_alloc(dap_session *s)
+{
+    for (int i = 0; i < DAP_MAX_BREAKPOINTS; i++)
+        if (!s->bps[i].in_use) return i;
+    return -1;
+}
+
+/* setBreakpoints: resolve each source `line` to a code address via libdw and
+ * install it through the shared breakpoint core (file:line source bps). */
+static int dap_handle_set_breakpoints(dap_session *s, const char *msg,
+                                      const dj_tok_t *t, long req_seq)
+{
+    char path[256] = "";
+    int args = dj_member(msg, t, 0, "arguments");
+    int srcobj = (args >= 0) ? dj_member(msg, t, args, "source") : -1;
+    if (srcobj >= 0) {
+        int p = dj_member(msg, t, srcobj, "path");
+        if (p < 0) p = dj_member(msg, t, srcobj, "name");
+        if (p >= 0) dj_strcpy(msg, t, p, path, sizeof path);
+    }
+
+    /* Replace this source's breakpoints wholesale. */
+    dap_bp_clear_source(s, path);
+
+    char body[1536];
+    size_t off = 0;
+    int    n   = snprintf(body, sizeof body, "{\"breakpoints\":[");
+    if (n > 0) off = (size_t)n;
+
+    int arr = (args >= 0) ? dj_member(msg, t, args, "breakpoints") : -1;
+    int count = (arr >= 0 && t[arr].type == DJ_ARRAY) ? t[arr].size : 0;
+    int elem = arr + 1;
+    for (int k = 0; k < count; k++, elem = t[elem].next) {
+        long line = 0;
+        int lm = dj_member(msg, t, elem, "line");
+        if (lm >= 0) (void)dj_long(msg, t, lm, &line);
+        char cond[128] = "";
+        int cm = dj_member(msg, t, elem, "condition");
+        if (cm >= 0) dj_strcpy(msg, t, cm, cond, sizeof cond);
+
+        uint32_t addr = 0;
+        bool resolved = (s->elf != NULL && path[0] != '\0' &&
+                         elf_line_to_addr(s->elf, path, (int)line, &addr) == 0);
+        bool verified = false;
+        int  id = s->next_bp_id;
+        if (resolved && s->updi_fd >= 0) {
+            int st = bp_insert(s->updi_fd, s->hw_bp_addr, s->hw_bp_pinned,
+                               s->sw_bp, s->bp_mode, &s->pc_dirty, '0', addr);
+            verified = (st == BP_OK);
+        } else if (resolved) {
+            verified = true;   /* unit-test path: resolved, no target to install */
+        }
+
+        int slot = dap_bp_alloc(s);
+        if (slot >= 0) {
+            s->bps[slot].id       = id;
+            s->bps[slot].addr     = addr;
+            s->bps[slot].line     = (int)line;
+            s->bps[slot].verified = verified;
+            s->bps[slot].in_use   = true;
+            snprintf(s->bps[slot].source, sizeof s->bps[slot].source, "%s", path);
+            snprintf(s->bps[slot].condition, sizeof s->bps[slot].condition,
+                     "%s", cond);
+            s->next_bp_id++;
+        }
+
+        int w = snprintf(body + off, sizeof body - off,
+                         "%s{\"id\":%d,\"verified\":%s,\"line\":%ld}",
+                         k ? "," : "", id, verified ? "true" : "false", line);
+        if (w < 0 || (size_t)w >= sizeof body - off) break;   /* bound the reply */
+        off += (size_t)w;
+    }
+    (void)snprintf(body + off, sizeof body - off, "]}");
+    return dap_send_response(s, req_seq, "setBreakpoints", true, body);
+}
+
+/* setInstructionBreakpoints: install breakpoints at raw instruction addresses
+ * (`instructionReference` + optional `offset`).  Replaces the full set of
+ * instruction breakpoints (marked with line == -1) each call. */
+static int dap_handle_set_instruction_breakpoints(dap_session *s, const char *msg,
+                                                  const dj_tok_t *t, long req_seq)
+{
+    /* Drop any previously-installed instruction breakpoints (line == -1). */
+    for (int i = 0; i < DAP_MAX_BREAKPOINTS; i++) {
+        if (!s->bps[i].in_use || s->bps[i].line != -1) continue;
+        if (s->bps[i].verified && s->updi_fd >= 0)
+            (void)bp_remove(s->updi_fd, s->hw_bp_addr, s->hw_bp_pinned,
+                            s->sw_bp, s->bp_mode, &s->pc_dirty, '0', s->bps[i].addr);
+        s->bps[i].in_use = false;
+    }
+
+    int args = dj_member(msg, t, 0, "arguments");
+    char body[1536];
+    size_t off = 0;
+    int    n   = snprintf(body, sizeof body, "{\"breakpoints\":[");
+    if (n > 0) off = (size_t)n;
+
+    int arr = (args >= 0) ? dj_member(msg, t, args, "breakpoints") : -1;
+    int count = (arr >= 0 && t[arr].type == DJ_ARRAY) ? t[arr].size : 0;
+    int elem = arr + 1;
+    for (int k = 0; k < count; k++, elem = t[elem].next) {
+        char ref[32] = "";
+        int rm = dj_member(msg, t, elem, "instructionReference");
+        if (rm >= 0) dj_strcpy(msg, t, rm, ref, sizeof ref);
+        long offw = 0;
+        int om = dj_member(msg, t, elem, "offset");
+        if (om >= 0) (void)dj_long(msg, t, om, &offw);
+
+        uint32_t addr = 0;
+        bool ok = (ref[0] != '\0');
+        if (ok) addr = (uint32_t)(strtoul(ref, NULL, 0) + offw);
+
+        bool verified = false;
+        int  id = s->next_bp_id;
+        if (ok && s->updi_fd >= 0) {
+            int st = bp_insert(s->updi_fd, s->hw_bp_addr, s->hw_bp_pinned,
+                               s->sw_bp, s->bp_mode, &s->pc_dirty, '0', addr);
+            verified = (st == BP_OK);
+        } else if (ok) {
+            verified = true;   /* unit-test path: no target to install */
+        }
+
+        int slot = dap_bp_alloc(s);
+        if (slot >= 0) {
+            s->bps[slot].id        = id;
+            s->bps[slot].addr      = addr;
+            s->bps[slot].line      = -1;     /* marks an instruction breakpoint */
+            s->bps[slot].verified  = verified;
+            s->bps[slot].in_use    = true;
+            s->bps[slot].source[0] = '\0';
+            s->bps[slot].condition[0] = '\0';
+            s->next_bp_id++;
+        }
+
+        int w = snprintf(body + off, sizeof body - off,
+                         "%s{\"id\":%d,\"verified\":%s,"
+                         "\"instructionReference\":\"0x%lx\"}",
+                         k ? "," : "", id, verified ? "true" : "false",
+                         (unsigned long)addr);
+        if (w < 0 || (size_t)w >= sizeof body - off) break;
+        off += (size_t)w;
+    }
+    (void)snprintf(body + off, sizeof body - off, "]}");
+    return dap_send_response(s, req_seq, "setInstructionBreakpoints", true, body);
+}
+
+/* Emit a `stopped` event after a halt detected while running: if the live PC
+ * matches an installed DAP breakpoint, report reason `breakpoint` with its
+ * `hitBreakpointIds`; otherwise a plain `breakpoint` stop. */
+static int dap_emit_stopped_breakpoint(dap_session *s)
+{
+    uint32_t pc = 0;
+    int ids[DAP_MAX_BREAKPOINTS];
+    int nids = 0;
+    if (s->updi_fd >= 0 && updi_ocd_read_pc(s->updi_fd, &pc) == 0) {
+        for (int i = 0; i < DAP_MAX_BREAKPOINTS && nids < DAP_MAX_BREAKPOINTS; i++)
+            if (s->bps[i].in_use && s->bps[i].verified && s->bps[i].addr == pc)
+                ids[nids++] = s->bps[i].id;
+    }
+    if (nids == 0)
+        return dap_emit_stopped(s, "breakpoint");
+
+    char   body[256];
+    size_t off = 0;
+    int    w = snprintf(body, sizeof body,
+        "{\"reason\":\"breakpoint\",\"threadId\":1,\"allThreadsStopped\":true,"
+        "\"hitBreakpointIds\":[");
+    if (w > 0) off = (size_t)w;
+    for (int i = 0; i < nids; i++) {
+        w = snprintf(body + off, sizeof body - off, "%s%d", i ? "," : "", ids[i]);
+        if (w < 0 || (size_t)w >= sizeof body - off) break;
+        off += (size_t)w;
+    }
+    (void)snprintf(body + off, sizeof body - off, "]}");
+    return dap_send_event(s, "stopped", body);
+}
+
+/* ── Conditional breakpoints + breakpoint-aware resume ────────────────────── */
+
+/* Read the innermost frame's live PC and the register values a variable's DWARF
+ * location may reference (Y pair, SP, and the CFA via .debug_frame). */
+static int dap_frame0(dap_session *s, uint32_t *pc, ElfFrameRegs *fr)
+{
+    uint16_t sp16 = 0;
+    uint8_t  r28 = 0, r29 = 0;
+    if (s->updi_fd < 0 || s->elf == NULL) return -1;
+    if (updi_ocd_read_pc (s->updi_fd, pc)       != 0) return -1;
+    if (updi_ocd_read_sp (s->updi_fd, &sp16)    != 0) return -1;
+    if (updi_ocd_read_gpr(s->updi_fd, 28, &r28) != 0) return -1;
+    if (updi_ocd_read_gpr(s->updi_fd, 29, &r29) != 0) return -1;
+    fr->y  = (uint32_t)r28 | ((uint32_t)r29 << 8);
+    fr->sp = sp16;
+    fr->cfa = 0;
+    int reg = 0, off = 0;
+    if (elf_cfi_cfa(s->elf, *pc, &reg, &off) == 0)
+        fr->cfa = ((reg == 32 ? fr->sp : fr->y) + (uint32_t)off) & 0xffffu;
+    return 0;
+}
+
+/* Evaluate a DAP breakpoint `condition` of the form `<ident> <op> <int>`
+ * (op one of == != < <= > >=) against the live target: resolve `ident` to a
+ * variable (local or global) via DWARF, read its value over OCD, and compare to
+ * the integer literal.  Returns 1 (true -> stop), 0 (false -> resume), or -1
+ * (cannot evaluate -> caller stops, so a bad condition never hides a hit). */
+static int dap_eval_condition(dap_session *s, uint32_t pc,
+                              const ElfFrameRegs *fr, const char *cond)
+{
+    const char *p = cond;
+    while (*p == ' ' || *p == '\t') p++;
+
+    char ident[64];
+    int  k = 0;
+    if (!(isalpha((unsigned char)*p) || *p == '_')) return -1;
+    while ((isalnum((unsigned char)*p) || *p == '_') && k < 63) ident[k++] = *p++;
+    ident[k] = '\0';
+    while (*p == ' ' || *p == '\t') p++;
+
+    char op[3] = {0};
+    if      (p[0] == '=' && p[1] == '=') { op[0]='='; op[1]='='; p += 2; }
+    else if (p[0] == '!' && p[1] == '=') { op[0]='!'; op[1]='='; p += 2; }
+    else if (p[0] == '<' && p[1] == '=') { op[0]='<'; op[1]='='; p += 2; }
+    else if (p[0] == '>' && p[1] == '=') { op[0]='>'; op[1]='='; p += 2; }
+    else if (p[0] == '<')                { op[0]='<';            p += 1; }
+    else if (p[0] == '>')                { op[0]='>';            p += 1; }
+    else return -1;
+    while (*p == ' ' || *p == '\t') p++;
+
+    char *end = NULL;
+    long  rhs = strtol(p, &end, 0);
+    if (end == p) return -1;
+
+    uint32_t addr = 0;
+    int      size = 2;
+    bool     sg   = false;
+    if (elf_var_addr(s->elf, pc, fr, ident, &addr, &size, &sg) != 0) return -1;
+
+    uint8_t buf[4] = {0};
+    if (updi_mem_read(s->updi_fd, addr & 0xffffu, buf, (size_t)size) < 0) return -1;
+    long lhs = 0;
+    for (int i = 0; i < size; i++) lhs |= (long)buf[i] << (8 * i);
+    if (sg && size < 4 && (lhs & (1L << (size * 8 - 1))))
+        lhs |= -(1L << (size * 8));     /* sign-extend a signed sub-word */
+
+    if (!strcmp(op, "==")) return lhs == rhs;
+    if (!strcmp(op, "!=")) return lhs != rhs;
+    if (!strcmp(op, "<"))  return lhs <  rhs;
+    if (!strcmp(op, "<=")) return lhs <= rhs;
+    if (!strcmp(op, ">"))  return lhs >  rhs;
+    if (!strcmp(op, ">=")) return lhs >= rhs;
+    return -1;
+}
+
+/* Step over every breakpoint installed at the current PC and resume — the GDB
+ * remove/single-step/insert dance — so a conditional breakpoint whose condition
+ * was false (or a plain resume parked on a breakpoint) does not immediately
+ * re-trigger.  Returns 0 on success. */
+static int dap_resume_over_current(dap_session *s)
+{
+    uint32_t pc = 0;
+    if (updi_ocd_read_pc(s->updi_fd, &pc) != 0) return -1;
+    for (int i = 0; i < DAP_MAX_BREAKPOINTS; i++)
+        if (s->bps[i].in_use && s->bps[i].verified && s->bps[i].addr == pc)
+            (void)bp_remove(s->updi_fd, s->hw_bp_addr, s->hw_bp_pinned,
+                            s->sw_bp, s->bp_mode, &s->pc_dirty, '0', pc);
+    if (bp_step_over(s->updi_fd, s->sw_bp, &s->pc_dirty) < 0) return -1;
+    for (int i = 0; i < DAP_MAX_BREAKPOINTS; i++)
+        if (s->bps[i].in_use && s->bps[i].verified && s->bps[i].addr == pc)
+            (void)bp_insert(s->updi_fd, s->hw_bp_addr, s->hw_bp_pinned,
+                            s->sw_bp, s->bp_mode, &s->pc_dirty, '0', pc);
+    return updi_run(s->updi_fd) < 0 ? -1 : 0;
+}
+
+/* Resume the target for `continue`: step over a breakpoint parked at the live
+ * PC if there is one, else a plain run. */
+static int dap_target_resume(dap_session *s)
+{
+    if (s->updi_fd < 0) return 0;
+    uint32_t pc = 0;
+    if (updi_ocd_read_pc(s->updi_fd, &pc) == 0)
+        for (int i = 0; i < DAP_MAX_BREAKPOINTS; i++)
+            if (s->bps[i].in_use && s->bps[i].verified && s->bps[i].addr == pc)
+                return dap_resume_over_current(s);
+    return updi_run(s->updi_fd) < 0 ? -1 : 0;
+}
+
+/* Called when the target halts while running.  If every breakpoint at the live
+ * PC is conditional and all conditions are false, step over and auto-resume —
+ * returning true (the caller keeps polling).  Returns false (the caller emits
+ * `stopped`) for a spontaneous halt, an unconditional breakpoint, or any
+ * condition that is true or cannot be evaluated. */
+static bool dap_conditional_skip(dap_session *s)
+{
+    if (s->updi_fd < 0) return false;
+    uint32_t      pc = 0;
+    ElfFrameRegs  fr = {0, 0, 0};
+    if (dap_frame0(s, &pc, &fr) != 0) return false;
+
+    bool any = false, stop = false;
+    for (int i = 0; i < DAP_MAX_BREAKPOINTS; i++) {
+        if (!(s->bps[i].in_use && s->bps[i].verified && s->bps[i].addr == pc))
+            continue;
+        any = true;
+        if (s->bps[i].condition[0] == '\0') { stop = true; continue; }
+        if (dap_eval_condition(s, pc, &fr, s->bps[i].condition) != 0) stop = true;
+    }
+    if (!any || stop) return false;
+    return dap_resume_over_current(s) == 0;
 }
 
 /* ── Request dispatch ─────────────────────────────────────────────────────── */
@@ -575,7 +1025,8 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
         /* Advertise only what the handshake needs; capabilities grow with the
          * Phase 17–19 features. */
         if (dap_send_response(s, req_seq, cmd, true,
-                "{\"supportsConfigurationDoneRequest\":true}") < 0)
+                "{\"supportsConfigurationDoneRequest\":true,"
+                "\"supportsInstructionBreakpoints\":true}") < 0)
             return -1;
         return dap_send_event(s, "initialized", NULL) < 0 ? -1 : 0;
     }
@@ -586,10 +1037,10 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
         return dap_send_response(s, req_seq, cmd, true, NULL) < 0 ? -1 : 0;
 
     if (strcmp(cmd, "setBreakpoints") == 0)
-        /* Phase 18 resolves source line -> address via DWARF and installs
-         * through the core arbiter; the handshake just needs a valid reply. */
-        return dap_send_response(s, req_seq, cmd, true,
-                                 "{\"breakpoints\":[]}") < 0 ? -1 : 0;
+        return dap_handle_set_breakpoints(s, msg, t, req_seq) < 0 ? -1 : 0;
+
+    if (strcmp(cmd, "setInstructionBreakpoints") == 0)
+        return dap_handle_set_instruction_breakpoints(s, msg, t, req_seq) < 0 ? -1 : 0;
 
     if (strcmp(cmd, "configurationDone") == 0) {
         if (s->updi_fd >= 0)
@@ -616,7 +1067,7 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
                 "{\"threadId\":1,\"allThreadsContinued\":true}") < 0)
             return -1;
         if (s->updi_fd >= 0) {
-            if (updi_run(s->updi_fd) == 0)
+            if (dap_target_resume(s) == 0)
                 s->running = true;   /* dap_serve() polls for the halt */
             else
                 return dap_emit_stopped(s, "breakpoint") < 0 ? -1 : 0;
@@ -656,8 +1107,19 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
                 "{\"scopes\":[]}") < 0 ? -1 : 0;
 
     if (strcmp(cmd, "disconnect") == 0 || strcmp(cmd, "terminate") == 0) {
-        if (s->updi_fd >= 0)
+        /* Remove all installed breakpoints from silicon before resuming, so
+         * the target runs free (and is not left halted on an armed comparator
+         * at the current PC).  Then let it run on detach. */
+        if (s->updi_fd >= 0) {
+            for (int i = 0; i < DAP_MAX_BREAKPOINTS; i++) {
+                if (s->bps[i].in_use && s->bps[i].verified)
+                    (void)bp_remove(s->updi_fd, s->hw_bp_addr, s->hw_bp_pinned,
+                                    s->sw_bp, s->bp_mode, &s->pc_dirty,
+                                    '0', s->bps[i].addr);
+                s->bps[i].in_use = false;
+            }
             (void)updi_run(s->updi_fd);          /* let the target run on detach */
+        }
         s->running = false;
         /* `terminate` asks the adapter to stop the debuggee; signal the
          * session end with a `terminated` event before the response.       */
@@ -692,7 +1154,9 @@ int dap_serve(int listen_fd, int updi_fd,
         return -1;
     }
 
-    dap_session s = { cfd, updi_fd, elf, idx, fsm, log, 0, false };
+    dap_session s = { .fd = cfd, .updi_fd = updi_fd, .elf = elf, .idx = idx,
+                      .fsm = fsm, .log = log, .out_seq = 0, .running = false };
+    dap_bp_reset(&s);   /* initialise breakpoint state (hw slots EMPTY, AUTO) */
     int rc = 0;
     while (quit == NULL || !*quit) {
         /* Wait for a readable client.  Tick faster while the target is running
@@ -713,8 +1177,15 @@ int dap_serve(int listen_fd, int updi_fd,
             if (s.running && updi_fd >= 0) {
                 int h = updi_ocd_poll_halted(updi_fd, 1);
                 if (h == 0) {
-                    s.running = false;
-                    if (dap_emit_stopped(&s, "breakpoint") < 0) { rc = -1; break; }
+                    /* A conditional breakpoint whose condition is false is
+                     * stepped over and the target auto-resumed (still
+                     * running); otherwise report the stop. */
+                    if (dap_conditional_skip(&s)) {
+                        /* resumed — keep polling */
+                    } else {
+                        s.running = false;
+                        if (dap_emit_stopped_breakpoint(&s) < 0) { rc = -1; break; }
+                    }
                 } else if (h < 0) {
                     fprintf(stderr, "avrOSdb: DAP target poll error\n");
                     rc = -1; break;

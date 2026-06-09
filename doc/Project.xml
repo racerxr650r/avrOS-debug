@@ -89,7 +89,7 @@ Phase 10 work shall continue to honour the layered architecture (§2.1) and the 
     </references>
 
     <architecture>
-      <intro><![CDATA[`avrOSdb` is a single-process C99 application. Responsibilities are divided into seven source modules arranged in four protocol layers; each layer depends only on the layers below it, and no upward calls are permitted. The protocol layer hosts two interchangeable client-facing front-ends over a shared protocol-agnostic debug core (HLR-073, `src/debug_core.h`): the GDB-RSP server (`src/gdb_rsp.c`) and the DAP server (`src/dap.c`), selected at startup by `--rsp` (default) / `--dap`. This layering is a hard design rule — see §2.2 "Layered Architecture" — and is enforced by review and by the `.h` dependency graph (the lower layers' headers must not `#include` any header from a higher layer).
+      <intro><![CDATA[`avrOSdb` is a single-process C99 application. Responsibilities are divided into eight source modules arranged in four protocol layers; each layer depends only on the layers below it, and no upward calls are permitted. The protocol layer hosts two interchangeable client-facing front-ends over a shared protocol-agnostic debug core (HLR-073, `src/debug_core.h` / `src/debug_bp.c`): the GDB-RSP server (`src/gdb_rsp.c`, §5) and the DAP server (`src/dap.c`, §10), selected at startup by `--rsp` (default) / `--dap`, both calling the shared breakpoint core (`src/debug_bp.c`, §9). This layering is a hard design rule — see §2.2 "Layered Architecture" — and is enforced by review and by the `.h` dependency graph (the lower layers' headers must not `#include` any header from a higher layer). This layering is a hard design rule — see §2.2 "Layered Architecture" — and is enforced by review and by the `.h` dependency graph (the lower layers' headers must not `#include` any header from a higher layer).
 
 **Layer stack (top to bottom):**
 
@@ -587,7 +587,8 @@ The `RspHandlers` and `RspContext` structs are declared in `src/gdb_rsp.h`. The 
           <function signature="int rsp_send_packet(int fd, const char *payload)"
                     summary="Frame payload as an RSP packet and transmit; return 0 or -1."/>
           <function signature="int rsp_dispatch(int fd, const char *packet, RspHandlers *h)">
-            <purpose>Identify the RSP packet type from the first character (and optionally subsequent characters) of packet and invoke the matching handler in h. Returns 0 on success or -1 if the selected handler reports a write error.</purpose>
+            <purpose>Identify the RSP packet type from the first character (and optionally subsequent characters) of packet and invoke the matching handler in h.</purpose>
+            <returns>0 on success; -1 if the selected handler reports a write error.</returns>
             <logic>
               <step><![CDATA[Match the leading characters of `packet` against the handler table using a switch on `packet[0]` with secondary string comparisons for multi-character commands (`qS`, `qA`, `qf`, `qs`, `qR`, `QS`, `vC`, `Hg`, `Hc`, `Z0`, `z0`).]]></step>
               <step>Invoke the matching handler function pointer from `h`, passing `fd`, `packet`, and the shared application context pointer.</step>
@@ -621,6 +622,8 @@ The `RspHandlers` and `RspContext` structs are declared in `src/gdb_rsp.h`. The 
 | `g_thread`, `c_thread` | `int` | 8 B | Selected GDB thread IDs for register and continue operations. |
 
 (The previous 96-byte software-breakpoint table has been removed; the two hardware-breakpoint shadow slots now live in `RspContext.hw_bp_addr[]` and are session-scoped.)
+
+**Breakpoints and stepping via the shared core (§9).** The breakpoint policy itself — the comparator arbiter, the software-`BREAK` model, and the single-step-over of every AVR instruction class — lives in `src/debug_bp.c`, not here. `dh_insert_bp`/`dh_remove_bp` are thin wrappers over `bp_insert`/`bp_remove`, `dh_step` delegates the actual single step to `bp_step_over()`, and `dh_continue` calls `bp_consume_pc_skip()` before resuming. `src/gdb_rsp.c` retains only the RSP packet translation around those core calls (and exports the shared TCP transport `rsp_accept`/`rsp_close`, which the DAP server reuses).
 
 Total static BSS in `src/gdb_rsp.c`: approximately 4.2 KiB.
 
@@ -680,6 +683,14 @@ int elf_addr_to_line(const ElfContext *ctx, uint32_t byte_addr,
 int elf_line_to_addr(const ElfContext *ctx, const char *file, int line,
                      uint32_t *byte_addr);
     /* Both return 0 on success, -1 when the ELF carries no DWARF or no match. */
+
+/* DAP stack-unwind + conditional-breakpoint support (Phase 18). */
+typedef struct { uint32_t cfa, y, sp; } ElfFrameRegs;
+int elf_cfi_cfa (const ElfContext *ctx, uint32_t byte_addr,
+                 int *cfa_reg, int *cfa_offset);
+int elf_var_addr(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr,
+                 const char *name, uint32_t *addr, int *size, bool *is_signed);
+int elf_addr_to_func(const ElfContext *ctx, uint32_t pc, char *name, size_t cap);
 ```
 
 The `ElfContext` and `AvrOsSymbolIndex` struct definitions are also declared in `src/elf_parser.h`.  The libelf `Elf*` and libdw `Dwarf*` handles are held in `ElfContext` as opaque `void*` so consumers need no elfutils headers.  Callers must zero-initialise `AvrOsSymbolIndex` before passing it to `elf_find_avros_tables()`.]]></interface>
@@ -731,6 +742,12 @@ The symbol and string tables are **not** copied into application heap buffers �
                     summary="Map a code byte address to source file:line via libdw (dwarf_addrdie + dwarf_getsrc_die); 0 on success, -1 when no DWARF or no line-table entry."/>
           <function signature="int elf_line_to_addr(const ElfContext *ctx, const char *file, int line, uint32_t *byte_addr)"
                     summary="Resolve file:line (basename match) to the first code byte address via libdw line tables; 0 on success, -1 when no DWARF or no match."/>
+          <function signature="int elf_cfi_cfa(const ElfContext *ctx, uint32_t byte_addr, int *cfa_reg, int *cfa_offset)"
+                    summary="Return the Canonical-Frame-Address rule at a PC by interpreting .debug_frame in-tree (libdw's dwarf_cfi_addrframe errors on AVR CFI): CFA = value(cfa_reg) + cfa_offset, cfa_reg = 28 (the Y pair) or 32 (SP). Drives the DAP multi-frame stackTrace. 0 on success, -1 when uncovered/unsupported."/>
+          <function signature="int elf_var_addr(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr, const char *name, uint32_t *addr, int *size, bool *is_signed)"
+                    summary="Resolve a variable visible at pc to its 16-bit data-space address, size, and signedness, evaluating its DWARF location with live frame registers (dwarf_getscopes/getscopevar; DW_OP_addr globals, DW_OP_breg28/breg32/fbreg locals). Backs DAP conditional-breakpoint evaluation. 0 on success, -1 when not in scope/unsupported."/>
+          <function signature="int elf_addr_to_func(const ElfContext *ctx, uint32_t pc, char *name, size_t cap)"
+                    summary="Resolve a code byte address to the enclosing function name (the DW_TAG_subprogram covering pc, via dwarf_getscopes + dwarf_diename); names the DAP stackTrace frames. 0 on success, -1 when no DWARF or pc is in no subprogram (the caller falls back to the raw address)."/>
         </functions>
         <algorithm><![CDATA[`elf_open()` validates and loads the ELF via libelf as follows:
 
@@ -757,6 +774,10 @@ The boundary symbols `__start_<NAME>` and `__stop_<NAME>` are emitted by the avr
 **Memory:** the symbol and string tables are owned by libelf (typically `mmap`'d from the file), not copied into application heap, so `elf_open()` performs no large allocations of its own. The libelf `Elf*`, libdw `Dwarf*`, and the fd are released by `elf_close()`.
 
 **Parse complexity:** libelf parses the container; `elf_find_avros_tables()` performs a single O(sym_count) linear scan of the first `SHT_SYMTAB` with 8 string comparisons per symbol entry.
+
+**DWARF stack-unwind support (`elf_cfi_cfa`).** libdw's high-level CFI executor (`dwarf_cfi_addrframe`) returns `UNKNOWN_ERROR` on AVR `.debug_frame` — GDB itself ships its own CFI interpreter for the same reason — so `elf_cfi_cfa()` parses the section directly: it locates `.debug_frame` via libelf, walks the CIE/FDE entries, and on the FDE covering the PC runs a minimal CFI state machine over the CIE-initial then FDE instructions (the CFA-defining opcodes plus operand-skipping of the register-save forms) to recover `CFA = value(cfa_reg) + cfa_offset`. avr-gcc encodes `cfa_reg` 28 as the 16-bit Y frame-pointer pair and 32 as SP. This is the per-PC half of the DAP stack unwind (§10); the AVR return-address/saved-Y recovery lives in `dap_unwind()`.
+
+**DWARF variable resolution (`elf_var_addr`).** For DAP conditional breakpoints, `elf_var_addr()` resolves a variable visible at a PC to its data-space address, size, and signedness: it obtains the CU (`dwarf_addrdie`), the lexical scope chain (`dwarf_getscopes`), and the matching DIE (`dwarf_getscopevar`, which searches locals/parameters then file scope), then decodes the single-operation location forms avr-gcc -O0 emits — `DW_OP_addr` (globals), `DW_OP_breg28`/`bregx 28` (the Y pair) and `bregx 32` (SP), and `DW_OP_fbreg` (against the CFA when the subprogram frame base is `DW_OP_call_frame_cfa`) — using the caller-supplied live `ElfFrameRegs`. Size/signedness come from the peeled `DW_AT_type` (`dwarf_peel_type` + `dwarf_bytesize` + `DW_AT_encoding`).
 
 **Test approach for `src/elf_parser.c`:** Unit-testable using pre-built AVR ELF fixtures (compiled with `-g` so DWARF is present). Test cases cover: magic/class validation rejection, `EM_AVR` check, correct `flash_base` / `sram_base` extraction, all 7 avrOS sentinel symbols found with correct address conversions, FLASH-table LMA translation vs. raw SRAM VMA, partial symbol set (graceful degradation), deviceinfo name extraction (present and absent), DWARF source-line round-trip, and `elf_close()` resource-release correctness. The former `malloc`-injection test is retired — libelf owns the allocations now.]]></algorithm>
         <dependencies>
@@ -905,6 +926,13 @@ Return values: 0 command recognised and executed; -1 UPDI read failure; -2 unrec
 *   `monitor avros events` — list each named event registered in `EVNT_TABLE` with its current status flag value.
 *   `monitor avros queues` — list each registered queue's capacity and per-element size from `QUE_TABLE`.]]></interface>
         </interfaces>
+        <data_structures><![CDATA[`src/monitor.c` holds no persistent state of its own — it is a stateless command dispatcher that reads the target's avrOS registration tables on demand via `updi_mem_read()`. The two FLASH-resident descriptor layouts it decodes (addresses and entry counts come from the `AvrOsSymbolIndex`, §6) are:
+
+**`evntDescriptor_t`** (4 bytes, `EVNT_TABLE`, read by `cmd_events()`): a FLASH `char *name` pointer (2 bytes) and an SRAM `event_t *status` pointer (2 bytes). The name pointer is followed into the mapped-flash window for the human-readable event name; the status pointer is read from SRAM for the current 1-byte flag value.
+
+**`queDescriptor_t`** (10 bytes, `QUE_TABLE`, read by `cmd_queues()`): three pointers (queue / buffer / event, 2 bytes each) plus a 2-byte `capacity` and a 2-byte `sizeOfElement`. Only the last two fields are reported.
+
+A single fixed 512-byte stack buffer is used to assemble each command's human-readable text before it is hex-encoded into RSP `O`-packets.]]></data_structures>
         <functions>
           <function signature="int monitor_dispatch(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx, const char *cmd)">
             <purpose>Hex-decode the qRcmd payload, match the sub-command token, and invoke the appropriate handler.</purpose>
@@ -919,6 +947,7 @@ Return values: 0 command recognised and executed; -1 UPDI read failure; -2 unrec
           </function>
           <function signature="static int cmd_events(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx)">
             <purpose>Iterate the avrOS `EVNT_TABLE` and report each named event's current status flag to the GDB console.</purpose>
+            <returns>0 on success; -1 on a UPDI read failure.</returns>
             <logic>
               <step><![CDATA[Read `idx->event_count` consecutive `evntDescriptor_t` records (4 bytes each: `char *name`, `event_t *status`) from FLASH at `idx->event_table_addr` using `updi_mem_read()`.]]></step>
               <step><![CDATA[For each descriptor, follow the FLASH `name` pointer to read the human-readable event name (NUL-terminated) and the SRAM `status` pointer to read the current 1-byte status value.]]></step>
@@ -927,6 +956,7 @@ Return values: 0 command recognised and executed; -1 UPDI read failure; -2 unrec
           </function>
           <function signature="static int cmd_queues(int rsp_fd, int updi_fd, const AvrOsSymbolIndex *idx)">
             <purpose>Read each registered avrOS queue's capacity and per-element size and send a formatted table to the GDB console.</purpose>
+            <returns>0 on success; -1 on a UPDI read failure.</returns>
             <logic>
               <step><![CDATA[Read `idx->queue_count` consecutive `queDescriptor_t` records (10 bytes each: queue/buffer/event pointers + 2-byte capacity + 2-byte sizeOfElement) from FLASH at `idx->queue_table_addr` using `updi_mem_read()`.]]></step>
               <step>For each descriptor, extract the `capacity` and `sizeOfElement` fields and format a one-line entry.</step>
@@ -969,6 +999,185 @@ typedef struct {
         <error_handling>
           <case name="Unrecognized sub-command">Return a human-readable error message to the GDB console output packet.</case>
           <case name="UPDI read failure">Report partial data alongside an error message to the GDB console; do not abort the server.</case>
+        </error_handling>
+      </module>
+
+      <module path="src/debug_bp.c">
+        <purpose><![CDATA[is the protocol-agnostic **breakpoint core** shared by both client front-ends (HLR-073): it owns the AVR-Dx breakpoint policy — the hardware OCD-comparator arbiter, the true software-breakpoint (`BREAK` opcode) model, the single-step-over of every AVR instruction class, and the silicon work-arounds that surround them (the NVMPROG-reset peripheral save/restore and the fresh-`OCD.PC`-write instruction skip). It contains no wire-protocol formatting; the GDB-RSP server (`src/gdb_rsp.c`) and the DAP server (`src/dap.c`) call it with their own breakpoint state and translate its results into RSP packets or DAP responses respectively. It was extracted (behaviour-preserving) from the breakpoint policy that lived inside `src/gdb_rsp.c` through Phase 17.]]></purpose>
+        <responsibility><![CDATA[Arbitrate the two AVR-Dx PC comparators: one user hardware-breakpoint slot plus one slot reserved for the 32-bit step-over, with eviction so an explicit `hbreak` always wins the comparator.]]></responsibility>
+        <responsibility><![CDATA[Install and remove breakpoints in either mode — a hardware comparator or a software `BREAK` (0x9598) flash patch — selected by the `auto`/`sw`/`hw-only` policy.]]></responsibility>
+        <responsibility><![CDATA[Single-step the instruction at the live PC over OCD, handling 16-bit, 32-bit LDS/STS, and 32-bit CALL/JMP change-of-flow, plus the fresh-PC/patched-`BREAK` injection case.]]></responsibility>
+        <responsibility><![CDATA[Classify why the CPU halted (software vs hardware breakpoint vs other) without adjusting the PC.]]></responsibility>
+        <interfaces>
+          <interface title="Public C API (src/debug_bp.h)"><![CDATA[The core is parameterised on the caller's breakpoint state (the same fields live in both `RspContext` and `dap_session`), so it holds no global state of its own:
+
+```c
+/* Policy + shadow types */
+#define RSP_HW_BP_USER_SLOTS  1      /* comparator 0 = the sole user HW slot   */
+#define RSP_HW_BP_STEP_SLOT   1      /* comparator 1 = reserved 32-bit step-over*/
+#define HW_BP_SLOT_EMPTY      0xFFFFFFFFu
+#define RSP_MAX_SW_BREAKPOINTS 64
+enum { RSP_BP_MODE_SW, RSP_BP_MODE_HW_ONLY, RSP_BP_MODE_AUTO };
+typedef struct { bool in_use; uint32_t addr; uint8_t orig[2]; } RspSwBp;
+enum RspStopCause { SC_NONE, SC_SWBREAK, SC_HWBREAK, SC_STEP, SC_INTR };
+typedef enum { BP_OK = 0, BP_ERR_IO = -1, BP_ERR_SLOT = -2, BP_ERR_DATASP = -3 } BpStatus;
+
+/* Install / remove (kind '0' = auto/SW-preferring, '1' = hbreak) */
+int  bp_insert(int updi_fd, uint32_t hw_bp_addr[2], bool hw_bp_pinned[2],
+               RspSwBp sw_bp[], int bp_mode, bool *pc_dirty,
+               char kind, uint32_t gdb_addr);
+int  bp_remove(int updi_fd, uint32_t hw_bp_addr[2], bool hw_bp_pinned[2],
+               RspSwBp sw_bp[], int bp_mode, bool *pc_dirty,
+               char kind, uint32_t gdb_addr);
+
+/* Resume / step helpers */
+int  bp_step_over(int updi_fd, RspSwBp sw_bp[], bool *pc_dirty);
+int  bp_consume_pc_skip(int updi_fd, RspSwBp sw_bp[], bool *pc_dirty);
+int  bp_classify_stop(int updi_fd, const RspSwBp sw_bp[],
+                      const uint32_t hw_bp_addr[2], int hint);
+void bp_clear_all_sw(RspSwBp sw_bp[]);
+
+/* CPU register-file snapshot/restore around the NVMPROG reset */
+int  bp_snapshot_cpu(int updi_fd, uint8_t gpr[32], uint8_t *sreg,
+                     uint16_t *sp, uint32_t *pc);
+int  bp_restore_cpu (int updi_fd, const uint8_t gpr[32], uint8_t sreg,
+                     uint16_t sp, uint32_t pc);
+```]]></interface>
+        </interfaces>
+        <data_structures><![CDATA[**`RspSwBp sw_bp[RSP_MAX_SW_BREAKPOINTS]`** — the software-breakpoint shadow table (caller-owned). Each in-use slot records the breakpoint `addr` and the original 2 opcode bytes (`orig`) displaced by the patched `BREAK`, so the instruction can be restored on removal or injected for a step-over.
+
+**`uint32_t hw_bp_addr[2]` / `bool hw_bp_pinned[2]`** — the hardware-comparator shadow (caller-owned). Index 0 is the user slot; index 1 is the reserved step-over slot. `hw_bp_pinned[i]` marks a slot installed by an explicit `hbreak` (`Z1`), which is non-evictable.
+
+**`bool pc_dirty`** — caller-owned flag set when a flash patch (or a 32-bit CoF emulation) has freshly written `OCD.PC`; the next resume must execute the instruction at PC by injection rather than letting the silicon skip it (see §9.3.3).
+
+The `SW_BP_BREAK_BYTES[2] = {0x98, 0x95}` constant is the little-endian AVR `BREAK` opcode word patched into flash for a software breakpoint.]]></data_structures>
+        <functions>
+          <function signature="int bp_insert(int updi_fd, uint32_t hw_bp_addr[2], bool hw_bp_pinned[2], RspSwBp sw_bp[], int bp_mode, bool *pc_dirty, char kind, uint32_t gdb_addr)">
+            <purpose>Install a breakpoint at gdb_addr, choosing a hardware comparator or a software BREAK per the policy, with hbreak eviction.</purpose>
+            <returns>`BP_OK` on success; `BP_ERR_DATASP` for a data-space address; `BP_ERR_SLOT` when no comparator is free in `hw-only` mode; `BP_ERR_IO` on UPDI failure.</returns>
+            <logic>
+              <step><![CDATA[Reject a data-space address (the breakpoint must be a code address) with `BP_ERR_DATASP`.]]></step>
+              <step><![CDATA[`kind == '1'` (hbreak / `Z1`): claim the user comparator, **evicting** an evictable `auto`-`Z0` already in it to a software `BREAK` first; pin the slot. This guarantees an explicit hardware breakpoint always wins the comparator.]]></step>
+              <step><![CDATA[`kind == '0'` in `auto` mode: prefer the free user comparator (glitch-free, sleep-safe); if it is occupied, fall back to a software `BREAK`. `sw` mode always patches flash; `hw-only` mode fails with `BP_ERR_SLOT` when the comparator is taken.]]></step>
+              <step><![CDATA[A software install patches the `BREAK` word into flash via the NVMPROG sequence (saving/restoring peripheral state and the CPU register file around the reset pulse) and records the displaced opcode in `sw_bp[]`; it sets `*pc_dirty` because the reset re-wrote `OCD.PC`.]]></step>
+            </logic>
+          </function>
+          <function signature="int bp_remove(int updi_fd, uint32_t hw_bp_addr[2], bool hw_bp_pinned[2], RspSwBp sw_bp[], int bp_mode, bool *pc_dirty, char kind, uint32_t gdb_addr)"
+                    summary="Remove the breakpoint at gdb_addr — clear the matching comparator slot, or un-patch the flash BREAK and restore the displaced opcode — mirroring bp_insert; returns BP_OK or a negative BpStatus."/>
+          <function signature="int bp_step_over(int updi_fd, RspSwBp sw_bp[], bool *pc_dirty)">
+            <purpose>Execute exactly one instruction at the live PC over OCD, handling every AVR case that needs help. Shared by the GDB-RSP step and the DAP conditional-breakpoint auto-resume.</purpose>
+            <returns>0 on success (one instruction executed or emulated); -1 on UPDI error.</returns>
+            <logic>
+              <step><![CDATA[Call `bp_consume_pc_skip()`; if it injected the instruction (return 1) that IS the step — return.]]></step>
+              <step><![CDATA[Read the opcode word; for a 32-bit CALL/JMP emulate the change-of-flow via `updi_ocd_emulate_cof_32bit()` and set `*pc_dirty`; for a 32-bit LDS/STS step via the reserved comparator at PC+4 (`updi_step_32bit`, RSP_HW_BP_STEP_SLOT); otherwise a plain `updi_step()`.]]></step>
+            </logic>
+          </function>
+          <function signature="int bp_consume_pc_skip(int updi_fd, RspSwBp sw_bp[], bool *pc_dirty)"
+                    summary="When *pc_dirty, execute the instruction at PC by opcode injection (substituting the saved original when a BREAK is patched there) so the next resume does not skip it; leaves a 32-bit CALL/JMP to the caller's CoF emulation. Returns 1 if it injected, 0 if nothing to do, -1 on error."/>
+          <function signature="int bp_classify_stop(int updi_fd, const RspSwBp sw_bp[], const uint32_t hw_bp_addr[2], int hint)"
+                    summary="Read the live PC and return SC_SWBREAK if it matches a software-BREAK shadow, SC_HWBREAK if it matches the user comparator, else the caller's hint; does not adjust the PC."/>
+          <function signature="int bp_snapshot_cpu(int updi_fd, uint8_t gpr[32], uint8_t *sreg, uint16_t *sp, uint32_t *pc)"
+                    summary="Save the full CPU register file (32 GPRs, SREG, SP, PC) before the NVMPROG system-reset pulse a software-breakpoint flash patch triggers; 0 on success, -1 on UPDI error."/>
+          <function signature="int bp_restore_cpu(int updi_fd, const uint8_t gpr[32], uint8_t sreg, uint16_t sp, uint32_t pc)"
+                    summary="Restore the CPU register file saved by bp_snapshot_cpu() after the patch so the program's register state survives the reset; 0 on success, -1 on UPDI error."/>
+          <function signature="void bp_clear_all_sw(RspSwBp sw_bp[])"
+                    summary="Clear every software-breakpoint shadow entry without UPDI I/O (used by vFlashDone / reset)."/>
+        </functions>
+        <algorithm><![CDATA[**Comparator arbiter (HLR-055 / HLR-016).** The AVR-Dx OCD exposes two PC comparators, but comparator 1 proved unreliable as a *general* user breakpoint on a free `continue` (the same address fires on comparator 0 yet is missed on comparator 1 — see User Manual Appendix B.11). The core therefore treats comparator 0 as the **sole** user hardware slot and reserves comparator 1 (`RSP_HW_BP_STEP_SLOT`) exclusively for the brief, controlled 32-bit step-over. Any second simultaneous user breakpoint becomes a software `BREAK`. An `hbreak` (`Z1`) is *pinned* and evicts an evictable `auto`-`Z0` from the comparator to a software `BREAK`, so the explicit hardware request always wins the slot.
+
+**Software breakpoints (HLR-054).** A software breakpoint patches the 2-byte `BREAK` opcode (0x9598) into flash via the NVMPROG controller, shadowing the displaced bytes in `sw_bp[]`. Entering NVMPROG pulses a system reset, which both wipes peripheral state and re-writes `OCD.PC`; `bp_insert`/`bp_remove` therefore snapshot and restore the CPU register file (and Phase-20 peripheral window) around the patch.
+
+**Fresh-PC-write skip (User Manual Appendix B.8).** A fresh `OCD.PC` write — from the NVMPROG reset, or from `updi_ocd_emulate_cof_32bit()` — makes the silicon skip the instruction at PC on the next *run* (a step settles fine). The core records this in `*pc_dirty`; the next resume calls `bp_consume_pc_skip()` to execute that one instruction by injection (substituting the original opcode when a `BREAK` is patched there) so nothing is silently dropped. This is what fixed the long-standing source-`step`-into-a-function frame corruption (Group-G G19): `bp_step_over` sets `pc_dirty` after a 32-bit CoF emulation precisely so the following `continue` injects the callee's first prologue instruction.
+
+**Single-step decode.** `bp_step_over()` is the one place that knows how to advance past any AVR instruction: 16-bit (a plain OCD step), 32-bit LDS/STS (a hardware breakpoint at PC+4 on the reserved comparator), and 32-bit CALL/JMP (full OCD emulation, since the comparator misses the first change-of-flow after a run). Both `dh_step()` in the RSP server and `dap_resume_over_current()` in the DAP server delegate to it.]]></algorithm>
+        <dependencies>
+          <dep><![CDATA[`src/updi.c` — all OCD/NVM primitives: `updi_mem_read`, `updi_nvm_flash_patch`, `updi_ocd_read/write_pc/sp/sreg/gpr`, `updi_ocd_set/clear_hw_bp`, `updi_ocd_step_inject_word0`, `updi_step`, `updi_step_32bit`, `updi_ocd_emulate_cof_32bit`, `updi_save/restore_peripherals`.]]></dep>
+        </dependencies>
+        <error_handling>
+          <case name="UPDI I/O failure"><![CDATA[Return `BP_ERR_IO` (-1); the calling front-end maps it to an RSP `E01` / a DAP `verified:false` or error.]]></case>
+          <case name="No comparator available in hw-only mode"><![CDATA[Return `BP_ERR_SLOT` (-2).]]></case>
+          <case name="Breakpoint requested at a data-space address"><![CDATA[Return `BP_ERR_DATASP` (-3).]]></case>
+        </error_handling>
+      </module>
+
+      <module path="src/dap.c">
+        <purpose><![CDATA[implements the **Debug Adapter Protocol (DAP) server** — the second client-facing front-end (selected by `--dap`), a peer of the GDB-RSP server over the same shared debug core. It accepts a single DAP client (VS Code, or Neovim/nvim-dap) on a TCP port, decodes `Content-Length`-framed JSON-RPC messages, dispatches DAP requests, and emits DAP responses and events. Like the RSP server it owns wire framing only: execution control, breakpoints, ELF/DWARF lookup, and the breakpoint policy all come from the lower layers (`src/debug_bp.c`, `src/elf_parser.c`, `src/updi.c`).]]></purpose>
+        <responsibility><![CDATA[Frame and codec DAP messages: a self-contained recursive-descent JSON tokenizer/accessor (`dj_*`) and `Content-Length` message framing — no third-party JSON dependency.]]></responsibility>
+        <responsibility><![CDATA[Serve the DAP lifecycle (`initialize`/`launch`/`attach`/`configurationDone`/`disconnect`/`terminate`), execution control (`continue`/`pause`/`next`/`stepIn`/`stepOut`), `threads`, and stop events.]]></responsibility>
+        <responsibility><![CDATA[Serve source and instruction breakpoints (`setBreakpoints`/`setInstructionBreakpoints`) through the shared breakpoint core, including conditional breakpoints evaluated on the live target.]]></responsibility>
+        <responsibility><![CDATA[Serve a multi-frame `stackTrace` by unwinding the target's DWARF Call-Frame-Information.]]></responsibility>
+        <interfaces>
+          <interface title="Public C API (src/dap.h)"><![CDATA[```c
+int  dap_serve(int updi_fd, int port, ElfContext *elf,
+               const AvrOsSymbolIndex *idx, FsmContext *fsm, bool log);
+int  dap_dispatch(dap_session *s, const char *msg, size_t len);
+int  dap_read_message (int fd, char *buf, size_t cap, size_t *out_len);
+int  dap_write_message(int fd, const char *body, size_t len);
+void dap_bp_reset(dap_session *s);
+```
+
+`dap_serve()` is the `--dap` analogue of the RSP `event_loop()`; `dap_dispatch()` is the per-message handler (driven over a socketpair in unit tests, no hardware). The transport (`rsp_accept`/`rsp_close`) is shared with the RSP server.]]></interface>
+          <interface title="DAP Network Interface"><![CDATA[A single TCP client speaking DAP over `Content-Length: <n>\r\n\r\n<json>` framing (the same framing VS Code and nvim-dap use). The adapter advertises `supportsConfigurationDoneRequest` and `supportsInstructionBreakpoints` in its `initialize` response.]]></interface>
+        </interfaces>
+        <data_structures><![CDATA[**`dap_session`** — all per-connection DAP state: the client fd, the target `updi_fd`, the `ElfContext`/`AvrOsSymbolIndex`/`FsmContext` pointers, a `running` flag, and the breakpoint state. The breakpoint state mirrors the RSP context so the shared core can be called directly: `uint32_t hw_bp_addr[2]; bool hw_bp_pinned[2]; RspSwBp sw_bp[RSP_MAX_SW_BREAKPOINTS]; int bp_mode; bool pc_dirty;` plus a DAP-facing table `bps[DAP_MAX_BREAKPOINTS]` (each `{int id; uint32_t addr; int line; bool verified, in_use; char source[256]; char condition[128];}`, where `line == -1` marks an instruction breakpoint) and a `next_bp_id` counter.
+
+**`dj_tok_t`** — one node of the in-tree JSON tokenizer's flat token array (type, span, child/next links), produced by `dj_parse()` and navigated with `dj_member()`/`dj_strcpy()`/`dj_long()`.
+
+**`ElfFrameRegs`** — the live frame registers (CFA, Y pair, SP) the stack unwinder and the conditional-expression variable resolver pass to `elf_var_addr()`.]]></data_structures>
+        <functions>
+          <function signature="int dap_serve(int updi_fd, int port, ElfContext *elf, const AvrOsSymbolIndex *idx, FsmContext *fsm, bool log)"
+                    summary="Accept one DAP client and run the select()-based read/dispatch loop; while the target is running, poll the OCD halt status and emit a stopped event (honouring conditional breakpoints). Returns 0 on clean disconnect."/>
+          <function signature="int dap_dispatch(dap_session *s, const char *msg, size_t len)"
+                    summary="Parse one DAP request and route it to its handler (initialize/attach/continue/step/threads/stackTrace/scopes/setBreakpoints/setInstructionBreakpoints/disconnect); unknown requests are answered success:false. Returns 0 to continue, non-zero to end the session."/>
+          <function signature="static int dap_handle_set_breakpoints(dap_session *s, const char *msg, const dj_tok_t *t, long req_seq)"
+                    summary="Install source breakpoints: resolve each {line[,condition]} for arguments.source.path via elf_line_to_addr(), install through bp_insert() (auto mode), replace the prior set for that source, and reply per-line {id,verified,line}."/>
+          <function signature="static int dap_handle_set_instruction_breakpoints(dap_session *s, const char *msg, const dj_tok_t *t, long req_seq)"
+                    summary="Install instruction breakpoints from each entry's instructionReference (+ optional offset) via bp_insert(), marking the table entry line == -1 and replacing the prior instruction-breakpoint set; reply per-entry {id,verified,instructionReference}."/>
+          <function signature="static int dap_handle_stack_trace(dap_session *s, long req_seq)"
+                    summary="Serve stackTrace: call dap_unwind(), then for each recovered PC resolve the function name via elf_addr_to_func() and file:line via elf_addr_to_line() and format the stackFrames array (falling back to the single innermost frame with no target/DWARF)."/>
+          <function signature="static int dap_unwind(dap_session *s, uint32_t *pcs, int max)">
+            <purpose>Walk the call stack via .debug_frame CFI plus AVR stack conventions, filling pcs[0..n-1] (frame 0 = innermost).</purpose>
+            <returns>The frame count (>= 1), or 0 when the live registers cannot be read.</returns>
+            <logic>
+              <step><![CDATA[Read the innermost PC/SP/Y over OCD; compute `CFA = (cfa_reg==32?SP:Y) + offset` from `elf_cfi_cfa()`.]]></step>
+              <step><![CDATA[Recover the caller from target memory: the 2-byte word return address at [CFA-1, CFA] (byte PC = word << 1) and the caller's saved Y at r28@CFA-2 / r29@CFA-3; iterate with PC=caller, SP=CFA, Y=caller-Y.]]></step>
+              <step><![CDATA[Stop at a zero / out-of-FLASH return address, where no CFI covers the PC (the C-runtime frame above `main`), or at `DAP_MAX_FRAMES`.]]></step>
+            </logic>
+          </function>
+          <function signature="static int dap_eval_condition(dap_session *s, uint32_t pc, const ElfFrameRegs *fr, const char *cond)">
+            <purpose><![CDATA[Evaluate a breakpoint `condition` of the form `<var> <relop> <int>` on the live target.]]></purpose>
+            <returns>1 (true → stop), 0 (false → resume), or -1 (cannot evaluate → caller stops, so a bad condition never hides a hit).</returns>
+            <logic>
+              <step><![CDATA[Parse `<ident> <relop> <int>` (relop one of `== != < <= > >=`; integer via `strtol(...,0)`).]]></step>
+              <step><![CDATA[Resolve `ident` to an address/size/signedness with `elf_var_addr()` using the live frame registers; read the value over `updi_mem_read()` and sign-extend per the type.]]></step>
+              <step><![CDATA[Apply the relational operator and return the boolean (or -1 on any parse/resolve/read failure).]]></step>
+            </logic>
+          </function>
+          <function signature="static bool dap_conditional_skip(dap_session *s)"
+                    summary="On a halt while running, examine every breakpoint at the live PC; if all are conditional and all conditions false, step over and auto-resume (return true); otherwise return false so dap_serve() emits the stopped event."/>
+          <function signature="static int dap_resume_over_current(dap_session *s)"
+                    summary="Resume past breakpoints parked at the live PC via the GDB remove/single-step/insert dance: bp_remove() each, bp_step_over() one instruction, bp_insert() to re-arm, then updi_run()."/>
+          <function signature="static int dap_target_resume(dap_session *s)"
+                    summary="Resume for continue: dap_resume_over_current() when a breakpoint sits at the live PC, else a plain updi_run()."/>
+        </functions>
+        <algorithm><![CDATA[**Lifecycle.** `dap_dispatch()` answers `initialize` with the capability set + an `initialized` event, treats `launch`/`attach` as an attach, halts at `configurationDone` with a `stopped`/`entry` event, reports the single live CPU as the sole `threads` entry, and on `disconnect`/`terminate` removes every installed breakpoint before resuming the target so detach leaves it running free. All target side effects are guarded by `updi_fd >= 0`, so the dispatch is unit-testable over a socketpair with no hardware.
+
+**Breakpoints.** Source and instruction breakpoints install through the shared core (`bp_insert`/`bp_remove`, §9) — exactly the HW-comparator arbiter + SW-`BREAK` model the RSP server uses. A hit while running surfaces as a `stopped` event whose `hitBreakpointIds` list every `bps[]` entry matching the live PC.
+
+**Multi-frame stackTrace (HLR-080).** libdw's high-level CFI executor errors on AVR `.debug_frame`, so the unwinder uses the in-tree `elf_cfi_cfa()` (§6) for the per-PC CFA rule and applies AVR's fixed stack conventions to recover each caller (2-byte word return address, word-to-byte PC, Y-pair frame pointer). See User Manual Appendix B.17.
+
+**Conditional breakpoints (HLR-081).** When a breakpoint is hit, `dap_conditional_skip()` evaluates each matching `bps[]` entry's `condition` on the live target: the variable is resolved from DWARF with `elf_var_addr()` (§6) using the live frame registers, read over OCD, and compared to the literal. A false condition steps over the breakpoint and auto-resumes (the shared `bp_step_over`, §9); a true / unevaluable / unconditional hit reports the stop — a bad condition never hides a breakpoint. See User Manual Appendix B.18.]]></algorithm>
+        <dependencies>
+          <dep><![CDATA[`src/debug_bp.c` — the breakpoint arbiter and single-step core (`bp_insert`/`bp_remove`/`bp_step_over`/…).]]></dep>
+          <dep><![CDATA[`src/elf_parser.c` — `elf_line_to_addr`, `elf_addr_to_line`, `elf_cfi_cfa`, `elf_var_addr`.]]></dep>
+          <dep><![CDATA[`src/gdb_rsp.c` — the shared TCP transport helpers `rsp_accept()`/`rsp_close()`.]]></dep>
+          <dep><![CDATA[`src/updi.c` — OCD execution control and memory/register reads (`updi_run`/`updi_halt`/`updi_step`/`updi_ocd_*`/`updi_mem_read`).]]></dep>
+        </dependencies>
+        <error_handling>
+          <case name="Unknown / unsupported request"><![CDATA[Reply with `success:false` and the command name; never abort the session.]]></case>
+          <case name="Breakpoint line/instruction unresolved or install failed"><![CDATA[Reply the breakpoint with `verified:false`; the client shows it as pending.]]></case>
+          <case name="Condition cannot be evaluated"><![CDATA[Treat as a stop (report the hit) rather than silently skipping — a bad condition must never hide a breakpoint.]]></case>
+          <case name="Message framing / read error"><![CDATA[Log and tear down the connection; the server returns to accept the next client.]]></case>
         </error_handling>
       </module>
     </modules>
@@ -1156,6 +1365,8 @@ Errors are propagated upward through the module stack without retrying:
       <theme name="ELF Parsing and Symbol Resolution" sections="§6 (src/elf_parser.c)"/>
       <theme name="FSM State Snapshot"        sections="§7 (src/fsm_mapper.c)"/>
       <theme name="System Introspection"              sections="§8 (src/monitor.c)"/>
+      <theme name="Shared Breakpoint Core"            sections="§9 (src/debug_bp.c)"/>
+      <theme name="DAP Server"                        sections="§10 (src/dap.c)"/>
       <theme name="Flash Programming"                 sections="§4 (src/updi.c)"/>
       <theme name="Console Bridge"                    sections="§4 (src/updi.c)"/>
     </traceability>
@@ -1481,7 +1692,7 @@ Errors are propagated upward through the module stack without retrying:
         <text><![CDATA[The server shall not allocate heap memory on any hot path (packet processing, UPDI reads, FSM enumeration, monitor commands). The application itself shall perform no `malloc` of the ELF symbol/string tables; ELF/DWARF parsing memory is owned internally by the elfutils handles (the libelf `Elf*` and libdw `Dwarf*` opened in `elf_open()`), is bounded by the size of the ELF binary, and is allocated at most once per GDB session. All such resources shall be released by `elf_close()` (via `dwarf_end()` / `elf_end()` and `close(fd)`) at session end or on error.]]></text>
         <traces>
           <trace target="SDD" ref="2.2"/>
-          <trace target="SDD" ref="9"/>
+          <trace target="SDD" ref="11"/>
         </traces>
       </hlr>
     </section>
@@ -1587,7 +1798,7 @@ Errors are propagated upward through the module stack without retrying:
         <text><![CDATA[The server's debug logic shall be structured as a protocol-agnostic *debug core* — execution control, register and memory access, the hardware-comparator arbiter and software-breakpoint model, target (avrOS FSM) introspection, and ELF/DWARF — that is independent of any client-facing wire protocol. Client protocols shall be implemented as thin front-ends over this core: the existing GDB-RSP server (`src/gdb_rsp.c`) and, in future, a native DAP server intended to run in parallel. A front-end shall translate wire framing to and from the core's verbs and shall be the only layer that formats a protocol-specific reply; the core shall never emit RSP, DAP, or any other wire encoding, and shall never be reached *into* by a lower layer (per the SDD §2.2 layered-architecture rule, UPDI helpers never choose policy such as breakpoint slots). The core's protocol-neutral entry surface shall be reachable through a single aggregating include, `src/debug_core.h`. Phase 15 establishes this seam by aggregation; physically relocating the arbiter, stop-cause classifier, and software-breakpoint bodies out of the RSP module into a dedicated debug-core translation unit is deferred to the DAP-server phase to avoid destabilising the verified RSP path.]]></text>
         <traces>
           <trace target="SDD" ref="2.2"/>
-          <trace target="SDD" ref="5.1"/>
+          <trace target="SDD" ref="9.1"/>
         </traces>
       </hlr>
 
@@ -1595,7 +1806,7 @@ Errors are propagated upward through the module stack without retrying:
         <text><![CDATA[The client-facing protocol front-end shall be selectable at startup via two mutually-exclusive command-line switches: `--rsp` (the GDB Remote Serial Protocol server, `src/gdb_rsp.c`) and `--dap` (the Debug Adapter Protocol server, `src/dap.c`). When neither switch is given the default shall be `--rsp`, preserving the historical behaviour of every existing invocation and test. Supplying both `--rsp` and `--dap` shall be rejected with a diagnostic and a non-zero exit. After argument parsing and target/ELF bring-up, the application shall dispatch to the selected front-end; both serve over the same TCP listener and the shared protocol-agnostic debug core (HLR-073). This requirement covers the selection and dispatch only; the DAP front-end's transport, lifecycle, and request handlers are specified by their own requirements as they are implemented (Phases 16–19).]]></text>
         <traces>
           <trace target="SDD" ref="2.2"/>
-          <trace target="SDD" ref="5.1"/>
+          <trace target="SDD" ref="10.1"/>
         </traces>
       </hlr>
 
@@ -1603,7 +1814,7 @@ Errors are propagated upward through the module stack without retrying:
         <text><![CDATA[The DAP front-end shall exchange messages with the client using the Debug Adapter Protocol wire format: each message is a JSON object framed by a `Content-Length: <n>\r\n\r\n` header block followed by exactly `n` bytes of UTF-8 JSON body. On receive, the server shall consume the header block (matching the `Content-Length` field case-insensitively), then read exactly `n` body bytes — never over-reading into the following message — and shall reject a message whose advertised length is non-negative-overflowing or exceeds the receive buffer (`DAP_MSG_MAX`). On send, it shall prefix the body with the same header framing. JSON shall be handled by a self-contained recursive-descent tokenizer (no third-party JSON library is vendored — chosen so the parser is in-tree, in the project's C99 style, and directly unit-testable) exposing object-member lookup, string extraction with JSON-escape decoding, numeric extraction, and a string escaper for emission. The transport (framing + codec) shall be independent of the target and therefore unit-testable over a pipe/socketpair without hardware.]]></text>
         <traces>
           <trace target="SDD" ref="2.2"/>
-          <trace target="SDD" ref="5.1"/>
+          <trace target="SDD" ref="10.1"/>
         </traces>
       </hlr>
 
@@ -1611,7 +1822,7 @@ Errors are propagated upward through the module stack without retrying:
         <text><![CDATA[The DAP front-end (`dap_serve()`, reached when the server is started with `--dap`) shall accept one client on the shared TCP listener and service it on the single `select()`-based event loop, honouring the global quit flag between messages. Over that connection it shall implement the DAP connection lifecycle: `initialize` (reply with the adapter capabilities — at minimum `supportsConfigurationDoneRequest` — then emit the `initialized` event); `launch` and `attach` (reply success; the target is already connected and in OCD debug mode, so attach/launch are equivalent here); `setBreakpoints` and `setExceptionBreakpoints` during the configuration phase (reply success — real breakpoint installation is Phase 18); `configurationDone` (halt the target and emit a `stopped` event with reason `entry` for thread 1, reaching the stopped-at-entry state); `threads` (report the single live CPU thread); and `disconnect`/`terminate` (resume the target and close the session). Every reply shall be a well-formed DAP `response` carrying the request's `seq` as `request_seq`, the `command`, and a `success` flag; a request the build does not yet implement shall receive a `success:false` response with a `message` (rather than silence), so the client is never left waiting. Each emitted message shall carry a monotonically increasing `seq`. UPDI side effects shall be skipped when no target link is present so the dispatch is unit-testable without hardware.]]></text>
         <traces>
           <trace target="SDD" ref="2.2"/>
-          <trace target="SDD" ref="5.1"/>
+          <trace target="SDD" ref="10.1"/>
         </traces>
       </hlr>
 
@@ -1626,7 +1837,35 @@ Errors are propagated upward through the module stack without retrying:
         <text><![CDATA[Over a connected DAP session (HLR-076), the DAP front-end shall expose run control and the run-state event stream, mapping each request to the debug-core execution verbs (the same OCD primitives the GDB-RSP front-end composes, HLR-073). It shall implement: `continue` — reply `{allThreadsContinued:true}`, emit a `continued` event, and resume the target (`updi_run()`); the server's idle event-loop tick shall then poll the OCD STOPPED status (`updi_ocd_poll_halted()`) and, on halt, emit a `stopped` event. `pause` — halt the target (`updi_halt()`) and emit `stopped` with reason `pause`. `next` / `stepIn` / `stepOut` — advance the target by one OCD instruction step (`updi_step()`) and emit `stopped` with reason `step`; true source-line-granular step-over and step-out are a deferred refinement, but the resulting PC still resolves to the correct source line. `threads` — report the single live CPU thread (`{id:1,name:"cpu"}`); avrOS FSM tasks remain `monitor`-style introspection, surfaced in a later refinement. Every `stopped` event shall carry `threadId:1` and `allThreadsStopped:true`; the defined reasons are `entry` (configurationDone, HLR-076), `step`, `breakpoint` (a halt detected while the target was running), and `pause`. `terminate` shall additionally emit a `terminated` event before closing. The front-end shall also serve a **shallow `stackTrace`** — frame 0 only: the live PC read over OCD (`updi_ocd_read_pc()`), resolved to `file:line` via libdw (`elf_addr_to_line()`, HLR-072) and returned with a `source` object; when no target or no DWARF line is available it shall still return one frame so the client has a valid stack. `scopes` shall return an empty array (frame variables are Phase 19); deeper frames via DWARF CFI unwinding and real function names are Phase 18. All target side effects shall be guarded (`updi_fd >= 0`) so the dispatch is unit-testable over a socketpair without hardware.]]></text>
         <traces>
           <trace target="SDD" ref="2.2"/>
-          <trace target="SDD" ref="5.1"/>
+          <trace target="SDD" ref="10.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-079" name="DAP Source Breakpoints">
+        <text><![CDATA[The DAP front-end shall implement `setBreakpoints` for source-level breakpoints, installed through the shared breakpoint core (debug_bp.h, HLR-054/055/016) — exactly the HW-comparator arbiter + SW-`BREAK` model the GDB-RSP front-end uses. For each requested `{line[,condition]}` against `arguments.source.path`, the adapter shall resolve the source line to a code byte address with libdw (`elf_line_to_addr()`, HLR-072) and, when a target is attached, install it via the core (`bp_insert`, `auto` mode: a free OCD comparator else a SW FLASH-`BREAK`). The response shall carry a `breakpoints` array — one entry per request in order, each with an `id`, a `verified` flag (true when resolved-and-installed), and the `line`. A `setBreakpoints` call shall **replace** the full breakpoint set for that source (the prior set for the same path is removed from silicon first). When the target later halts on an installed breakpoint, the `stopped` event (HLR-078) shall carry reason `breakpoint` and the matching `hitBreakpointIds`. On `disconnect`/`terminate` all installed breakpoints shall be removed from silicon before the target is resumed, so detach leaves it running free. The breakpoint table and install/remove shall be guarded by the target link so the dispatch is unit-testable without hardware. The adapter shall also implement `setInstructionBreakpoints` (advertising `supportsInstructionBreakpoints`): each entry's `instructionReference` (+ optional `offset`) is parsed to a code address and installed through the same core, replacing the prior instruction-breakpoint set; the response carries per-entry `{id,verified,instructionReference}`. Conditional breakpoints are HLR-081.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+          <trace target="SDD" ref="10.1"/>
+          <trace target="SDD" ref="9.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-080" name="DAP Multi-Frame Stack Trace">
+        <text><![CDATA[The DAP front-end's `stackTrace` shall report the full call stack — not just the innermost frame — by unwinding through the target's DWARF Call-Frame-Information (`.debug_frame`).  For the halted PC and each recovered caller it shall resolve `file:line` via libdw (HLR-072) and emit a DAP stack frame with a monotonic `id`, the enclosing function name (the `DW_TAG_subprogram` covering the PC, falling back to the raw address when none does), the PC as `instructionPointerReference`, and the source location.  The unwind shall be driven by the per-PC Canonical-Frame-Address rule extracted from `.debug_frame` (CFA = value(reg) + offset, where reg is the AVR Y frame-pointer pair r28:r29 or SP=r32); libdw's high-level CFI executor (`dwarf_cfi_addrframe`) returns an error on AVR `.debug_frame`, so a minimal in-tree CFI interpreter shall provide the CFA rule.  AVR's fixed stack conventions then recover each caller: the 2-byte word return address spans [CFA-1, CFA] (code byte PC = word << 1) and the caller's saved Y pair sits just below it (callee `push r28; push r29`).  Unwinding shall stop at an invalid return address (out of the FLASH range, or where no CFI covers the PC — e.g. the C-runtime frame that called `main`), or at a bounded frame cap.  With no target or no DWARF the handler shall still return the single innermost frame so the client has a valid stack.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+          <trace target="SDD" ref="10.1"/>
+          <trace target="SDD" ref="6.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-081" name="DAP Conditional Breakpoints">
+        <text><![CDATA[A DAP source breakpoint (HLR-079) may carry a `condition` expression; the adapter shall evaluate it on the live target each time the breakpoint is hit and resume transparently when it is false, stopping only when it is true.  The supported grammar is `<variable> <relop> <integer>` with `<relop>` one of `== != < <= > >=`.  The variable shall be resolved to its data-space address, size, and signedness from DWARF at the halted PC — locals/parameters via their `DW_OP_breg28`(Y pair)/`DW_OP_fbreg`(CFA) location and globals via `DW_OP_addr` — read over OCD, and compared against the integer.  When the condition is false the adapter shall step over the breakpoint and auto-resume (the target keeps running, no `stopped` event); when true, unevaluable (unknown variable, unsupported form, or a UPDI error), or for an unconditional breakpoint at the same PC, it shall stop and report the hit (a bad condition must never hide a breakpoint).  Stepping over a breakpoint to resume shall reuse the shared single-step core (the GDB remove/single-step/insert sequence), so it is correct for HW-comparator and SW-`BREAK` breakpoints and for 16-/32-bit instructions alike.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+          <trace target="SDD" ref="10.1"/>
+          <trace target="SDD" ref="9.1"/>
+          <trace target="SDD" ref="6.1"/>
         </traces>
       </hlr>
     </section>
@@ -2657,6 +2896,27 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
           <trace target="HLR" ref="HLR-072" name="DWARF Source-Level Lookup (DAP Groundwork)"/>
         </traces>
       </llr>
+
+      <llr id="LLR-ELF-14">
+        <text><![CDATA[`elf_cfi_cfa()` shall return the Canonical-Frame-Address rule at a code-space byte address by interpreting the ELF's `.debug_frame` section directly (libdw's `dwarf_cfi_addrframe()` returns an error on AVR `.debug_frame`).  It shall locate `.debug_frame` via libelf (`elf_getshdrstrndx`/`elf_nextscn`/`elf_strptr`), walk its CIE/FDE entries, and on the FDE whose `[initial_location, +address_range)` covers the address, run a minimal CFI state machine over the CIE-initial then FDE instructions up to that PC — tracking only the CFA-defining opcodes (`DW_CFA_def_cfa`/`_register`/`_offset` and their `_sf` forms, plus `advance_loc`/`set_loc` and operand-skipping of the register-save and expression opcodes).  On success it shall store the CFA base register in `*cfa_reg` (decoded from `def_cfa_register`; AVR: 28 = the Y pair r28:r29, 32 = SP) and the signed byte offset in `*cfa_offset`, so CFA = value(cfa_reg) + cfa_offset, and return 0.  It shall return -1 when the ELF has no `.debug_frame`, the PC is not covered by any FDE, the entry uses 64-bit DWARF or a `z`-augmented/CFA-expression form, or no CFA rule is established.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-080" name="DAP Multi-Frame Stack Trace"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-ELF-15">
+        <text><![CDATA[`elf_var_addr()` shall resolve a variable `name` visible at a code byte address `pc` to its 16-bit data-space address, byte size, and signedness, evaluating its DWARF location against live frame registers (`ElfFrameRegs`: the CFA, the Y pair r28:r29, and SP).  It shall obtain the CU via `dwarf_addrdie()`, the lexical scope chain via `dwarf_getscopes()`, and the matching variable DIE via `dwarf_getscopevar()` (which searches locals/parameters then outward to file scope).  It shall decode the single-operation location forms avr-gcc -O0 emits: `DW_OP_addr` → the absolute (data-space) address; `DW_OP_breg28`/`DW_OP_bregx 28` + offset → `fr->y + offset`; `DW_OP_bregx 32` + offset → `fr->sp + offset`; and `DW_OP_fbreg` + offset → `fr->cfa + offset` when the enclosing subprogram's `DW_AT_frame_base` is `DW_OP_call_frame_cfa`.  The result address shall be masked to 16 bits (the SRAM data space).  Size/signedness shall come from the peeled (`dwarf_peel_type`) `DW_AT_type` — `dwarf_bytesize()` clamped to 1..4 (default 2) and `DW_AT_encoding` (`DW_ATE_signed`/`signed_char` ⇒ signed).  It shall return 0 on success, or -1 with no DWARF, when `name` is not in scope, or for an unsupported location/type form.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-081" name="DAP Conditional Breakpoints"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-ELF-16">
+        <text><![CDATA[`elf_addr_to_func()` shall resolve a code byte address to the name of the enclosing function.  It shall obtain the CU via `dwarf_addrdie()` and the lexical scope chain via `dwarf_getscopes()`, find the innermost `DW_TAG_subprogram` scope, and copy its `dwarf_diename()` into the caller's `name` buffer (NUL-terminated, truncated to `cap`).  It shall return 0 on success, or -1 when the ELF lacks DWARF or `pc` is inside no subprogram (e.g. the C-runtime frame above `main`), so the DAP front-end can fall back to the raw address for the frame name.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-080" name="DAP Multi-Frame Stack Trace"/>
+        </traces>
+      </llr>
     </function>
 
     <function number="6" title="src/fsm_mapper.c — FSM State Snapshot Provider" name="fsm" source="src/fsm_mapper.c">
@@ -2991,6 +3251,30 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces>
           <trace target="HLR" ref="HLR-078" name="DAP Execution Control, Stop Events &amp; Shallow stackTrace"/>
           <trace target="HLR" ref="HLR-072" name="DWARF Source-Level Lookup (DAP Groundwork)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-DAP-10">
+        <text><![CDATA[`dap_dispatch()` shall serve `setBreakpoints` via a private `dap_handle_set_breakpoints()` helper, and `dap_session` shall carry the shared breakpoint state (`hw_bp_addr[2]`, `hw_bp_pinned[2]`, `sw_bp[RSP_MAX_SW_BREAKPOINTS]`, `bp_mode`, `pc_dirty`) plus a `bps[DAP_MAX_BREAKPOINTS]` table (`id`, `addr`, `line`, `verified`, `in_use`, `source`, `condition`) and `next_bp_id`; `dap_bp_reset()` shall initialise it (HW shadow slots `HW_BP_SLOT_EMPTY`, `bp_mode = RSP_BP_MODE_AUTO`, `next_bp_id = 1`) and shall be called at session start (`dap_serve`).  The handler shall: (1) read `arguments.source.path` (falling back to `name`); (2) remove every existing breakpoint whose `source` equals that path — `bp_remove()` per installed entry — so the call replaces that source's set; (3) for each element of `arguments.breakpoints`, read `line` and optional `condition`, resolve `line` to a code byte address via `elf_line_to_addr(elf, path, line, &addr)`, and — when resolved and `updi_fd >= 0` — install it with `bp_insert(updi_fd, hw_bp_addr, hw_bp_pinned, sw_bp, bp_mode, &pc_dirty, '0', addr)` (verified iff `BP_OK`); record the entry (assigning `id = next_bp_id++`); (4) reply `{"breakpoints":[{"id":<id>,"verified":<bool>,"line":<line>}, …]}` in request order.  When the target later halts while `running`, `dap_serve()` shall emit the `stopped` event via `dap_emit_stopped_breakpoint()`, which reads the live PC and, for every `bps[]` entry whose `addr` matches, includes its id in `hitBreakpointIds` (falling back to a plain reason-`breakpoint` stop when none match).  `disconnect`/`terminate` shall `bp_remove()` every installed breakpoint before `updi_run()`.  A sibling `dap_handle_set_instruction_breakpoints()` shall serve `setInstructionBreakpoints`: parse each entry's `instructionReference` (+ optional `offset`) to an address, install via `bp_insert('0', addr)`, mark the table entry with `line == -1`, and replace the prior instruction-breakpoint set (entries with `line == -1`) each call; `initialize` shall advertise `supportsInstructionBreakpoints`.  Conditional-expression evaluation is LLR-DAP-12.  All target side effects are guarded by `updi_fd >= 0`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-079" name="DAP Source Breakpoints"/>
+          <trace target="HLR" ref="HLR-054" name="True Software Breakpoints via Flash BREAK Opcode"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-DAP-11">
+        <text><![CDATA[`dap_handle_stack_trace()` shall return the full call stack by unwinding through `.debug_frame` CFI via a private `dap_unwind()` helper.  `dap_unwind()` shall read the innermost frame's live state — PC (`updi_ocd_read_pc`), SP (`updi_ocd_read_sp`), and the Y pair r28/r29 (`updi_ocd_read_gpr`) — then iterate: obtain the CFA rule at the current PC with `elf_cfi_cfa()` (LLR-ELF-14), compute `CFA = (cfa_reg == 32 ? SP : Y) + cfa_offset` (16-bit SRAM address), and recover the caller from target memory (`updi_mem_read`) using AVR conventions — the return-address word at [CFA-1, CFA] (high byte at CFA-1, low at CFA; caller byte PC = word << 1) and the caller's saved Y as r28@CFA-2 / r29@CFA-3.  Each iteration sets the next frame's PC = caller byte PC, SP = CFA, Y = caller Y.  It shall stop when the return word is 0, when the byte PC is outside `[0, flash_size)`, when no CFI covers the PC (`elf_cfi_cfa` returns -1 — e.g. the C-runtime frame above `main`), when the CFA fails to advance, or at `DAP_MAX_FRAMES`.  `dap_handle_stack_trace()` shall format each recovered PC with `dap_format_frame()` — the frame `name` is the enclosing function from `elf_addr_to_func()` (LLR-ELF-16; the raw `0x…` address when no subprogram covers it) and the source is `file:line` via `elf_addr_to_line()`, both JSON-escaped — into `{stackFrames:[…],totalFrames:n}`, frame ids ascending from 0.  With no target or no DWARF (`dap_unwind()` returns 0) it shall fall back to the single innermost frame so the client always has a valid stack.  When `AVROSDB_DAP_UNWIND_LOG` is set, `dap_unwind()` shall emit a per-frame diagnostic to stderr.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-080" name="DAP Multi-Frame Stack Trace"/>
+          <trace target="HLR" ref="HLR-072" name="DWARF Source-Level Lookup (DAP Groundwork)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-DAP-12">
+        <text><![CDATA[`dap_dispatch()`/`dap_serve()` shall honour a DAP breakpoint `condition` (stored per `bps[]` entry by LLR-DAP-10).  A private `dap_eval_condition()` shall parse `<ident> <relop> <integer>` (relop `== != < <= > >=`; integer via `strtol(...,0)` so decimal and `0x` hex are accepted), resolve `ident` with `elf_var_addr()` (LLR-ELF-15) using the live frame registers from a `dap_frame0()` helper (PC/SP/Y over OCD; CFA via `elf_cfi_cfa()`), read the value over `updi_mem_read()` (sign-extended per the type), and return 1 (true → stop), 0 (false → resume), or -1 (cannot evaluate).  When the target halts while running, `dap_conditional_skip()` shall examine every installed breakpoint at the live PC: if any is unconditional, or any condition is true or returns -1, it shall return false so `dap_serve()` emits the `stopped` event; only when all matching breakpoints are conditional-and-false shall it step over them and auto-resume (returning true so the poll loop keeps running).  Stepping over shall use `dap_resume_over_current()` — the GDB remove/single-step/insert dance: `bp_remove()` every breakpoint at the PC, `bp_step_over()` (the shared single-step core) one instruction, `bp_insert()` to re-arm, then `updi_run()`.  `continue` shall resume via `dap_target_resume()`, which applies the same step-over when a breakpoint is parked at the live PC and otherwise issues a plain `updi_run()`.  All paths are guarded by `updi_fd >= 0` so dispatch stays unit-testable without hardware.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-081" name="DAP Conditional Breakpoints"/>
+          <trace target="HLR" ref="HLR-054" name="True Software Breakpoints via Flash BREAK Opcode"/>
         </traces>
       </llr>
     </function>
@@ -3956,7 +4240,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/elf_parser.c unit tests                                  -->
     <!-- ============================================================ -->
-    <file path="tests/test_elf.c" role="unit" count="15">
+    <file path="tests/test_elf.c" role="unit" count="18">
       <header><![CDATA[Unit tests for the elfutils-based `src/elf_parser.c`: ELF validation, avrOS sentinel symbol discovery, Harvard / mapped-flash address conversion, fail-safe degradation, deviceinfo note extraction, DWARF source-line round-trip, and handle release. Fixture ELF binaries (compiled with `-g`) are generated under `tests/fixtures/`. The former heap symtab/strtab and malloc-injection tests are retired — libelf owns that memory now.]]></header>
 
       <test name="elf_open_accepts_valid_avr_elf32_binary">
@@ -4032,6 +4316,21 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="elf_dwarf_accessors_round_trip">
         <purpose><![CDATA[On a `-g` fixture, verify `elf_dwarf_available()` returns 1; map the entry-point code address to a source `file:line` via `elf_addr_to_line()` (when it resolves, assert line > 0 and a non-empty file, and that `elf_line_to_addr()` returns a real address for that `file:line`); and verify `elf_addr_to_line()` on an address far outside any CU returns -1 without crashing.]]></purpose>
         <traces><trace target="LLR" ref="LLR-ELF-11"/><trace target="LLR" ref="LLR-ELF-12"/><trace target="LLR" ref="LLR-ELF-13"/></traces>
+      </test>
+
+      <test name="elf_cfi_cfa_extracts_avr_frame_rules">
+        <purpose><![CDATA[On the gdb_debug_session fixture, derive a post-prologue address inside `leaf()` from its source line via `elf_line_to_addr()` (so the test is independent of the toolchain's code layout) and assert `elf_cfi_cfa()` returns a Canonical-Frame-Address rule based on the Y frame-pointer pair (r28) with a positive offset; an address past the last FDE returns -1 without crashing. Deterministic / hardware-free guard for the in-tree `.debug_frame` interpreter. Per LLR-ELF-14.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-14"/></traces>
+      </test>
+
+      <test name="elf_var_addr_resolves_globals_and_locals">
+        <purpose><![CDATA[On the gdb_debug_session fixture, derive a PC inside `leaf()` from its source line (`elf_line_to_addr()`) and assert `elf_var_addr()` resolves variable locations/types from DWARF: the global `g_marker` (DW_OP_addr) to a non-zero masked SRAM address with size 2 / unsigned; the leaf() parameter `b` (a Y-relative local) to a size-2 address above the supplied synthetic Y; and an unknown name to -1 without crashing. Exact addresses/offsets are toolchain-specific, so only type and Y-relative placement are asserted. Deterministic / hardware-free guard for the variable-resolution backing conditional breakpoints. Per LLR-ELF-15.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-15"/></traces>
+      </test>
+
+      <test name="elf_addr_to_func_resolves_enclosing_function">
+        <purpose><![CDATA[On the gdb_debug_session fixture, derive PCs inside leaf() and main() from their source lines (`elf_line_to_addr()`) and assert `elf_addr_to_func()` maps them to "leaf" and "main" respectively, and returns -1 for an address outside any subprogram. Deterministic / hardware-free guard for the DAP stackTrace frame names. Per LLR-ELF-16.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-16"/></traces>
       </test>
     </file>
 
@@ -4518,7 +4817,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/dap.c DAP wire-transport tests (Phase 16)                -->
     <!-- ============================================================ -->
-    <file path="tests/test_dap.c" role="unit" count="18">
+    <file path="tests/test_dap.c" role="unit" count="21">
       <header><![CDATA[Unit tests for the DAP front-end: the wire transport (HLR-075) — the JSON codec (`dj_*` recursive-descent tokenizer, member/string/number accessors, escape decode, and the emission escaper) and the Content-Length message framing (`dap_read_message` / `dap_write_message`) — and the connection lifecycle dispatch (HLR-076) driven over a `socketpair` with `updi_fd = -1` so no hardware is touched. Framing is exercised over an anonymous pipe.]]></header>
 
       <test name="dj_parse_extracts_request_fields">
@@ -4606,6 +4905,21 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces><trace target="LLR" ref="LLR-DAP-09"/></traces>
       </test>
 
+      <test name="dap_set_breakpoints_responds_with_per_line_entries">
+        <purpose><![CDATA[Dispatch `setBreakpoints` with two source breakpoints (`{line:139}`, `{line:141,condition:"n==3"}`) and no ELF/target; verify the response carries a `breakpoints` array with per-line entries (`id:1`/`line:139`, `id:2`/`line:141`), that both entries are recorded in the session table with the condition captured, and that `next_bp_id` advanced to 3. Per LLR-DAP-10.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-10"/></traces>
+      </test>
+
+      <test name="dap_set_breakpoints_replaces_prior_set_for_source">
+        <purpose><![CDATA[Dispatch `setBreakpoints` for `main.c` with two lines, then again with one line; verify the second call replaces the source's set wholesale — only the single new breakpoint remains in the session table. Per LLR-DAP-10.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-10"/></traces>
+      </test>
+
+      <test name="dap_set_instruction_breakpoints_responds_with_refs">
+        <purpose><![CDATA[Dispatch `setInstructionBreakpoints` with two entries (`instructionReference:"0x40c"`, and `"0x400"` with `offset:4`) and no target; verify the response carries per-entry `{id,verified,instructionReference}`, that the addresses resolve (0x40c; 0x400+4=0x404), and that the table entries are marked as instruction breakpoints (`line == -1`). Per LLR-DAP-10.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-10"/></traces>
+      </test>
+
       <test name="dap_serve_runs_handshake_to_disconnect">
         <purpose><![CDATA[Drive `dap_serve()` end-to-end without hardware: a stubbed `rsp_accept()` hands it a pre-connected socketpair end whose request stream is pre-loaded with `initialize` then `disconnect`. Verify the accept/select/read/dispatch loop processes both (emitting the initialize response, the `initialized` event, and the disconnect response) and returns 0 when the client disconnects.]]></purpose>
         <traces><trace target="LLR" ref="LLR-DAP-05"/></traces>
@@ -4615,7 +4929,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src DAP on-target acceptance harness (Neovim + nvim-dap)     -->
     <!-- ============================================================ -->
-    <file path="tests/hw/dap_acceptance.lua" role="hardware" count="7">
+    <file path="tests/hw/dap_acceptance.lua" role="hardware" count="8">
       <header><![CDATA[On-target DAP acceptance harness (the DAP analogue of the Group-G GDB harness): spawns a fresh `avrOSdb --dap` against live AVR-Dx silicon and drives it with the real nvim-dap client (headless Neovim) over TCP, applying per-case verdicts to the connection lifecycle. Manual-only (`make hw-test-dap`); never invoked by `make test`. Phase 16 covers the handshake (DAP1–DAP4); execution control, breakpoints, and variables grow this suite in Phases 17–19.]]></header>
 
       <test name="DAP1_initialize_handshake">
@@ -4648,9 +4962,67 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces><trace target="HLR" ref="HLR-078"/></traces>
       </test>
 
-      <test name="DAP7_disconnect_clean">
-        <purpose><![CDATA[Issue a `disconnect` request and verify the adapter responds successfully and the session tears down cleanly (the target is resumed).]]></purpose>
+      <test name="DAP7_source_breakpoint_hit">
+        <purpose><![CDATA[Phase-18 source breakpoints. `setBreakpoints` for a reachable source line in the loaded fixture (default `gdb_target.c:51` — the `blink()` call in the main loop; override via `DAP_BP_SOURCE`/`DAP_BP_LINE`) — verify it resolves+verifies via DWARF and installs through the shared breakpoint core — then `continue` and verify the adapter emits a `stopped` event with reason `breakpoint`, proving file:line breakpoint resolution + install + hit end-to-end on silicon. The harness reflashes `HW_DAP_ELF` first so the running firmware matches the ELF handed to the server. Per HLR-079 / LLR-DAP-10.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-079"/></traces>
+      </test>
+
+      <test name="DAP8_disconnect_clean">
+        <purpose><![CDATA[Issue a `disconnect` request and verify the session tears down cleanly (installed breakpoints removed, target resumed) — accepting either the disconnect response or the session object going away, since nvim-dap does not always deliver the response callback as the adapter closes the socket. Per HLR-076 / HLR-079.]]></purpose>
         <traces><trace target="HLR" ref="HLR-076"/></traces>
+      </test>
+    </file>
+
+    <file path="tests/hw/dap_unwind.py" role="hardware" count="6">
+      <header><![CDATA[On-target DAP multi-frame stackTrace acceptance harness (Phase 18, the DAP analogue of GDB G18). A pure-Python DAP client spawns `avrOSdb --dap` against live AVR-Dx silicon running the `gdb_debug_session` fixture (`main->top->mid->leaf` nested call chain), breaks inside `leaf` via an instruction breakpoint, and verifies the DWARF-CFI unwinder reports the full call chain. The expected per-frame functions and the break address are derived from the ELF (`avr-nm -S` / `avr-objdump`) at runtime, so the test survives a fixture recompile. Manual-only (`make hw-test-dap-unwind`) — never wired into `make test`.]]></header>
+
+      <test name="DAP_U1_instr_bp_at_leaf_verified">
+        <purpose><![CDATA[`setInstructionBreakpoints` at a post-prologue address inside `leaf` returns a verified breakpoint, installed through the shared core on silicon. Per LLR-DAP-10.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-079"/></traces>
+      </test>
+
+      <test name="DAP_U2_continue_to_breakpoint">
+        <purpose><![CDATA[`continue` from reset runs the `main->top->mid->leaf` chain and halts at the `leaf` instruction breakpoint, emitting `stopped` with reason `breakpoint`. Per HLR-079.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-079"/></traces>
+      </test>
+
+      <test name="DAP_U3_stacktrace_depth">
+        <purpose><![CDATA[`stackTrace` at the `leaf` stop returns at least four frames — proving the CFI unwinder walks past frame 0. Per HLR-080 / LLR-DAP-11.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-080"/></traces>
+      </test>
+
+      <test name="DAP_U4_frames_map_to_call_chain">
+        <purpose><![CDATA[Each of the first four stack frames' PCs falls inside the expected function of the call chain (`leaf`, `mid`, `top`, `main`), checked against the functions' address ranges from `avr-nm -S` — proving the recovered return addresses are correct, not just non-empty. Per HLR-080 / LLR-DAP-11 / LLR-ELF-14.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-080"/><trace target="LLR" ref="LLR-DAP-11"/><trace target="LLR" ref="LLR-ELF-14"/></traces>
+      </test>
+
+      <test name="DAP_U5_frames_resolve_source_lines">
+        <purpose><![CDATA[Each chain frame resolves to a source line (`line > 0`) via DWARF, confirming the unwound caller PCs map to real source through `elf_addr_to_line()`. Per HLR-080 / HLR-072.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-080"/><trace target="HLR" ref="HLR-072"/></traces>
+      </test>
+
+      <test name="DAP_U6_frames_named_for_function">
+        <purpose><![CDATA[Each of the first four stack frames carries the name of its function — `leaf`, `mid`, `top`, `main` — proving the adapter resolves the enclosing subprogram via `elf_addr_to_func()` for the frame name (not the raw PC). Per HLR-080 / LLR-ELF-16.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-080"/><trace target="LLR" ref="LLR-ELF-16"/></traces>
+      </test>
+    </file>
+
+    <file path="tests/hw/dap_cond.py" role="hardware" count="3">
+      <header><![CDATA[On-target DAP conditional-breakpoint acceptance harness (Phase 18, the DAP analogue of GDB G21). A pure-Python DAP client spawns `avrOSdb --dap` against live AVR-Dx silicon running the `gdb_debug_session` fixture (whose `main -> top -> mid -> leaf` chain calls `leaf(7,2)` then `leaf(7,3)` every loop), sets a *source* breakpoint in `leaf` carrying a DAP `condition`, and verifies the adapter evaluates it on the live target — auto-resuming when false, stopping when true. The leaf source line is derived from the ELF with `avr-addr2line` at runtime. Manual-only (`make hw-test-dap-cond`) — never wired into `make test`.]]></header>
+
+      <test name="DAP_K1_false_local_condition_skips">
+        <purpose><![CDATA[A source breakpoint in `leaf` with the always-false local condition `b == 99` (b is only ever 2 or 3): after `continue` the target keeps running and NO breakpoint stop arrives within the window — proving the adapter reads the local over DWARF/OCD, evaluates the condition false, steps over and auto-resumes. Per HLR-081 / LLR-DAP-12 / LLR-ELF-15.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-081"/><trace target="LLR" ref="LLR-DAP-12"/><trace target="LLR" ref="LLR-ELF-15"/></traces>
+      </test>
+
+      <test name="DAP_K2_true_local_condition_stops">
+        <purpose><![CDATA[A source breakpoint in `leaf` with the true local condition `b == 2` (hit on the `leaf(7,2)` call): after `continue` the adapter emits `stopped` with reason `breakpoint` — proving a true local condition stops. Per HLR-081 / LLR-DAP-12.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-081"/><trace target="LLR" ref="LLR-DAP-12"/></traces>
+      </test>
+
+      <test name="DAP_K3_true_global_condition_stops">
+        <purpose><![CDATA[A source breakpoint in `leaf` with the true global condition `g_marker == 49374` (a constant): after `continue` the adapter emits `stopped` with reason `breakpoint` — proving global-variable conditions (DW_OP_addr resolution) work on silicon. Per HLR-081 / LLR-DAP-12 / LLR-ELF-15.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-081"/><trace target="LLR" ref="LLR-DAP-12"/><trace target="LLR" ref="LLR-ELF-15"/></traces>
       </test>
     </file>
 

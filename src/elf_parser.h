@@ -18,6 +18,7 @@
 #ifndef AOD_ELF_PARSER_H
 #define AOD_ELF_PARSER_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -123,5 +124,44 @@ int elf_addr_to_line(const ElfContext *ctx, uint32_t byte_addr,
  * Returns -1 when the ELF lacks DWARF or no matching row exists. */
 int elf_line_to_addr(const ElfContext *ctx, const char *file, int line,
                      uint32_t *byte_addr);
+
+/* Call-Frame-Information rule for the (canonical) frame address (CFA) at a
+ * code-space byte address.  On success returns 0 and stores the DWARF register
+ * whose value forms the CFA base in *cfa_reg (AVR: 28 = the Y frame-pointer
+ * pair r28:r29, or 32 = SP) and the signed byte offset added to it in
+ * *cfa_offset, so CFA = value(cfa_reg) + cfa_offset.  Returns -1 when the ELF
+ * lacks `.debug_frame`, `addr` is not covered by an FDE, or the CFA rule is not
+ * the simple register+offset form avr-gcc emits.  This is the per-PC half of a
+ * stack unwind; the return-address and saved-frame-pointer recovery (AVR's
+ * 2-byte word return address, word<->byte PC) live in the caller's unwinder. */
+int elf_cfi_cfa(const ElfContext *ctx, uint32_t byte_addr,
+                int *cfa_reg, int *cfa_offset);
+
+/* Live frame register values an AVR variable's DWARF location may reference. */
+typedef struct {
+    uint32_t cfa;  /* canonical frame address (DW_OP_fbreg / call_frame_cfa)   */
+    uint32_t y;    /* Y frame-pointer pair r28:r29 (DW_OP_breg28)              */
+    uint32_t sp;   /* stack pointer (DW_OP_breg32)                             */
+} ElfFrameRegs;
+
+/* Resolve a variable `name` visible at code byte address `pc` to its 16-bit
+ * data-space address and size, evaluating its DWARF location with the live
+ * frame registers `fr`.  Searches the lexical scopes containing `pc` (locals,
+ * parameters) then file/global scope.  Supports the location forms avr-gcc -O0
+ * emits: DW_OP_addr (globals), DW_OP_breg28/breg32 + offset (Y-/SP-relative
+ * locals), and DW_OP_fbreg + offset when the enclosing subprogram's frame base
+ * is DW_OP_call_frame_cfa.  On success returns 0 and fills *addr (masked to the
+ * 16-bit SRAM data space), *size (1/2/4 bytes, clamped), and *is_signed.
+ * Returns -1 with no DWARF, when `name` is not in scope, or for an unsupported
+ * location/type form.  `fr` may be NULL if only globals are expected. */
+int elf_var_addr(const ElfContext *ctx, uint32_t pc, const ElfFrameRegs *fr,
+                 const char *name, uint32_t *addr, int *size, bool *is_signed);
+
+/* Resolve a code-space byte address to the name of the enclosing function
+ * (the DWARF DW_TAG_subprogram whose range covers `pc`).  On success returns 0
+ * and copies the NUL-terminated, `cap`-truncated name into `name`.  Returns -1
+ * when the ELF lacks DWARF or `pc` is not inside any subprogram (e.g. the C
+ * runtime above `main`) — the caller then falls back to the raw address. */
+int elf_addr_to_func(const ElfContext *ctx, uint32_t pc, char *name, size_t cap);
 
 #endif /* AOD_ELF_PARSER_H */

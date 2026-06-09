@@ -8,13 +8,27 @@ jobs:
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest
+    # Run inside Debian 13 (trixie) so the AVR toolchain matches the developer /
+    # hardware environment (avr-gcc 14.2 + avr-libc 2.2 with native AVR-Dx
+    # support).  ubuntu-latest's distro gcc-avr is 5.x, whose different DWARF
+    # line tables break the fixture-derived DWARF tests.
+    container: debian:trixie
     permissions:
       pull-requests: write   # post / update the PR comment
 
     steps:
+      # Bootstrap the bits `make prereqs` and actions/checkout need (the
+      # container runs as root, so install sudo for prereqs' apt calls).
+      - name: Bootstrap container
+        run: |
+          apt-get update -q
+          apt-get install -y --no-install-recommends make sudo git ca-certificates
+
       - name: Checkout
         uses: actions/checkout@v4
 
+      # The canonical, single-source dev setup: installs the AVR toolchain,
+      # libdw/libelf, and the AVR-Dx DFP the fixtures' memory layout depends on.
       - name: Install build dependencies
         run: make prereqs
 
@@ -150,10 +164,17 @@ jobs:
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
+    # Same Debian-trixie toolchain as the unit-tests job (see note above).
+    container: debian:trixie
     permissions:
       pull-requests: write   # post / update the PR comment
 
     steps:
+      - name: Bootstrap container
+        run: |
+          apt-get update -q
+          apt-get install -y --no-install-recommends make sudo git ca-certificates
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -162,8 +183,7 @@ jobs:
 
       - name: Install gcovr
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcovr
+          apt-get install -y --no-install-recommends gcovr
           gcovr --version
 
       # Build with --coverage, run every unit test suite, and emit

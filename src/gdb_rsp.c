@@ -53,19 +53,12 @@ bool rsp_get_noack(void)   { return g_noack; }
 #define AVR_MAPPED_FLASH_OFF  0x8000u   /* data-space base of the window  */
 #define AVR_MAPPED_FLASH_LEN  0x8000u   /* 32 KiB mapped-flash window size */
 
-/* Sentinel: no breakpoint installed in this HW comparator slot. */
-#define HW_BP_SLOT_EMPTY    0xFFFFFFFFu
-
-/* HW-comparator allocation policy (HLR-016).  The AVR-Dx OCD exposes two
- * program-counter comparators (BP0/BP1, shadowed in `hw_bp_addr[2]`):
- *   - comparator 0 is the sole *user* HW-breakpoint slot (Z1/`hbreak`, or
- *     Z0 in `hw-only` mode); a second user HW BP returns E08.
- *   - comparator 1 is reserved exclusively for the single-step-over of a
- *     32-bit non-CoF (`LDS`/`STS`) instruction, so stepping is always
- *     possible regardless of which user breakpoints are set.
- * SW breakpoints (FLASH `BREAK`, the default) remain unlimited. */
-#define RSP_HW_BP_USER_SLOTS  1          /* comparators usable by GDB     */
-#define RSP_HW_BP_STEP_SLOT   1          /* comparator reserved for step  */
+/* The breakpoint policy constants (HW_BP_SLOT_EMPTY, RSP_HW_BP_USER_SLOTS,
+ * RSP_HW_BP_STEP_SLOT) and the install/remove/classify/step-skip logic now
+ * live in the shared breakpoint core (src/debug_bp.{h,c}), reached here via
+ * gdb_rsp.h → debug_bp.h.  Comparator 0 is the user slot (with hbreak-wins
+ * eviction); comparator 1 (RSP_HW_BP_STEP_SLOT) is reserved for the 32-bit
+ * single-step-over, used below via updi_step_32bit(). */
 
 /* HLR-053: byte length of the most recently received packet.  Set by
  * rsp_dispatch_n(); read by binary handlers (vFlashWrite) that need the
@@ -360,39 +353,9 @@ static const char *signal_for_halt_status(int updi_fd)
     return "T05";
 }
 
-/* HLR-062 / LLR-RSP-44: stop-cause classification.  Returned from
- * classify_stop_cause() and stored in RspContext.last_stop_cause for
- * the formatter (LLR-RSP-45).                                        */
-enum RspStopCause {
-    SC_NONE    = 0,
-    SC_SWBREAK = 1,
-    SC_HWBREAK = 2,
-    SC_STEP    = 3,
-    SC_INTR    = 4
-};
-
-/* Read the live PC and decide whether the halt is a SW-BP hit, a
- * HW-BP hit, or something else (in which case the caller's `hint` is
- * returned unchanged).  No PC adjustment — GDB rewinds itself when it
- * sees `swbreak:;`.                                                  */
-static int classify_stop_cause(RspContext *ctx, int hint)
-{
-    uint32_t pc = 0;
-    if (ctx == NULL) return hint;
-    if (updi_ocd_read_pc(ctx->updi_fd, &pc) < 0) return hint;
-    for (int i = 0; i < RSP_MAX_SW_BREAKPOINTS; i++) {
-        if (ctx->sw_bp[i].in_use && ctx->sw_bp[i].addr == pc) {
-            return SC_SWBREAK;
-        }
-    }
-    for (int i = 0; i < RSP_HW_BP_USER_SLOTS; i++) {
-        if (ctx->hw_bp_addr[i] != HW_BP_SLOT_EMPTY &&
-            ctx->hw_bp_addr[i] == pc) {
-            return SC_HWBREAK;
-        }
-    }
-    return hint;
-}
+/* Stop-cause classification (enum RspStopCause / SC_*) and the classifier
+ * itself now live in the shared breakpoint core (debug_bp.h / debug_bp.c,
+ * bp_classify_stop()); call sites below pass ctx->sw_bp / ctx->hw_bp_addr. */
 
 /* HLR-062 / LLR-RSP-45: render `<sig><tag>thread:<hex_tid>;` into a
  * single packet.  `sig` is "T05" or "T02"; `tag` is "swbreak:;"
@@ -431,118 +394,28 @@ void rsp_hw_bp_clear_all(RspContext *ctx)
             (void)updi_ocd_clear_hw_bp(ctx->updi_fd, i);
             ctx->hw_bp_addr[i] = HW_BP_SLOT_EMPTY;
         }
+        ctx->hw_bp_pinned[i] = false;
     }
-    /* The arbiter owns both comparators: also disarm the reserved
-     * single-step slot in silicon so detach always leaves clean state,
-     * even if a step was interrupted before it released the slot. */
+    /* Also disarm the reserved single-step comparator in silicon so detach
+     * always leaves clean state, even if a step was interrupted. */
     (void)updi_ocd_clear_hw_bp(ctx->updi_fd, RSP_HW_BP_STEP_SLOT);
 }
 
 #define hw_bp_clear_all rsp_hw_bp_clear_all
 
-/* HLR-054: drop every SW-BP shadow entry.  Callers (vFlashDone,
- * monitor reset, monitor chip-erase) have already destroyed the
- * underlying FLASH instruction, so no silicon I/O is needed.        */
+/* HLR-054: drop every SW-BP shadow entry.  Callers (vFlashDone, monitor
+ * reset, monitor chip-erase) have already destroyed the underlying FLASH
+ * instruction, so no silicon I/O is needed.  Thin wrapper over the shared
+ * breakpoint core.                                                       */
 void rsp_sw_bp_clear_all(RspContext *ctx)
 {
-    for (int i = 0; i < RSP_MAX_SW_BREAKPOINTS; i++) {
-        ctx->sw_bp[i].in_use = false;
-        ctx->sw_bp[i].addr   = 0;
-        ctx->sw_bp[i].orig[0] = 0;
-        ctx->sw_bp[i].orig[1] = 0;
-    }
+    bp_clear_all_sw(ctx->sw_bp);
 }
 
-/* HLR-054: AVR BREAK instruction (little-endian in FLASH).  Decoded
- * by the AVR core as an OCD-trapping breakpoint regardless of the
- * current debug-enable state — exactly the semantic GDB needs for a
- * software breakpoint.                                              */
-static const uint8_t SW_BP_BREAK_BYTES[2] = { 0x98u, 0x95u };
-
-/* Snapshot R0–R31, SREG, SP, and PC via the OCD register file.
- * Returns -1 on any UPDI link failure.                              */
-static int sw_bp_snapshot_cpu(int updi_fd, uint8_t gpr[32],
-                              uint8_t *sreg, uint16_t *sp, uint32_t *pc)
-{
-    for (int i = 0; i < 32; i++) {
-        if (updi_ocd_read_gpr(updi_fd, (uint8_t)i, &gpr[i]) < 0) return -1;
-    }
-    if (updi_ocd_read_sreg(updi_fd, sreg) < 0) return -1;
-    if (updi_ocd_read_sp  (updi_fd, sp)   < 0) return -1;
-    if (updi_ocd_read_pc  (updi_fd, pc)   < 0) return -1;
-    return 0;
-}
-
-/* Restore the register file after the NVMPROG → OCD round-trip.    */
-static int sw_bp_restore_cpu(int updi_fd, const uint8_t gpr[32],
-                             uint8_t sreg, uint16_t sp, uint32_t pc)
-{
-    for (int i = 0; i < 32; i++) {
-        if (updi_ocd_write_gpr(updi_fd, (uint8_t)i, gpr[i]) < 0) return -1;
-    }
-    if (updi_ocd_write_sreg(updi_fd, sreg) < 0) return -1;
-    if (updi_ocd_write_sp  (updi_fd, sp)   < 0) return -1;
-    if (updi_ocd_write_pc  (updi_fd, pc)   < 0) return -1;
-    if (updi_ocd_stabilize_pc_after_write(updi_fd) < 0) return -1;
-    return 0;
-}
-
-/* HLR-054: install or remove a software breakpoint by patching the
- * 2-byte FLASH word at `byte_addr` (UPDI-side address, no FLASH_BASE
- * offset).  When `orig_out` is non-NULL the current FLASH word is
- * read out first (used during Z0 install to capture the opcode that
- * z0 will later restore).  CPU state is snapshotted before the
- * NVMPROG entry that `updi_nvm_flash_patch()` performs internally
- * and restored after `updi_enter_debug()` brings the chip back into
- * OCD.  Returns 0 on success, -1 on any UPDI failure.               */
-static int sw_bp_patch_flash(RspContext *ctx, uint32_t byte_addr,
-                             const uint8_t bytes[2], uint8_t orig_out[2])
-{
-    uint8_t  gpr[32], sreg;
-    uint16_t sp;
-    uint32_t pc;
-    int updi_fd = ctx->updi_fd;
-    /* Phase 20: peripheral I/O snapshot preserved across the NVMPROG system
-     * reset so any SLEEP wake source (timer/USART/pin/...) survives.  No-op
-     * (and `periph` left untouched) when debug-in-sleep is disabled (--sleep). */
-    static uint8_t periph[UPDI_PERIPH_LEN];
-
-    if (sw_bp_snapshot_cpu(updi_fd, gpr, &sreg, &sp, &pc) < 0) return -1;
-    if (updi_save_peripherals(updi_fd, periph) < 0) return -1;
-
-    if (orig_out != NULL) {
-        if (updi_mem_read(updi_fd, UPDI_FLASH_BASE + byte_addr,
-                          orig_out, 2) < 0)
-            return -1;
-    }
-
-    if (updi_nvm_flash_patch(updi_fd, UPDI_FLASH_BASE + byte_addr,
-                             bytes, 2) < 0)
-        return -1;
-
-    if (updi_enter_debug(updi_fd) < 0) return -1;
-
-    for (int i = 0; i < RSP_HW_BP_USER_SLOTS; i++) {
-        if (ctx->hw_bp_addr[i] != HW_BP_SLOT_EMPTY) {
-            uint32_t flash_byte = ctx->hw_bp_addr[i] & GDB_AVR_ADDR_MASK;
-            if (updi_ocd_set_hw_bp(updi_fd, i, flash_byte) < 0)
-                return -1;
-        }
-    }
-
-    /* Restore the peripheral configuration the reset wiped, before re-arming
-     * the CPU state (which writes OCD.PC last for the pc_dirty handling). */
-    if (updi_restore_peripherals(updi_fd, periph) < 0) return -1;
-
-    if (sw_bp_restore_cpu(updi_fd, gpr, sreg, sp, pc) < 0) return -1;
-
-    /* The restore above re-wrote OCD.PC after the NVMPROG system-reset.
-     * A fresh OCD.PC write makes the silicon skip the instruction at PC on
-     * the next step/run; mark the PC dirty so the next resume executes that
-     * instruction via injection (consume_pc_skip) rather than skipping it. */
-    ctx->pc_dirty = true;
-    return 0;
-}
+/* The SW-breakpoint FLASH patch (CPU + peripheral snapshot/restore around
+ * the NVMPROG reset) and the AVR `BREAK` opcode bytes now live in the
+ * shared breakpoint core (debug_bp.c: bp_sw_patch_flash / SW_BP_BREAK_BYTES,
+ * with bp_snapshot_cpu / bp_restore_cpu).                                */
 
 /* HLR-056: data-address watchpoints over UPDI are not implemented in
  * silicon.  See src/updi.h and doc/reference/guesswork.md.  The Z2/
@@ -563,7 +436,7 @@ static int dh_halt_reason(int fd, const char *pkt, void *vctx)
     /* HLR-062: classify (PC vs SW/HW BP shadow) when the previous
      * resume path has not already set a more specific cause.        */
     if (ctx->last_stop_cause == SC_NONE) {
-        ctx->last_stop_cause = classify_stop_cause(ctx, SC_NONE);
+        ctx->last_stop_cause = bp_classify_stop(ctx->updi_fd, ctx->sw_bp, ctx->hw_bp_addr,SC_NONE);
     }
     select_stop_thread(ctx, FSM_SYSTEM_THREAD_ID);
     return format_stop_reply(fd, ctx,
@@ -891,50 +764,10 @@ static int continue_step_over_leading_cof(RspContext *ctx)
     return 0;
 }
 
-/* When a SW-breakpoint flash patch (Z0/z0) has just re-written OCD.PC after
- * its NVMPROG round-trip, the silicon will skip the instruction at PC on the
- * next step/run (ctx->pc_dirty; see RspContext).  Execute that one
- * instruction here via instruction injection — which feeds the opcode to the
- * core directly and is immune to the fresh-PC-write skip — so the resume
- * does not silently lose it.  Direct 32-bit CALL/JMP at PC is left to the
- * caller's change-of-flow emulation (it rewrites OCD.PC to the target
- * anyway, so the skip is moot).  Returns 1 if an instruction was injected
- * and executed, 0 if nothing was done (not dirty, or a CoF left for the
- * caller), -1 on UPDI error.  Always clears ctx->pc_dirty.                */
-static int consume_pc_skip(RspContext *ctx)
-{
-    if (!ctx->pc_dirty) return 0;
-    ctx->pc_dirty = false;
-
-    int updi_fd = ctx->updi_fd;
-    uint32_t pc = 0;
-    if (updi_ocd_read_pc(updi_fd, &pc) < 0) return -1;
-
-    uint8_t op[4] = {0};
-    if (updi_mem_read(updi_fd, pc | UPDI_FLASH_BASE, op, 4) < 0) return -1;
-    uint16_t w0 = (uint16_t)op[0] | ((uint16_t)op[1] << 8);
-
-    /* Leave a direct 32-bit CALL/JMP to the CoF emulator. */
-    if ((w0 & 0xFE0Eu) == 0x940Eu || (w0 & 0xFE0Eu) == 0x940Cu)
-        return 0;
-
-    /* If a BREAK is currently patched at PC (an active SW breakpoint we are
-     * resuming over), inject the saved original opcode word instead. */
-    uint16_t exec_w0 = w0;
-    if (w0 == ((uint16_t)SW_BP_BREAK_BYTES[0]
-               | ((uint16_t)SW_BP_BREAK_BYTES[1] << 8))) {
-        for (int i = 0; i < RSP_MAX_SW_BREAKPOINTS; i++) {
-            if (ctx->sw_bp[i].in_use && ctx->sw_bp[i].addr == pc) {
-                exec_w0 = (uint16_t)ctx->sw_bp[i].orig[0]
-                        | ((uint16_t)ctx->sw_bp[i].orig[1] << 8);
-                break;
-            }
-        }
-    }
-
-    if (updi_ocd_step_inject_word0(updi_fd, exec_w0) < 0) return -1;
-    return 1;
-}
+/* The "execute the instruction the silicon would skip after a fresh OCD.PC
+ * write" logic now lives in the shared breakpoint core as
+ * bp_consume_pc_skip(ctx->updi_fd, ctx->sw_bp, &ctx->pc_dirty); call sites
+ * below invoke it directly. */
 
 static int dh_continue(int fd, const char *pkt, void *vctx)
 {
@@ -947,7 +780,7 @@ static int dh_continue(int fd, const char *pkt, void *vctx)
     /* If a prior SW-BP flash patch left OCD.PC freshly written, execute the
      * instruction at PC via injection so the upcoming free-run does not skip
      * it (the silicon's fresh-PC-write one-instruction skip).            */
-    if (consume_pc_skip(ctx) < 0) return reply_err(fd, "E01");
+    if (bp_consume_pc_skip(ctx->updi_fd, ctx->sw_bp, &ctx->pc_dirty) < 0) return reply_err(fd, "E01");
     /* HLR-062 (issue #40): emulate a direct 32-bit CALL/JMP parked at
      * the resume PC so the OCD "first change-of-flow after RUN" quirk
      * does not skip breakpoints inside the callee.                   */
@@ -1023,7 +856,7 @@ static int dh_continue(int fd, const char *pkt, void *vctx)
     {
         const char *sig = got_ctrl_c ? "T02" : "T05";
         int hint = got_ctrl_c ? SC_INTR : SC_NONE;
-        ctx->last_stop_cause = classify_stop_cause(ctx, hint);
+        ctx->last_stop_cause = bp_classify_stop(ctx->updi_fd, ctx->sw_bp, ctx->hw_bp_addr,hint);
         select_stop_thread(ctx, FSM_SYSTEM_THREAD_ID);
         return format_stop_reply(fd, ctx, sig, ctx->last_stop_cause);
     }
@@ -1039,92 +872,19 @@ static int dh_step(int fd, const char *pkt, void *vctx)
      * neither shadow matches.                                       */
     ctx->last_stop_cause = SC_NONE;
 
-    /* If a prior SW-BP flash patch left OCD.PC freshly written, the single
-     * step must execute the instruction at PC via injection (immune to the
-     * fresh-PC-write skip).  consume_pc_skip() does exactly one instruction
-     * when it returns 1 — that IS this step, so report the stop and return.
-     * A direct 32-bit CALL/JMP returns 0 and falls through to the normal
-     * change-of-flow step path below.                                     */
-    {
-        int cs = consume_pc_skip(ctx);
-        if (cs < 0) return reply_err(fd, "E01");
-        if (cs == 1) {
-            fsm_invalidate(ctx->fsm);
-            if (ctx->fsm) {
-                (void)fsm_build_thread_list(ctx->fsm, ctx->idx, ctx->updi_fd);
-            }
-            ctx->last_stop_cause = classify_stop_cause(ctx, SC_STEP);
-            return dh_halt_reason(fd, "?", vctx);
-        }
-    }
-
-    /* Detect if current instruction is 32-bit (AVR UPDI hardware stepper errata workaround) */
-    uint32_t pc_byte = 0;
-    if (updi_ocd_read_pc(ctx->updi_fd, &pc_byte) < 0) return reply_err(fd, "E01");
-
-    uint8_t opcode[4] = {0};
-    if (updi_mem_read(ctx->updi_fd, pc_byte | UPDI_FLASH_BASE, opcode, 4) < 0) return reply_err(fd, "E01");
-
-    uint16_t w0 = (uint16_t)opcode[0] | ((uint16_t)opcode[1] << 8);
-    uint16_t w1 = (uint16_t)opcode[2] | ((uint16_t)opcode[3] << 8);
-
-    bool is_32bit = false;
-    bool is_call_32bit = false;     /* direct 32-bit CALL — needs return push */
-    bool is_jmp_32bit  = false;     /* direct 32-bit JMP  — no return push    */
-    uint32_t target_pc = pc_byte + 4;
-
-    if ((w0 & 0xFE0F) == 0x9000 || (w0 & 0xFE0F) == 0x9200) {
-        /* LDS or STS — 32-bit non-CoF: HW-BP@PC+4 workaround is fine. */
-        is_32bit = true;
-    } else if ((w0 & 0xFE0E) == 0x940E) {
-        /* CALL k  (1001 010k kkkk 111k) */
-        uint32_t k = (uint32_t)w1
-                   | (((uint32_t)w0 & 0x0001u) << 16)
-                   | ((((uint32_t)w0 & 0x01F0u) >> 4) << 17);
-        target_pc = k * 2u;
-        is_32bit = true;
-        is_call_32bit = true;
-    } else if ((w0 & 0xFE0E) == 0x940C) {
-        /* JMP k   (1001 010k kkkk 110k) */
-        uint32_t k = (uint32_t)w1
-                   | (((uint32_t)w0 & 0x0001u) << 16)
-                   | ((((uint32_t)w0 & 0x01F0u) >> 4) << 17);
-        target_pc = k * 2u;
-        is_32bit = true;
-        is_jmp_32bit = true;
-    }
-    bool halt_on_jump = is_call_32bit || is_jmp_32bit;
-
-    if (is_32bit) {
-        /* HLR-062 (issue #40): for direct 32-bit CoF (CALL/JMP) the
-         * AVR-Dx OCD comparator and OCD_CTRL1_JMP both fail to halt
-         * on the very first change-of-flow after RUN.  Emulate
-         * entirely via OCD primitives instead — push return address
-         * for CALL, then set OCD PC = target and settle the pipeline.
-         * Plain HW-BP@PC+4 (via updi_step_32bit) is still correct for
-         * the 32-bit non-CoF case (LDS/STS).                          */
-        if (is_call_32bit) {
-            if (updi_ocd_emulate_cof_32bit(ctx->updi_fd,
-                                           pc_byte + 4u, target_pc) < 0)
-                return reply_err(fd, "E01");
-        } else if (is_jmp_32bit) {
-            if (updi_ocd_emulate_cof_32bit(ctx->updi_fd,
-                                           0u, target_pc) < 0)
-                return reply_err(fd, "E01");
-        } else {
-            if (updi_step_32bit(ctx->updi_fd, RSP_HW_BP_STEP_SLOT,
-                                target_pc, halt_on_jump) < 0)
-                return reply_err(fd, "E01");
-        }
-    } else {
-        if (updi_step(ctx->updi_fd) < 0) return reply_err(fd, "E01");
-    }
+    /* Execute exactly one instruction over OCD — the shared core handles the
+     * fresh-PC/patched-BREAK injection, 32-bit CALL/JMP CoF emulation (which
+     * sets pc_dirty so the next resume injects the skipped instruction — see
+     * B.8 / Group-G G19), the 32-bit LDS/STS HW-BP@PC+4 step, and the ordinary
+     * 16-bit step.  (HLR-062, issue #40.) */
+    if (bp_step_over(ctx->updi_fd, ctx->sw_bp, &ctx->pc_dirty) < 0)
+        return reply_err(fd, "E01");
 
     fsm_invalidate(ctx->fsm);
     if (ctx->fsm) {
         (void)fsm_build_thread_list(ctx->fsm, ctx->idx, ctx->updi_fd);
     }
-    ctx->last_stop_cause = classify_stop_cause(ctx, SC_STEP);
+    ctx->last_stop_cause = bp_classify_stop(ctx->updi_fd, ctx->sw_bp, ctx->hw_bp_addr,SC_STEP);
     return dh_halt_reason(fd, "?", vctx);
 }
 
@@ -1187,7 +947,7 @@ static int dh_range_step(int fd, const char *pkt, void *vctx)
         (void)fsm_build_thread_list(ctx->fsm, ctx->idx, ctx->updi_fd);
     }
     ctx->last_stop_cause =
-        classify_stop_cause(ctx, got_ctrl_c ? SC_INTR : SC_STEP);
+        bp_classify_stop(ctx->updi_fd, ctx->sw_bp, ctx->hw_bp_addr,got_ctrl_c ? SC_INTR : SC_STEP);
     select_stop_thread(ctx, FSM_SYSTEM_THREAD_ID);
     return format_stop_reply(fd, ctx,
                              got_ctrl_c ? "T02" : "T05",
@@ -1198,31 +958,26 @@ static int dh_range_step(int fd, const char *pkt, void *vctx)
  * (BP0, BP1).  The per-session shadow lives in RspContext so detach
  * and reattach cycles leave silicon in a known state.                */
 
+/* Map a BpStatus from the shared breakpoint core to an RSP reply. */
+static int reply_for_bp_status(int fd, int status)
+{
+    switch (status) {
+    case BP_OK:         return reply_ok(fd);
+    case BP_ERR_SLOT:   return reply_err(fd, "E08");
+    case BP_ERR_DATASP: return reply_err(fd, "E22");
+    default:            return reply_err(fd, "E01");   /* BP_ERR_IO */
+    }
+}
+
 static int dh_insert_bp(int fd, const char *pkt, void *vctx)
 {
     RspContext *ctx = (RspContext *)vctx;
-    /* Z0 = software breakpoint, Z1 = hardware breakpoint.
-     *
-     * Z0 in OCD mode would normally be implemented by patching FLASH
-     * with the AVR BREAK opcode.  That requires exiting OCD, entering
-     * NVMPROG (which issues a system-reset pulse), patching the page,
-     * then re-entering OCD — a sequence that destroys live CPU state
-     * (PC/SREG/GPRs) and is non-trivial to save/restore over UPDI.
-     *
-     * Pragmatic choice: route Z0 (in hw-only mode) and Z1 to the single
-     * user HW comparator (slot 0; RSP_HW_BP_USER_SLOTS).  Comparator 1 is
-     * reserved for the single-step-over workaround (RSP_HW_BP_STEP_SLOT),
-     * so only one user HW breakpoint is available; a second returns E08.
-     * SW breakpoints (FLASH `BREAK`, the default `bp-mode sw`) are
-     * unlimited, so this 1-slot limit only bites `hbreak` / hw-only.   */
     char kind = pkt[1];
     /* HLR-056: Z2/Z3/Z4 — AVR-Dx OCD over UPDI exposes no data-address
      * watchpoint hardware (see src/updi.h, doc/reference/guesswork.md).
-     * Reply with the empty packet so GDB transparently falls back to
-     * software watchpoints.                                            */
-    if (kind == '2' || kind == '3' || kind == '4') {
-        return reply_empty(fd);
-    }
+     * Reply with the empty packet so GDB falls back to software
+     * watchpoints.                                                      */
+    if (kind == '2' || kind == '3' || kind == '4') return reply_empty(fd);
     if (kind != '0' && kind != '1') return reply_empty(fd);
     const char *p = pkt + 2;
     if (*p != ',') return reply_err(fd, "E01");
@@ -1230,96 +985,18 @@ static int dh_insert_bp(int fd, const char *pkt, void *vctx)
     uint32_t addr;
     if (parse_hex_u32(&p, &addr) < 0) return reply_err(fd, "E01");
 
-    /* HLR-054 / HLR-055: decide whether this Z0 is installed as a SW
-     * FLASH-BREAK patch or routed to a HW comparator.
-     *   - bp_mode == sw       → always SW.
-     *   - bp_mode == hw-only  → always HW (Z0 aliases the comparator).
-     *   - bp_mode == auto     → prefer a HW comparator when the single
-     *     user slot is free (no NVMPROG reset glitch, survives SLEEP),
-     *     and fall back to SW only once that slot is occupied.
-     * Z1 always takes the HW path below regardless of bp_mode.        */
-    bool z0_use_sw = (kind == '0' && ctx->bp_mode == RSP_BP_MODE_SW);
-    if (kind == '0' && ctx->bp_mode == RSP_BP_MODE_AUTO) {
-        /* `BREAK` is only meaningful fetched from FLASH; a data-space
-         * address can be neither a SW patch nor a PC comparator hit.  */
-        if (addr & GDB_AVR_DATA_FLAG) return reply_err(fd, "E22");
-        /* Idempotent: already installed as SW (an earlier fallback)?  */
-        for (int i = 0; i < RSP_MAX_SW_BREAKPOINTS; i++) {
-            if (ctx->sw_bp[i].in_use && ctx->sw_bp[i].addr == addr)
-                return reply_ok(fd);
-        }
-        /* Idempotent: already on a HW comparator?  Catch this here so a
-         * re-insert of an address that already holds the (now occupied)
-         * comparator does not wrongly fall through to a duplicate SW
-         * patch at the same address.                                  */
-        for (int i = 0; i < RSP_HW_BP_USER_SLOTS; i++) {
-            if (ctx->hw_bp_addr[i] == addr) return reply_ok(fd);
-        }
-        /* Prefer HW: fall back to SW only when no user slot is free.
-         * (HW install is handled by the HW path below.)               */
-        bool hw_free = false;
-        for (int i = 0; i < RSP_HW_BP_USER_SLOTS; i++) {
-            if (ctx->hw_bp_addr[i] == HW_BP_SLOT_EMPTY) { hw_free = true; break; }
-        }
-        z0_use_sw = !hw_free;
-    }
-
-    /* HLR-054: Z0 routed to SW patches the BREAK opcode into FLASH for an
-     * unbounded number of simultaneous SW breakpoints.  Z1, or Z0 in
-     * `hw-only` mode (HLR-055) / `auto` with the comparator occupied,
-     * aliases to the OCD HW comparators (HLR-016).                     */
-    if (z0_use_sw) {
-        /* Reject addresses in the data-space windows (SIGROW, FUSES,
-         * USERROW, EEPROM, LOCK) — `BREAK` is only meaningful when
-         * fetched from FLASH as an instruction.                       */
-        if (addr & GDB_AVR_DATA_FLAG) return reply_err(fd, "E22");
-        /* Idempotent re-insert on the same address. */
-        for (int i = 0; i < RSP_MAX_SW_BREAKPOINTS; i++) {
-            if (ctx->sw_bp[i].in_use && ctx->sw_bp[i].addr == addr)
-                return reply_ok(fd);
-        }
-        int slot_i = -1;
-        for (int i = 0; i < RSP_MAX_SW_BREAKPOINTS; i++) {
-            if (!ctx->sw_bp[i].in_use) { slot_i = i; break; }
-        }
-        if (slot_i < 0) return reply_err(fd, "E08");
-        uint32_t byte_addr = addr & GDB_AVR_ADDR_MASK;
-        uint8_t  orig[2];
-        if (sw_bp_patch_flash(ctx, byte_addr,
-                              SW_BP_BREAK_BYTES, orig) < 0)
-            return reply_err(fd, "E01");
-        ctx->sw_bp[slot_i].in_use  = true;
-        ctx->sw_bp[slot_i].addr    = addr;
-        ctx->sw_bp[slot_i].orig[0] = orig[0];
-        ctx->sw_bp[slot_i].orig[1] = orig[1];
-        return reply_ok(fd);
-    }
-
-    /* Already set?  Idempotent OK. */
-    for (int i = 0; i < RSP_HW_BP_USER_SLOTS; i++) {
-        if (ctx->hw_bp_addr[i] == addr) return reply_ok(fd);
-    }
-    int slot_i = -1;
-    for (int i = 0; i < RSP_HW_BP_USER_SLOTS; i++) {
-        if (ctx->hw_bp_addr[i] == HW_BP_SLOT_EMPTY) { slot_i = i; break; }
-    }
-    if (slot_i < 0) return reply_err(fd, "E08");          /* slot used */
-    uint32_t flash_byte = addr & GDB_AVR_ADDR_MASK;       /* gdb→byte */
-    if (updi_ocd_set_hw_bp(ctx->updi_fd, slot_i, flash_byte) < 0)
-        return reply_err(fd, "E01");
-    ctx->hw_bp_addr[slot_i] = addr;
-    return reply_ok(fd);
+    /* Install through the shared breakpoint core (HLR-054/055/016): the
+     * arbiter picks HW comparator vs SW FLASH-BREAK per ctx->bp_mode. */
+    int st = bp_insert(ctx->updi_fd, ctx->hw_bp_addr, ctx->hw_bp_pinned,
+                       ctx->sw_bp, ctx->bp_mode, &ctx->pc_dirty, kind, addr);
+    return reply_for_bp_status(fd, st);
 }
 
 static int dh_remove_bp(int fd, const char *pkt, void *vctx)
 {
     RspContext *ctx = (RspContext *)vctx;
     char kind = pkt[1];
-    /* HLR-056: z2/z3/z4 — see dh_insert_bp.  Hardware not present. */
-    if (kind == '2' || kind == '3' || kind == '4') {
-        return reply_empty(fd);
-    }
-    /* Z0 and Z1 both map to HW comparators (see dh_insert_bp). */
+    if (kind == '2' || kind == '3' || kind == '4') return reply_empty(fd);
     if (kind != '0' && kind != '1') return reply_empty(fd);
     const char *p = pkt + 2;
     if (*p != ',') return reply_err(fd, "E01");
@@ -1327,41 +1004,9 @@ static int dh_remove_bp(int fd, const char *pkt, void *vctx)
     uint32_t addr;
     if (parse_hex_u32(&p, &addr) < 0) return reply_err(fd, "E01");
 
-    /* HLR-054: a matching z0 restores the captured original opcode and
-     * frees the shadow slot.  Scanned in `sw` and `auto` modes (the
-     * latter may have installed either kind); if no SW shadow matches we
-     * fall through to the HW-comparator scan, so a server that toggled
-     * bp_mode mid-session — or an `auto` breakpoint that took the HW
-     * slot — still drains the correct table.                          */
-    if (kind == '0' && (ctx->bp_mode == RSP_BP_MODE_SW ||
-                        ctx->bp_mode == RSP_BP_MODE_AUTO)) {
-        for (int i = 0; i < RSP_MAX_SW_BREAKPOINTS; i++) {
-            if (ctx->sw_bp[i].in_use && ctx->sw_bp[i].addr == addr) {
-                uint32_t byte_addr = addr & GDB_AVR_ADDR_MASK;
-                if (sw_bp_patch_flash(ctx, byte_addr,
-                                      ctx->sw_bp[i].orig, NULL) < 0)
-                    return reply_err(fd, "E01");
-                ctx->sw_bp[i].in_use  = false;
-                ctx->sw_bp[i].addr    = 0;
-                ctx->sw_bp[i].orig[0] = 0;
-                ctx->sw_bp[i].orig[1] = 0;
-                return reply_ok(fd);
-            }
-        }
-        /* Not in SW shadow — fall through to HW shadow scan below.   */
-    }
-
-    for (int i = 0; i < RSP_HW_BP_USER_SLOTS; i++) {
-        if (ctx->hw_bp_addr[i] == addr) {
-            if (updi_ocd_clear_hw_bp(ctx->updi_fd, i) < 0)
-                return reply_err(fd, "E01");
-            ctx->hw_bp_addr[i] = HW_BP_SLOT_EMPTY;
-            return reply_ok(fd);
-        }
-    }
-    /* No record (e.g. server restarted mid-session) — report OK so a
-     * GDB resync is non-fatal.                                       */
-    return reply_ok(fd);
+    int st = bp_remove(ctx->updi_fd, ctx->hw_bp_addr, ctx->hw_bp_pinned,
+                       ctx->sw_bp, ctx->bp_mode, &ctx->pc_dirty, kind, addr);
+    return reply_for_bp_status(fd, st);
 }
 
 static int dh_thread_info(int fd, const char *pkt, void *vctx)
@@ -1882,6 +1527,8 @@ void rsp_default_handlers(RspHandlers *h, RspContext *ctx)
      * RspContext to zero, but the slot-empty sentinel is 0xFFFFFFFF.  */
     ctx->hw_bp_addr[0] = HW_BP_SLOT_EMPTY;
     ctx->hw_bp_addr[1] = HW_BP_SLOT_EMPTY;
+    ctx->hw_bp_pinned[0] = false;
+    ctx->hw_bp_pinned[1] = false;
     /* HLR-054: drop any SW-BP shadow that survived memset(). */
     rsp_sw_bp_clear_all(ctx);
     /* HLR-065 / LLR-RSP-43: no disconnect classification recorded yet. */

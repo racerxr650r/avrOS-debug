@@ -95,6 +95,7 @@ int dap_write_message(int fd, const char *body, size_t len);
  * the debug-core handles. Exposed so the dispatch is unit-testable over a
  * socketpair without the accept loop or hardware (set `updi_fd = -1` to skip
  * the UPDI side effects). */
+#define DAP_MAX_BREAKPOINTS 64
 typedef struct {
     int                     fd;       /* connected DAP client socket            */
     int                     updi_fd;  /* target UPDI link (-1 in unit tests)    */
@@ -107,7 +108,31 @@ typedef struct {
                                        * dap_serve() polls the OCD STOPPED status
                                        * each idle tick and emits `stopped` when
                                        * the target halts (breakpoint / spontaneous). */
+
+    /* Phase 18: breakpoint state, driven through the shared breakpoint core
+     * (debug_bp.h) — exactly the arbiter the GDB-RSP front-end uses.        */
+    uint32_t                hw_bp_addr[2];                  /* HW comparator shadow */
+    bool                    hw_bp_pinned[2];                /* per-slot pin flag    */
+    RspSwBp                 sw_bp[RSP_MAX_SW_BREAKPOINTS];  /* SW-BP shadow         */
+    int                     bp_mode;                        /* RSP_BP_MODE_*        */
+    bool                    pc_dirty;                       /* fresh-PC-write skip  */
+    /* DAP source/instruction breakpoint table (one entry per installed bp). */
+    struct {
+        int      id;                 /* DAP breakpoint id (1-based)            */
+        uint32_t addr;               /* resolved GDB byte address (FLASH)      */
+        int      line;               /* source line (0 for instruction bps)    */
+        bool     verified;           /* resolved + installed                   */
+        bool     in_use;
+        char     source[256];        /* source path (empty for instruction bps)*/
+        char     condition[128];     /* DAP condition expression ("" = none)   */
+    } bps[DAP_MAX_BREAKPOINTS];
+    int                     next_bp_id;
 } dap_session;
+
+/* Reset a dap_session's breakpoint state to empty (HW comparator shadow
+ * slots EMPTY, AUTO bp-mode, no SW/DAP breakpoints).  Call once at session
+ * start before any setBreakpoints. */
+void dap_bp_reset(dap_session *s);
 
 /* Handle one decoded DAP message: parse, dispatch to the matching request
  * handler, and write the response (+ any events). Returns 0 to continue, 1 to

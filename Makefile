@@ -130,8 +130,11 @@ CFLAGS := -std=c99 -D_POSIX_C_SOURCE=200809L \
 
 # Test builds: suppress warnings on __wrap_* stubs (no header declares them),
 # and pass -DUNIT_TEST so src/main.c can exclude its main() entry point.
+# -Wno-missing-field-initializers: test fixtures positionally partial-init
+# larger structs (e.g. dap_session) on purpose and reset the rest at runtime.
 TEST_CFLAGS := $(CFLAGS) -DUNIT_TEST \
-               -Wno-missing-prototypes -Wno-strict-prototypes
+               -Wno-missing-prototypes -Wno-strict-prototypes \
+               -Wno-missing-field-initializers
 
 # ── Directories ───────────────────────────────────────────────────────────────
 SRCDIR      := src
@@ -149,6 +152,7 @@ SRCS     := $(SRCDIR)/main.c \
              $(SRCDIR)/elf_parser.c \
              $(SRCDIR)/fsm_mapper.c \
              $(SRCDIR)/monitor.c \
+             $(SRCDIR)/debug_bp.c \
              $(SRCDIR)/gdb_rsp.c \
              $(SRCDIR)/dap.c
 OBJS     := $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(SRCS))
@@ -219,7 +223,7 @@ TEST_WRAP_test_elf  :=
 TEST_EXTRA_LDFLAGS_test_elf :=
 
 # test_dap  (DAP transport: JSON codec + Content-Length framing)
-TEST_SRCS_test_dap  := $(TESTDIR)/test_dap.c $(SRCDIR)/dap.c
+TEST_SRCS_test_dap  := $(TESTDIR)/test_dap.c $(SRCDIR)/dap.c $(SRCDIR)/debug_bp.c $(TESTDIR)/ocd_stubs.c
 TEST_WRAP_test_dap  :=
 TEST_EXTRA_LDFLAGS_test_dap :=
 
@@ -249,6 +253,7 @@ TEST_EXTRA_LDFLAGS_test_monitor :=
 # test_rsp
 TEST_SRCS_test_rsp := $(TESTDIR)/test_rsp.c \
                        $(SRCDIR)/gdb_rsp.c \
+                       $(SRCDIR)/debug_bp.c \
                        $(SRCDIR)/fsm_mapper.c \
                        $(SRCDIR)/monitor.c
 TEST_WRAP_test_rsp  := updi_mem_read updi_mem_write updi_halt updi_run updi_step \
@@ -273,7 +278,7 @@ TEST_EXTRA_LDFLAGS_test_rsp :=
 
 # test_main — test_main.c #includes src/main.c so it can reach the
 # static parse_args() / event_loop() / load_flash_segments() helpers.
-TEST_SRCS_test_main := $(TESTDIR)/test_main.c $(SRCDIR)/dap.c
+TEST_SRCS_test_main := $(TESTDIR)/test_main.c $(SRCDIR)/dap.c $(SRCDIR)/debug_bp.c $(TESTDIR)/ocd_stubs.c
 TEST_WRAP_test_main  := updi_open updi_close updi_console_poll \
                         updi_select_device updi_get_device \
                         updi_nvm_write_flash updi_nvm_flash_patch \
@@ -305,7 +310,7 @@ TEST_EXTRA_LDFLAGS_test_install :=
 # updi.c is linked in real so updi_read_device_info exercises the PTY
 # harness; updi_open / updi_close are wrapped to substitute a pre-opened
 # PTY slave fd.
-TEST_SRCS_test_device := $(TESTDIR)/test_device.c $(SRCDIR)/updi.c $(SRCDIR)/dap.c
+TEST_SRCS_test_device := $(TESTDIR)/test_device.c $(SRCDIR)/updi.c $(SRCDIR)/dap.c $(SRCDIR)/debug_bp.c
 TEST_WRAP_test_device  := select updi_open updi_close \
                           updi_nvm_write_flash updi_console_poll \
                           updi_probe_baud updi_nvm_read \
@@ -333,10 +338,18 @@ $(BUILDDIR)/$(TARGET): $(OBJS)
 	@echo "  LD  $@"
 
 # ── Compile host object files ─────────────────────────────────────────────────
+# `-MMD -MP` emits a per-object `.d` makefrag listing the headers each object
+# depends on, so editing a header (e.g. a field added to RspContext) forces a
+# rebuild of every dependent object.  Without this, an incremental build leaves
+# stale objects with a mismatched struct layout — a silent, memory-corrupting
+# footgun.  (Test binaries compile all their sources in one invocation, so they
+# are always consistent and need no `.d` tracking.)
 $(BUILDDIR)/%.o: $(SRCDIR)/%.c
 	@mkdir -p $(BUILDDIR)
-	$(Q)$(CC) $(CFLAGS) -I$(SRCDIR) -c $< -o $@
+	$(Q)$(CC) $(CFLAGS) -MMD -MP -I$(SRCDIR) -c $< -o $@
 	@echo "  CC  $<"
+
+-include $(OBJS:.o=.d)
 
 # ── Unity object ─────────────────────────────────────────────────────────────
 $(UNITY_OBJ): $(UNITY_SRC)
@@ -564,7 +577,7 @@ $(HW_TEST_BIN): $(HW_TEST_SRC) $(BUILDDIR)/updi.o
 	$(Q)$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $^ $(LUTIL)
 	@echo "  LD  $@"
 
-.PHONY: hw-test hw-test-nvm hw-test-rsp hw-test-gdb hw-test-all hw-test-dap
+.PHONY: hw-test hw-test-nvm hw-test-rsp hw-test-gdb hw-test-all hw-test-dap hw-test-dap-unwind hw-test-dap-cond
 hw-test: $(HW_TEST_BIN)
 	$(Q)$(HW_ENV) $(HW_TEST_BIN)
 
@@ -634,18 +647,49 @@ hw-test-all: $(HW_TEST_BIN) $(FIXBINDIR)/all_nvm.elf all
 
 # DAP acceptance harness (Phase 16+). Spawns `avrOSdb --dap` and drives it with
 # the real nvim-dap client (headless Neovim) over TCP, asserting the connection
-# lifecycle. Non-destructive (attach only — does not reflash). Requires `nvim`
-# (and network on first run to fetch nvim-dap into tests/hw/.nvim-dap).
-HW_DAP_PORT ?= 1234
-HW_DAP_ELF  ?= $(FIXBINDIR)/gdb_target.elf
+# lifecycle + execution control + a source breakpoint hit. Reflashes HW_DAP_ELF
+# first so the firmware on the target matches the ELF handed to the server (the
+# DAP7 source breakpoint must resolve and be reachable). Requires `nvim` (and
+# network on first run to fetch nvim-dap into tests/hw/.nvim-dap).
+# DAP_BP_SOURCE / DAP_BP_LINE select the DAP7 breakpoint (default: the blink()
+# call in gdb_target.c's main loop); override them with a custom HW_DAP_ELF.
+HW_DAP_PORT    ?= 1234
+HW_DAP_ELF     ?= $(FIXBINDIR)/gdb_target.elf
+HW_DAP_BP_SRC  ?= gdb_target.c
+HW_DAP_BP_LINE ?= 51
 hw-test-dap: $(FIXBINDIR)/gdb_target.elf all
 	@if ! command -v nvim >/dev/null 2>&1; then \
 	    echo "hw-test-dap: required tool not found: nvim" >&2; \
 	    exit 1; \
 	fi
+	$(Q)$(BUILDDIR)/$(TARGET) --prog --erase $(HW_PORT) $(HW_DAP_ELF)
 	$(Q)AVROSDB_BIN='$(BUILDDIR)/$(TARGET)' HW_PORT='$(HW_PORT)' \
 	    DAP_PORT='$(HW_DAP_PORT)' DAP_ELF='$(HW_DAP_ELF)' \
+	    DAP_BP_SOURCE='$(HW_DAP_BP_SRC)' DAP_BP_LINE='$(HW_DAP_BP_LINE)' \
 	    nvim --headless -u tests/hw/dap_init.lua -l tests/hw/dap_acceptance.lua
+
+# hw-test-dap-unwind — DAP multi-frame stackTrace acceptance (Phase 18,
+# HLR-080).  Spawns avrOSdb --dap against the gdb_debug_session fixture's
+# main->top->mid->leaf chain and verifies the DWARF-CFI unwinder reports every
+# frame.  Pure-Python DAP client (no nvim).  Non-destructive beyond reflashing
+# the fixture it needs to debug.
+hw-test-dap-unwind: $(GDB_DBG_SESSION_ELF) all
+	$(Q)$(BUILDDIR)/$(TARGET) --prog --erase $(HW_PORT) $(GDB_DBG_SESSION_ELF)
+	$(Q)AVROSDB_BIN='$(BUILDDIR)/$(TARGET)' HW_PORT='$(HW_PORT)' \
+	    DAP_PORT='$(HW_DAP_PORT)' \
+	    python3 tests/hw/dap_unwind.py --port '$(HW_PORT)' \
+	        --dap-port '$(HW_DAP_PORT)' --elf '$(GDB_DBG_SESSION_ELF)'
+
+# hw-test-dap-cond — DAP conditional-breakpoint acceptance (Phase 18, HLR-081).
+# Spawns avrOSdb --dap against the gdb_debug_session fixture and verifies the
+# adapter evaluates DAP `condition`s on the live target (local + global vars,
+# true/false/auto-resume).  Pure-Python DAP client (no nvim).
+hw-test-dap-cond: $(GDB_DBG_SESSION_ELF) all
+	$(Q)$(BUILDDIR)/$(TARGET) --prog --erase $(HW_PORT) $(GDB_DBG_SESSION_ELF)
+	$(Q)AVROSDB_BIN='$(BUILDDIR)/$(TARGET)' HW_PORT='$(HW_PORT)' \
+	    DAP_PORT='$(HW_DAP_PORT)' \
+	    python3 tests/hw/dap_cond.py --port '$(HW_PORT)' \
+	        --dap-port '$(HW_DAP_PORT)' --elf '$(GDB_DBG_SESSION_ELF)'
 
 # ── check-tools target ────────────────────────────────────────────────────────
 # LLR-INST-01: verify every required host tool is on PATH.

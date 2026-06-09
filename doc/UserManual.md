@@ -1186,6 +1186,26 @@ halted-CPU `LDS`/`STS`. Two PC quirks must be handled:
   one-instruction skip that Phase 14 fixed for the software-breakpoint resume
   path (`pc_dirty` + resume-time instruction injection).
 
+> [!WARNING]
+> **The fresh-PC-write skip bites a subsequent *run*, not just a step — and it
+> hides behind change-of-flow emulation.** The 32-bit CALL/JMP step-over
+> (`updi_ocd_emulate_cof_32bit`, §B.11/issue #40) finishes by writing a fresh
+> `OCD_PC` at the branch target. A subsequent single-*step* settles cleanly,
+> but a subsequent *run* (`continue`) **skips the instruction at the target**.
+> GDB's source-level `step` *into* a function is exactly that pattern — an
+> instruction-step of the `call` (the CoF emulation) followed by a `continue`
+> to the function's first source line — so the `continue` skipped the callee's
+> **first prologue instruction** (`push r28`). That dropped the caller's saved
+> frame pointer, and every unwound caller value then read as garbage (`bt`
+> showed `seed=32710`; `finish` returned the wrong value). It surfaced only in
+> Phase 18's full step→`bt`/`finish` flow (Group-G G19) — single-stepping the
+> prologue, or tests that don't inspect the *caller* frame (G11/G12), masked
+> it. **Fix:** mark `pc_dirty` after the CoF emulation too, so the next resume
+> *injects* the skipped instruction (§B.9) instead of running over it — the
+> same mechanism the software-breakpoint path already used. The lesson: any
+> path that writes `OCD_PC` and may be followed by a `continue` must arm the
+> skip-injection, not just the step paths.
+
 ### B.9 Instruction injection (software-breakpoint step-over)
 
 The OCD can be made to execute an opcode the host supplies instead of the one
@@ -1215,8 +1235,8 @@ stays planted and only the inevitable plant/remove cycles cost flash wear.
 
 ### B.10 Software breakpoints (`Z0`/`z0`) — the `BREAK` opcode
 
-Software breakpoints are unlimited and are `avrOSdb`'s default
-(`bp-mode sw`):
+Software breakpoints are unlimited and reliable. They are the fallback path of
+the default `auto` policy and the whole of `bp-mode sw` (§B.16):
 
 - **Insert:** read and save the original 16-bit opcode at the target flash
   word, then overwrite it with the AVR `BREAK` opcode **`0x9598`** via the NVM
@@ -1225,12 +1245,28 @@ Software breakpoints are unlimited and are `avrOSdb`'s default
 - **Remove:** rewrite the saved original opcode.
 - **Step over** without two flash writes: see §B.9.
 
-> [!NOTE]
-> Every flash patch enters NVMPROG, whose mandatory reset pulse resets the
-> AVR-Dx peripherals (including any avrOS tick timer). This is a UPDI/NVMPROG
-> constraint, not an `avrOSdb` defect — it is why some tick-driven firmware
-> cannot re-enter its dispatch loop after a software-breakpoint plant (see the
-> Phase 14 notes in `doc/SDP.md`).
+> [!WARNING]
+> **The NVMPROG reset wipes peripheral state — preserve it across the patch.**
+> Every flash patch enters NVMPROG, whose mandatory `ASI_RESET_REQ` pulse (it
+> latches the NVMProg key) resets **all** AVR-Dx peripherals to defaults. That
+> erases whatever interrupt source the firmware configured to wake itself from
+> `SLEEP`, so a firmware idling in `sysSleep()` never wakes after a
+> software-breakpoint plant and the next breakpoint past the sleep is never
+> reached (the LED simply freezes). This is a UPDI/NVMPROG constraint, not an
+> `avrOSdb` defect.
+>
+> **Fix (Phase 20, HLR-077, on by default):** the SW-breakpoint patch
+> snapshots the peripheral I/O register window before the reset and writes it
+> back after re-entering OCD, so *any* wake source survives (no system tick
+> required). The complementary `CLK_REQ` bit (`ASI_SYS_CTRLA[0]`) is also
+> asserted on OCD entry to keep the system clock running through `SLEEP`. The
+> `--sleep` flag disables both, restoring native sleep/power behaviour for
+> power-path debugging.
+>
+> **Cost:** the patch still pulses a reset, so target pins briefly glitch to
+> their reset state on every SW-breakpoint insert/remove (a visible LED blink
+> per breakpoint). Hardware breakpoints avoid this entirely — which is the
+> motivation for the `auto` policy (§B.16).
 
 ### B.11 Hardware breakpoints (`Z1`/`z1`) — the PC comparators
 
@@ -1241,7 +1277,8 @@ enable in `OCD_CTRL1` (`BP0`/`BP1`) **and** the global `OCD_CTRL0.HWBP` bit.
 `avrOSdb` reserves these via a single arbiter (Phase 13):
 
 - **Comparator 0** is the sole *user* hardware-breakpoint slot — a second
-  `Z1` request returns `E08`.
+  concurrent hardware breakpoint returns `E08` (extra breakpoints fall back to
+  SW; see §B.16).
 - **Comparator 1** is permanently reserved for the 32-bit `LDS`/`STS`
   single-step-over workaround, so stepping is always possible regardless of any
   user breakpoint.
@@ -1249,6 +1286,20 @@ enable in `OCD_CTRL1` (`BP0`/`BP1`) **and** the global `OCD_CTRL0.HWBP` bit.
 Write the 17-bit byte address into the comparator (LSb is always 0), set the
 enable bits, and resume. On halt, `OCD_STATUS1[0]`/`[1]` indicate which
 comparator matched.
+
+> [!WARNING]
+> **Comparator 1 is not dependable as a *general* user breakpoint on
+> `continue`.** Phase 18 tried to manage both comparators as user slots
+> (eviction arbiter, with the step-over *borrowing* a slot). On hardware the
+> *same* breakpoint address fired reliably on comparator 0 but was **missed on
+> comparator 1** during a free run — the CPU ran straight past it (proven with
+> the avrOS example: a breakpoint at `fsmDispatch+10` on comparator 1 never
+> halted; on comparator 0 it always did). Comparator 1 *does* work for the
+> brief, controlled 32-bit step-over (a one-instruction run to `PC+4`), which is
+> why it is fine as the reserved step slot but unsafe for arbitrary user
+> breakpoints. **Conclusion:** keep one user comparator (comparator 0) and
+> route any second breakpoint to a SW `BREAK` (always reliable). This is the
+> original Phase-13 split, now validated by direct experiment.
 
 ### B.12 Halt-on-change-of-flow, halt-on-interrupt, external break
 
@@ -1296,7 +1347,148 @@ Note `BP0_STEP` is shared between hardware comparator 0 and step completion;
 the arbiter (§B.11) disambiguates using whether a step was armed and which slot
 holds a user breakpoint.
 
-### B.15 Further reading
+### B.15 Breakpoint-mode policy (`auto` / `sw` / `hw-only`) and hbreak eviction
+
+`monitor bp-mode <auto|sw|hw-only>` selects how a `Z0` (`break`) is installed
+(Phase 20 added `auto` and made it the default; Phase 18 added the eviction
+arbiter that makes it safe to mix with `hbreak`):
+
+- **`auto` (default).** A `break` in FLASH is placed on the free user
+  comparator (comparator 0) when available — no flash write, so no NVMPROG
+  reset glitch (§B.10) and no SLEEP wake-source loss — and **falls back to a SW
+  `BREAK`** once the comparator is taken. Glitch-free for the common
+  single-breakpoint case, unlimited beyond it.
+- **`sw`.** Every `break` is a SW `BREAK` patch. Unlimited, but each
+  insert/remove pulses the NVMPROG reset (§B.10).
+- **`hw-only`.** `break` aliases to the comparator (legacy); a second returns
+  `E08`.
+
+**hbreak eviction (the key correctness rule).** With only one user comparator,
+an explicit `hbreak` (`Z1`) and an `auto`-placed `break` (`Z0`) both want it.
+GDB removes and re-inserts *all* breakpoints on every resume, in an order that
+can let an `auto` `Z0` grab the comparator before the `hbreak` — which then
+fails with `E08` and silently drops, derailing the run. The fix: an `auto`
+`Z0` on the comparator is **evictable**; when an `hbreak` needs the slot, the
+`auto` `Z0` is converted to a SW `BREAK` to make room, so an explicit hardware
+breakpoint **always** wins the comparator. (Without this, mixing `hbreak` with
+ordinary breakpoints on the avrOS example failed intermittently — Group-G G8.)
+
+### B.16 Reading flash-resident data (`.rodata`, FSM state names)
+
+AVR-Dx maps a 32 KiB window of FLASH into the **high half of the 16-bit data
+space** (data addresses `≥ 0x8000`; `NVMCTRL.FLMAP` selects which physical
+section). `avr-gcc` places `.rodata` there, so a plain `const char *` (e.g. an
+avrOS `stateMachine->currStateName`) holds a value like `0x8156`, and GDB reads
+the string as **data** at GDB address `0x80_8156`. Three things must line up
+or the read fails or returns garbage:
+
+1. **Advertise the window.** GDB honours the target memory map
+   (`qXfer:memory-map:read`); an undescribed address is refused client-side
+   with *"Cannot access memory"* (it never reaches the server). `avrOSdb`
+   advertises the mapped-flash window as a read-only `rom` region at
+   `0x808000` so GDB will issue the read (Phase 20).
+2. **Translate to the physical LMA.** A raw UPDI data-space read of `0x8xxx`
+   returns FLMAP-dependent garbage. The read must be routed through the UPDI
+   **flash mirror** at the *physical* flash byte (LMA). `avrOSdb` translates the
+   16-bit mapped pointer with `flash_lma_off` and reads via the mirror — the
+   same path `fsm_mapper` uses to resolve FSM state-name strings.
+3. **Compute `flash_lma_off` against the 16-bit pointer, not the full VMA.**
+   `flash_lma_off = LMA − (VMA & 0xFFFF)`. avr-gcc 14.2 emits `.rodata` /
+   `FSM_TABLE` at a *full* mapped-flash VMA (e.g. `0x00a08000`); subtracting the
+   full VMA yields a bogus (negative) delta that misdirects every flash-string
+   read. Masking to 16 bits is correct for both the new full-VMA convention and
+   the legacy 16-bit-VMA fixtures. (This bug had silently turned every FSM name
+   in `monitor avros tasks` into `<unnamed>` after the toolchain upgrade.)
+
+> [!NOTE]
+> **Build hygiene that this work exposed.** Adding a field to a shared struct
+> (`RspContext`) while the Makefile did *not* track header dependencies left a
+> stale `main.c.o` compiled against the old layout — it wrote `ctx->map` at one
+> offset while freshly-built code read it at another, corrupting the advertised
+> memory map and making *every* memory read fail with `E14`. The Makefile now
+> emits and includes per-object `.d` dependency files (`-MMD -MP`), so a header
+> edit always recompiles its dependents. If you ever see broad, inexplicable
+> hardware failures after a struct change, suspect a stale object before the
+> logic.
+
+### B.17 Multi-frame stack unwinding (DWARF CFI on AVR)
+
+A full backtrace (GDB's `bt`, the DAP `stackTrace`) needs to walk from the
+halted frame up through its callers. The robust way is the target's **DWARF
+Call-Frame-Information** (`.debug_frame`), which records, per code range, how to
+compute the **Canonical Frame Address (CFA)** and where each saved register
+lives. Two AVR-specific realities shape the implementation in `avrOSdb`:
+
+1. **libdw cannot execute AVR CFI.** elfutils' high-level walker
+   (`dwarf_cfi_addrframe()`) returns `UNKNOWN_ERROR` on a valid AVR
+   `.debug_frame` PC — GDB itself ships its own CFI interpreter rather than
+   relying on libdw for this. So `elf_cfi_cfa()` parses `.debug_frame` directly:
+   it locates the section with libelf, walks the CIE/FDE entries, and runs a
+   minimal CFI state machine (`DW_CFA_def_cfa*`, `advance_loc`, operand-skipping
+   of the register-save opcodes) up to the requested PC to recover the CFA rule.
+
+2. **The CFA rule and the saved-register layout are AVR conventions.** The rule
+   is `CFA = value(reg) + offset`, where avr-gcc uses DWARF register **r28** to
+   mean the **16-bit Y frame-pointer pair** `r28:r29` and **r32** to mean SP. At
+   a function's entry the rule is `SP + 2` (just the pushed return address);
+   after the Y-prologue (`push r28; push r29; … ; Y = SP`) it becomes
+   `r28 + frame_size`. From the CFA, the caller is recovered with fixed offsets
+   that were **locked against the known `main→top→mid→leaf` call chain** on
+   silicon (they don't fall out of the DWARF offsets cleanly because of AVR's
+   word-addressed PC and post-decrement push):
+
+   | Quantity | Location | Reconstruction |
+   | -------- | -------- | -------------- |
+   | Return-address word | `[CFA-1, CFA]` | high byte at `CFA-1`, low at `CFA` |
+   | Caller code PC (byte) | — | `return_word << 1` (PC is word-addressed) |
+   | Caller's saved Y | `r28 @ CFA-2`, `r29 @ CFA-3` | `Y = mem[CFA-2] | mem[CFA-3] << 8` |
+   | Caller's SP at its call | — | the callee's CFA |
+
+The unwinder (`dap_unwind()` in `src/dap.c`) reads the innermost PC/SP/Y over
+OCD, then iterates: get the CFA rule, read the return word and caller Y from
+target SRAM, and repeat with `PC = caller`, `SP = CFA`, `Y = caller Y`. It stops
+at a zero/out-of-FLASH return address, at a PC no FDE covers (the C-runtime
+frame that called `main`), or at a frame cap. Set `AVROSDB_DAP_UNWIND_LOG=1` to
+dump each frame's CFA and the surrounding stack bytes — the same way `--log-rsp`
+exposes the GDB wire. `make hw-test-dap-unwind` validates the whole chain end to
+end on hardware (the DAP analogue of the GDB G18 backtrace test).
+
+### B.18 Conditional breakpoints (variable resolution + auto-resume)
+
+A DAP source breakpoint may carry a `condition`; `avrOSdb` evaluates it **on the
+target** each time the breakpoint is hit and resumes transparently when it is
+false, so the editor only stops when the condition holds. Two pieces make this
+work on AVR:
+
+1. **Resolving the variable.** The condition grammar is `<var> <relop> <int>`
+   (`==  !=  <  <=  >  >=`). `elf_var_addr()` finds `<var>` in the DWARF scopes
+   covering the halted PC (`dwarf_getscopes` / `dwarf_getscopevar`, which searches
+   locals and parameters first, then file scope) and decodes its location. At
+   `-O0` avr-gcc emits the forms this handles directly:
+   - a **global** as `DW_OP_addr` → the absolute data-space address;
+   - a **local / parameter** as `DW_OP_breg28 + off` → `Y + off` (the live Y
+     frame-pointer pair r28:r29), or `DW_OP_fbreg + off` → `CFA + off` when the
+     function's frame base is `DW_OP_call_frame_cfa` (the CFA comes from the same
+     `.debug_frame` machinery as the backtrace, B.17).
+
+   The value is read over OCD (`updi_mem_read`), sign-extended per the DWARF type
+   (`DW_AT_byte_size` / `DW_AT_encoding`), and compared to the literal.
+
+2. **Stepping over to auto-resume.** When the condition is false the server must
+   get past the breakpoint and run on — GDB's classic *remove → single-step →
+   insert → run* dance: `bp_remove()` every breakpoint at the PC, `bp_step_over()`
+   one instruction, `bp_insert()` to re-arm, then `updi_run()`. `bp_step_over()`
+   is the shared single-step core (extracted from the GDB-RSP `dh_step`), so it is
+   correct for a HW-comparator or SW-`BREAK` breakpoint and for 16-bit, 32-bit
+   LDS/STS, and 32-bit CALL/JMP instructions alike. A condition that is **true**,
+   that **cannot be evaluated** (unknown variable, unsupported form, UPDI error),
+   or an **unconditional** breakpoint at the same address always stops — a bad
+   condition must never hide a hit.
+
+`make hw-test-dap-cond` validates this on silicon against the `gdb_debug_session`
+fixture (`leaf if b == 99` skips, `b == 2` stops, `g_marker == 49374` stops).
+
+### B.19 Further reading
 
 - [`doc/reference/guesswork.md`](reference/guesswork.md) — the reverse-engineering
   lab notebook, including the FF-bomb register-mapping method and the full v0/v1

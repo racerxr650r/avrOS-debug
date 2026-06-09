@@ -823,13 +823,19 @@ static void on_insert_bp_calls_updi_ocd_set_hw_bp_with_byte_addr(void)
 
 static void on_insert_bp_second_slot_fails(void)
 {
+    /* One user HW comparator (comparator 1 is reserved for stepping), so a
+     * second hw-only breakpoint returns E08. */
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
     ctx.bp_mode = RSP_BP_MODE_HW_ONLY;
     rsp_dispatch(sock_pair[1], "Z0,200,2", &h);
+    char drain_buf[256]; drain(sock_pair[0], drain_buf, sizeof drain_buf);
     rsp_dispatch(sock_pair[1], "Z0,400,2", &h);
-    TEST_ASSERT_EQUAL(1, mock_hw_bp_set_calls);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("E08", payload);
+    TEST_ASSERT_EQUAL(1, mock_hw_bp_set_calls);     /* one installed, second refused */
     TEST_ASSERT_EQUAL(0x200u, mock_hw_bp_silicon[0]);
-    // slot 1 is reserved for 32-bit stepping workaround
 }
 
 static void on_insert_bp_duplicate_returns_ok_without_reprogramming(void)
@@ -864,7 +870,7 @@ static void on_remove_bp_unknown_address_returns_ok_for_resync(void)
     TEST_ASSERT_EQUAL(0, mock_hw_bp_clear_calls);
 }
 
-/* ── LLR-RSP-09: third bp returns E08 ──────────────────────────────── */
+/* ── LLR-RSP-09: a second HW breakpoint returns E08 (one user comparator) ── */
 
 static void on_insert_bp_returns_E08_when_slot_occupied(void)
 {
@@ -878,6 +884,29 @@ static void on_insert_bp_returns_E08_when_slot_occupied(void)
     TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
     TEST_ASSERT_EQUAL_STRING("E08", payload);
     TEST_ASSERT_EQUAL(1, mock_hw_bp_set_calls); /* no second call */
+}
+
+/* Eviction: an explicit hbreak (Z1) wins the user comparator even when it is
+ * held by an evictable auto-mode Z0 — the Z0 is converted to a SW breakpoint
+ * so the hardware breakpoint always gets the comparator (regression guard
+ * for Group-G G8). */
+static void Z1_evicts_auto_z0_to_sw_when_comparator_busy(void)
+{
+    RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
+    ctx.bp_mode = RSP_BP_MODE_AUTO;
+    rsp_dispatch(sock_pair[1], "Z0,400,2", &h);   /* auto → HW comparator 0 */
+    char drain_buf[256]; drain(sock_pair[0], drain_buf, sizeof drain_buf);
+    /* hbreak at 0x600: the user comparator holds an evictable auto-Z0 → it is
+     * evicted to a SW patch, and the hbreak takes the freed comparator. */
+    rsp_dispatch(sock_pair[1], "Z1,600,2", &h);
+    char stream[64]; drain(sock_pair[0], stream, sizeof stream);
+    char payload[64];
+    TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
+    TEST_ASSERT_EQUAL_STRING("OK", payload);
+    TEST_ASSERT_EQUAL(0x600u, ctx.hw_bp_addr[0]);   /* hbreak won the comparator */
+    TEST_ASSERT_EQUAL(1, mock_flash_patch_count);   /* the evicted Z0's SW patch */
+    TEST_ASSERT_TRUE(ctx.sw_bp[0].in_use);
+    TEST_ASSERT_EQUAL(0x400u, ctx.sw_bp[0].addr);
 }
 
 /* ── LLR-RSP-10: step ───────────────────────────────────────────────── */
@@ -2196,9 +2225,7 @@ static void Z0_in_auto_mode_falls_back_to_sw_when_hw_slot_occupied(void)
     TEST_ASSERT_EQUAL(0, last_packet_payload(stream, payload, sizeof payload));
     TEST_ASSERT_EQUAL_STRING("OK", payload);
     /* Exactly one FLASH-BREAK patch (the fallback); the comparator is
-     * retained, holding the first address.  (sw_bp_patch_flash re-arms
-     * live HW comparators after its NVMPROG reset, so the HW set-call
-     * count legitimately bumps — assert the retained slot, not it.)    */
+     * retained, holding the first address. */
     TEST_ASSERT_EQUAL(1, mock_flash_patch_count);
     TEST_ASSERT_EQUAL(UPDI_FLASH_BASE + 0x500u, mock_flash_patches[0].addr);
     TEST_ASSERT_EQUAL(0x400u, ctx.hw_bp_addr[0]);
@@ -2210,8 +2237,8 @@ static void z0_in_auto_mode_removes_both_hw_and_sw(void)
 {
     RspContext ctx; RspHandlers h; build_ctx(&ctx, &h);
     ctx.bp_mode = RSP_BP_MODE_AUTO;
-    rsp_dispatch(sock_pair[1], "Z0,400,2", &h);   /* HW comparator */
-    rsp_dispatch(sock_pair[1], "Z0,500,2", &h);   /* SW fallback   */
+    rsp_dispatch(sock_pair[1], "Z0,400,2", &h);   /* HW comparator 0 */
+    rsp_dispatch(sock_pair[1], "Z0,500,2", &h);   /* SW fallback     */
     char drain_buf[256]; drain(sock_pair[0], drain_buf, sizeof drain_buf);
     /* Removing the SW fallback drains the SW shadow, not the comparator. */
     rsp_dispatch(sock_pair[1], "z0,500,2", &h);
@@ -2303,6 +2330,7 @@ int main(void)
     RUN_TEST(on_remove_bp_calls_updi_ocd_clear_hw_bp);
     RUN_TEST(on_remove_bp_unknown_address_returns_ok_for_resync);
     RUN_TEST(on_insert_bp_returns_E08_when_slot_occupied);
+    RUN_TEST(Z1_evicts_auto_z0_to_sw_when_comparator_busy);
     RUN_TEST(on_step_s_calls_updi_step_and_sends_T05_stop_reason);
     RUN_TEST(on_step_s_uses_32bit_breakpoint_workaround_for_call);
     RUN_TEST(step_over_32bit_lds_uses_reserved_slot_and_keeps_user_hw_bp);
