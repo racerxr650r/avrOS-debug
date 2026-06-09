@@ -84,8 +84,9 @@ Phase 10 work shall continue to honour the layered architecture (§2.1) and the 
 *   Section 8: Detailed design for [src/monitor.c](../src/monitor.c).
 *   Section 9: Detailed design for [src/debug_bp.c](../src/debug_bp.c).
 *   Section 10: Detailed design for [src/dap.c](../src/dap.c).
-*   Section 11: Data Dictionary.
-*   Section 12: Traceability.
+*   Section 11: Detailed design for [src/avros.c](../src/avros.c).
+*   Section 12: Data Dictionary.
+*   Section 13: Traceability.
 
 ## 2. System Overview
 
@@ -133,6 +134,7 @@ Layer 1 (`src/main.c`) is the orchestrator and is permitted to reach into any mo
 *   **[src/elf_parser.c](../src/elf_parser.c)** — ELF parser; produces the `AvrOsSymbolIndex` (FLASH addresses of avrOS system tables) at attach time.
 *   **[src/fsm_mapper.c](../src/fsm_mapper.c)** — FSM mapper; reads UPDI memory using the symbol index and exposes avrOS FSM state as introspection.
 *   **[src/monitor.c](../src/monitor.c)** — Monitor handler; implements the custom `monitor avros events|queues` introspection commands without halting the CPU.
+*   **[src/avros.c](../src/avros.c)** — avrOS introspection core; the single home for decoding the avrOS event/queue descriptor tables off the target. Both front-ends call it — the GDB-RSP `monitor avros` formatter and the DAP `avrosdb/*List` custom requests — so the table-decode logic is not duplicated and the DAP front-end does not depend on the RSP one.
 
 The startup and attach sequence proceeds as follows:
 
@@ -1263,7 +1265,78 @@ For source-level state inspection (Phase 19) `dap_session` also holds `frames[DA
 *   **Breakpoint line/instruction unresolved or install failed** Reply the breakpoint with `verified:false`; the client shows it as pending.
 *   **Condition cannot be evaluated** Treat as a stop (report the hit) rather than silently skipping — a bad condition must never hide a breakpoint.
 *   **Message framing / read error** Log and tear down the connection; the server returns to accept the next client.
-## 11. Data Dictionary
+
+## 11. Detailed Design for [src/avros.c](../src/avros.c)
+
+### 11.1 Purpose and Responsibilities
+[src/avros.c](../src/avros.c) the single, protocol-agnostic home for decoding the avrOS event and queue descriptor tables off a running target. It exists so the table-decode logic lives in exactly one place: both client front-ends — the GDB-RSP `monitor avros events|queues` formatter (§8) and the DAP `avrosdb/eventList` / `avrosdb/queueList` custom requests (§10) — call these readers and apply their own wire formatting, so neither front-end depends on the other.
+
+*   Read the avrOS `EVNT_TABLE` / `QUE_TABLE` FLASH descriptor tables via non-intrusive UPDI background reads, using the addresses and counts from the `AvrOsSymbolIndex`.
+*   Decode each descriptor into a small, wire-neutral C struct, following FLASH name pointers into the mapped-flash window and SRAM status pointers as needed.
+*   Depend only on the UPDI and ELF layers — never on a client-protocol front-end — honouring the §2.2 downward-only layering rule.
+
+### 11.2 External Interfaces
+#### 11.2.1 Public C API (src/avros.h)
+
+```c
+typedef struct { char name[32]; uint8_t status; bool has_status; } AvrosEvent;
+typedef struct { uint16_t capacity; uint16_t elem_size; } AvrosQueue;
+
+int avros_read_events(const AvrOsSymbolIndex *idx, int updi_fd,
+                      AvrosEvent *out, int max);
+int avros_read_queues(const AvrOsSymbolIndex *idx, int updi_fd,
+                      AvrosQueue *out, int max);
+```
+
+Each reader fills at most `max` entries and returns the number decoded (0 when the corresponding table is empty), or -1 on a bad argument or a UPDI read error. FSM introspection is intentionally not duplicated here — it lives in `src/fsm_mapper.c` (§7), which both front-ends also call directly.
+
+
+### 11.3 Internal Structure
+#### 11.3.1 Key Data Structures
+
+`src/avros.c` holds no persistent state — it decodes the target's FLASH-resident registration tables on demand. The two descriptor layouts it decodes (addresses and counts come from the `AvrOsSymbolIndex`, §6) are the canonical definitions for the whole server:
+
+**`evntDescriptor_t`** (4 bytes, `EVNT_TABLE`): a FLASH `char *name` pointer (2 bytes) and an SRAM `event_t *status` pointer (2 bytes). The name pointer is followed into the mapped-flash window for the human-readable name (a null pointer yields `<null>`); a non-null status pointer is read from SRAM for the current 1-byte flag (a null pointer leaves `has_status` false).
+
+**`queDescriptor_t`** (10 bytes, `QUE_TABLE`): three pointers (queue / buffer / event, 2 bytes each) plus a 2-byte `capacity` and a 2-byte `sizeOfElement`; only the last two fields are reported.
+
+
+#### 11.3.2 Key Functions
+
+*   **`int avros_read_events(const AvrOsSymbolIndex *idx, int updi_fd, AvrosEvent *out, int max)`**
+    *   Purpose: Decode the avrOS `EVNT_TABLE` into the caller's array.
+    *   Return Value: The number of events decoded (0 when `event_count` is 0); -1 on a bad argument or a UPDI read failure.
+    *   Logic:
+        1.  Return 0 immediately when `idx->event_count` is 0; else read `event_count` × 4-byte records from `flash_to_updi(idx->event_table_addr)` with `updi_mem_read()`.
+        2.  For each record, extract the little-endian FLASH `name` and SRAM `status` pointers. A null name pointer renders `<null>`; otherwise follow it into the mapped-flash window with the private `read_target_string()` helper (NUL-terminated read via `updi_mem_read`, non-printable bytes rendered as `?`).
+        3.  A non-null status pointer is read as one byte and flagged `has_status`; a null pointer leaves the status absent. Fill at most `max` entries and return the count.
+
+*   **`int avros_read_queues(const AvrOsSymbolIndex *idx, int updi_fd, AvrosQueue *out, int max)`**
+    *   Purpose: Decode the avrOS `QUE_TABLE` into the caller's array.
+    *   Return Value: The number of queues decoded (0 when `queue_count` is 0); -1 on a bad argument or a UPDI read failure.
+    *   Logic:
+        1.  Return 0 when `idx->queue_count` is 0; else read `queue_count` × 10-byte records from `flash_to_updi(idx->queue_table_addr)` with `updi_mem_read()`.
+        2.  From each record report the little-endian `capacity` (bytes 6–7) and `sizeOfElement` (bytes 8–9), filling at most `max` entries and returning the count.
+
+
+#### 11.3.3 Parsing Strategy / Algorithm
+
+**Non-intrusive reads:** Both readers use `updi_mem_read()` exclusively and never halt the CPU, so a DAP client or a `monitor` command can sample avrOS objects while the target runs (at the cost of a possible read-during-write race for a multi-byte field — acceptable for observational introspection).
+
+**One spot, two front-ends:** Before this module, the table decode lived in `src/monitor.c`; the DAP front-end needed the same data but must not depend on the RSP front-end. The decode therefore moved here so `src/monitor.c` (§8) and `src/dap.c` (§10) both call `avros_read_events()` / `avros_read_queues()` and only differ in how they format the result (hex-encoded O-packets vs. JSON). FSM data is shared the same way through `src/fsm_mapper.c` (§7).
+
+**Test approach for `src/avros.c`:** Unit-testable by linking the real module against a mock `updi_mem_read()` that returns canned `EVNT_TABLE` / `QUE_TABLE` bytes; the `test_monitor` and `test_dap` suites exercise it through their respective front-ends, and the on-target `dap_introspect.py` harness validates it against live silicon.
+
+### 11.4 Dependencies
+
+*   `src/updi.c` — `updi_mem_read()` and `flash_to_updi()` for non-intrusive mapped-flash/SRAM reads.
+*   `src/elf_parser.c` — `AvrOsSymbolIndex` for table addresses and entry counts.
+
+### 11.5 Error Handling and Logging
+
+*   **Bad argument** Return -1 when `idx`/`out` is NULL or `max <= 0`; the caller reports an empty list.
+*   **UPDI read failure** Return -1; the front-end surfaces the failure without aborting the server.
+## 12. Data Dictionary
 
 *   **`AppConfig`** (defined in [src/main.c](../src/main.c)) — Application-wide configuration populated by parse_args().
 
@@ -1440,7 +1513,7 @@ Errors are propagated upward through the module stack without retrying:
 | `src/gdb_rsp.c` | Socket error, checksum mismatch | NAK on mismatch; close socket on disconnect; send `E` packet on UPDI errors. |
 | `src/monitor.c` | UPDI read failure | Send partial output with error message as O-packet; return -1 but do not abort server. |
 | `src/main.c` | Fatal startup error | `exit(1)` with message to stderr. Mid-session UPDI loss: close client, await next connection. |
-## 12. Traceability
+## 13. Traceability
 
 The following table maps the high-level requirements in
 [doc/HLRs.md](HLRs.md) and the low-level requirements in
@@ -1457,6 +1530,7 @@ should be reconciled against the latest revisions of those documents.)
 | System Introspection | §8 (src/monitor.c) |
 | Shared Breakpoint Core | §9 (src/debug_bp.c) |
 | DAP Server | §10 (src/dap.c) |
+| avrOS Introspection Core | §11 (src/avros.c) |
 | Flash Programming | §4 (src/updi.c) |
 | Console Bridge | §4 (src/updi.c) |
 ---

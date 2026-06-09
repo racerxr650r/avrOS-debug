@@ -382,7 +382,7 @@ Role: **hardware**. **1 test(s).**
 
 ### 3.12. [tests/test_dap.c](../tests/test_dap.c)
 
-Role: **unit**. **25 test(s).**
+Role: **unit**. **28 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -411,6 +411,9 @@ Role: **unit**. **25 test(s).**
 | 23 | <a id="dap_set_breakpoints_replaces_prior_set_for_source"></a>`dap_set_breakpoints_replaces_prior_set_for_source` | `LLR-DAP-10` | Dispatch `setBreakpoints` for `main.c` with two lines, then again with one line; verify the second call replaces the source's set wholesale — only the single new breakpoint remains in the session table. Per LLR-DAP-10. |
 | 24 | <a id="dap_set_instruction_breakpoints_responds_with_refs"></a>`dap_set_instruction_breakpoints_responds_with_refs` | `LLR-DAP-10` | Dispatch `setInstructionBreakpoints` with two entries (`instructionReference:"0x40c"`, and `"0x400"` with `offset:4`) and no target; verify the response carries per-entry `{id,verified,instructionReference}`, that the addresses resolve (0x40c; 0x400+4=0x404), and that the table entries are marked as instruction breakpoints (`line == -1`). Per LLR-DAP-10. |
 | 25 | <a id="dap_serve_runs_handshake_to_disconnect"></a>`dap_serve_runs_handshake_to_disconnect` | `LLR-DAP-05` | Drive `dap_serve()` end-to-end without hardware: a stubbed `rsp_accept()` hands it a pre-connected socketpair end whose request stream is pre-loaded with `initialize` then `disconnect`. Verify the accept/select/read/dispatch loop processes both (emitting the initialize response, the `initialized` event, and the disconnect response) and returns 0 when the client disconnects. |
+| 26 | <a id="test_dap_fsm_list_empty_without_target"></a>`test_dap_fsm_list_empty_without_target` | `LLR-DAP-17` | The `avrosdb/fsmList` custom request, dispatched with `updi_fd = -1` (no target), returns a successful response whose body carries an empty `"fsms":[]` array — graceful degradation, no hardware touched. |
+| 27 | <a id="test_dap_event_list_empty_without_target"></a>`test_dap_event_list_empty_without_target` | `LLR-DAP-17` | The `avrosdb/eventList` custom request, dispatched with `updi_fd = -1`, returns a successful response whose body carries an empty `"events":[]` array. |
+| 28 | <a id="test_dap_queue_list_empty_without_target"></a>`test_dap_queue_list_empty_without_target` | `LLR-DAP-17` | The `avrosdb/queueList` custom request, dispatched with `updi_fd = -1`, returns a successful response whose body carries an empty `"queues":[]` array. |
 
 ### 3.13. [tests/hw/dap_acceptance.lua](../tests/hw/dap_acceptance.lua)
 
@@ -465,6 +468,16 @@ Role: **hardware**. **8 test(s).**
 | 6 | <a id="DAP_V6_evaluate_field_and_element"></a>`DAP_V6_evaluate_field_and_element` | `LLR-DAP-14` | `evaluate` resolves `g_cfg.base` (= 100), `g_arr[2]` (= 30), and `g_marker` (= 49374) — identifier + `.field` / `[index]` navigation. Per HLR-083 / LLR-DAP-14. |
 | 7 | <a id="DAP_V7_read_memory_array_bytes"></a>`DAP_V7_read_memory_array_bytes` | `LLR-DAP-15` | `readMemory` of `g_arr` returns the 8 bytes that decode (little-endian) to the u16 sequence 10,20,30,40. Per HLR-084 / LLR-DAP-15. |
 | 8 | <a id="DAP_V8_set_variable_writes_back"></a>`DAP_V8_set_variable_writes_back` | `LLR-DAP-16` | `setVariable` writes `g_counter = 1234`; a subsequent `evaluate` reads back 1234 — proving the write reached silicon at the right address and width. Per HLR-084 / LLR-DAP-16. |
+
+### 3.17. [tests/hw/dap_introspect.py](../tests/hw/dap_introspect.py)
+
+Role: **hardware**. **3 test(s).**
+
+| # | Test | Verifies | Purpose |
+| - | ---- | -------- | ------- |
+| 1 | <a id="DAP_I1_fsm_list_well_formed"></a>`DAP_I1_fsm_list_well_formed` | `LLR-DAP-17` | `avrosdb/fsmList` returns a well-formed `fsms` array (the zero descriptor's null state-machine pointer is skipped, so 0 entries — graceful). Per HLR-086 / LLR-DAP-17. |
+| 2 | <a id="DAP_I2_event_list_reads_table"></a>`DAP_I2_event_list_reads_table` | `LLR-AVROS-01` | `avrosdb/eventList` reads the `EVNT_TABLE` off silicon: against `avros_full` it returns one event whose name is `<null>` (null name pointer) and whose status is the JSON null literal (null status pointer) — exercising the count>0 decode and the null-pointer rendering. Per HLR-086 / LLR-AVROS-01. |
+| 3 | <a id="DAP_I3_queue_list_reads_table"></a>`DAP_I3_queue_list_reads_table` | `LLR-AVROS-02` | `avrosdb/queueList` reads the `QUE_TABLE` off silicon: against `avros_full` it returns one queue with `capacity = 0` (the zero descriptor) — exercising the count>0 decode path on hardware. Per HLR-086 / LLR-AVROS-02. |
 
 ## 4. LLR Coverage Matrix
 
@@ -649,3 +662,6 @@ verified by code review — see
 | `LLR-DAP-14` | `dap` | `HLR-083` | `dap_evaluate_unresolved_is_error`, `DAP_V6_evaluate_field_and_element` |
 | `LLR-DAP-15` | `dap` | `HLR-084` | `dap_read_memory_responds_with_data_field`, `DAP_V7_read_memory_array_bytes` |
 | `LLR-DAP-16` | `dap` | `HLR-084` | `dap_set_variable_unknown_ref_errors`, `DAP_V8_set_variable_writes_back` |
+| `LLR-DAP-17` | `dap` | `HLR-086` | `test_dap_fsm_list_empty_without_target`, `test_dap_event_list_empty_without_target`, `test_dap_queue_list_empty_without_target`, `DAP_I1_fsm_list_well_formed` |
+| `LLR-AVROS-01` | `avros` | `HLR-086` | `DAP_I2_event_list_reads_table` |
+| `LLR-AVROS-02` | `avros` | `HLR-086` | `DAP_I3_queue_list_reads_table` |

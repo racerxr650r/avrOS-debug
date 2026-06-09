@@ -131,6 +131,7 @@ Layer 1 (`src/main.c`) is the orchestrator and is permitted to reach into any mo
       <component path="src/elf_parser.c"><![CDATA[ELF parser; produces the `AvrOsSymbolIndex` (FLASH addresses of avrOS system tables) at attach time.]]></component>
       <component path="src/fsm_mapper.c"><![CDATA[FSM mapper; reads UPDI memory using the symbol index and exposes avrOS FSM state as introspection.]]></component>
       <component path="src/monitor.c"><![CDATA[Monitor handler; implements the custom `monitor avros events|queues` introspection commands without halting the CPU.]]></component>
+      <component path="src/avros.c"><![CDATA[avrOS introspection core; the single home for decoding the avrOS event/queue descriptor tables off the target. Both front-ends call it — the GDB-RSP `monitor avros` formatter and the DAP `avrosdb/*List` custom requests — so the table-decode logic is not duplicated and the DAP front-end does not depend on the RSP one.]]></component>
       <flow>
         <intro>The startup and attach sequence proceeds as follows:</intro>
         <step><![CDATA[`main()` parses argv, opens the UART serial device, and starts the GDB TCP listener socket.]]></step>
@@ -1204,6 +1205,63 @@ For source-level state inspection (Phase 19) `dap_session` also holds `frames[DA
           <case name="Message framing / read error"><![CDATA[Log and tear down the connection; the server returns to accept the next client.]]></case>
         </error_handling>
       </module>
+
+      <module path="src/avros.c">
+        <purpose><![CDATA[the single, protocol-agnostic home for decoding the avrOS event and queue descriptor tables off a running target. It exists so the table-decode logic lives in exactly one place: both client front-ends — the GDB-RSP `monitor avros events|queues` formatter (§8) and the DAP `avrosdb/eventList` / `avrosdb/queueList` custom requests (§10) — call these readers and apply their own wire formatting, so neither front-end depends on the other.]]></purpose>
+        <responsibility><![CDATA[Read the avrOS `EVNT_TABLE` / `QUE_TABLE` FLASH descriptor tables via non-intrusive UPDI background reads, using the addresses and counts from the `AvrOsSymbolIndex`.]]></responsibility>
+        <responsibility>Decode each descriptor into a small, wire-neutral C struct, following FLASH name pointers into the mapped-flash window and SRAM status pointers as needed.</responsibility>
+        <responsibility>Depend only on the UPDI and ELF layers — never on a client-protocol front-end — honouring the §2.2 downward-only layering rule.</responsibility>
+        <interfaces>
+          <interface title="Public C API (src/avros.h)"><![CDATA[```c
+typedef struct { char name[32]; uint8_t status; bool has_status; } AvrosEvent;
+typedef struct { uint16_t capacity; uint16_t elem_size; } AvrosQueue;
+
+int avros_read_events(const AvrOsSymbolIndex *idx, int updi_fd,
+                      AvrosEvent *out, int max);
+int avros_read_queues(const AvrOsSymbolIndex *idx, int updi_fd,
+                      AvrosQueue *out, int max);
+```
+
+Each reader fills at most `max` entries and returns the number decoded (0 when the corresponding table is empty), or -1 on a bad argument or a UPDI read error. FSM introspection is intentionally not duplicated here — it lives in `src/fsm_mapper.c` (§7), which both front-ends also call directly.]]></interface>
+        </interfaces>
+        <data_structures><![CDATA[`src/avros.c` holds no persistent state — it decodes the target's FLASH-resident registration tables on demand. The two descriptor layouts it decodes (addresses and counts come from the `AvrOsSymbolIndex`, §6) are the canonical definitions for the whole server:
+
+**`evntDescriptor_t`** (4 bytes, `EVNT_TABLE`): a FLASH `char *name` pointer (2 bytes) and an SRAM `event_t *status` pointer (2 bytes). The name pointer is followed into the mapped-flash window for the human-readable name (a null pointer yields `<null>`); a non-null status pointer is read from SRAM for the current 1-byte flag (a null pointer leaves `has_status` false).
+
+**`queDescriptor_t`** (10 bytes, `QUE_TABLE`): three pointers (queue / buffer / event, 2 bytes each) plus a 2-byte `capacity` and a 2-byte `sizeOfElement`; only the last two fields are reported.]]></data_structures>
+        <functions>
+          <function signature="int avros_read_events(const AvrOsSymbolIndex *idx, int updi_fd, AvrosEvent *out, int max)">
+            <purpose>Decode the avrOS `EVNT_TABLE` into the caller's array.</purpose>
+            <returns>The number of events decoded (0 when `event_count` is 0); -1 on a bad argument or a UPDI read failure.</returns>
+            <logic>
+              <step><![CDATA[Return 0 immediately when `idx->event_count` is 0; else read `event_count` × 4-byte records from `flash_to_updi(idx->event_table_addr)` with `updi_mem_read()`.]]></step>
+              <step><![CDATA[For each record, extract the little-endian FLASH `name` and SRAM `status` pointers. A null name pointer renders `<null>`; otherwise follow it into the mapped-flash window with the private `read_target_string()` helper (NUL-terminated read via `updi_mem_read`, non-printable bytes rendered as `?`).]]></step>
+              <step><![CDATA[A non-null status pointer is read as one byte and flagged `has_status`; a null pointer leaves the status absent. Fill at most `max` entries and return the count.]]></step>
+            </logic>
+          </function>
+          <function signature="int avros_read_queues(const AvrOsSymbolIndex *idx, int updi_fd, AvrosQueue *out, int max)">
+            <purpose>Decode the avrOS `QUE_TABLE` into the caller's array.</purpose>
+            <returns>The number of queues decoded (0 when `queue_count` is 0); -1 on a bad argument or a UPDI read failure.</returns>
+            <logic>
+              <step><![CDATA[Return 0 when `idx->queue_count` is 0; else read `queue_count` × 10-byte records from `flash_to_updi(idx->queue_table_addr)` with `updi_mem_read()`.]]></step>
+              <step><![CDATA[From each record report the little-endian `capacity` (bytes 6–7) and `sizeOfElement` (bytes 8–9), filling at most `max` entries and returning the count.]]></step>
+            </logic>
+          </function>
+        </functions>
+        <algorithm><![CDATA[**Non-intrusive reads:** Both readers use `updi_mem_read()` exclusively and never halt the CPU, so a DAP client or a `monitor` command can sample avrOS objects while the target runs (at the cost of a possible read-during-write race for a multi-byte field — acceptable for observational introspection).
+
+**One spot, two front-ends:** Before this module, the table decode lived in `src/monitor.c`; the DAP front-end needed the same data but must not depend on the RSP front-end. The decode therefore moved here so `src/monitor.c` (§8) and `src/dap.c` (§10) both call `avros_read_events()` / `avros_read_queues()` and only differ in how they format the result (hex-encoded O-packets vs. JSON). FSM data is shared the same way through `src/fsm_mapper.c` (§7).
+
+**Test approach for `src/avros.c`:** Unit-testable by linking the real module against a mock `updi_mem_read()` that returns canned `EVNT_TABLE` / `QUE_TABLE` bytes; the `test_monitor` and `test_dap` suites exercise it through their respective front-ends, and the on-target `dap_introspect.py` harness validates it against live silicon.]]></algorithm>
+        <dependencies>
+          <dep><![CDATA[`src/updi.c` — `updi_mem_read()` and `flash_to_updi()` for non-intrusive mapped-flash/SRAM reads.]]></dep>
+          <dep><![CDATA[`src/elf_parser.c` — `AvrOsSymbolIndex` for table addresses and entry counts.]]></dep>
+        </dependencies>
+        <error_handling>
+          <case name="Bad argument"><![CDATA[Return -1 when `idx`/`out` is NULL or `max <= 0`; the caller reports an empty list.]]></case>
+          <case name="UPDI read failure">Return -1; the front-end surfaces the failure without aborting the server.</case>
+        </error_handling>
+      </module>
     </modules>
 
     <data_dictionary>
@@ -1391,6 +1449,7 @@ Errors are propagated upward through the module stack without retrying:
       <theme name="System Introspection"              sections="§8 (src/monitor.c)"/>
       <theme name="Shared Breakpoint Core"            sections="§9 (src/debug_bp.c)"/>
       <theme name="DAP Server"                        sections="§10 (src/dap.c)"/>
+      <theme name="avrOS Introspection Core"          sections="§11 (src/avros.c)"/>
       <theme name="Flash Programming"                 sections="§4 (src/updi.c)"/>
       <theme name="Console Bridge"                    sections="§4 (src/updi.c)"/>
     </traceability>
@@ -1924,6 +1983,15 @@ Errors are propagated upward through the module stack without retrying:
         <traces>
           <trace target="SDD" ref="3.1"/>
           <trace target="SDD" ref="3.2.2"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-086" name="avrOS Introspection over DAP Custom Requests">
+        <text><![CDATA[The DAP front-end shall expose the target's avrOS runtime objects to a DAP client through three custom requests — DAP has no `monitor` console channel, so this is the DAP analogue of `monitor avros`: `avrosdb/fsmList` shall reply `{"fsms":[{"id","name","state","active"}]}`, `avrosdb/eventList` shall reply `{"events":[{"name","status"}]}` (a null status when the descriptor's status pointer is null), and `avrosdb/queueList` shall reply `{"queues":[{"id","capacity","elemSize"}]}`. The FSM list shall reuse the FSM-thread snapshot (`fsm_build_thread_list()` in `src/fsm_mapper.c`) — the same data the GDB-RSP front-end surfaces as virtual threads — so a slot with a null state-machine pointer is skipped rather than listed. The event and queue lists shall decode the avrOS `EVNT_TABLE` / `QUE_TABLE` FLASH descriptor tables. To implement that decode in one place and keep the DAP front-end from depending on the GDB-RSP one, the event/queue table reader shall live in a protocol-agnostic introspection core (`src/avros.c`) that depends only on the UPDI and ELF layers; both these DAP custom requests and the GDB-RSP `monitor avros events|queues` formatter shall call it, per the SDD §2.2 layered-architecture rule (downward-only calls, no front-end → front-end dependency). Each request shall degrade gracefully — with no target link or no avrOS symbol tables it shall return an empty array rather than an error — and all target access shall be guarded by `updi_fd >= 0` so the dispatch is unit-testable without hardware. A null event-name pointer shall render the name as `<null>`, preserving the existing monitor output.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+          <trace target="SDD" ref="10.1"/>
+          <trace target="SDD" ref="11.1"/>
         </traces>
       </hlr>
     </section>
@@ -3404,6 +3472,31 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <text><![CDATA[`dap_handle_set_variable()` shall serve `setVariable`.  It shall locate the named child of the given `variablesReference` (via `elf_type_children()` for an aggregate, else `elf_var_enum()` for a scope) to obtain its address and type, parse the new `value` (`strtol(...,0)`), and write `elf_type_size()` little-endian bytes to the writable data space (`addr < 0x8000`) via `updi_mem_write()`, then re-render the stored value into the reply.  An unknown reference/name shall reply `success:false`.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-084" name="DAP Memory &amp; Set Variable"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-DAP-17">
+        <text><![CDATA[`dap_dispatch()` shall serve three avrOS-introspection custom requests through private handlers, each guarded by `updi_fd >= 0` and degrading to an empty array when no target link or no avrOS symbol index is present. `dap_handle_fsm_list()` (`avrosdb/fsmList`) shall, when the FSM context and symbol index are present, rebuild the thread list with `fsm_build_thread_list()` and reply `{"fsms":[{"id":<gdb_id>,"name":"…","state":"…","active":<bool>}]}` from each `FsmThread`'s `gdb_id` / `name` / `state_name` / `is_active`. `dap_handle_event_list()` (`avrosdb/eventList`) shall read the event table with `avros_read_events()` (LLR-AVROS-01) and reply `{"events":[{"name":"…","status":<n|null>}]}` — `status` is the JSON null literal when the descriptor carries no status pointer (`has_status` false). `dap_handle_queue_list()` (`avrosdb/queueList`) shall read the queue table with `avros_read_queues()` (LLR-AVROS-02) and reply `{"queues":[{"id":<i>,"capacity":<n>,"elemSize":<n>}]}`. All dynamic strings shall be JSON-escaped via `dj_escape()`; the handlers shall touch no target when `updi_fd < 0`, so dispatch is unit-testable over a socketpair.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-086" name="avrOS Introspection over DAP Custom Requests"/>
+        </traces>
+      </llr>
+    </function>
+
+    <function number="11" title="src/avros.c — avrOS Introspection Core" name="avros" source="src/avros.c">
+      <intro><![CDATA[Requirements for the protocol-agnostic avrOS introspection core (`src/avros.c`): the single home for decoding the avrOS event/queue descriptor tables off the target, called by both the GDB-RSP `monitor avros` formatter and the DAP `avrosdb/*List` custom requests. Depends only on the UPDI and ELF layers (no front-end dependency).]]></intro>
+
+      <llr id="LLR-AVROS-01">
+        <text><![CDATA[`avros_read_events()` shall decode the avrOS `EVNT_TABLE` event descriptors into a caller-supplied `AvrosEvent` array. It shall return -1 on a bad argument (`idx`/`out` NULL or `max <= 0`) and 0 immediately when `idx->event_count` is 0; otherwise it shall read `event_count` × 4-byte `evntDescriptor_t` records from `flash_to_updi(idx->event_table_addr)` with a single `updi_mem_read()`. For each record it shall extract the little-endian FLASH `name` pointer and SRAM `status` pointer: a null name pointer yields the name `<null>`, otherwise the name is followed (with `idx->flash_lma_off` applied) into the mapped-flash window by the private `read_target_string()` helper — a NUL-terminated `updi_mem_read()` loop that renders non-printable bytes as `?` and bounds the copy to the field width. A non-null status pointer shall be read as one byte and flagged `has_status`; a null pointer shall leave `has_status` false. It shall fill at most `max` entries and return the count, or -1 on any UPDI read error.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-086" name="avrOS Introspection over DAP Custom Requests"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-AVROS-02">
+        <text><![CDATA[`avros_read_queues()` shall decode the avrOS `QUE_TABLE` queue descriptors into a caller-supplied `AvrosQueue` array. It shall return -1 on a bad argument and 0 when `idx->queue_count` is 0; otherwise it shall read `queue_count` × 10-byte `queDescriptor_t` records from `flash_to_updi(idx->queue_table_addr)` with a single `updi_mem_read()`. From each record — three pointers (queue / buffer / event, 2 bytes each) followed by a 2-byte `capacity` and a 2-byte `sizeOfElement` — it shall report the little-endian `capacity` (offset 6) and `elem_size` (offset 8), filling at most `max` entries and returning the count, or -1 on a UPDI read error.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-086" name="avrOS Introspection over DAP Custom Requests"/>
         </traces>
       </llr>
     </function>
@@ -4961,7 +5054,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/dap.c DAP wire-transport tests (Phase 16)                -->
     <!-- ============================================================ -->
-    <file path="tests/test_dap.c" role="unit" count="25">
+    <file path="tests/test_dap.c" role="unit" count="28">
       <header><![CDATA[Unit tests for the DAP front-end: the wire transport (HLR-075) — the JSON codec (`dj_*` recursive-descent tokenizer, member/string/number accessors, escape decode, and the emission escaper) and the Content-Length message framing (`dap_read_message` / `dap_write_message`) — and the connection lifecycle dispatch (HLR-076) driven over a `socketpair` with `updi_fd = -1` so no hardware is touched. Framing is exercised over an anonymous pipe.]]></header>
 
       <test name="dj_parse_extracts_request_fields">
@@ -5087,6 +5180,19 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="dap_serve_runs_handshake_to_disconnect">
         <purpose><![CDATA[Drive `dap_serve()` end-to-end without hardware: a stubbed `rsp_accept()` hands it a pre-connected socketpair end whose request stream is pre-loaded with `initialize` then `disconnect`. Verify the accept/select/read/dispatch loop processes both (emitting the initialize response, the `initialized` event, and the disconnect response) and returns 0 when the client disconnects.]]></purpose>
         <traces><trace target="LLR" ref="LLR-DAP-05"/></traces>
+      </test>
+
+      <test name="test_dap_fsm_list_empty_without_target">
+        <purpose><![CDATA[The `avrosdb/fsmList` custom request, dispatched with `updi_fd = -1` (no target), returns a successful response whose body carries an empty `"fsms":[]` array — graceful degradation, no hardware touched.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-17"/></traces>
+      </test>
+      <test name="test_dap_event_list_empty_without_target">
+        <purpose><![CDATA[The `avrosdb/eventList` custom request, dispatched with `updi_fd = -1`, returns a successful response whose body carries an empty `"events":[]` array.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-17"/></traces>
+      </test>
+      <test name="test_dap_queue_list_empty_without_target">
+        <purpose><![CDATA[The `avrosdb/queueList` custom request, dispatched with `updi_fd = -1`, returns a successful response whose body carries an empty `"queues":[]` array.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-17"/></traces>
       </test>
     </file>
 
@@ -5229,6 +5335,26 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="DAP_V8_set_variable_writes_back">
         <purpose><![CDATA[`setVariable` writes `g_counter = 1234`; a subsequent `evaluate` reads back 1234 — proving the write reached silicon at the right address and width. Per HLR-084 / LLR-DAP-16.]]></purpose>
         <traces><trace target="HLR" ref="HLR-084"/><trace target="LLR" ref="LLR-DAP-16"/></traces>
+      </test>
+    </file>
+
+    <!-- ============================================================ -->
+    <!-- src DAP on-target avrOS-introspection acceptance harness     -->
+    <!-- ============================================================ -->
+    <file path="tests/hw/dap_introspect.py" role="hardware" count="3">
+      <header><![CDATA[On-target DAP avrOS-introspection acceptance harness (Phase 21): a pure-Python DAP client spawns `avrOSdb --dap` against live AVR-Dx silicon and drives the `avrosdb/fsmList` / `avrosdb/eventList` / `avrosdb/queueList` custom requests that feed the VS Code avrOS view, confirming they read the avrOS descriptor tables off the target and return well-formed JSON. Run against the `avros_full` fixture, whose FSM/event/queue table sections hold one zero-filled descriptor each — enough to exercise the count>0 reader path on silicon deterministically. Manual-only (`make hw-test-dap-introspect`) — never wired into `make test`.]]></header>
+
+      <test name="DAP_I1_fsm_list_well_formed">
+        <purpose><![CDATA[`avrosdb/fsmList` returns a well-formed `fsms` array (the zero descriptor's null state-machine pointer is skipped, so 0 entries — graceful). Per HLR-086 / LLR-DAP-17.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-086"/><trace target="LLR" ref="LLR-DAP-17"/></traces>
+      </test>
+      <test name="DAP_I2_event_list_reads_table">
+        <purpose><![CDATA[`avrosdb/eventList` reads the `EVNT_TABLE` off silicon: against `avros_full` it returns one event whose name is `<null>` (null name pointer) and whose status is the JSON null literal (null status pointer) — exercising the count>0 decode and the null-pointer rendering. Per HLR-086 / LLR-AVROS-01.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-086"/><trace target="LLR" ref="LLR-AVROS-01"/></traces>
+      </test>
+      <test name="DAP_I3_queue_list_reads_table">
+        <purpose><![CDATA[`avrosdb/queueList` reads the `QUE_TABLE` off silicon: against `avros_full` it returns one queue with `capacity = 0` (the zero descriptor) — exercising the count>0 decode path on hardware. Per HLR-086 / LLR-AVROS-02.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-086"/><trace target="LLR" ref="LLR-AVROS-02"/></traces>
       </test>
     </file>
 
