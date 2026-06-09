@@ -1344,10 +1344,12 @@ MAYBE_STATIC int run_prog_mode(AppConfig *cfg)
     return 0;
 }
 
-/* --emit-vscode-config: print a ready-to-use VS Code attach `launch.json` for
- * the `--dap` server to stdout and exit.  Needs no target or ELF — pipe it into
- * a project's .vscode/launch.json.  The companion `avrosdb` debug-type
- * extension (tools/vscode/avrosdb-dap/) must be installed. */
+/* --emit-vscode-config: print a ready-to-use VS Code `launch.json` for the
+ * `--dap` front-end to stdout and exit.  Needs no target or ELF — redirect it
+ * into a project's .vscode/launch.json and edit the paths.  The primary
+ * `launch` config has the companion `avrosdb` extension
+ * (tools/vscode/avrosdb-dap/) start avrOSdb itself (one F5, no separate
+ * terminal); an `attach` config to a server you run yourself is also included. */
 static void emit_vscode_config(void)
 {
     fputs(
@@ -1356,8 +1358,17 @@ static void emit_vscode_config(void)
 "  \"configurations\": [\n"
 "    {\n"
 "      \"type\": \"avrosdb\",\n"
+"      \"request\": \"launch\",\n"
+"      \"name\": \"Debug with avrOSdb (--dap)\",\n"
+"      \"program\": \"${workspaceFolder}/build/avrOSdb\",\n"
+"      \"serial\": \"/dev/ttyAMA2\",\n"
+"      \"elf\": \"${workspaceFolder}/firmware.elf\",\n"
+"      \"port\": 1234\n"
+"    },\n"
+"    {\n"
+"      \"type\": \"avrosdb\",\n"
 "      \"request\": \"attach\",\n"
-"      \"name\": \"Attach to avrOSdb (--dap)\",\n"
+"      \"name\": \"Attach to running avrOSdb (--dap)\",\n"
 "      \"host\": \"127.0.0.1\",\n"
 "      \"port\": 1234\n"
 "    }\n"

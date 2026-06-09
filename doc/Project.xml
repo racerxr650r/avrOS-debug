@@ -1919,8 +1919,8 @@ Errors are propagated upward through the module stack without retrying:
         </traces>
       </hlr>
 
-      <hlr id="HLR-085" name="VS Code Attach-Config Helper">
-        <text><![CDATA[To ease VS Code setup for the `--dap` server, `avrOSdb --emit-vscode-config` shall print a ready-to-use attach `launch.json` (the `avrosdb` debug type pointed at `127.0.0.1:<port>`) to stdout and exit, needing no target or ELF, so it can be redirected into a project's `.vscode/launch.json`.  It complements the companion `avrosdb-dap` debug-type extension and the User-Manual VS Code section.]]></text>
+      <hlr id="HLR-085" name="VS Code Launch-Config Helper">
+        <text><![CDATA[To ease VS Code setup for the `--dap` front-end, `avrOSdb --emit-vscode-config` shall print a ready-to-use `launch.json` to stdout and exit, needing no target or ELF, so it can be redirected into a project's `.vscode/launch.json`.  The primary configuration shall be a self-starting `request: "launch"` config (the `avrosdb` debug type with `program`/`serial`/`elf`/`port`) — the companion `avrosdb-dap` extension spawns `avrOSdb --dap` itself and attaches, so the user does not run the server separately — with a `request: "attach"` config (to a server on `127.0.0.1:<port>`) included as an alternative.]]></text>
         <traces>
           <trace target="SDD" ref="3.1"/>
           <trace target="SDD" ref="3.2.2"/>
@@ -2243,9 +2243,9 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-MAIN-26">
-        <text><![CDATA[`MAIN_NAME()` shall, before `parse_args()` and any device/ELF handling, scan `argv` for `--emit-vscode-config`; when present it shall call `emit_vscode_config()` — which writes a VS Code attach `launch.json` (the `avrosdb` debug type at `127.0.0.1:1234`) to stdout — and return 0 without touching the target.  The usage/`--help` text shall document the flag.]]></text>
+        <text><![CDATA[`MAIN_NAME()` shall, before `parse_args()` and any device/ELF handling, scan `argv` for `--emit-vscode-config`; when present it shall call `emit_vscode_config()` — which writes a VS Code `launch.json` with a self-starting `request: "launch"` config (`avrosdb` type + `program`/`serial`/`elf`/`port`) and a `request: "attach"` alternative to stdout — and return 0 without touching the target.  The usage/`--help` text shall document the flag.]]></text>
         <traces>
-          <trace target="HLR" ref="HLR-085" name="VS Code Attach-Config Helper"/>
+          <trace target="HLR" ref="HLR-085" name="VS Code Launch-Config Helper"/>
         </traces>
       </llr>
 
@@ -4704,7 +4704,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <header><![CDATA[Unit and harness-level tests covering the `--device` one-shot diagnostic mode and the `--rsp`/`--dap` front-end selection: argument parsing, mutual exclusion (with `--load`, and between `--rsp`/`--dap`), `updi_read_device_info()` success and failure paths over a PTY, the human-readable report format, and verification that the diagnostic path bypasses the GDB listener.]]></header>
 
       <test name="emit_vscode_config_prints_attach_launch_json">
-        <purpose><![CDATA[Capture stdout while calling `emit_vscode_config()` and assert the printed launch.json carries the `avrosdb` debug type, an `attach` request, and the default port 1234 — the `--emit-vscode-config` helper. Per LLR-MAIN-26.]]></purpose>
+        <purpose><![CDATA[Capture stdout while calling `emit_vscode_config()` and assert the printed launch.json carries the `avrosdb` debug type, a self-starting `request: "launch"` config with `program`/`serial`, the `request: "attach"` alternative, and the default port 1234 — the `--emit-vscode-config` helper. Per LLR-MAIN-26.]]></purpose>
         <traces><trace target="LLR" ref="LLR-MAIN-26"/></traces>
       </test>
 

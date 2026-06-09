@@ -1,8 +1,8 @@
 {
   "name": "avrosdb-dap",
   "displayName": "avrOSdb (DAP)",
-  "description": "Attach VS Code to a running `avrOSdb --dap` server over TCP.",
-  "version": "0.1.0",
+  "description": "Debug AVR-Dx targets in VS Code via `avrOSdb --dap` — launch the server and attach, or attach to a running one.",
+  "version": "0.2.0",
   "publisher": "avrOS",
   "engines": { "vscode": "^1.66.0" },
   "categories": ["Debuggers"],
@@ -14,6 +14,47 @@
         "type": "avrosdb",
         "label": "avrOSdb (DAP)",
         "configurationAttributes": {
+          "launch": {
+            "required": ["serial", "elf"],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Path to the avrOSdb binary to launch.",
+                "default": "${workspaceFolder}/build/avrOSdb"
+              },
+              "serial": {
+                "type": "string",
+                "description": "Serial device connected to the target's UPDI pin.",
+                "default": "/dev/ttyAMA2"
+              },
+              "elf": {
+                "type": "string",
+                "description": "ELF to debug (its DWARF drives source/variables).",
+                "default": "${workspaceFolder}/firmware.elf"
+              },
+              "port": {
+                "type": "number",
+                "description": "TCP port for the spawned avrOSdb --dap server.",
+                "default": 1234
+              },
+              "host": {
+                "type": "string",
+                "description": "Host to connect to the spawned server on.",
+                "default": "127.0.0.1"
+              },
+              "extraArgs": {
+                "type": "array",
+                "description": "Extra avrOSdb flags (e.g. [\"--baud\",\"230400\"]).",
+                "items": { "type": "string" },
+                "default": []
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory for the spawned server.",
+                "default": "${workspaceFolder}"
+              }
+            }
+          },
           "attach": {
             "properties": {
               "host": {
@@ -32,8 +73,17 @@
         "initialConfigurations": [
           {
             "type": "avrosdb",
+            "request": "launch",
+            "name": "Debug with avrOSdb (--dap)",
+            "program": "${workspaceFolder}/build/avrOSdb",
+            "serial": "/dev/ttyAMA2",
+            "elf": "${workspaceFolder}/firmware.elf",
+            "port": 1234
+          },
+          {
+            "type": "avrosdb",
             "request": "attach",
-            "name": "Attach to avrOSdb (--dap)",
+            "name": "Attach to running avrOSdb (--dap)",
             "host": "127.0.0.1",
             "port": 1234
           }

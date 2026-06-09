@@ -612,8 +612,16 @@ static void emit_vscode_config_prints_attach_launch_json(void)
 
     TEST_ASSERT_NOT_NULL_MESSAGE(strstr(buf, "\"type\": \"avrosdb\""),
         "launch.json missing the avrosdb debug type");
+    /* Primary config self-starts avrOSdb (request:launch + program/serial). */
+    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(buf, "\"request\": \"launch\""),
+        "launch.json missing the self-starting launch request");
+    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(buf, "\"program\""),
+        "launch config missing the avrOSdb program path");
+    TEST_ASSERT_NOT_NULL_MESSAGE(strstr(buf, "\"serial\""),
+        "launch config missing the serial device");
+    /* The attach alternative is still offered. */
     TEST_ASSERT_NOT_NULL_MESSAGE(strstr(buf, "\"request\": \"attach\""),
-        "launch.json missing the attach request");
+        "launch.json missing the attach alternative");
     TEST_ASSERT_NOT_NULL_MESSAGE(strstr(buf, "\"port\": 1234"),
         "launch.json missing the default port");
 }

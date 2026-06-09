@@ -288,8 +288,8 @@ Requirements in this section govern the on-target hardware integration test harn
     The DAP front-end shall implement `readMemory`, `writeMemory`, and `setVariable`, advertising the corresponding capabilities.  `readMemory` shall return base64 of `count` bytes from `memoryReference` + `offset` over the target data space (mapped-flash window via the flash mirror), marking unreadable bytes.  `writeMemory` shall write base64 `data` to `memoryReference` + `offset` over the data space.  `setVariable` shall write a scalar value (decimal or `0x`-hex) back to a named child of a Locals/Globals/aggregate reference, at the variable's resolved address and DWARF byte width, then re-render the stored value.  Writes are confined to the writable data space and guarded by the target link.
     *Trace:* [SDD Section 2.2](SDD.md), [SDD Section 10.1](SDD.md).
 
-*   <a id="HLR-085"></a>**HLR-085: VS Code Attach-Config Helper.**
-    To ease VS Code setup for the `--dap` server, `avrOSdb --emit-vscode-config` shall print a ready-to-use attach `launch.json` (the `avrosdb` debug type pointed at `127.0.0.1:<port>`) to stdout and exit, needing no target or ELF, so it can be redirected into a project's `.vscode/launch.json`.  It complements the companion `avrosdb-dap` debug-type extension and the User-Manual VS Code section.
+*   <a id="HLR-085"></a>**HLR-085: VS Code Launch-Config Helper.**
+    To ease VS Code setup for the `--dap` front-end, `avrOSdb --emit-vscode-config` shall print a ready-to-use `launch.json` to stdout and exit, needing no target or ELF, so it can be redirected into a project's `.vscode/launch.json`.  The primary configuration shall be a self-starting `request: "launch"` config (the `avrosdb` debug type with `program`/`serial`/`elf`/`port`) — the companion `avrosdb-dap` extension spawns `avrOSdb --dap` itself and attaches, so the user does not run the server separately — with a `request: "attach"` config (to a server on `127.0.0.1:<port>`) included as an alternative.
     *Trace:* [SDD Section 3.1](SDD.md), [SDD Section 3.2.2](SDD.md).
 
 ## 11. CI-Grade Loader and Link Diagnostics

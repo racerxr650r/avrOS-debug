@@ -1,13 +1,25 @@
 {
   "// note": "Sample .vscode/launch.json for debugging with avrOSdb --dap.",
   "// note2": "Requires the companion extension in tools/vscode/avrosdb-dap/.",
-  "// note3": "Start the server first: build/avrOSdb --dap --port 1234 <serial> <elf>",
+  "// note3": "The 'launch' config starts avrOSdb itself (F5) — no separate terminal.",
+  "// note4": "Edit program/serial/elf for your setup; extraArgs takes extra flags.",
   "version": "0.2.0",
   "configurations": [
     {
       "type": "avrosdb",
+      "request": "launch",
+      "name": "Debug with avrOSdb (--dap)",
+      "program": "${workspaceFolder}/build/avrOSdb",
+      "serial": "/dev/ttyAMA2",
+      "elf": "${workspaceFolder}/firmware.elf",
+      "port": 1234
+    },
+    {
+      "// note": "Alternative: attach to an avrOSdb --dap server you started yourself",
+      "// note2": "(e.g. running on a remote target host): build/avrOSdb --dap --port 1234 <serial> <elf>",
+      "type": "avrosdb",
       "request": "attach",
-      "name": "Attach to avrOSdb (--dap)",
+      "name": "Attach to running avrOSdb (--dap)",
       "host": "127.0.0.1",
       "port": 1234
     }

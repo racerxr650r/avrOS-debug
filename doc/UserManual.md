@@ -805,12 +805,15 @@ An automated on-target acceptance harness drives this same path headlessly:
 
 ### 6.3 VS Code (native DAP)
 
-VS Code can also talk to the `avrOSdb --dap` server directly. Unlike Neovim,
-VS Code will only attach to a DAP server through a *contributed debug type*, so
-a tiny companion extension is provided in
-[`tools/vscode/avrosdb-dap/`](../tools/vscode/avrosdb-dap/). It launches nothing
-itself — it just points the `avrosdb` debug type at the running server's TCP
-port (`vscode.DebugAdapterServer`).
+VS Code can also debug through `avrOSdb --dap` directly. Unlike Neovim, VS Code
+only talks to a DAP server through a *contributed debug type*, so a small
+companion extension is provided in
+[`tools/vscode/avrosdb-dap/`](../tools/vscode/avrosdb-dap/) contributing the
+`avrosdb` type. With a `request: "launch"` config the extension **starts
+`avrOSdb --dap` for you** (spawns it, waits for its "listening on" banner, then
+connects) — one **F5**, no separate terminal. A `request: "attach"` config is
+also provided for connecting to a server you run yourself (e.g. on a remote
+target host).
 
 > [!NOTE]
 > The native DAP front-end is now full-featured: attach, execution control
@@ -821,8 +824,9 @@ port (`vscode.DebugAdapterServer`).
 > GDB-RSP path (§6.1) remains available and shares the same debug core.
 
 > [!TIP]
-> `avrOSdb --emit-vscode-config` prints a ready-to-use attach `launch.json` to
-> stdout — e.g. `avrOSdb --emit-vscode-config > .vscode/launch.json`.
+> `avrOSdb --emit-vscode-config` prints a ready-to-use `launch.json` (the
+> self-starting `launch` config + an `attach` alternative) to stdout — e.g.
+> `avrOSdb --emit-vscode-config > .vscode/launch.json`.
 
 **Install the companion extension** (one of):
 
@@ -831,16 +835,16 @@ port (`vscode.DebugAdapterServer`).
 code tools/vscode/avrosdb-dap
 
 # …or install it for all workspaces by copying it into the extensions dir
-cp -r tools/vscode/avrosdb-dap ~/.vscode/extensions/avrosdb-dap-0.1.0
+cp -r tools/vscode/avrosdb-dap ~/.vscode/extensions/avrosdb-dap-0.2.0
 #   (VS Code Remote-SSH: use ~/.vscode-server/extensions/ on the remote host)
 ```
 
 Reload VS Code after copying. The extension contributes the `avrosdb` debug type
-and a default *attach* configuration.
+with a self-starting *launch* configuration (and an *attach* alternative).
 
 **Add a launch configuration** — copy
 [`tools/vscode/launch.json`](../tools/vscode/launch.json) to your project's
-`.vscode/launch.json`:
+`.vscode/launch.json` and edit the paths:
 
 ```jsonc
 {
@@ -848,8 +852,18 @@ and a default *attach* configuration.
   "configurations": [
     {
       "type": "avrosdb",
+      "request": "launch",
+      "name": "Debug with avrOSdb (--dap)",
+      "program": "${workspaceFolder}/build/avrOSdb",
+      "serial": "/dev/ttyAMA2",
+      "elf": "${workspaceFolder}/firmware.elf",
+      "port": 1234
+      // "extraArgs": ["--baud", "230400"]   // optional avrOSdb flags
+    },
+    {
+      "type": "avrosdb",
       "request": "attach",
-      "name": "Attach to avrOSdb (--dap)",
+      "name": "Attach to running avrOSdb (--dap)",
       "host": "127.0.0.1",
       "port": 1234
     }
@@ -857,24 +871,22 @@ and a default *attach* configuration.
 }
 ```
 
-**Use it:**
+**Use it:** pick **“Debug with avrOSdb (--dap)”** in the Run and Debug view and
+press **F5**. The extension launches `avrOSdb --dap --port 1234 <serial> <elf>`,
+waits for it to listen, attaches, and the target stops at entry — and it stops
+the server when you end the session. No separate terminal is needed.
 
-```bash
-# 1. start the DAP server on the target host
-build/avrOSdb --dap --port 1234 /dev/ttyAMA2 firmware.elf
-```
-
-2. In VS Code, pick **“Attach to avrOSdb (--dap)”** in the Run and Debug view
-   and press **F5**. VS Code connects to `localhost:1234` and the target stops
-   at entry. (When the server runs on a remote Pi, either use VS Code
-   Remote-SSH, or forward the port — e.g. `ssh -L 1234:localhost:1234 pi` — and
-   keep `"host": "127.0.0.1"`.)
+For a target on a remote Pi, run VS Code over Remote-SSH (the `launch` config
+then spawns avrOSdb on the Pi), or start avrOSdb on the Pi yourself and use the
+`attach` config with a forwarded port — e.g. `ssh -L 1234:localhost:1234 pi`,
+keeping `"host": "127.0.0.1"`.
 
 > [!TIP]
-> Prefer a no-extension quick test? Add `"debugServer": 1234` to a
-> configuration whose `type` belongs to an already-installed debugger (e.g.
-> `cppdbg`); VS Code then connects to that port instead of spawning an adapter.
-> The companion extension above is the clean, type-correct route.
+> Prefer a no-extension quick test? Start `avrOSdb --dap --port 1234 …` yourself
+> and add `"debugServer": 1234` to a configuration whose `type` belongs to an
+> already-installed debugger (e.g. `cppdbg`); VS Code connects to that port
+> instead of spawning an adapter. The companion extension above is the clean,
+> type-correct route.
 
 ---
 
