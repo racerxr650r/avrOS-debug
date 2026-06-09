@@ -681,131 +681,16 @@ was started with `--allow-erase`.
 
 ## 6. Editor Integration
 
-`avrOSdb` supports two editor paths: **VS Code** over GDB RSP today (via an
-external `avr-gdb`), and an in-development **native DAP** front-end
-(`avrOSdb --dap`) that DAP-native editors such as Neovim talk to directly.
+`avrOSdb` exposes two client protocols, sharing one debug core. The **native
+DAP** front-end (`avrOSdb --dap`) is the primary, full-featured path: VS Code
+(via the bundled companion extension) and DAP-native editors such as Neovim talk
+to it directly, with **no `avr-gdb` in the loop**. The **GDB RSP** front-end
+remains available for VS Code through an external `avr-gdb` and the Cortex-Debug
+extension.
 
-### 6.1 VS Code (Cortex-Debug, via GDB RSP)
+### 6.1 VS Code (native DAP)
 
-`avrOSdb` speaks standard GDB RSP. While many debug adapters support RSP, the **cortex-debug** extension is the only officially tested extension for `avrOSdb` integration in VS Code.
-
-Two pieces are required:
-
-1. The **Cortex-Debug** extension (`marus25.cortex-debug`).
-2. An `avr-gdb` binary on `PATH` (the adapter spawns it locally).
-
-Add the following to `.vscode/launch.json` in your firmware project (note that we use `gdbTarget` and a `custom` server type):
-
-```json
-{
-  "version": "0.2.0",
-  "configurations": [
-    {
-      // Cortex-debug used as a *generic* GDB frontend
-      "name": "Debug avrOS (external GDB)",
-      "type": "cortex-debug",
-      "request": "attach",
-      "servertype": "external",
-      "gdbTarget": "localhost:1234",
-      "gdbPath": "/usr/bin/avr-gdb",
-      "executable": "${workspaceFolder}/app/avrOS_example/build/main.elf",
-      "cwd": "${workspaceFolder}/app/avrOS_example",
-      "overrideAttachCommands": [
-        "target extended-remote localhost:1234",
-        "monitor reset",
-        "tbreak main",
-        "continue"
-      ],
-      "overrideResetCommands": [
-        "monitor reset",
-        "tbreak main",
-        "continue"
-      ],
-      "showDevDebugOutput": "none",
-      "preAttachCommands": [
-        "set breakpoint auto-hw off",
-        "set pagination off",
-        "set print pretty on",
-        "set remotetimeout 30",
-        "set mem inaccessible-by-default off"
-      ]
-    }
-  ]
-}```
-
-Recommended workflow:
-
-1. Start `avrOSdb` in an integrated terminal:
-   ```bash
-   avrOSdb --load /dev/ttyUSB0 build/firmware.elf
-   ```
-2. Press **F5** to launch the `Debug AVR via avrOSdb` configuration.
-   VS Code spawns `avr-gdb`, which connects to `localhost:1234` and
-   downloads symbols.
-3. Set breakpoints in the editor margin. The **Call Stack** view shows
-   the single CPU thread; run `monitor avros tasks` in the **Debug
-   Console** to list each avrOS FSM and its current state.
-4. Use the **Debug Console** for ad-hoc commands, e.g.
-   `-exec monitor avros events`.
-
-For a more polished UPDI/AVR-specific UI, the
-[Cortex-Debug](https://marketplace.visualstudio.com/items?itemName=marus25.cortex-debug)
-extension can be configured similarly with `"servertype": "external"`
-and `"gdbTarget": "localhost:1234"` — useful when an external GDB
-launch script already manages the stub.
-
-### 6.2 Neovim (nvim-dap) — native DAP front-end
-
-`avrOSdb --dap` serves the Debug Adapter Protocol directly, so Neovim's
-[nvim-dap](https://github.com/mfussenegger/nvim-dap) plugin can debug the target
-with **no `avr-gdb` in the loop**.
-
-> [!NOTE]
-> The native DAP front-end is full-featured: attach, execution control,
-> source / instruction / conditional breakpoints, a DWARF multi-frame call
-> stack, variables (Locals / Registers / Globals with struct & array
-> expansion), watch/REPL `evaluate`, read/write memory, and set variable. The
-> RSP path (§6.1) shares the same debug core and remains available.
-
-**One-time setup.** `make prereqs` (or just `make prereqs-nvim`) installs
-nvim-dap as a native Neovim package and installs the avrOSdb DAP config into
-`~/.config/nvim/init.lua` — idempotent, and it never clobbers an existing
-config (it appends a clearly-marked block if one is absent). Equivalently, by
-hand:
-
-```bash
-# install nvim-dap as a native package (auto-loaded; no plugin manager)
-git clone --depth=1 https://github.com/mfussenegger/nvim-dap \
-    ~/.local/share/nvim/site/pack/dap/start/nvim-dap
-
-# install the avrOSdb DAP config (adapter + attach config + keymaps)
-mkdir -p ~/.config/nvim
-cat tools/nvim/avrosdb-dap.lua >> ~/.config/nvim/init.lua
-```
-
-The config (`tools/nvim/avrosdb-dap.lua`) defines a `server`-type adapter that
-connects to `127.0.0.1:1234` (override with `vim.g.avrosdb_dap_host` /
-`vim.g.avrosdb_dap_port`), an **attach** configuration for C/C++ buffers, and
-debugger keymaps (`<F5>` continue/attach, `<F10>/<F11>/<F12>` step
-over/into/out, `<F9>` toggle breakpoint, `<F6>` terminate, `<leader>dr` REPL).
-
-**Use it:**
-
-```bash
-# 1. start the DAP server on the target host
-build/avrOSdb --dap --port 1234 /dev/ttyAMA2 firmware.elf
-
-# 2. in Neovim, open a source file and attach:
-#      <F5>            (picks the "Attach to avrOSdb (--dap)" config), or
-#      :DapAvrOSdb     (optionally :DapAvrOSdb <host> <port>)
-```
-
-An automated on-target acceptance harness drives this same path headlessly:
-`make hw-test-dap` (see §7 / the Makefile).
-
-### 6.3 VS Code (native DAP)
-
-VS Code can also debug through `avrOSdb --dap` directly. Unlike Neovim, VS Code
+VS Code debugs through `avrOSdb --dap` directly. Unlike Neovim, VS Code
 only talks to a DAP server through a *contributed debug type*, so a small
 companion extension is provided in
 [`tools/vscode/avrosdb-dap/`](../tools/vscode/avrosdb-dap/) contributing the
@@ -816,12 +701,12 @@ also provided for connecting to a server you run yourself (e.g. on a remote
 target host).
 
 > [!NOTE]
-> The native DAP front-end is now full-featured: attach, execution control
+> The native DAP front-end is full-featured: attach, execution control
 > (continue / pause / step), source + instruction + **conditional** breakpoints,
 > a DWARF multi-frame call stack, **variables** (Locals / Registers / Globals
 > with struct & array expansion), **watch/REPL `evaluate`** (including
 > `g_cfg.base` / `g_arr[2]`), **read/write memory**, and **set variable**. The
-> GDB-RSP path (§6.1) remains available and shares the same debug core.
+> GDB-RSP path (§6.2) remains available and shares the same debug core.
 
 > [!TIP]
 > `avrOSdb --emit-vscode-config` prints a ready-to-use `launch.json` (the
@@ -916,7 +801,7 @@ The first three mirror the built-in Run-and-Debug side bar (VS Code does not let
 those views be moved, so the extension re-renders them here); the last three are
 the avrOS-specific introspection that `avrOSdb --dap` exposes through custom
 requests — the DAP analogue of `monitor avros tasks|events|queues` on the
-GDB-RSP path (§6.1). The views refresh automatically each time the target halts;
+GDB-RSP path (§6.2). The views refresh automatically each time the target halts;
 the **↻** title-bar button forces a manual refresh.
 
 > [!TIP]
@@ -925,6 +810,124 @@ the **↻** title-bar button forces a manual refresh.
 > already-installed debugger (e.g. `cppdbg`); VS Code connects to that port
 > instead of spawning an adapter. The companion extension above is the clean,
 > type-correct route.
+
+### 6.2 VS Code (Cortex-Debug, via avr-gdb)
+
+`avrOSdb` speaks standard GDB RSP. While many debug adapters support RSP, the **cortex-debug** extension is the only officially tested extension for `avrOSdb` integration in VS Code.
+
+Two pieces are required:
+
+1. The **Cortex-Debug** extension (`marus25.cortex-debug`).
+2. An `avr-gdb` binary on `PATH` (the adapter spawns it locally).
+
+Add the following to `.vscode/launch.json` in your firmware project (note that we use `gdbTarget` and a `custom` server type):
+
+```json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // Cortex-debug used as a *generic* GDB frontend
+      "name": "Debug avrOS (external GDB)",
+      "type": "cortex-debug",
+      "request": "attach",
+      "servertype": "external",
+      "gdbTarget": "localhost:1234",
+      "gdbPath": "/usr/bin/avr-gdb",
+      "executable": "${workspaceFolder}/app/avrOS_example/build/main.elf",
+      "cwd": "${workspaceFolder}/app/avrOS_example",
+      "overrideAttachCommands": [
+        "target extended-remote localhost:1234",
+        "monitor reset",
+        "tbreak main",
+        "continue"
+      ],
+      "overrideResetCommands": [
+        "monitor reset",
+        "tbreak main",
+        "continue"
+      ],
+      "showDevDebugOutput": "none",
+      "preAttachCommands": [
+        "set breakpoint auto-hw off",
+        "set pagination off",
+        "set print pretty on",
+        "set remotetimeout 30",
+        "set mem inaccessible-by-default off"
+      ]
+    }
+  ]
+}```
+
+Recommended workflow:
+
+1. Start `avrOSdb` in an integrated terminal:
+   ```bash
+   avrOSdb --load /dev/ttyUSB0 build/firmware.elf
+   ```
+2. Press **F5** to launch the `Debug AVR via avrOSdb` configuration.
+   VS Code spawns `avr-gdb`, which connects to `localhost:1234` and
+   downloads symbols.
+3. Set breakpoints in the editor margin. The **Call Stack** view shows
+   the single CPU thread; run `monitor avros tasks` in the **Debug
+   Console** to list each avrOS FSM and its current state.
+4. Use the **Debug Console** for ad-hoc commands, e.g.
+   `-exec monitor avros events`.
+
+For a more polished UPDI/AVR-specific UI, the
+[Cortex-Debug](https://marketplace.visualstudio.com/items?itemName=marus25.cortex-debug)
+extension can be configured similarly with `"servertype": "external"`
+and `"gdbTarget": "localhost:1234"` — useful when an external GDB
+launch script already manages the stub.
+
+### 6.3 Neovim (nvim-dap, native DAP)
+
+`avrOSdb --dap` serves the Debug Adapter Protocol directly, so Neovim's
+[nvim-dap](https://github.com/mfussenegger/nvim-dap) plugin can debug the target
+with **no `avr-gdb` in the loop**.
+
+> [!NOTE]
+> The native DAP front-end is full-featured: attach, execution control,
+> source / instruction / conditional breakpoints, a DWARF multi-frame call
+> stack, variables (Locals / Registers / Globals with struct & array
+> expansion), watch/REPL `evaluate`, read/write memory, and set variable. The
+> RSP path (§6.2) shares the same debug core and remains available.
+
+**One-time setup.** `make prereqs` (or just `make prereqs-nvim`) installs
+nvim-dap as a native Neovim package and installs the avrOSdb DAP config into
+`~/.config/nvim/init.lua` — idempotent, and it never clobbers an existing
+config (it appends a clearly-marked block if one is absent). Equivalently, by
+hand:
+
+```bash
+# install nvim-dap as a native package (auto-loaded; no plugin manager)
+git clone --depth=1 https://github.com/mfussenegger/nvim-dap \
+    ~/.local/share/nvim/site/pack/dap/start/nvim-dap
+
+# install the avrOSdb DAP config (adapter + attach config + keymaps)
+mkdir -p ~/.config/nvim
+cat tools/nvim/avrosdb-dap.lua >> ~/.config/nvim/init.lua
+```
+
+The config (`tools/nvim/avrosdb-dap.lua`) defines a `server`-type adapter that
+connects to `127.0.0.1:1234` (override with `vim.g.avrosdb_dap_host` /
+`vim.g.avrosdb_dap_port`), an **attach** configuration for C/C++ buffers, and
+debugger keymaps (`<F5>` continue/attach, `<F10>/<F11>/<F12>` step
+over/into/out, `<F9>` toggle breakpoint, `<F6>` terminate, `<leader>dr` REPL).
+
+**Use it:**
+
+```bash
+# 1. start the DAP server on the target host
+build/avrOSdb --dap --port 1234 /dev/ttyAMA2 firmware.elf
+
+# 2. in Neovim, open a source file and attach:
+#      <F5>            (picks the "Attach to avrOSdb (--dap)" config), or
+#      :DapAvrOSdb     (optionally :DapAvrOSdb <host> <port>)
+```
+
+An automated on-target acceptance harness drives this same path headlessly:
+`make hw-test-dap` (see §7 / the Makefile).
 
 ---
 
