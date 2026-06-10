@@ -340,8 +340,28 @@ int elf_addr_to_line(const ElfContext *ctx, uint32_t byte_addr,
         const char *src = dwarf_linesrc(ln, NULL, NULL);
         if (src == NULL)
             return -1;
-        strncpy(file, src, file_cap - 1);
-        file[file_cap - 1] = '\0';
+        /* DWARF often records the source path relative to the compilation
+         * directory (e.g. "../../sys/fsm.c").  A DAP client cannot open a
+         * relative path and falls back to the `source` request, so resolve it
+         * to an absolute path against the CU's DW_AT_comp_dir.  The lexical
+         * join may retain `..` segments (e.g. ".../build/../../sys/fsm.c");
+         * that is still a valid absolute path the client/OS normalises when it
+         * opens the file. */
+        if (src[0] == '/') {
+            strncpy(file, src, file_cap - 1);
+            file[file_cap - 1] = '\0';
+        } else {
+            const char     *comp_dir = NULL;
+            Dwarf_Attribute attr;
+            if (dwarf_attr(&cu, DW_AT_comp_dir, &attr) != NULL)
+                comp_dir = dwarf_formstring(&attr);
+            if (comp_dir != NULL)
+                (void)snprintf(file, file_cap, "%s/%s", comp_dir, src);
+            else {
+                strncpy(file, src, file_cap - 1);
+                file[file_cap - 1] = '\0';
+            }
+        }
     }
     return 0;
 }

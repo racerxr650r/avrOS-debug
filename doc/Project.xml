@@ -3061,7 +3061,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-ELF-12">
-        <text><![CDATA[`elf_addr_to_line()` shall map a code-space byte address to its source `file:line` using libdw: `dwarf_addrdie()` to find the compilation-unit DIE containing the address, then `dwarf_getsrc_die()` and `dwarf_lineno()`/`dwarf_linesrc()`. On success it shall return 0, store the 1-based line in `*line` (when non-NULL), and copy the NUL-terminated source path (truncated to `file_cap`) into `file` (when non-NULL). It shall return -1 — leaving the outputs untouched and never aborting — when `ctx->dwarf` is NULL or the address has no line-table entry.]]></text>
+        <text><![CDATA[`elf_addr_to_line()` shall map a code-space byte address to its source `file:line` using libdw: `dwarf_addrdie()` to find the compilation-unit DIE containing the address, then `dwarf_getsrc_die()` and `dwarf_lineno()`/`dwarf_linesrc()`. On success it shall return 0, store the 1-based line in `*line` (when non-NULL), and copy the NUL-terminated source path (truncated to `file_cap`) into `file` (when non-NULL). The source path shall be made **absolute**: DWARF frequently records it relative to the compilation directory (e.g. `../../sys/fsm.c`), which a DAP client cannot open — so when `dwarf_linesrc()` returns a relative path it shall be joined to the CU's `DW_AT_comp_dir` (`dwarf_attr()`/`dwarf_formstring()`); an already-absolute path is copied verbatim. (The lexical join may retain `..` segments, which the client/OS normalises on open.) It shall return -1 — leaving the outputs untouched and never aborting — when `ctx->dwarf` is NULL or the address has no line-table entry.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-072" name="DWARF Source-Level Lookup (DAP Groundwork)"/>
         </traces>
@@ -3537,6 +3537,14 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <text><![CDATA[`dap_dispatch()` shall serve three avrOS-introspection custom requests through private handlers, each guarded by `updi_fd >= 0` and degrading to an empty array when no target link or no avrOS symbol index is present. `dap_handle_fsm_list()` (`avrosdb/fsmList`) shall, when the FSM context and symbol index are present, rebuild the thread list with `fsm_build_thread_list()` and reply `{"fsms":[{"id":<gdb_id>,"name":"…","state":"…","active":<bool>}]}` from each `FsmThread`'s `gdb_id` / `name` / `state_name` / `is_active`. `dap_handle_event_list()` (`avrosdb/eventList`) shall read the event table with `avros_read_events()` (LLR-AVROS-01) and reply `{"events":[{"name":"…","status":<n|null>}]}` — `status` is the JSON null literal when the descriptor carries no status pointer (`has_status` false). `dap_handle_queue_list()` (`avrosdb/queueList`) shall read the queue table with `avros_read_queues()` (LLR-AVROS-02) and reply `{"queues":[{"id":<i>,"capacity":<n>,"elemSize":<n>}]}`. All dynamic strings shall be JSON-escaped via `dj_escape()`; the handlers shall touch no target when `updi_fd < 0`, so dispatch is unit-testable over a socketpair.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-086" name="avrOS Introspection over DAP Custom Requests"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-DAP-18">
+        <text><![CDATA[`dap_dispatch()` shall serve the DAP `source` request via a private `dap_handle_source()` helper, so a client that cannot open a frame's `Source.path` (now emitted absolute, LLR-ELF-12) still gets a clean answer rather than the generic unsupported-request error. The handler shall read `arguments.source.path`, open it on the debug host, and reply `{"content":"<file>"}` (`success:true`) with the file's text JSON-escaped via `dj_escape()`; because a source file can exceed the standard `DAP_OUT_MAX` response buffer it shall frame the reply through a heap buffer bounded by `DAP_MSG_MAX`. A path that is absent/unreadable, or whose content would not fit the frame, shall reply `success:false` with an explanatory message (e.g. "source file is not available on the debug host" / "source too large to stream over DAP; open it from the workspace"). Any request the adapter does not model shall likewise receive a `success:false` response (never silence/hang).]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-078" name="DAP Execution Control, Stop Events &amp; Shallow stackTrace"/>
+          <trace target="HLR" ref="HLR-072" name="DWARF Source-Level Lookup (DAP Groundwork)"/>
         </traces>
       </llr>
     </function>
@@ -5144,7 +5152,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/dap.c DAP wire-transport tests (Phase 16)                -->
     <!-- ============================================================ -->
-    <file path="tests/test_dap.c" role="unit" count="28">
+    <file path="tests/test_dap.c" role="unit" count="30">
       <header><![CDATA[Unit tests for the DAP front-end: the wire transport (HLR-075) — the JSON codec (`dj_*` recursive-descent tokenizer, member/string/number accessors, escape decode, and the emission escaper) and the Content-Length message framing (`dap_read_message` / `dap_write_message`) — and the connection lifecycle dispatch (HLR-076) driven over a `socketpair` with `updi_fd = -1` so no hardware is touched. Framing is exercised over an anonymous pipe.]]></header>
 
       <test name="dj_parse_extracts_request_fields">
@@ -5265,6 +5273,15 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="dap_set_instruction_breakpoints_responds_with_refs">
         <purpose><![CDATA[Dispatch `setInstructionBreakpoints` with two entries (`instructionReference:"0x40c"`, and `"0x400"` with `offset:4`) and no target; verify the response carries per-entry `{id,verified,instructionReference}`, that the addresses resolve (0x40c; 0x400+4=0x404), and that the table entries are marked as instruction breakpoints (`line == -1`). Per LLR-DAP-10.]]></purpose>
         <traces><trace target="LLR" ref="LLR-DAP-10"/></traces>
+      </test>
+
+      <test name="test_dap_source_returns_file_content">
+        <purpose><![CDATA[Write a small temp `.c` file, then dispatch a `source` request with `arguments.source.path` set to it; assert the response is `success:true` for command `source` and its `body.content` carries the file text — confirming the DAP source fallback streams host file content.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-18"/></traces>
+      </test>
+      <test name="test_dap_source_missing_file_fails">
+        <purpose><![CDATA[Dispatch a `source` request for a non-existent path and assert the response is `success:false` for command `source` — a clean failure rather than the generic unsupported-request error or a hang.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-18"/></traces>
       </test>
 
       <test name="dap_serve_runs_handshake_to_disconnect">
@@ -5391,7 +5408,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </test>
     </file>
 
-    <file path="tests/hw/dap_vars.py" role="hardware" count="8">
+    <file path="tests/hw/dap_vars.py" role="hardware" count="10">
       <header><![CDATA[On-target DAP variables / evaluate / memory acceptance harness (Phase 19, the DAP analogue of GDB Group-G state inspection — G17/G22/G23). A pure-Python DAP client spawns `avrOSdb --dap` against live AVR-Dx silicon running the `gdb_debug_session` fixture, breaks inside `leaf`, and verifies scopes, variables (with struct/array expansion), per-frame locals, evaluate, read/write memory, and setVariable against the fixture's documented values. Manual-only (`make hw-test-dap-vars`) — never wired into `make test`.]]></header>
 
       <test name="DAP_V1_scopes_locals_registers_globals">
@@ -5425,6 +5442,14 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="DAP_V8_set_variable_writes_back">
         <purpose><![CDATA[`setVariable` writes `g_counter = 1234`; a subsequent `evaluate` reads back 1234 — proving the write reached silicon at the right address and width. Per HLR-084 / LLR-DAP-16.]]></purpose>
         <traces><trace target="HLR" ref="HLR-084"/><trace target="LLR" ref="LLR-DAP-16"/></traces>
+      </test>
+      <test name="DAP_V9_frame_source_path_absolute">
+        <purpose><![CDATA[Stopped inside `leaf`, the `stackTrace` frame's `source.path` is an absolute path that exists on the debug host (resolved from the CU `comp_dir`), so a DAP client opens the source directly instead of falling back to the `source` request. Per LLR-ELF-12.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-072"/><trace target="LLR" ref="LLR-ELF-12"/></traces>
+      </test>
+      <test name="DAP_V10_source_request_returns_content">
+        <purpose><![CDATA[A `source` request for that frame's path returns `success:true` with non-empty `body.content` — the source fallback streams the host file content over DAP. Per LLR-DAP-18.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-078"/><trace target="LLR" ref="LLR-DAP-18"/></traces>
       </test>
     </file>
 

@@ -389,7 +389,7 @@ Role: **hardware**. **1 test(s).**
 
 ### 3.12. [tests/test_dap.c](../tests/test_dap.c)
 
-Role: **unit**. **28 test(s).**
+Role: **unit**. **30 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -417,10 +417,12 @@ Role: **unit**. **28 test(s).**
 | 22 | <a id="dap_set_breakpoints_responds_with_per_line_entries"></a>`dap_set_breakpoints_responds_with_per_line_entries` | `LLR-DAP-10` | Dispatch `setBreakpoints` with two source breakpoints (`{line:139}`, `{line:141,condition:"n==3"}`) and no ELF/target; verify the response carries a `breakpoints` array with per-line entries (`id:1`/`line:139`, `id:2`/`line:141`), that both entries are recorded in the session table with the condition captured, and that `next_bp_id` advanced to 3. Per LLR-DAP-10. |
 | 23 | <a id="dap_set_breakpoints_replaces_prior_set_for_source"></a>`dap_set_breakpoints_replaces_prior_set_for_source` | `LLR-DAP-10` | Dispatch `setBreakpoints` for `main.c` with two lines, then again with one line; verify the second call replaces the source's set wholesale — only the single new breakpoint remains in the session table. Per LLR-DAP-10. |
 | 24 | <a id="dap_set_instruction_breakpoints_responds_with_refs"></a>`dap_set_instruction_breakpoints_responds_with_refs` | `LLR-DAP-10` | Dispatch `setInstructionBreakpoints` with two entries (`instructionReference:"0x40c"`, and `"0x400"` with `offset:4`) and no target; verify the response carries per-entry `{id,verified,instructionReference}`, that the addresses resolve (0x40c; 0x400+4=0x404), and that the table entries are marked as instruction breakpoints (`line == -1`). Per LLR-DAP-10. |
-| 25 | <a id="dap_serve_runs_handshake_to_disconnect"></a>`dap_serve_runs_handshake_to_disconnect` | `LLR-DAP-05` | Drive `dap_serve()` end-to-end without hardware: a stubbed `rsp_accept()` hands it a pre-connected socketpair end whose request stream is pre-loaded with `initialize` then `disconnect`. Verify the accept/select/read/dispatch loop processes both (emitting the initialize response, the `initialized` event, and the disconnect response) and returns 0 when the client disconnects. |
-| 26 | <a id="test_dap_fsm_list_empty_without_target"></a>`test_dap_fsm_list_empty_without_target` | `LLR-DAP-17` | The `avrosdb/fsmList` custom request, dispatched with `updi_fd = -1` (no target), returns a successful response whose body carries an empty `"fsms":[]` array — graceful degradation, no hardware touched. |
-| 27 | <a id="test_dap_event_list_empty_without_target"></a>`test_dap_event_list_empty_without_target` | `LLR-DAP-17` | The `avrosdb/eventList` custom request, dispatched with `updi_fd = -1`, returns a successful response whose body carries an empty `"events":[]` array. |
-| 28 | <a id="test_dap_queue_list_empty_without_target"></a>`test_dap_queue_list_empty_without_target` | `LLR-DAP-17` | The `avrosdb/queueList` custom request, dispatched with `updi_fd = -1`, returns a successful response whose body carries an empty `"queues":[]` array. |
+| 25 | <a id="test_dap_source_returns_file_content"></a>`test_dap_source_returns_file_content` | `LLR-DAP-18` | Write a small temp `.c` file, then dispatch a `source` request with `arguments.source.path` set to it; assert the response is `success:true` for command `source` and its `body.content` carries the file text — confirming the DAP source fallback streams host file content. |
+| 26 | <a id="test_dap_source_missing_file_fails"></a>`test_dap_source_missing_file_fails` | `LLR-DAP-18` | Dispatch a `source` request for a non-existent path and assert the response is `success:false` for command `source` — a clean failure rather than the generic unsupported-request error or a hang. |
+| 27 | <a id="dap_serve_runs_handshake_to_disconnect"></a>`dap_serve_runs_handshake_to_disconnect` | `LLR-DAP-05` | Drive `dap_serve()` end-to-end without hardware: a stubbed `rsp_accept()` hands it a pre-connected socketpair end whose request stream is pre-loaded with `initialize` then `disconnect`. Verify the accept/select/read/dispatch loop processes both (emitting the initialize response, the `initialized` event, and the disconnect response) and returns 0 when the client disconnects. |
+| 28 | <a id="test_dap_fsm_list_empty_without_target"></a>`test_dap_fsm_list_empty_without_target` | `LLR-DAP-17` | The `avrosdb/fsmList` custom request, dispatched with `updi_fd = -1` (no target), returns a successful response whose body carries an empty `"fsms":[]` array — graceful degradation, no hardware touched. |
+| 29 | <a id="test_dap_event_list_empty_without_target"></a>`test_dap_event_list_empty_without_target` | `LLR-DAP-17` | The `avrosdb/eventList` custom request, dispatched with `updi_fd = -1`, returns a successful response whose body carries an empty `"events":[]` array. |
+| 30 | <a id="test_dap_queue_list_empty_without_target"></a>`test_dap_queue_list_empty_without_target` | `LLR-DAP-17` | The `avrosdb/queueList` custom request, dispatched with `updi_fd = -1`, returns a successful response whose body carries an empty `"queues":[]` array. |
 
 ### 3.13. [tests/hw/dap_acceptance.lua](../tests/hw/dap_acceptance.lua)
 
@@ -463,7 +465,7 @@ Role: **hardware**. **3 test(s).**
 
 ### 3.16. [tests/hw/dap_vars.py](../tests/hw/dap_vars.py)
 
-Role: **hardware**. **8 test(s).**
+Role: **hardware**. **10 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -475,6 +477,8 @@ Role: **hardware**. **8 test(s).**
 | 6 | <a id="DAP_V6_evaluate_field_and_element"></a>`DAP_V6_evaluate_field_and_element` | `LLR-DAP-14` | `evaluate` resolves `g_cfg.base` (= 100), `g_arr[2]` (= 30), and `g_marker` (= 49374) — identifier + `.field` / `[index]` navigation. Per HLR-083 / LLR-DAP-14. |
 | 7 | <a id="DAP_V7_read_memory_array_bytes"></a>`DAP_V7_read_memory_array_bytes` | `LLR-DAP-15` | `readMemory` of `g_arr` returns the 8 bytes that decode (little-endian) to the u16 sequence 10,20,30,40. Per HLR-084 / LLR-DAP-15. |
 | 8 | <a id="DAP_V8_set_variable_writes_back"></a>`DAP_V8_set_variable_writes_back` | `LLR-DAP-16` | `setVariable` writes `g_counter = 1234`; a subsequent `evaluate` reads back 1234 — proving the write reached silicon at the right address and width. Per HLR-084 / LLR-DAP-16. |
+| 9 | <a id="DAP_V9_frame_source_path_absolute"></a>`DAP_V9_frame_source_path_absolute` | `LLR-ELF-12` | Stopped inside `leaf`, the `stackTrace` frame's `source.path` is an absolute path that exists on the debug host (resolved from the CU `comp_dir`), so a DAP client opens the source directly instead of falling back to the `source` request. Per LLR-ELF-12. |
+| 10 | <a id="DAP_V10_source_request_returns_content"></a>`DAP_V10_source_request_returns_content` | `LLR-DAP-18` | A `source` request for that frame's path returns `success:true` with non-empty `body.content` — the source fallback streams the host file content over DAP. Per LLR-DAP-18. |
 
 ### 3.17. [tests/hw/dap_introspect.py](../tests/hw/dap_introspect.py)
 
@@ -626,7 +630,7 @@ verified by code review — see
 | `LLR-ELF-09` | `elf` | `HLR-021`, `HLR-048` | `elf_open_extracts_device_name_from_deviceinfo_note`, `elf_open_leaves_device_name_empty_when_note_absent` |
 | `LLR-ELF-10` | `elf` | `HLR-021`, `HLR-071` | `elf_open_returns_minus1_on_wrong_machine_type` |
 | `LLR-ELF-11` | `elf` | `HLR-072` | `elf_dwarf_accessors_round_trip` |
-| `LLR-ELF-12` | `elf` | `HLR-072` | `elf_dwarf_accessors_round_trip` |
+| `LLR-ELF-12` | `elf` | `HLR-072` | `elf_dwarf_accessors_round_trip`, `DAP_V9_frame_source_path_absolute` |
 | `LLR-ELF-13` | `elf` | `HLR-072` | `elf_dwarf_accessors_round_trip` |
 | `LLR-ELF-14` | `elf` | `HLR-080` | `elf_cfi_cfa_extracts_avr_frame_rules`, `DAP_U4_frames_map_to_call_chain` |
 | `LLR-ELF-15` | `elf` | `HLR-081` | `elf_var_addr_resolves_globals_and_locals`, `DAP_K1_false_local_condition_skips`, `DAP_K3_true_global_condition_stops` |
@@ -688,5 +692,6 @@ verified by code review — see
 | `LLR-DAP-15` | `dap` | `HLR-084` | `dap_read_memory_responds_with_data_field`, `DAP_V7_read_memory_array_bytes` |
 | `LLR-DAP-16` | `dap` | `HLR-084` | `dap_set_variable_unknown_ref_errors`, `DAP_V8_set_variable_writes_back` |
 | `LLR-DAP-17` | `dap` | `HLR-086` | `test_dap_fsm_list_empty_without_target`, `test_dap_event_list_empty_without_target`, `test_dap_queue_list_empty_without_target`, `DAP_I1_fsm_list_well_formed` |
+| `LLR-DAP-18` | `dap` | `HLR-078`, `HLR-072` | `test_dap_source_returns_file_content`, `test_dap_source_missing_file_fails`, `DAP_V10_source_request_returns_content` |
 | `LLR-AVROS-01` | `avros` | `HLR-086` | `DAP_I2_event_list_reads_table` |
 | `LLR-AVROS-02` | `avros` | `HLR-086` | `DAP_I3_queue_list_reads_table` |

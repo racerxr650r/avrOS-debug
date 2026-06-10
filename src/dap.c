@@ -1139,6 +1139,75 @@ static int dap_handle_queue_list(dap_session *s, long req_seq)
     return dap_send_response(s, req_seq, "avrosdb/queueList", true, body);
 }
 
+/* ── source request ──────────────────────────────────────────────────────────
+ *
+ * VS Code falls back to the DAP `source` request when it cannot open a frame's
+ * `Source.path` itself.  stackTrace now emits absolute paths (LLR-ELF-13), so a
+ * source present on the debug host is opened directly and this request is not
+ * issued; we still serve it here as a robust fallback, reading
+ * `arguments.source.path` from the host filesystem.  A file that is absent, or
+ * too large to frame under DAP_MSG_MAX, gets a clean `success:false` rather than
+ * a stub error. */
+static int dap_handle_source(dap_session *s, const char *msg,
+                             const dj_tok_t *t, long req_seq)
+{
+    char path[512] = "";
+    int  args   = dj_member(msg, t, 0, "arguments");
+    int  srcobj = (args >= 0) ? dj_member(msg, t, args, "source") : -1;
+    if (srcobj >= 0) {
+        int p = dj_member(msg, t, srcobj, "path");
+        if (p >= 0) dj_strcpy(msg, t, p, path, sizeof path);
+    }
+
+    FILE *fp = (path[0] != '\0') ? fopen(path, "rb") : NULL;
+    if (fp == NULL)
+        return dap_send_error(s, req_seq, "source",
+            "source file is not available on the debug host") < 0 ? -1 : 0;
+
+    enum { SRC_RAW_MAX = 56u * 1024u };
+    char *raw = malloc(SRC_RAW_MAX + 1u);
+    if (raw == NULL) {
+        fclose(fp);
+        return dap_send_error(s, req_seq, "source", "out of memory") < 0 ? -1 : 0;
+    }
+    size_t n        = fread(raw, 1, SRC_RAW_MAX, fp);
+    int    overflow = (fgetc(fp) != EOF);          /* more bytes than the cap */
+    fclose(fp);
+    raw[n] = '\0';
+    if (overflow) {
+        free(raw);
+        return dap_send_error(s, req_seq, "source",
+            "source too large to stream over DAP; open it from the workspace")
+            < 0 ? -1 : 0;
+    }
+
+    /* Worst-case JSON escape is 6 bytes per input byte (\uXXXX). */
+    size_t esccap = n * 6u + 1u;
+    char  *esc    = malloc(esccap);
+    char  *out    = malloc(DAP_MSG_MAX);
+    if (esc == NULL || out == NULL) {
+        free(raw); free(esc); free(out);
+        return dap_send_error(s, req_seq, "source", "out of memory") < 0 ? -1 : 0;
+    }
+    dj_escape(raw, esc, esccap);
+    free(raw);
+
+    int w = snprintf(out, DAP_MSG_MAX,
+        "{\"seq\":%ld,\"type\":\"response\",\"request_seq\":%ld,"
+        "\"success\":true,\"command\":\"source\",\"body\":{\"content\":\"%s\"}}",
+        dap_next_seq(s), req_seq, esc);
+    free(esc);
+    if (w < 0 || (size_t)w >= DAP_MSG_MAX) {
+        free(out);
+        return dap_send_error(s, req_seq, "source",
+            "source too large to stream over DAP; open it from the workspace")
+            < 0 ? -1 : 0;
+    }
+    int rc = dap_write_message(s->fd, out, (size_t)w);
+    free(out);
+    return rc < 0 ? -1 : 0;
+}
+
 /* ── Breakpoints (Phase 18) ───────────────────────────────────────────────── */
 
 void dap_bp_reset(dap_session *s)
@@ -1631,9 +1700,12 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
         return 1;                                /* close the session */
     }
 
-    /* Variables, memory, evaluate, and breakpoint installation: Phases 18–19. */
+    if (strcmp(cmd, "source") == 0)
+        return dap_handle_source(s, msg, t, req_seq);
+
+    /* Any request we do not model: a clean success:false (never a hang). */
     return dap_send_error(s, req_seq, cmd,
-                          "request not implemented yet (Phase 18+)") < 0 ? -1 : 0;
+                          "request not supported by avrOSdb") < 0 ? -1 : 0;
 }
 
 /* ── Server entry: accept one client, then dispatch on the event loop ─────── */

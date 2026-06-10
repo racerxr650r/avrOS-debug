@@ -137,7 +137,21 @@ def main() -> int:
         dap.send("continue", {"threadId": 1})
         dap.wait(lambda m: m.get("event") == "stopped"
                  and (m.get("body") or {}).get("reason") == "breakpoint", timeout=12)
-        dap.rpc("stackTrace", {"threadId": 1})
+        st = dap.rpc("stackTrace", {"threadId": 1})
+
+        # The frame's source path must be absolute and openable, so VS Code
+        # loads it directly instead of falling back to the DAP `source` request.
+        fr0 = ((st or {}).get("body", {}).get("stackFrames") or [{}])[0]
+        spath = (fr0.get("source") or {}).get("path")
+        record("DAP-V9  frame source path absolute + on disk",
+               bool(spath) and spath.startswith("/") and os.path.exists(spath),
+               str(spath))
+        # …and the `source` request still serves the content as a fallback.
+        srcr = dap.rpc("source", {"source": {"path": spath}}) if spath else None
+        record("DAP-V10 source request returns file content",
+               bool(srcr) and srcr.get("success")
+               and len(((srcr or {}).get("body") or {}).get("content", "")) > 0,
+               str((srcr or {}).get("success")))
 
         sc = dap.rpc("scopes", {"frameId": 0})
         scopes = {x["name"]: x["variablesReference"]
