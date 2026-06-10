@@ -133,9 +133,14 @@ CP210x) or `/dev/ttyACM0` (CDC ACM); on a Raspberry Pi's built-in UART it is
 ## 4. Command-Line Invocation
 
 ```
-avrOSdb [--port <port>] [--baud <baud>] [--erase] [--load] [--no-verify] [--allow-lock-updi] [--allow-erase] [--force-device <family>] <serial-device> <elf-file>
-avrOSdb --prog [--baud <baud>] [--erase] [--no-verify] [--allow-lock-updi] [--force-device <family>] <serial-device> <elf-file>
+avrOSdb [--rsp | --dap] [--port <port>] [--baud <baud>] [--erase] [--load]
+        [--no-verify] [--allow-lock-updi] [--allow-erase] [--force-device <family>]
+        [--no-introspect] [--sleep] [--log-rsp] <serial-device> <elf-file>
+avrOSdb --prog [--baud <baud>] [--erase] [--no-verify] [--allow-lock-updi]
+        [--force-device <family>] [--log-rsp] <serial-device> <elf-file>
 avrOSdb --device [--baud <baud>] [--no-autobaud] [--force-device <family>] <serial-device> [elf-file]
+avrOSdb --reset [--baud <baud>] <serial-device>
+avrOSdb --emit-vscode-config
 ```
 
 ### Options
@@ -154,6 +159,12 @@ avrOSdb --device [--baud <baud>] [--no-autobaud] [--force-device <family>] <seri
 | `--device` | flag | unset | One-shot diagnostic: open UPDI, run an auto-baud link-quality probe (unless `--no-autobaud`), read the SIGROW signature + serial number, ASI status bytes, FUSES, and LOCK byte, print a human-readable report (including the per-rung baud table and a decoded fuse listing) to stdout, then exit. No TCP listener is opened, no ELF is loaded, the target CPU is not halted. Mutually exclusive with `--load` and `--prog`. Makes `<elf-file>` optional. |
 | `--force-device <family>` | string | unset | Override automatic family detection. Accepts one of `AVR-DA`, `AVR-DB`, `AVR-DD`, `AVR-DU`, `AVR-SD` (case-insensitive). When set, this string is passed verbatim to the UPDI device-table selector and suppresses the ELF-vs-silicon family mismatch check (see §4.1 below). Use this when you knowingly want to debug an ELF against a different silicon family. |
 | `--no-introspect` | flag | unset | Disable the avrOS FSM introspection reads behind `monitor avros tasks` / `events` / `queues`. The GDB thread model is unaffected — the live CPU is always the sole GDB thread either way. Use when debugging non-avrOS firmware or to avoid the background UPDI reads. |
+| `--rsp` | flag | *(default)* | Serve the **GDB Remote Serial Protocol** front-end. This is the default when neither `--rsp` nor `--dap` is given. Mutually exclusive with `--dap`. Drives an external `avr-gdb` / Cortex-Debug (see §6.2). |
+| `--dap` | flag | unset | Serve the **Debug Adapter Protocol** front-end for DAP-native editors — the VS Code companion extension (§6.1) and Neovim nvim-dap (§6.3). Mutually exclusive with `--rsp`. |
+| `--sleep` | flag | unset | Allow the target to sleep natively. By default the debugger snapshots and restores the firmware's peripheral state across the software-breakpoint NVMPROG reset (and asserts `CLK_REQ`) so the configured SLEEP wake source survives and breakpoints still fire after the firmware sleeps. Pass `--sleep` to restore native sleep/power behaviour (for power-path debugging). (HLR-077.) |
+| `--log-rsp` | flag | unset | Log every incoming and outgoing GDB RSP packet to `stderr` — the primary wire-level trace when debugging the RSP path. (Equivalent to setting `AVROSDB_GDB_LOG_RSP=1`.) |
+| `--reset` | flag | unset | One-shot: pulse the UPDI system reset and exit. Requires only `<serial-device>` — no ELF needed. Redundant when combined with `--prog`. |
+| `--emit-vscode-config` | flag | unset | Print a ready-to-use VS Code `launch.json` for the `--dap` front-end to stdout and exit — needs no target or ELF. E.g. `avrOSdb --emit-vscode-config > .vscode/launch.json` (see §6.1). |
 
 ### 4.1 Exit Status
 
