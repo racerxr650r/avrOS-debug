@@ -5551,7 +5551,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces><trace target="HLR" ref="HLR-078"/><trace target="LLR" ref="LLR-DAP-19"/></traces>
       </test>
       <test name="ST4b_next_is_line_granular">
-        <purpose><![CDATA[The lines visited by successive `next` within `mid` are monotonic and span several source lines over a handful of steps (instruction-granularity would crawl within one line); a call line may legitimately appear twice (avr-gcc -O0 splits `acc += leaf(...)` into a call row then a post-call assign row). Per HLR-078 / LLR-DAP-19.]]></purpose>
+        <purpose><![CDATA[Successive `next` within `mid` advance exactly one source line per step — the recorded lines are strictly increasing with no repeats, including on the call lines `acc += leaf(n,2)` / `(n,3)` (each crossed in a single `next`, the run-to-return completing in one press). Per HLR-078 / LLR-DAP-19.]]></purpose>
         <traces><trace target="HLR" ref="HLR-078"/><trace target="LLR" ref="LLR-DAP-19"/></traces>
       </test>
     </file>

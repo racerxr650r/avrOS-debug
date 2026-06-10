@@ -513,7 +513,7 @@ Role: **hardware**. **5 test(s).**
 | 2 | <a id="ST2_stepIn_descends_into_callee"></a>`ST2_stepIn_descends_into_callee` | `LLR-DAP-19` | Continued `stepIn` at the `mid()` call line descends into the callee — the stackTrace frame name becomes `mid`. Per HLR-078 / LLR-DAP-19. |
 | 3 | <a id="ST3_stepOut_returns_to_caller"></a>`ST3_stepOut_returns_to_caller` | `LLR-DAP-19` | `stepOut` from `mid` runs to the return and stops back in the caller `top` (frame name `top`) — distinct from stepIn. Per HLR-078 / LLR-DAP-19. |
 | 4 | <a id="ST4a_next_steps_over_calls"></a>`ST4a_next_steps_over_calls` | `LLR-DAP-19` | From `mid`'s entry, repeated `next` walks mid's body and never enters `leaf` — `next` steps OVER the two `leaf()` calls (running to the return) rather than descending. Per HLR-078 / LLR-DAP-19. |
-| 5 | <a id="ST4b_next_is_line_granular"></a>`ST4b_next_is_line_granular` | `LLR-DAP-19` | The lines visited by successive `next` within `mid` are monotonic and span several source lines over a handful of steps (instruction-granularity would crawl within one line); a call line may legitimately appear twice (avr-gcc -O0 splits `acc += leaf(...)` into a call row then a post-call assign row). Per HLR-078 / LLR-DAP-19. |
+| 5 | <a id="ST4b_next_is_line_granular"></a>`ST4b_next_is_line_granular` | `LLR-DAP-19` | Successive `next` within `mid` advance exactly one source line per step — the recorded lines are strictly increasing with no repeats, including on the call lines `acc += leaf(n,2)` / `(n,3)` (each crossed in a single `next`, the run-to-return completing in one press). Per HLR-078 / LLR-DAP-19. |
 
 ## 4. LLR Coverage Matrix
 

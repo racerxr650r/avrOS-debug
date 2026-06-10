@@ -184,16 +184,12 @@ def main() -> int:
         # next stepped over both leaf() calls (never entered leaf) …
         record("ST4a next steps OVER calls (never enters leaf)", not seen_leaf,
                "entered leaf" if seen_leaf else "")
-        # … and advanced with SOURCE-LINE granularity, not instruction: the
-        # lines are monotonic and span several of mid's lines over a handful of
-        # `next`s (instruction-granularity would crawl within one line).  A
-        # call-line may legitimately appear twice (avr-gcc -O0 splits `acc +=
-        # leaf(...)` into the call row then the post-call assign row).
-        monotonic = all(b >= a for a, b in zip(lines_in_mid, lines_in_mid[1:]))
-        span = (max(lines_in_mid) - min(lines_in_mid)) if lines_in_mid else 0
-        record("ST4b next is line-granular within mid",
-               monotonic and span >= 3 and len(set(lines_in_mid)) >= 4,
-               str(lines_in_mid))
+        # … advancing exactly ONE source line per `next` — strictly increasing,
+        # with no repeats even on the call lines (acc += leaf(n,2) / (n,3)).
+        strictly_inc = (len(lines_in_mid) >= 4
+                        and all(b > a for a, b in zip(lines_in_mid, lines_in_mid[1:])))
+        record("ST4b next advances one source line per step",
+               strictly_inc, str(lines_in_mid))
 
         dap.send("disconnect", {})
         time.sleep(0.3)

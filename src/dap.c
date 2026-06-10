@@ -1517,11 +1517,14 @@ static int dap_run_to(dap_session *s, uint32_t target, uint16_t min_sp)
     int rc = -1;
     for (int run = 0; run < 64; run++) {
         if (updi_run(s->updi_fd) < 0) break;
+        /* updi_ocd_poll_halted(): 0 = halted, 1 = still running (timeout),
+         * -1 = UPDI error. */
         int halted = 0;
         for (int w = 0; w < DAP_RUN_TO_POLLS; w++) {
             int h = updi_ocd_poll_halted(s->updi_fd, 50);
             if (h < 0) { halted = -1; break; }
-            if (h > 0) { halted = 1;  break; }
+            if (h == 0) { halted = 1; break; }   /* STOPPED bit set */
+            /* h > 0: still running within the budget → keep polling */
         }
         if (halted != 1) { (void)updi_halt(s->updi_fd); break; }
         uint32_t pc = 0; uint16_t sp = 0;
