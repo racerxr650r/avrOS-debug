@@ -521,16 +521,24 @@ static void dap_format_frame(dap_session *s, int id, uint32_t pc,
     /* Frame name: the enclosing function (DWARF), falling back to the raw PC
      * hex when no subprogram covers it (e.g. the C runtime above main). */
     char fname[128], nesc[260];
-    if (s->elf != NULL &&
-        elf_addr_to_func(s->elf, pc, fname, sizeof fname) == 0) {
+    int  have_func = (s->elf != NULL &&
+                      elf_addr_to_func(s->elf, pc, fname, sizeof fname) == 0);
+    if (have_func) {
         dj_escape(fname, nesc, sizeof nesc);
     } else {
         (void)snprintf(nesc, sizeof nesc, "0x%06lx", (unsigned long)pc);
     }
 
+    /* Only attach a source object when the PC is inside a real function.  A PC
+     * with no enclosing subprogram (the reset vector / C-runtime, or a stub) is
+     * not a C source location — yet libdw's line table can still hand back a
+     * stale row for it (e.g. a `--gc-sections`-discarded function whose
+     * `.debug_line` entry was relocated to address 0), which would make VS Code
+     * show a misleading file:line.  Gating on `have_func` suppresses that and
+     * lets the client show the instruction address instead. */
     char file[256];
     int  line = 0;
-    if (s->elf != NULL &&
+    if (have_func && s->elf != NULL &&
         elf_addr_to_line(s->elf, pc, file, sizeof file, &line) == 0) {
         const char *base = strrchr(file, '/');
         base = base ? base + 1 : file;

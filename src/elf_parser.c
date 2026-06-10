@@ -330,6 +330,12 @@ int elf_addr_to_line(const ElfContext *ctx, uint32_t byte_addr,
     if (ln == NULL)
         return -1;
 
+    /* Reject an end-of-sequence row: it marks the address one past a code
+     * range and carries a stale (last-seen) line number, not a real statement. */
+    bool end_seq = false;
+    if (dwarf_lineendsequence(ln, &end_seq) == 0 && end_seq)
+        return -1;
+
     if (line != NULL) {
         int n = 0;
         if (dwarf_lineno(ln, &n) != 0)
