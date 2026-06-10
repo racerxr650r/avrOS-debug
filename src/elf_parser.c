@@ -408,6 +408,46 @@ int elf_line_to_addr(const ElfContext *ctx, const char *want_file,
     return -1;
 }
 
+int elf_line_range(const ElfContext *ctx, uint32_t byte_addr,
+                   uint32_t *lo, uint32_t *hi)
+{
+    if (ctx == NULL || ctx->dwarf == NULL)
+        return -1;
+
+    Dwarf    *dw = (Dwarf *)ctx->dwarf;
+    Dwarf_Die cu;
+    if (dwarf_addrdie(dw, (Dwarf_Addr)byte_addr, &cu) == NULL)
+        return -1;
+
+    Dwarf_Lines *lines  = NULL;
+    size_t       nlines = 0;
+    if (dwarf_getsrclines(&cu, &lines, &nlines) != 0 || nlines == 0)
+        return -1;
+
+    /* The row covering `byte_addr` spans [greatest addr <= it, smallest addr >
+     * it).  Scan for both bounds without assuming the table is address-sorted. */
+    uint32_t lo_best = 0, hi_best = 0;
+    int      have_lo = 0, have_hi = 0;
+    for (size_t i = 0; i < nlines; i++) {
+        Dwarf_Line *ln = dwarf_onesrcline(lines, i);
+        Dwarf_Addr  a  = 0;
+        if (ln == NULL || dwarf_lineaddr(ln, &a) != 0)
+            continue;
+        uint32_t ua = (uint32_t)a;
+        if (ua <= byte_addr) {
+            if (!have_lo || ua > lo_best) { lo_best = ua; have_lo = 1; }
+        } else {
+            if (!have_hi || ua < hi_best) { hi_best = ua; have_hi = 1; }
+        }
+    }
+    if (!have_lo || !have_hi || hi_best <= lo_best)
+        return -1;
+
+    if (lo != NULL) *lo = lo_best;
+    if (hi != NULL) *hi = hi_best;
+    return 0;
+}
+
 /* ── .debug_frame CFI (CFA-rule) parser ──────────────────────────────────────
  *
  * libdw's high-level CFI executor (dwarf_cfi_addrframe) returns UNKNOWN_ERROR

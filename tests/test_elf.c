@@ -331,9 +331,18 @@ void test_elf_dwarf_accessors_round_trip(void)
             TEST_ASSERT_NOT_EQUAL(0xFFFFFFFFu, addr);
     }
 
-    /* An address far outside any CU yields -1, never a crash. */
+    /* elf_line_range: the line-table row covering a code address brackets it
+     * with a non-empty half-open range — the span a source-line step uses. */
+    uint32_t lo = 0, hi = 0;
+    if (elf_line_range(&ctx, ctx.ehdr.e_entry, &lo, &hi) == 0) {
+        TEST_ASSERT_TRUE(lo <= ctx.ehdr.e_entry);
+        TEST_ASSERT_TRUE(ctx.ehdr.e_entry < hi);
+        TEST_ASSERT_TRUE(hi > lo);
+    }
+    /* An address far outside any CU yields -1, never a crash (both lookups). */
     TEST_ASSERT_EQUAL_INT(-1,
         elf_addr_to_line(&ctx, 0x7FFFFFFFu, file, sizeof file, &line));
+    TEST_ASSERT_EQUAL_INT(-1, elf_line_range(&ctx, 0x7FFFFFFFu, &lo, &hi));
 
     elf_close(&ctx);
 }

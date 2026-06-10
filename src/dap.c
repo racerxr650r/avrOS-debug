@@ -1487,6 +1487,130 @@ static int dap_eval_condition(dap_session *s, uint32_t pc,
     return -1;
 }
 
+/* ── Source-line stepping (HLR-078) ───────────────────────────────────────────
+ *
+ * VS Code sends next/stepIn/stepOut with no address range — unlike GDB, which
+ * computes the source line's range and drives the server's `vCont;r`.  So the
+ * DAP front-end orchestrates source-line stepping itself, but over the SAME
+ * core primitives the GDB-RSP range-step uses: `bp_step_range()` single-steps
+ * within a line's address range (`elf_line_range`), and the reserved stepping
+ * comparator (`RSP_HW_BP_STEP_SLOT`) runs to a return address to step over / out
+ * of calls without touching user breakpoints. */
+#define DAP_STEP_LINE_MAX 4096      /* max line-table rows traversed per step   */
+#define DAP_RUN_TO_POLLS  1200      /* 1200 × 50 ms = 60 s run-to-return budget  */
+
+static int dap_pc_line(dap_session *s, uint32_t pc, char *file, size_t cap, int *line)
+{
+    if (s->elf == NULL) return -1;
+    return elf_addr_to_line(s->elf, pc, file, cap, line);
+}
+
+/* Run the target until it halts at `target` with SP >= `min_sp` (so a recursive
+ * re-entry of the same address at a deeper level is skipped), via the reserved
+ * stepping comparator so user breakpoints are untouched.  Returns 0 when it
+ * reaches the target (or stops at another breakpoint), -1 on a UPDI error or a
+ * poll timeout (target left halted wherever it stopped). */
+static int dap_run_to(dap_session *s, uint32_t target, uint16_t min_sp)
+{
+    if (updi_ocd_set_hw_bp(s->updi_fd, RSP_HW_BP_STEP_SLOT, target) < 0)
+        return -1;
+    int rc = -1;
+    for (int run = 0; run < 64; run++) {
+        if (updi_run(s->updi_fd) < 0) break;
+        int halted = 0;
+        for (int w = 0; w < DAP_RUN_TO_POLLS; w++) {
+            int h = updi_ocd_poll_halted(s->updi_fd, 50);
+            if (h < 0) { halted = -1; break; }
+            if (h > 0) { halted = 1;  break; }
+        }
+        if (halted != 1) { (void)updi_halt(s->updi_fd); break; }
+        uint32_t pc = 0; uint16_t sp = 0;
+        (void)updi_ocd_read_pc(s->updi_fd, &pc);
+        (void)updi_ocd_read_sp(s->updi_fd, &sp);
+        if (pc != target)  { rc = 0; break; }   /* stopped at another (user) bp */
+        if (sp >= min_sp)  { rc = 0; break; }    /* returned to our frame */
+        /* same address but a deeper frame (recursion) → run again */
+    }
+    (void)updi_ocd_clear_hw_bp(s->updi_fd, RSP_HW_BP_STEP_SLOT);
+    return rc;
+}
+
+/* stepIn: advance to a different source line, descending into calls. */
+static void dap_step_line(dap_session *s)
+{
+    uint32_t pc = 0;
+    if (updi_ocd_read_pc(s->updi_fd, &pc) < 0) return;
+    char f0[256] = ""; int l0 = -1;
+    int have0 = (dap_pc_line(s, pc, f0, sizeof f0, &l0) == 0);
+
+    for (int g = 0; g < DAP_STEP_LINE_MAX; g++) {
+        uint32_t lo = 0, hi = 0;
+        if (s->elf != NULL && elf_line_range(s->elf, pc, &lo, &hi) == 0) {
+            if (bp_step_range(s->updi_fd, lo, hi, NULL, NULL) < 0) return;
+        } else if (updi_step(s->updi_fd) < 0) {
+            return;                          /* no line info → single instr step */
+        }
+        if (updi_ocd_read_pc(s->updi_fd, &pc) < 0) return;
+        char f[256] = ""; int l = -1;
+        if (dap_pc_line(s, pc, f, sizeof f, &l) == 0
+            && (!have0 || l != l0 || strcmp(f, f0) != 0))
+            return;                          /* reached a different source line */
+        /* same line (multi-row) or no line yet → keep stepping */
+    }
+}
+
+/* next: like stepIn, but step OVER calls — run to the return rather than
+ * single-stepping through (so stepping over a delay/loop is instant). */
+static void dap_step_over(dap_session *s)
+{
+    uint32_t pc = 0; uint16_t sp0 = 0;
+    if (updi_ocd_read_pc(s->updi_fd, &pc) < 0) return;
+    if (updi_ocd_read_sp(s->updi_fd, &sp0) < 0) return;
+    char f0[256] = ""; int l0 = -1;
+    int have0 = (dap_pc_line(s, pc, f0, sizeof f0, &l0) == 0);
+    char fn0[128] = "";
+    int havef0 = (s->elf != NULL && elf_addr_to_func(s->elf, pc, fn0, sizeof fn0) == 0);
+
+    for (int g = 0; g < DAP_STEP_LINE_MAX; g++) {
+        uint32_t lo = 0, hi = 0;
+        if (s->elf != NULL && elf_line_range(s->elf, pc, &lo, &hi) == 0) {
+            if (bp_step_range(s->updi_fd, lo, hi, NULL, NULL) < 0) return;
+        } else if (updi_step(s->updi_fd) < 0) {
+            return;
+        }
+        uint32_t npc = 0; uint16_t sp = 0;
+        if (updi_ocd_read_pc(s->updi_fd, &npc) < 0) return;
+        (void)updi_ocd_read_sp(s->updi_fd, &sp);
+
+        /* Descended into a call? (stack grew AND we left our function.)  Run to
+         * the return address in our frame instead of stepping through the callee. */
+        char fn[128] = "";
+        int havef = (s->elf != NULL && elf_addr_to_func(s->elf, npc, fn, sizeof fn) == 0);
+        if (sp < sp0 && (!havef0 || !havef || strcmp(fn, fn0) != 0)) {
+            if (dap_unwind(s) >= 2) {        /* frames[1] = our frame (the return) */
+                if (dap_run_to(s, s->frames[1].pc, sp0) != 0) return;
+                if (updi_ocd_read_pc(s->updi_fd, &pc) < 0) return;
+                continue;                    /* back in our frame; re-evaluate */
+            }
+            return;                          /* no unwind → stop here */
+        }
+        pc = npc;
+        char f[256] = ""; int l = -1;
+        if (dap_pc_line(s, pc, f, sizeof f, &l) == 0
+            && (!have0 || l != l0 || strcmp(f, f0) != 0))
+            return;
+    }
+}
+
+/* stepOut: run until the current function returns to its caller. */
+static void dap_step_out(dap_session *s)
+{
+    if (dap_unwind(s) < 2) { (void)updi_step(s->updi_fd); return; }  /* no caller */
+    uint32_t ret    = s->frames[1].pc;            /* caller's return PC */
+    uint16_t min_sp = (uint16_t)s->frames[0].fr.cfa;  /* SP once we return */
+    (void)dap_run_to(s, ret, min_sp);
+}
+
 /* Step over every breakpoint installed at the current PC and resume — the GDB
  * remove/single-step/insert dance — so a conditional breakpoint whose condition
  * was false (or a plain resume parked on a breakpoint) does not immediately
@@ -1633,15 +1757,19 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
         return dap_emit_stopped(s, "pause") < 0 ? -1 : 0;
     }
 
-    /* next / stepIn / stepOut map to a single OCD instruction step (the core
-     * execution verb); source-line granularity and true step-over/step-out
-     * are a later refinement.  Either way the resulting PC resolves to the
-     * correct source line via the shallow stackTrace.                      */
-    if (strcmp(cmd, "next") == 0 || strcmp(cmd, "stepIn") == 0 ||
+    /* Source-line stepping (HLR-078): stepIn advances one source line into
+     * calls; next steps over calls (run-to-return); stepOut runs to the caller.
+     * All are built on the shared bp_step_range() core + the reserved stepping
+     * comparator, so a line of several instructions is one step and a stepped-
+     * over call (even a delay/loop) returns at once. */
+    if (strcmp(cmd, "stepIn") == 0 || strcmp(cmd, "next") == 0 ||
         strcmp(cmd, "stepOut") == 0) {
         dap_varref_reset(s);         /* frame/var handles go stale on step */
-        if (s->updi_fd >= 0)
-            (void)updi_step(s->updi_fd);
+        if (s->updi_fd >= 0) {
+            if (strcmp(cmd, "stepIn") == 0)       dap_step_line(s);
+            else if (strcmp(cmd, "next") == 0)    dap_step_over(s);
+            else                                  dap_step_out(s);
+        }
         s->running = false;
         if (dap_send_response(s, req_seq, cmd, true, NULL) < 0)
             return -1;

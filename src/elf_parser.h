@@ -125,6 +125,15 @@ int elf_addr_to_line(const ElfContext *ctx, uint32_t byte_addr,
 int elf_line_to_addr(const ElfContext *ctx, const char *file, int line,
                      uint32_t *byte_addr);
 
+/* Half-open code-space byte-address range [*lo, *hi) of the line-table row
+ * covering `byte_addr`: *lo is the greatest row address <= byte_addr and *hi
+ * the smallest row address > byte_addr.  This is the span a source-line step
+ * single-steps within (the DAP analogue of the range GDB sends on `vCont;r`).
+ * Returns 0 on success; -1 when the ELF lacks DWARF, the address is in no CU,
+ * or there is no following row (caller then falls back to a single step). */
+int elf_line_range(const ElfContext *ctx, uint32_t byte_addr,
+                   uint32_t *lo, uint32_t *hi);
+
 /* Call-Frame-Information rule for the (canonical) frame address (CFA) at a
  * code-space byte address.  On success returns 0 and stores the DWARF register
  * whose value forms the CFA base in *cfa_reg (AVR: 28 = the Y frame-pointer

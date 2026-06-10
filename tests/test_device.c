@@ -200,6 +200,8 @@ int elf_addr_to_line(const ElfContext *c, uint32_t a, char *f, size_t cap, int *
 { (void)c; (void)a; (void)f; (void)cap; (void)ln; return -1; }
 int elf_line_to_addr(const ElfContext *c, const char *f, int line, uint32_t *a)
 { (void)c; (void)f; (void)line; (void)a; return -1; }
+int elf_line_range(const ElfContext *c, uint32_t a, uint32_t *lo, uint32_t *hi)
+{ (void)c; (void)a; (void)lo; (void)hi; return -1; }
 int elf_cfi_cfa(const ElfContext *c, uint32_t a, int *reg, int *off)
 { (void)c; (void)a; (void)reg; (void)off; return -1; }
 int elf_var_addr(const ElfContext *c, uint32_t pc, const ElfFrameRegs *fr,

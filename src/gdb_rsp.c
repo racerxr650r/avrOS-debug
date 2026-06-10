@@ -893,8 +893,29 @@ static int dh_step(int fd, const char *pkt, void *vctx)
  * range [start, end).  Mirrors GDB's range-step optimisation so the
  * front-end does not have to round-trip a `vCont;s` per instruction
  * during source-stepping over a multi-statement line.  The handler
- * does not install breakpoints; it is a host-driven step loop.       */
-#define RSP_RANGE_STEP_MAX 100000
+ * does not install breakpoints; it is a host-driven step loop — now the shared
+ * `bp_step_range()` core (also used by the DAP step handlers).        */
+
+/* Per-step abort probe passed to bp_step_range(): peek the GDB socket for a
+ * Ctrl-C (`\x03`) or a peer disconnect without blocking the step loop. */
+struct rsp_step_abort { int fd; int disconnected; };
+static bool rsp_step_abort_cb(void *v)
+{
+    struct rsp_step_abort *a = (struct rsp_step_abort *)v;
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(a->fd, &rfds);
+    struct timeval tv = { 0, 0 };
+    if (select(a->fd + 1, &rfds, NULL, NULL, &tv) > 0 && FD_ISSET(a->fd, &rfds)) {
+        char    c;
+        ssize_t n;
+        do { n = read(a->fd, &c, 1); } while (n < 0 && errno == EINTR);
+        if (n <= 0)        { a->disconnected = 1; return true; }  /* peer closed */
+        if (c == '\x03')   { return true; }                       /* Ctrl-C */
+        /* Any other stray byte mid-range-step is discarded (liberal). */
+    }
+    return false;
+}
 
 static int dh_range_step(int fd, const char *pkt, void *vctx)
 {
@@ -910,37 +931,18 @@ static int dh_range_step(int fd, const char *pkt, void *vctx)
      * core target, the active thread is implicit.                    */
 
     ctx->last_stop_cause = SC_NONE;
-    bool got_ctrl_c = false;
-    int  iter = 0;
-    for (;;) {
-        uint32_t pc = 0;
-        if (updi_ocd_read_pc(ctx->updi_fd, &pc) < 0) break;
-        if (pc < start || pc >= end) break;
-        if (++iter > RSP_RANGE_STEP_MAX) break;
 
-        if (updi_step(ctx->updi_fd) < 0) {
-            (void)updi_halt(ctx->updi_fd);
-            return reply_err(fd, "E01");
-        }
-
-        /* Non-blocking peek for Ctrl-C from the GDB client. */
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(fd, &rfds);
-        struct timeval tv = { 0, 0 };
-        int sel = select(fd + 1, &rfds, NULL, NULL, &tv);
-        if (sel > 0 && FD_ISSET(fd, &rfds)) {
-            char c;
-            ssize_t n;
-            do { n = read(fd, &c, 1); } while (n < 0 && errno == EINTR);
-            if (n <= 0) {
-                (void)updi_halt(ctx->updi_fd);
-                return -1;
-            }
-            if (c == '\x03') { got_ctrl_c = true; break; }
-            /* Liberal: discard any other stray byte mid-range-step. */
-        }
+    /* Shared step loop: single-step while PC stays in [start, end). */
+    struct rsp_step_abort ab = { fd, 0 };
+    int r = bp_step_range(ctx->updi_fd, start, end, rsp_step_abort_cb, &ab);
+    if (r < 0)                          /* UPDI error (target already halted) */
+        return reply_err(fd, "E01");
+    if (r == 2 && ab.disconnected) {    /* peer closed mid-step */
+        (void)updi_halt(ctx->updi_fd);
+        return -1;
     }
+    bool got_ctrl_c = (r == 2);         /* aborted but still connected = Ctrl-C */
+    /* r == 0 (PC left range) or r == 1 (cap) → an ordinary step stop. */
 
     fsm_invalidate(ctx->fsm);
     if (ctx->fsm) {

@@ -583,7 +583,7 @@ $(HW_TEST_BIN): $(HW_TEST_SRC) $(BUILDDIR)/updi.o
 	$(Q)$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $^ $(LUTIL)
 	@echo "  LD  $@"
 
-.PHONY: hw-test hw-test-nvm hw-test-rsp hw-test-gdb hw-test-all hw-test-dap hw-test-dap-unwind hw-test-dap-cond hw-test-dap-vars hw-test-dap-introspect hw-test-start-stop
+.PHONY: hw-test hw-test-nvm hw-test-rsp hw-test-gdb hw-test-all hw-test-dap hw-test-dap-unwind hw-test-dap-cond hw-test-dap-vars hw-test-dap-introspect hw-test-start-stop hw-test-dap-step
 hw-test: $(HW_TEST_BIN)
 	$(Q)$(HW_ENV) $(HW_TEST_BIN)
 
@@ -708,6 +708,16 @@ hw-test-dap-introspect: $(HW_INTROSPECT_ELF) all
 	    DAP_PORT='$(HW_DAP_PORT)' \
 	    python3 tests/hw/dap_introspect.py --port '$(HW_PORT)' \
 	        --dap-port '$(HW_DAP_PORT)' --elf '$(HW_INTROSPECT_ELF)'
+
+# hw-test-dap-step — DAP source-line stepping acceptance (HLR-078).  Spawns
+# avrOSdb --dap against the gdb_debug_session fixture and verifies stepIn/next/
+# stepOut have source-line granularity and distinct semantics on silicon.
+hw-test-dap-step: $(GDB_DBG_SESSION_ELF) all
+	$(Q)$(BUILDDIR)/$(TARGET) --prog --erase $(HW_PORT) $(GDB_DBG_SESSION_ELF)
+	$(Q)AVROSDB_BIN='$(BUILDDIR)/$(TARGET)' HW_PORT='$(HW_PORT)' \
+	    DAP_PORT='$(HW_DAP_PORT)' \
+	    python3 tests/hw/dap_step.py --port '$(HW_PORT)' \
+	        --dap-port '$(HW_DAP_PORT)' --elf '$(GDB_DBG_SESSION_ELF)'
 
 # hw-test-start-stop — --start / --stop / --reset one-shot run-state modes
 # (HLR-089).  Spawns avrOSdb in each CPU run-state mode against live silicon and

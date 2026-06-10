@@ -8,6 +8,10 @@
 #include "debug_bp.h"
 #include "updi.h"   /* UPDI_FLASH_BASE, GDB_AVR_*, updi_* OCD/NVM primitives */
 
+/* Safety cap on a single range-step so a runaway loop (PC never leaves the
+ * range) cannot wedge the server.  Matches the GDB-RSP vCont;r bound. */
+#define BP_STEP_RANGE_MAX 100000
+
 const uint8_t SW_BP_BREAK_BYTES[2] = { 0x98u, 0x95u };
 
 /* ── CPU register-file snapshot / restore around the NVMPROG reset ─────────── */
@@ -324,6 +328,27 @@ int bp_step_over(int updi_fd, RspSwBp sw_bp[], bool *pc_dirty)
         if (updi_step(updi_fd) < 0) return -1;
     }
     return 0;
+}
+
+int bp_step_range(int updi_fd, uint32_t lo, uint32_t hi,
+                  bool (*should_abort)(void *), void *abort_ctx)
+{
+    int iter = 0;
+    for (;;) {
+        uint32_t pc = 0;
+        if (updi_ocd_read_pc(updi_fd, &pc) < 0)
+            return -1;
+        if (pc < lo || pc >= hi)
+            return 0;                     /* PC left the range — stop */
+        if (++iter > BP_STEP_RANGE_MAX)
+            return 1;                     /* safety cap reached */
+        if (updi_step(updi_fd) < 0) {
+            (void)updi_halt(updi_fd);
+            return -1;
+        }
+        if (should_abort != NULL && should_abort(abort_ctx))
+            return 2;                     /* caller asked to stop (Ctrl-C/…) */
+    }
 }
 
 void bp_clear_all_sw(RspSwBp sw_bp[])

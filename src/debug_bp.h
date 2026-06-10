@@ -138,6 +138,16 @@ int bp_consume_pc_skip(int updi_fd, RspSwBp sw_bp[], bool *pc_dirty);
  * DAP conditional-breakpoint auto-resume. */
 int bp_step_over(int updi_fd, RspSwBp sw_bp[], bool *pc_dirty);
 
+/* Single-step (plain OCD step) while the live PC stays in the half-open
+ * byte-address range [lo, hi).  Returns 0 when the PC leaves the range, 1 when
+ * the BP_STEP_RANGE_MAX safety cap is hit, 2 when should_abort() (polled after
+ * each step; may be NULL) returns true, or -1 on a UPDI error (target halted).
+ * This is the shared core of the GDB-RSP `vCont;r` range-step (HLR-066) and the
+ * DAP source-line step handlers (HLR-078) — the front-end supplies the line's
+ * address range; the loop is identical. */
+int bp_step_range(int updi_fd, uint32_t lo, uint32_t hi,
+                  bool (*should_abort)(void *), void *abort_ctx);
+
 /* Clear every SW-BP shadow entry without UPDI I/O (vFlashDone / reset). */
 void bp_clear_all_sw(RspSwBp sw_bp[]);
 
