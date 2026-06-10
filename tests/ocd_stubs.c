@@ -43,6 +43,8 @@ int elf_line_to_addr(const ElfContext *c, const char *f, int line, uint32_t *a)
 
 int elf_line_range(const ElfContext *c, uint32_t a, uint32_t *lo, uint32_t *hi)
 { (void)c; (void)a; (void)lo; (void)hi; return -1; }    /* no line ranges in unit tests */
+int elf_func_entry(const ElfContext *c, const char *n, uint32_t *a)
+{ (void)c; (void)n; (void)a; return -1; }               /* no symbol lookup in unit tests */
 
 int elf_cfi_cfa(const ElfContext *c, uint32_t a, int *reg, int *off)
 { (void)c; (void)a; (void)reg; (void)off; return -1; } /* no CFI in unit tests */

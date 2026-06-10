@@ -134,6 +134,12 @@ def main() -> int:
         dap.send("configurationDone")
         dap.wait(lambda m: m.get("event") == "stopped")
 
+        # ST0: the entry stop runs to main (GDB-style), so the client highlights
+        # main's first source line rather than the source-less reset vector.
+        ne, le = dap.where()
+        record("ST0  entry stop lands in main (run-to-main)",
+               ne == "main" and le is not None and le > 0, f"{ne}:{le}")
+
         # ── Phase 1: break at top entry → stepIn (granularity + descend), stepOut.
         dap.rpc("setInstructionBreakpoints", {"breakpoints": [hexref(top_a)]})
         dap.send("continue", {"threadId": 1})

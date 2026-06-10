@@ -134,6 +134,11 @@ int elf_line_to_addr(const ElfContext *ctx, const char *file, int line,
 int elf_line_range(const ElfContext *ctx, uint32_t byte_addr,
                    uint32_t *lo, uint32_t *hi);
 
+/* Resolve a function's entry byte-address from the ELF symbol table (the first
+ * STT_FUNC symbol named `name`).  Returns 0 and stores *addr on success; -1 when
+ * no symbol table or no matching function symbol exists. */
+int elf_func_entry(const ElfContext *ctx, const char *name, uint32_t *addr);
+
 /* Call-Frame-Information rule for the (canonical) frame address (CFA) at a
  * code-space byte address.  On success returns 0 and stores the DWARF register
  * whose value forms the CFA base in *cfa_reg (AVR: 28 = the Y frame-pointer

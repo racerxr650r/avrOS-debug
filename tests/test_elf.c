@@ -344,6 +344,14 @@ void test_elf_dwarf_accessors_round_trip(void)
         elf_addr_to_line(&ctx, 0x7FFFFFFFu, file, sizeof file, &line));
     TEST_ASSERT_EQUAL_INT(-1, elf_line_range(&ctx, 0x7FFFFFFFu, &lo, &hi));
 
+    /* elf_func_entry: `main` resolves to a function entry address; an unknown
+     * symbol returns -1. */
+    uint32_t main_addr = 0xFFFFFFFFu;
+    TEST_ASSERT_EQUAL_INT(0, elf_func_entry(&ctx, "main", &main_addr));
+    TEST_ASSERT_NOT_EQUAL(0xFFFFFFFFu, main_addr);
+    TEST_ASSERT_EQUAL_INT(-1,
+        elf_func_entry(&ctx, "no_such_function_xyz", &main_addr));
+
     elf_close(&ctx);
 }
 

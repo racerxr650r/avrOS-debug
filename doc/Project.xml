@@ -1925,7 +1925,7 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-076" name="DAP Connection Lifecycle">
-        <text><![CDATA[The DAP front-end (`dap_serve()`, reached when the server is started with `--dap`) shall accept one client on the shared TCP listener and service it on the single `select()`-based event loop, honouring the global quit flag between messages. Over that connection it shall implement the DAP connection lifecycle: `initialize` (reply with the adapter capabilities — at minimum `supportsConfigurationDoneRequest` — then emit the `initialized` event); `launch` and `attach` (reply success; the target is already connected and in OCD debug mode, so attach/launch are equivalent here); `setBreakpoints` and `setExceptionBreakpoints` during the configuration phase (reply success — real breakpoint installation is Phase 18); `configurationDone` (halt the target and emit a `stopped` event with reason `entry` for thread 1, reaching the stopped-at-entry state); `threads` (report the single live CPU thread); and `disconnect`/`terminate` (resume the target and close the session). Every reply shall be a well-formed DAP `response` carrying the request's `seq` as `request_seq`, the `command`, and a `success` flag; a request the build does not yet implement shall receive a `success:false` response with a `message` (rather than silence), so the client is never left waiting. Each emitted message shall carry a monotonically increasing `seq`. UPDI side effects shall be skipped when no target link is present so the dispatch is unit-testable without hardware.]]></text>
+        <text><![CDATA[The DAP front-end (`dap_serve()`, reached when the server is started with `--dap`) shall accept one client on the shared TCP listener and service it on the single `select()`-based event loop, honouring the global quit flag between messages. Over that connection it shall implement the DAP connection lifecycle: `initialize` (reply with the adapter capabilities — at minimum `supportsConfigurationDoneRequest` — then emit the `initialized` event); `launch` and `attach` (reply success; the target is already connected and in OCD debug mode, so attach/launch are equivalent here); `setBreakpoints` and `setExceptionBreakpoints` during the configuration phase (reply success — real breakpoint installation is Phase 18); `configurationDone` (halt the target and emit a `stopped` event with reason `entry` for thread 1, reaching the stopped-at-entry state; when the target is halted at the reset vector — PC 0 — it shall first run to `main`'s first statement, GDB-style, so the client highlights the first source line in `main` rather than the source-less reset vector, falling back to the plain reset-vector stop when `main` cannot be located — LLR-DAP-20); `threads` (report the single live CPU thread); and `disconnect`/`terminate` (resume the target and close the session). Every reply shall be a well-formed DAP `response` carrying the request's `seq` as `request_seq`, the `command`, and a `success` flag; a request the build does not yet implement shall receive a `success:false` response with a `message` (rather than silence), so the client is never left waiting. Each emitted message shall carry a monotonically increasing `seq`. UPDI side effects shall be skipped when no target link is present so the dispatch is unit-testable without hardware.]]></text>
         <traces>
           <trace target="SDD" ref="2.2"/>
           <trace target="SDD" ref="10.1"/>
@@ -3144,6 +3144,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
           <trace target="HLR" ref="HLR-072" name="DWARF Source-Level Lookup (DAP Groundwork)"/>
         </traces>
       </llr>
+
+      <llr id="LLR-ELF-23">
+        <text><![CDATA[`elf_func_entry()` shall resolve a function's entry byte-address from the ELF symbol table: it scans the first `SHT_SYMTAB` section (`gelf_getsym()`) for a defined `STT_FUNC` symbol whose name (`elf_strptr()`) equals the requested name, and on a match stores `sym.st_value` in `*addr` and returns 0.  It shall return -1 when there is no symbol table or no matching function symbol.  The DAP run-to-main (LLR-DAP-20) uses it to locate `main`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-076" name="DAP Connection Lifecycle"/>
+        </traces>
+      </llr>
     </function>
 
     <function number="6" title="src/fsm_mapper.c — FSM State Snapshot Provider" name="fsm" source="src/fsm_mapper.c">
@@ -3474,7 +3481,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-DAP-07">
-        <text><![CDATA[`dap_dispatch()` shall implement the Phase-16 lifecycle commands: `initialize` → a capabilities response (`supportsConfigurationDoneRequest:true`) followed by the `initialized` event; `launch` / `attach` → success; `setExceptionBreakpoints` → success; `setBreakpoints` → success with an empty `breakpoints` array (real installation deferred to Phase 18); `configurationDone` → halt the target (`updi_halt()` when `updi_fd >= 0`) and emit a `stopped` event (`reason:"entry"`, `threadId:1`, `allThreadsStopped:true`); `threads` → one thread `{id:1,name:"cpu"}`; `disconnect` / `terminate` → resume the target (`updi_run()` when `updi_fd >= 0`), reply success, and return 1. Any other command shall receive a `success:false` response with an explanatory `message`. All UPDI side effects shall be guarded by `updi_fd >= 0` so the dispatch is exercisable without hardware.]]></text>
+        <text><![CDATA[`dap_dispatch()` shall implement the Phase-16 lifecycle commands: `initialize` → a capabilities response (`supportsConfigurationDoneRequest:true`) followed by the `initialized` event; `launch` / `attach` → success; `setExceptionBreakpoints` → success; `setBreakpoints` → success with an empty `breakpoints` array (real installation deferred to Phase 18); `configurationDone` → halt the target (`updi_halt()` when `updi_fd >= 0`), then — when the live PC is the reset vector (0) — run to `main` via `dap_run_to_main()` (LLR-DAP-20), and emit a `stopped` event (`reason:"entry"`, `threadId:1`, `allThreadsStopped:true`); `threads` → one thread `{id:1,name:"cpu"}`; `disconnect` / `terminate` → resume the target (`updi_run()` when `updi_fd >= 0`), reply success, and return 1. Any other command shall receive a `success:false` response with an explanatory `message`. All UPDI side effects shall be guarded by `updi_fd >= 0` so the dispatch is exercisable without hardware.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-076" name="DAP Connection Lifecycle"/>
         </traces>
@@ -3568,6 +3575,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces>
           <trace target="HLR" ref="HLR-078" name="DAP Execution Control, Stop Events &amp; Shallow stackTrace"/>
           <trace target="HLR" ref="HLR-072" name="DWARF Source-Level Lookup (DAP Groundwork)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-DAP-20">
+        <text><![CDATA[`dap_run_to_main()` shall, on the `configurationDone` entry stop when the live PC is the reset vector (0), advance the target to `main`'s first statement so the client highlights it (GDB-style run-to-main).  It shall locate `main`'s entry via `elf_func_entry()` (LLR-ELF-23); returning -1 (caller keeps the plain reset-vector stop) when `main` is absent or no target/ELF is present.  It shall skip the prologue by walking line-table rows from `main`'s entry (via `elf_line_range()` + `elf_addr_to_line()`) until the line differs from `main`'s declaration line — the first executable statement — then run there with `dap_run_to()` (LLR-DAP-19, the reserved stepping comparator).  `dap_dispatch()` shall invoke it from `configurationDone` only when `updi_ocd_read_pc()` reports PC 0, so attaching to an already-running target (PC ≠ 0) is left where it stopped.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-076" name="DAP Connection Lifecycle"/>
         </traces>
       </llr>
     </function>
@@ -4648,8 +4662,8 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </test>
 
       <test name="elf_dwarf_accessors_round_trip">
-        <purpose><![CDATA[On a `-g` fixture, verify `elf_dwarf_available()` returns 1; map the entry-point code address to a source `file:line` via `elf_addr_to_line()` (when it resolves, assert line > 0 and a non-empty file, and that `elf_line_to_addr()` returns a real address for that `file:line`); verify `elf_line_range()` brackets the entry address with a non-empty half-open range (`lo <= addr < hi`); and verify both `elf_addr_to_line()` and `elf_line_range()` on an address far outside any CU return -1 without crashing.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-ELF-11"/><trace target="LLR" ref="LLR-ELF-12"/><trace target="LLR" ref="LLR-ELF-13"/><trace target="LLR" ref="LLR-ELF-22"/></traces>
+        <purpose><![CDATA[On a `-g` fixture, verify `elf_dwarf_available()` returns 1; map the entry-point code address to a source `file:line` via `elf_addr_to_line()` (when it resolves, assert line > 0 and a non-empty file, and that `elf_line_to_addr()` returns a real address for that `file:line`); verify `elf_line_range()` brackets the entry address with a non-empty half-open range (`lo <= addr < hi`); verify `elf_func_entry("main")` resolves to a function address and an unknown symbol returns -1; and verify both `elf_addr_to_line()` and `elf_line_range()` on an address far outside any CU return -1 without crashing.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-11"/><trace target="LLR" ref="LLR-ELF-12"/><trace target="LLR" ref="LLR-ELF-13"/><trace target="LLR" ref="LLR-ELF-22"/><trace target="LLR" ref="LLR-ELF-23"/></traces>
       </test>
 
       <test name="elf_cfi_cfa_extracts_avr_frame_rules">
@@ -5531,9 +5545,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src DAP source-line stepping acceptance (stepIn/next/stepOut) -->
     <!-- ============================================================ -->
-    <file path="tests/hw/dap_step.py" role="hardware" count="5">
+    <file path="tests/hw/dap_step.py" role="hardware" count="6">
       <header><![CDATA[On-target DAP source-line stepping acceptance (HLR-078). Spawns `avrOSdb --dap` against live AVR-Dx silicon running the `gdb_debug_session` fixture (call chain main -> top -> mid -> leaf) and verifies stepIn/next/stepOut have source-line granularity and distinct semantics — the regression being that all three single-stepped one instruction. Breakpoints are set at function entries via `setInstructionBreakpoints` (addresses from `avr-nm`). Manual-only (`make hw-test-dap-step`) — never wired into `make test`.]]></header>
 
+      <test name="ST0_entry_stop_lands_in_main">
+        <purpose><![CDATA[After `configurationDone` the entry stop's frame 0 is in `main` at a real source line (line > 0) — confirming the GDB-style run-to-main so the client highlights main's first statement instead of the source-less reset vector. Per HLR-076 / LLR-DAP-20.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-076"/><trace target="LLR" ref="LLR-DAP-20"/></traces>
+      </test>
       <test name="ST1_stepIn_advances_one_source_line">
         <purpose><![CDATA[From `top`'s entry, one `stepIn` advances a whole source line within `top` (the reported line changes in a single step) — proving source-line, not single-instruction, granularity. Per HLR-078 / LLR-DAP-19.]]></purpose>
         <traces><trace target="HLR" ref="HLR-078"/><trace target="LLR" ref="LLR-DAP-19"/></traces>

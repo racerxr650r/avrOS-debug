@@ -1622,6 +1622,35 @@ static void dap_step_out(dap_session *s)
     (void)dap_run_to(s, ret, min_sp);
 }
 
+/* Run to main()'s first statement, GDB-style, on the entry stop: locate main in
+ * the symbol table, skip its prologue (advance to the first line-table row whose
+ * line differs from main's declaration line), and run there.  This makes the
+ * client highlight the first source line in main instead of leaving the PC at
+ * the reset vector with no source.  Returns 0 if it ran to main, -1 if main
+ * could not be located (caller keeps the plain reset-vector entry stop). */
+static int dap_run_to_main(dap_session *s)
+{
+    if (s->updi_fd < 0 || s->elf == NULL) return -1;
+    uint32_t main_lo = 0;
+    if (elf_func_entry(s->elf, "main", &main_lo) != 0) return -1;
+
+    /* Skip the prologue: from main's entry, advance over line-table rows that
+     * share main's declaration line until the line changes (the first real
+     * statement).  Falls back to the entry address if the line table is thin. */
+    uint32_t target = main_lo;
+    int entry_line = -1;
+    int have_entry = (elf_addr_to_line(s->elf, main_lo, NULL, 0, &entry_line) == 0);
+    for (int g = 0; g < 64; g++) {
+        uint32_t lo = 0, hi = 0;
+        if (elf_line_range(s->elf, target, &lo, &hi) != 0) break;
+        int l = -1;
+        int ok = (elf_addr_to_line(s->elf, hi, NULL, 0, &l) == 0);
+        target = hi;
+        if (!have_entry || !ok || l != entry_line) break;   /* first statement */
+    }
+    return dap_run_to(s, target, 0);
+}
+
 /* Step over every breakpoint installed at the current PC and resume — the GDB
  * remove/single-step/insert dance — so a conditional breakpoint whose condition
  * was false (or a plain resume parked on a breakpoint) does not immediately
@@ -1726,8 +1755,15 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
         return dap_handle_set_instruction_breakpoints(s, msg, t, req_seq) < 0 ? -1 : 0;
 
     if (strcmp(cmd, "configurationDone") == 0) {
-        if (s->updi_fd >= 0)
+        if (s->updi_fd >= 0) {
             (void)updi_halt(s->updi_fd);
+            /* GDB-like run-to-main: when halted at the reset vector (PC 0),
+             * advance to main's first statement so the client highlights it
+             * rather than showing the source-less reset vector. */
+            uint32_t pc = 0;
+            if (updi_ocd_read_pc(s->updi_fd, &pc) == 0 && pc == 0)
+                (void)dap_run_to_main(s);
+        }
         s->running = false;
         if (dap_send_response(s, req_seq, cmd, true, NULL) < 0)
             return -1;

@@ -454,6 +454,37 @@ int elf_line_range(const ElfContext *ctx, uint32_t byte_addr,
     return 0;
 }
 
+int elf_func_entry(const ElfContext *ctx, const char *name, uint32_t *addr)
+{
+    if (ctx == NULL || ctx->elf == NULL || name == NULL)
+        return -1;
+
+    Elf     *e   = (Elf *)ctx->elf;
+    Elf_Scn *scn = NULL;
+    while ((scn = elf_nextscn(e, scn)) != NULL) {
+        GElf_Shdr sh;
+        if (gelf_getshdr(scn, &sh) == NULL)  continue;
+        if (sh.sh_type != SHT_SYMTAB)        continue;
+
+        Elf_Data *d = elf_getdata(scn, NULL);
+        if (d == NULL)  break;
+        size_t count = (sh.sh_entsize != 0) ? sh.sh_size / sh.sh_entsize : 0;
+        for (size_t i = 0; i < count; i++) {
+            GElf_Sym sym;
+            if (gelf_getsym(d, (int)i, &sym) == NULL)             continue;
+            if (sym.st_shndx == SHN_UNDEF || sym.st_name == 0)    continue;
+            if (GELF_ST_TYPE(sym.st_info) != STT_FUNC)            continue;
+            const char *sn = elf_strptr(e, sh.sh_link, sym.st_name);
+            if (sn != NULL && strcmp(sn, name) == 0) {
+                if (addr != NULL) *addr = (uint32_t)sym.st_value;
+                return 0;
+            }
+        }
+        break;  /* first symtab only */
+    }
+    return -1;
+}
+
 /* ── .debug_frame CFI (CFA-rule) parser ──────────────────────────────────────
  *
  * libdw's high-level CFI executor (dwarf_cfi_addrframe) returns UNKNOWN_ERROR
