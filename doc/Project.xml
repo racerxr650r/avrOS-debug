@@ -5448,5 +5448,37 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </test>
     </file>
 
+    <!-- ============================================================ -->
+    <!-- src CPU run-state one-shot mode acceptance (start/stop/reset) -->
+    <!-- ============================================================ -->
+    <file path="tests/hw/start_stop.py" role="hardware" count="6">
+      <header><![CDATA[On-target acceptance for the `--start` / `--stop` / `--reset` one-shot CPU run-state modes (HLR-089). Spawns the real `avrOSdb` binary against live AVR-Dx silicon and drives each run-state mode in turn, asserting it takes OCD control and exits cleanly with its success banner, and that the UPDI link stays healthy across the repeated attach/detach cycles — exercising the on-silicon `updi_open` → `updi_enter_debug` → `updi_run`/`updi_halt` → `updi_detach` path the host unit tests can only stub. Manual-only (`make hw-test-start-stop`) — never wired into `make test`. Needs only the serial device.]]></header>
+
+      <test name="SS0_start_stop_mutually_exclusive">
+        <purpose><![CDATA[`avrOSdb --start --stop <serial>` exits non-zero with a "mutually exclusive" diagnostic — the run-state modes reject combination before touching hardware. Per LLR-MAIN-27.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-089"/><trace target="LLR" ref="LLR-MAIN-27"/></traces>
+      </test>
+      <test name="SS1_stop_halts_cpu">
+        <purpose><![CDATA[`avrOSdb --stop <serial>` takes OCD control, halts the CPU on live silicon, and exits 0 printing `stop: OK`. Per HLR-089 / LLR-MAIN-28.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-089"/><trace target="LLR" ref="LLR-MAIN-28"/></traces>
+      </test>
+      <test name="SS2_start_runs_cpu">
+        <purpose><![CDATA[`avrOSdb --start <serial>` takes OCD control, runs the CPU on live silicon, and exits 0 printing `start: OK`. Per HLR-089 / LLR-MAIN-28.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-089"/><trace target="LLR" ref="LLR-MAIN-28"/></traces>
+      </test>
+      <test name="SS3_reset_sibling">
+        <purpose><![CDATA[`avrOSdb --reset <serial>` pulses the UPDI system reset and exits 0 printing `reset: OK`, confirming the sibling run-state mode still works after a start/stop cycle. Per HLR-089.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-089"/></traces>
+      </test>
+      <test name="SS4_link_healthy_after_cycle">
+        <purpose><![CDATA[After the start/stop/reset cycle, a fresh `avrOSdb --device <serial>` re-opens the link and reads the SIGROW report (exit 0) — proving `updi_detach()` left the link in a re-openable state. Per HLR-089 / LLR-UPDI-37.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-089"/><trace target="LLR" ref="LLR-UPDI-37"/></traces>
+      </test>
+      <test name="SS5_stop_repeatable">
+        <purpose><![CDATA[A second `avrOSdb --stop <serial>` after the full cycle still succeeds (exit 0, `stop: OK`), confirming repeated OCD attach/detach cycles are stable. Per HLR-089 / LLR-MAIN-28.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-089"/><trace target="LLR" ref="LLR-MAIN-28"/></traces>
+      </test>
+    </file>
+
   </tests>
 </project>

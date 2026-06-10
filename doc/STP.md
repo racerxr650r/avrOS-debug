@@ -486,6 +486,19 @@ Role: **hardware**. **3 test(s).**
 | 2 | <a id="DAP_I2_event_list_reads_table"></a>`DAP_I2_event_list_reads_table` | `LLR-AVROS-01` | `avrosdb/eventList` reads the `EVNT_TABLE` off silicon: against `avros_full` it returns one event whose name is `<null>` (null name pointer) and whose status is the JSON null literal (null status pointer) — exercising the count>0 decode and the null-pointer rendering. Per HLR-086 / LLR-AVROS-01. |
 | 3 | <a id="DAP_I3_queue_list_reads_table"></a>`DAP_I3_queue_list_reads_table` | `LLR-AVROS-02` | `avrosdb/queueList` reads the `QUE_TABLE` off silicon: against `avros_full` it returns one queue with `capacity = 0` (the zero descriptor) — exercising the count>0 decode path on hardware. Per HLR-086 / LLR-AVROS-02. |
 
+### 3.18. [tests/hw/start_stop.py](../tests/hw/start_stop.py)
+
+Role: **hardware**. **6 test(s).**
+
+| # | Test | Verifies | Purpose |
+| - | ---- | -------- | ------- |
+| 1 | <a id="SS0_start_stop_mutually_exclusive"></a>`SS0_start_stop_mutually_exclusive` | `LLR-MAIN-27` | `avrOSdb --start --stop <serial>` exits non-zero with a "mutually exclusive" diagnostic — the run-state modes reject combination before touching hardware. Per LLR-MAIN-27. |
+| 2 | <a id="SS1_stop_halts_cpu"></a>`SS1_stop_halts_cpu` | `LLR-MAIN-28` | `avrOSdb --stop <serial>` takes OCD control, halts the CPU on live silicon, and exits 0 printing `stop: OK`. Per HLR-089 / LLR-MAIN-28. |
+| 3 | <a id="SS2_start_runs_cpu"></a>`SS2_start_runs_cpu` | `LLR-MAIN-28` | `avrOSdb --start <serial>` takes OCD control, runs the CPU on live silicon, and exits 0 printing `start: OK`. Per HLR-089 / LLR-MAIN-28. |
+| 4 | <a id="SS3_reset_sibling"></a>`SS3_reset_sibling` | — | `avrOSdb --reset <serial>` pulses the UPDI system reset and exits 0 printing `reset: OK`, confirming the sibling run-state mode still works after a start/stop cycle. Per HLR-089. |
+| 5 | <a id="SS4_link_healthy_after_cycle"></a>`SS4_link_healthy_after_cycle` | `LLR-UPDI-37` | After the start/stop/reset cycle, a fresh `avrOSdb --device <serial>` re-opens the link and reads the SIGROW report (exit 0) — proving `updi_detach()` left the link in a re-openable state. Per HLR-089 / LLR-UPDI-37. |
+| 6 | <a id="SS5_stop_repeatable"></a>`SS5_stop_repeatable` | `LLR-MAIN-28` | A second `avrOSdb --stop <serial>` after the full cycle still succeeds (exit 0, `stop: OK`), confirming repeated OCD attach/detach cycles are stable. Per HLR-089 / LLR-MAIN-28. |
+
 ## 4. LLR Coverage Matrix
 
 Every LLR in [LLRs.md](LLRs.md) and the test(s) that verify it.
@@ -517,8 +530,8 @@ verified by code review — see
 | `LLR-MAIN-24` | `main` | `HLR-074` | `parse_args_mode_defaults_to_rsp_and_honours_dap_rsp`, `parse_args_rejects_rsp_combined_with_dap` |
 | `LLR-MAIN-25` | `main` | `HLR-077` | `parse_args_sleep_flag_disables_debug_in_sleep` |
 | `LLR-MAIN-26` | `main` | `HLR-085` | `emit_vscode_config_prints_attach_launch_json` |
-| `LLR-MAIN-27` | `main` | `HLR-089` | `test_parse_args_start_sets_flag`, `test_parse_args_stop_sets_flag` |
-| `LLR-MAIN-28` | `main` | `HLR-089` | `test_run_start_mode_runs_cpu_and_detaches`, `test_run_stop_mode_halts_cpu_and_detaches` |
+| `LLR-MAIN-27` | `main` | `HLR-089` | `test_parse_args_start_sets_flag`, `test_parse_args_stop_sets_flag`, `SS0_start_stop_mutually_exclusive` |
+| `LLR-MAIN-28` | `main` | `HLR-089` | `test_run_start_mode_runs_cpu_and_detaches`, `test_run_stop_mode_halts_cpu_and_detaches`, `SS1_stop_halts_cpu`, `SS2_start_runs_cpu`, `SS5_stop_repeatable` |
 | `LLR-MAIN-22` | `main` | `HLR-065` | `test_sig_handler_records_signo_in_g_shutdown_signal`, `test_event_loop_clears_disconnect_reason_after_drain` |
 | `LLR-UPDI-01` | `updi` | `HLR-006` | `updi_open_sets_8e2_raw_half_duplex_via_termios`, `updi_open_returns_minus1_on_device_open_failure` |
 | `LLR-UPDI-02` | `updi` | `HLR-006`, `HLR-036` | `updi_open_asserts_wake_byte_then_stcs_ctrlb`, `updi_open_restores_session_baud_after_break` |
@@ -556,7 +569,7 @@ verified by code review — see
 | `LLR-UPDI-34` | `updi` | `HLR-054` | `continue_after_sw_bp_install_injects_leading_instruction`, `step_after_sw_bp_install_injects_leading_instruction` |
 | `LLR-UPDI-35` | `updi` | `HLR-077` | `updi_apply_debug_in_sleep_asserts_clkreq_when_enabled`, `updi_apply_debug_in_sleep_emits_nothing_when_disabled` |
 | `LLR-UPDI-36` | `updi` | `HLR-077` | `updi_save_restore_peripherals_noop_when_disabled` |
-| `LLR-UPDI-37` | `updi` | `HLR-089` | `updi_detach_closes_fd_and_ignores_negative` |
+| `LLR-UPDI-37` | `updi` | `HLR-089` | `updi_detach_closes_fd_and_ignores_negative`, `SS4_link_healthy_after_cycle` |
 | `LLR-RSP-01` | `rsp` | `HLR-003`, `HLR-038` | `rsp_listen_sets_so_reuseaddr_before_bind`, `rsp_accept_sets_tcp_nodelay_on_client_socket` |
 | `LLR-RSP-02` | `rsp` | `HLR-013` | `rsp_recv_packet_discards_leading_ack_nak_bytes`, `rsp_recv_packet_sends_plus_on_valid_checksum`, `rsp_recv_packet_sends_minus_and_returns_minus1_on_bad_checksum` |
 | `LLR-RSP-03` | `rsp` | `HLR-014` | `on_read_regs_g_returns_78_char_hex_string`, `on_read_regs_g_places_pc_little_endian_at_positions_70_77` |

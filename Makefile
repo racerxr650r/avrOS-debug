@@ -583,7 +583,7 @@ $(HW_TEST_BIN): $(HW_TEST_SRC) $(BUILDDIR)/updi.o
 	$(Q)$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $^ $(LUTIL)
 	@echo "  LD  $@"
 
-.PHONY: hw-test hw-test-nvm hw-test-rsp hw-test-gdb hw-test-all hw-test-dap hw-test-dap-unwind hw-test-dap-cond hw-test-dap-vars hw-test-dap-introspect
+.PHONY: hw-test hw-test-nvm hw-test-rsp hw-test-gdb hw-test-all hw-test-dap hw-test-dap-unwind hw-test-dap-cond hw-test-dap-vars hw-test-dap-introspect hw-test-start-stop
 hw-test: $(HW_TEST_BIN)
 	$(Q)$(HW_ENV) $(HW_TEST_BIN)
 
@@ -708,6 +708,14 @@ hw-test-dap-introspect: $(HW_INTROSPECT_ELF) all
 	    DAP_PORT='$(HW_DAP_PORT)' \
 	    python3 tests/hw/dap_introspect.py --port '$(HW_PORT)' \
 	        --dap-port '$(HW_DAP_PORT)' --elf '$(HW_INTROSPECT_ELF)'
+
+# hw-test-start-stop — --start / --stop / --reset one-shot run-state modes
+# (HLR-089).  Spawns avrOSdb in each CPU run-state mode against live silicon and
+# checks it takes OCD control and exits cleanly with its banner, and that the
+# UPDI link stays healthy across the attach/detach cycles.  Needs no ELF.
+hw-test-start-stop: all
+	$(Q)AVROSDB_BIN='$(BUILDDIR)/$(TARGET)' HW_PORT='$(HW_PORT)' \
+	    python3 tests/hw/start_stop.py --serial '$(HW_PORT)'
 
 # hw-test-dap-vars — DAP variables / evaluate / memory acceptance (Phase 19,
 # the DAP analogue of GDB Group-G state inspection).  Spawns avrOSdb --dap
