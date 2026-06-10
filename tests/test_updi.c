@@ -1069,11 +1069,28 @@ static void updi_crc32_matches_known_vector_for_single_zero_byte(void)
     TEST_ASSERT_EQUAL_HEX32(0xD202EF8Du, updi_crc32(z, 1));
 }
 
+/* LLR-UPDI-37: updi_detach() closes the fd without a reset pulse, and is a
+ * no-op on a negative fd. */
+static void updi_detach_closes_fd_and_ignores_negative(void)
+{
+    int fds[2];
+    TEST_ASSERT_EQUAL_INT(0, pipe(fds));
+
+    updi_detach(fds[1]);            /* should tcdrain (ignored) + close fds[1] */
+    errno = 0;
+    TEST_ASSERT_EQUAL_INT(-1, write(fds[1], "x", 1));
+    TEST_ASSERT_EQUAL_INT(EBADF, errno);   /* proves the fd was closed */
+
+    close(fds[0]);
+    updi_detach(-1);                /* no-op, must not crash */
+}
+
 /* ── Test runner ─────────────────────────────────────────────────────── */
 
 int main(void)
 {
     UNITY_BEGIN();
+    RUN_TEST(updi_detach_closes_fd_and_ignores_negative);
 
     /* Phase B */
     RUN_TEST(updi_open_returns_minus1_on_device_open_failure);

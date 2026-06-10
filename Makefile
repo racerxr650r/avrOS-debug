@@ -284,7 +284,7 @@ TEST_EXTRA_LDFLAGS_test_rsp :=
 # static parse_args() / event_loop() / load_flash_segments() helpers.
 TEST_SRCS_test_main := $(TESTDIR)/test_main.c $(SRCDIR)/dap.c $(SRCDIR)/debug_bp.c \
                        $(SRCDIR)/avros.c $(TESTDIR)/ocd_stubs.c
-TEST_WRAP_test_main  := updi_open updi_close updi_console_poll \
+TEST_WRAP_test_main  := updi_open updi_close updi_detach updi_console_poll \
                         updi_select_device updi_get_device \
                         updi_nvm_write_flash updi_nvm_flash_patch \
                         updi_nvm_write_eeprom updi_nvm_write_userrow \

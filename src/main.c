@@ -43,13 +43,16 @@ typedef struct {
     bool        no_verify;     /* --no-verify: skip read-back verify
                                 *  after --load / --prog (LLR-MAIN-14)  */
     bool        no_autobaud;   /* --no-autobaud: skip --device autobaud */
-    bool        log_rsp;       /* --log-rsp: detailed logging to stderr */
+    bool        log;           /* --log: detailed activity logging to stderr
+                                *  (RSP packets / DAP messages / prog phases) */
     bool        allow_erase;   /* --allow-erase: HLR-055 gate for the
                                 *  monitor erase / chip-erase verbs   */
     const char *force_device;    /* --force-device=<family>: skip SIGROW
                                   *  autodetect and use the named family  */
     bool        no_introspect;  /* --no-introspect: disable avrOS FSM introspection */
     bool        reset_cpu;       /* --reset: pulse UPDI system reset and exit    */
+    bool        start_cpu;       /* --start: run the CPU under OCD and exit      */
+    bool        stop_cpu;        /* --stop: halt the CPU under OCD and exit      */
     bool        dap_mode;        /* --dap: serve DAP instead of RSP (default).
                                   *  --rsp selects RSP explicitly; the two are
                                   *  mutually exclusive (Phase 16).            */
@@ -86,14 +89,14 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
         "usage: %s [--rsp | --dap] [--port <port>] [--baud <baud>] [--erase] [--load] "
-        "[--no-verify] [--allow-lock-updi] [--force-device=<family>] [--log-rsp] "
-        "<serial-device> <elf-file>\n"
+        "[--no-verify] [--allow-lock-updi] [--force-device=<family>] [--no-introspect] "
+        "[--sleep] [--log] <serial-device> <elf-file>\n"
         "       %s --prog [--baud <baud>] [--erase] [--no-verify] "
-        "[--allow-lock-updi] [--force-device=<family>] [--log-rsp] "
+        "[--allow-lock-updi] [--force-device=<family>] [--log] "
         "<serial-device> <elf-file>\n"
         "       %s --device [--baud <baud>] [--no-autobaud] "
         "[--force-device=<family>] <serial-device> [elf-file]\n"
-        "       %s --reset [--baud <baud>] <serial-device>\n"
+        "       %s {--reset | --start | --stop} [--baud <baud>] <serial-device>\n"
         "\n"
         "  --erase            DESTRUCTIVE: chip-erase + unlock before --load.\n"
         "                     Required on a locked AVR-Dx target before NVMPROG.\n"
@@ -121,8 +124,13 @@ static void usage(const char *prog)
         "  --reset            Pulse the UPDI system reset and exit.\n"
         "                     Requires only <serial-device>; no ELF needed.\n"
         "                     Redundant when combined with --prog.\n"
-        "  --log-rsp          Log all incoming and outgoing GDB RSP packets\n"
-        "                     to standard error.\n"
+        "  --start            Run the CPU under OCD control and exit, leaving\n"
+        "                     the target running.  Requires only <serial-device>.\n"
+        "  --stop             Halt the CPU under OCD control and exit, leaving\n"
+        "                     the target stopped.  Requires only <serial-device>.\n"
+        "  --log              Log detailed activity to standard error — GDB RSP\n"
+        "                     packets (--rsp), DAP messages (--dap), or the\n"
+        "                     programming phases (--load / --prog), as applicable.\n"
         "  --sleep            Allow the target to sleep natively. By default the\n"
         "                     debugger preserves the firmware's peripheral state\n"
         "                     across the software-breakpoint NVMPROG reset (and\n"
@@ -150,6 +158,8 @@ MAYBE_STATIC int  verify_segments(AppConfig *cfg, ElfContext *ctx);
 MAYBE_STATIC int  run_device_mode(AppConfig *cfg);
 MAYBE_STATIC int  run_prog_mode(AppConfig *cfg);
 MAYBE_STATIC int  run_reset_mode(AppConfig *cfg);
+MAYBE_STATIC int  run_start_mode(AppConfig *cfg);
+MAYBE_STATIC int  run_stop_mode(AppConfig *cfg);
 MAYBE_STATIC void run_autobaud_probe(AppConfig *cfg);
 MAYBE_STATIC void sig_handler(int signo);
 MAYBE_STATIC void progress_render(const char *phase, const char *window,
@@ -400,6 +410,8 @@ MAYBE_STATIC int  verify_segments(AppConfig *cfg, ElfContext *ctx);
 MAYBE_STATIC int  run_device_mode(AppConfig *cfg);
 MAYBE_STATIC int  run_prog_mode(AppConfig *cfg);
 MAYBE_STATIC int  run_reset_mode(AppConfig *cfg);
+MAYBE_STATIC int  run_start_mode(AppConfig *cfg);
+MAYBE_STATIC int  run_stop_mode(AppConfig *cfg);
 MAYBE_STATIC void run_autobaud_probe(AppConfig *cfg);
 MAYBE_STATIC void sig_handler(int signo);
 MAYBE_STATIC void progress_render(const char *phase, const char *window,
@@ -421,9 +433,11 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
     cfg->no_autobaud   = false;
     cfg->force_device  = NULL;
     cfg->allow_erase   = false;
-    cfg->log_rsp       = false;
+    cfg->log           = false;
     cfg->no_introspect = false;
     cfg->reset_cpu      = false;
+    cfg->start_cpu      = false;
+    cfg->stop_cpu       = false;
     cfg->dap_mode       = false;   /* default: RSP front-end */
     cfg->debug_in_sleep = true;    /* default: keep clock alive in SLEEP */
     cfg->listen_fd     = -1;
@@ -468,12 +482,16 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
             cfg->no_autobaud = true;
         } else if (strcmp(a, "--allow-erase") == 0) {
             cfg->allow_erase = true;
-        } else if (strcmp(a, "--log-rsp") == 0) {
-            cfg->log_rsp = true;
+        } else if (strcmp(a, "--log") == 0) {
+            cfg->log = true;
         } else if (strcmp(a, "--no-introspect") == 0) {
             cfg->no_introspect = true;
         } else if (strcmp(a, "--reset") == 0) {
             cfg->reset_cpu = true;
+        } else if (strcmp(a, "--start") == 0) {
+            cfg->start_cpu = true;
+        } else if (strcmp(a, "--stop") == 0) {
+            cfg->stop_cpu = true;
         } else if (strcmp(a, "--sleep") == 0) {
             cfg->debug_in_sleep = false;
         } else if (strcmp(a, "--rsp") == 0) {
@@ -526,14 +544,26 @@ MAYBE_STATIC void parse_args(int argc, char *argv[], AppConfig *cfg)
         exit(1);
     }
 
+    /* --reset / --start / --stop are one-shot run-state modes and are mutually
+     * exclusive with each other. */
+    if ((cfg->reset_cpu ? 1 : 0) + (cfg->start_cpu ? 1 : 0) +
+        (cfg->stop_cpu ? 1 : 0) > 1) {
+        fprintf(stderr,
+                "%s: error: --reset, --start and --stop are mutually exclusive\n",
+                argv[0]);
+        usage(argv[0]);
+        exit(1);
+    }
+
     if (cfg->serial_device == NULL) {
         usage(argv[0]);
         exit(1);
     }
     /* --device makes <elf-file> optional (LLR-MAIN-08).
-     * --reset makes <elf-file> optional.
+     * --reset / --start / --stop make <elf-file> optional (run-state only).
      * --prog requires an ELF (LLR-MAIN-15).                            */
-    if (!cfg->device_info && !cfg->reset_cpu && cfg->elf_path == NULL) {
+    if (!cfg->device_info && !cfg->reset_cpu && !cfg->start_cpu &&
+        !cfg->stop_cpu && cfg->elf_path == NULL) {
         usage(argv[0]);
         exit(1);
     }
@@ -864,6 +894,63 @@ MAYBE_STATIC int run_reset_mode(AppConfig *cfg)
     updi_close(fd);
     cfg->updi_fd = -1;
     fprintf(stdout, "reset: OK\n");
+    fflush(stdout);
+    return 0;
+}
+
+/* run_start_mode (--start): take OCD control and run the CPU, then detach
+ * leaving the target running.  Entering OCD pulses a reset, so the CPU runs
+ * from the reset vector.  No ELF, no GDB listener, no event loop. */
+MAYBE_STATIC int run_start_mode(AppConfig *cfg)
+{
+    int fd = updi_open(cfg->serial_device, cfg->baud_rate);
+    if (fd < 0) {
+        fprintf(stderr,
+                "error: updi-open failed for '%s' — "
+                "check wiring, target power, UPDIDIS fuse\n",
+                cfg->serial_device);
+        return 1;
+    }
+    cfg->updi_fd = fd;
+    int rc = updi_enter_debug(fd);
+    if (rc == 0) rc = updi_run(fd);
+    /* Detach without the reset pulse so the CPU keeps running from where
+     * updi_run() resumed it rather than being reset a second time. */
+    updi_detach(fd);
+    cfg->updi_fd = -1;
+    if (rc != 0) {
+        fprintf(stderr, "error: --start failed to run the CPU\n");
+        return 1;
+    }
+    fprintf(stdout, "start: OK (CPU running)\n");
+    fflush(stdout);
+    return 0;
+}
+
+/* run_stop_mode (--stop): take OCD control and halt the CPU, then detach
+ * WITHOUT a reset pulse so the target stays halted under OCD.  Entering OCD
+ * pulses a reset and stops at the reset vector; the explicit halt is belt-and-
+ * braces.  No ELF, no GDB listener, no event loop. */
+MAYBE_STATIC int run_stop_mode(AppConfig *cfg)
+{
+    int fd = updi_open(cfg->serial_device, cfg->baud_rate);
+    if (fd < 0) {
+        fprintf(stderr,
+                "error: updi-open failed for '%s' — "
+                "check wiring, target power, UPDIDIS fuse\n",
+                cfg->serial_device);
+        return 1;
+    }
+    cfg->updi_fd = fd;
+    int rc = updi_enter_debug(fd);
+    if (rc == 0) rc = updi_halt(fd);
+    updi_detach(fd);   /* leave the CPU halted (no reset on the way out) */
+    cfg->updi_fd = -1;
+    if (rc != 0) {
+        fprintf(stderr, "error: --stop failed to halt the CPU\n");
+        return 1;
+    }
+    fprintf(stdout, "stop: OK (CPU halted)\n");
     fflush(stdout);
     return 0;
 }
@@ -1310,7 +1397,18 @@ MAYBE_STATIC int run_prog_mode(AppConfig *cfg)
         }
     }
 
+    /* --log: trace the programming pipeline to stderr. */
+    if (cfg->log) {
+        const UpdiDeviceMap *d = updi_get_device();
+        fprintf(stderr,
+                "log: prog target=%s baud=%d erase=%s verify=%s elf=%s\n",
+                (d != NULL && d->family != NULL) ? d->family : "?",
+                cfg->baud_rate, cfg->erase_chip ? "yes" : "no",
+                cfg->no_verify ? "off" : "on", cfg->elf_path);
+    }
+
     if (cfg->erase_chip) {
+        if (cfg->log) fprintf(stderr, "log: chip erase\n");
         if (updi_chip_erase(cfg->updi_fd) < 0) {
             fprintf(stderr, "error: chip erase failed\n");
             updi_close(cfg->updi_fd); cfg->updi_fd = -1;
@@ -1410,6 +1508,14 @@ int MAIN_NAME(int argc, char *argv[])
     /* --reset: pulse UPDI system reset and exit. */
     if (cfg.reset_cpu) {
         return run_reset_mode(&cfg);
+    }
+
+    /* --start / --stop: one-shot CPU run-state control, then exit. */
+    if (cfg.start_cpu) {
+        return run_start_mode(&cfg);
+    }
+    if (cfg.stop_cpu) {
+        return run_stop_mode(&cfg);
     }
 
     /* Signal handlers (LLR-MAIN-06). */
@@ -1597,12 +1703,17 @@ int MAIN_NAME(int argc, char *argv[])
     RspHandlers handlers;
     rsp_default_handlers(&handlers, &rctx);
 
-    rsp_set_logging(cfg.log_rsp);
+    rsp_set_logging(cfg.log);
     /* Phase 16: dispatch to the selected protocol front-end. Both serve over
-     * the same TCP listener + debug core; --rsp is the default. */
+     * the same TCP listener + debug core; --rsp is the default.
+     * --no-introspect (enable_introspect == false) disables avrOS introspection
+     * on the DAP path too: passing a NULL symbol index leaves the
+     * avrosdb/fsmList|eventList|queueList custom requests returning empty
+     * (dap.c uses `idx` only for those handlers), matching the RSP path. */
     if (cfg.dap_mode)
-        dap_serve(cfg.listen_fd, cfg.updi_fd, &elf_ctx, &idx,
-                  enable_introspect ? &fsm_ctx : NULL, &g_quit, cfg.log_rsp);
+        dap_serve(cfg.listen_fd, cfg.updi_fd, &elf_ctx,
+                  enable_introspect ? &idx : NULL,
+                  enable_introspect ? &fsm_ctx : NULL, &g_quit, cfg.log);
     else
         event_loop(&cfg, &handlers);
 

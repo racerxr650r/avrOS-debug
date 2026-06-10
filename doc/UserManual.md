@@ -135,11 +135,11 @@ CP210x) or `/dev/ttyACM0` (CDC ACM); on a Raspberry Pi's built-in UART it is
 ```
 avrOSdb [--rsp | --dap] [--port <port>] [--baud <baud>] [--erase] [--load]
         [--no-verify] [--allow-lock-updi] [--allow-erase] [--force-device <family>]
-        [--no-introspect] [--sleep] [--log-rsp] <serial-device> <elf-file>
+        [--no-introspect] [--sleep] [--log] <serial-device> <elf-file>
 avrOSdb --prog [--baud <baud>] [--erase] [--no-verify] [--allow-lock-updi]
-        [--force-device <family>] [--log-rsp] <serial-device> <elf-file>
+        [--force-device <family>] [--log] <serial-device> <elf-file>
 avrOSdb --device [--baud <baud>] [--no-autobaud] [--force-device <family>] <serial-device> [elf-file]
-avrOSdb --reset [--baud <baud>] <serial-device>
+avrOSdb {--reset | --start | --stop} [--baud <baud>] <serial-device>
 avrOSdb --emit-vscode-config
 ```
 
@@ -162,8 +162,10 @@ avrOSdb --emit-vscode-config
 | `--rsp` | flag | *(default)* | Serve the **GDB Remote Serial Protocol** front-end. This is the default when neither `--rsp` nor `--dap` is given. Mutually exclusive with `--dap`. Drives an external `avr-gdb` / Cortex-Debug (see §6.2). |
 | `--dap` | flag | unset | Serve the **Debug Adapter Protocol** front-end for DAP-native editors — the VS Code companion extension (§6.1) and Neovim nvim-dap (§6.3). Mutually exclusive with `--rsp`. |
 | `--sleep` | flag | unset | Allow the target to sleep natively. By default the debugger snapshots and restores the firmware's peripheral state across the software-breakpoint NVMPROG reset (and asserts `CLK_REQ`) so the configured SLEEP wake source survives and breakpoints still fire after the firmware sleeps. Pass `--sleep` to restore native sleep/power behaviour (for power-path debugging). (HLR-077.) |
-| `--log-rsp` | flag | unset | Log every incoming and outgoing GDB RSP packet to `stderr` — the primary wire-level trace when debugging the RSP path. (Equivalent to setting `AVROSDB_GDB_LOG_RSP=1`.) |
-| `--reset` | flag | unset | One-shot: pulse the UPDI system reset and exit. Requires only `<serial-device>` — no ELF needed. Redundant when combined with `--prog`. |
+| `--log` | flag | unset | Log detailed activity to `stderr`, selected by the active mode: GDB RSP packets (`--rsp`, each prefixed `RSP < ` / `RSP > `), DAP connection/message activity (`--dap`), or the programming phases (`--load` / `--prog`). The primary wire-level trace for debugging. (Renamed from the earlier RSP-only `--log-rsp`.) |
+| `--reset` | flag | unset | One-shot: pulse the UPDI system reset and exit, leaving the target running. Requires only `<serial-device>` — no ELF needed. Mutually exclusive with `--start` / `--stop`. Redundant when combined with `--prog`. |
+| `--start` | flag | unset | One-shot: take OCD control and run the CPU, then exit leaving the target running. Requires only `<serial-device>`. Because taking OCD control pulses a reset, the CPU runs from the reset vector. Mutually exclusive with `--reset` / `--stop`. |
+| `--stop` | flag | unset | One-shot: take OCD control and halt the CPU, then exit leaving the target stopped. Requires only `<serial-device>`. Detaches without a reset pulse so the CPU stays halted. Mutually exclusive with `--reset` / `--start`. |
 | `--emit-vscode-config` | flag | unset | Print a ready-to-use VS Code `launch.json` for the `--dap` front-end to stdout and exit — needs no target or ELF. E.g. `avrOSdb --emit-vscode-config > .vscode/launch.json` (see §6.1). |
 
 ### 4.1 Exit Status
@@ -1519,7 +1521,7 @@ OCD, then iterates: get the CFA rule, read the return word and caller Y from
 target SRAM, and repeat with `PC = caller`, `SP = CFA`, `Y = caller Y`. It stops
 at a zero/out-of-FLASH return address, at a PC no FDE covers (the C-runtime
 frame that called `main`), or at a frame cap. Set `AVROSDB_DAP_UNWIND_LOG=1` to
-dump each frame's CFA and the surrounding stack bytes — the same way `--log-rsp`
+dump each frame's CFA and the surrounding stack bytes — the same way `--log`
 exposes the GDB wire. `make hw-test-dap-unwind` validates the whole chain end to
 end on hardware (the DAP analogue of the GDB G18 backtrace test).
 

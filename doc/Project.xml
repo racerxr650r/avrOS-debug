@@ -1465,8 +1465,8 @@ Errors are propagated upward through the module stack without retrying:
     <section number="1" title="System Startup and Command-Line Interface">
       <intro><![CDATA[Requirements in this section govern how `avrOSdb` is invoked, how it initialises its resources, and how quickly it becomes ready for a GDB connection.]]></intro>
 
-      <hlr id="HLR-068" name="Detailed RSP Traffic Logging">
-        <text><![CDATA[The application shall accept a `--log-rsp` command line flag that enables detailed logging of all GDB Remote Serial Protocol requests and responses to `stderr`. It shall be parsed via `--log-rsp` and set an internal logging flag. When this flag is enabled, every RSP packet received from or sent to the GDB client shall be printed to `stderr` prefixed with `RSP &lt; ` or `RSP &gt; ` respectively.]]></text>
+      <hlr id="HLR-068" name="Detailed Activity Logging">
+        <text><![CDATA[The application shall accept a `--log` command line flag that enables detailed activity logging to `stderr`, with the logged activity selected by the active mode: in the GDB-RSP front-end (`--rsp`) every RSP packet received from or sent to the client shall be printed prefixed with `RSP &lt; ` or `RSP &gt; ` respectively; in the DAP front-end (`--dap`) the connection lifecycle and per-message activity shall be logged; and in the programming pipeline (`--load` / `--prog`) the resolved target, baud, erase/verify settings, and per-phase progress shall be logged. The flag shall set an internal logging flag passed to the selected front-end. (Renamed from the earlier RSP-only `--log-rsp`.)]]></text>
         <traces>
           <trace target="SDD" ref="1.1"/>
           <trace target="SDD" ref="3.2.2"/>
@@ -1477,6 +1477,14 @@ Errors are propagated upward through the module stack without retrying:
         <text><![CDATA[The application shall accept the following command-line arguments: a required positional `<serial-device>` path, a required positional `<elf-file>` path, an optional `--port <port>` TCP port (default `1234`), an optional `--baud <baud>` UART baud rate (default `115200`), and an optional `--load` flag. Any unrecognised argument shall cause the application to print a usage message to `stderr` and exit with a non-zero status.]]></text>
         <traces>
           <trace target="SDD" ref="3.2.2"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-089" name="CPU Run-State One-Shot Modes">
+        <text><![CDATA[The application shall provide three one-shot CPU run-state command-line modes that open the UPDI link, perform a single action, and exit without opening a GDB/DAP listener or entering the event loop — each requiring only `<serial-device>` (the `<elf-file>` operand is optional): `--reset` shall pulse the UPDI system reset and let the target run; `--start` shall take OCD control and run the CPU (`updi_enter_debug()` then `updi_run()`), leaving the target running; and `--stop` shall take OCD control and halt the CPU (`updi_enter_debug()` then `updi_halt()`), leaving the target halted. `--reset`, `--start`, and `--stop` shall be mutually exclusive with one another; supplying more than one shall print a diagnostic and exit non-zero. Because taking OCD control pulses a system reset, `--start` and `--stop` act from the reset vector. To leave the CPU in the requested run state after the tool exits, `--start` and `--stop` shall detach the link with `updi_detach()` — a teardown that does NOT pulse `ASI_RESET_REQ` (unlike `updi_close()`, which resets and releases the CPU), so a `--stop` target stays halted rather than running free on exit.]]></text>
+        <traces>
+          <trace target="SDD" ref="3.2.2"/>
+          <trace target="SDD" ref="4.1"/>
         </traces>
       </hlr>
 
@@ -2002,7 +2010,7 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-086" name="avrOS Introspection over DAP Custom Requests">
-        <text><![CDATA[The DAP front-end shall expose the target's avrOS runtime objects to a DAP client through three custom requests — DAP has no `monitor` console channel, so this is the DAP analogue of `monitor avros`: `avrosdb/fsmList` shall reply `{"fsms":[{"id","name","state","active"}]}`, `avrosdb/eventList` shall reply `{"events":[{"name","status"}]}` (a null status when the descriptor's status pointer is null), and `avrosdb/queueList` shall reply `{"queues":[{"id","capacity","elemSize"}]}`. The FSM list shall reuse the FSM-thread snapshot (`fsm_build_thread_list()` in `src/fsm_mapper.c`) — the same data the GDB-RSP front-end surfaces as virtual threads — so a slot with a null state-machine pointer is skipped rather than listed. The event and queue lists shall decode the avrOS `EVNT_TABLE` / `QUE_TABLE` FLASH descriptor tables. To implement that decode in one place and keep the DAP front-end from depending on the GDB-RSP one, the event/queue table reader shall live in a protocol-agnostic introspection core (`src/avros.c`) that depends only on the UPDI and ELF layers; both these DAP custom requests and the GDB-RSP `monitor avros events|queues` formatter shall call it, per the SDD §2.2 layered-architecture rule (downward-only calls, no front-end → front-end dependency). Each request shall degrade gracefully — with no target link or no avrOS symbol tables it shall return an empty array rather than an error — and all target access shall be guarded by `updi_fd >= 0` so the dispatch is unit-testable without hardware. A null event-name pointer shall render the name as `<null>`, preserving the existing monitor output.]]></text>
+        <text><![CDATA[The DAP front-end shall expose the target's avrOS runtime objects to a DAP client through three custom requests — DAP has no `monitor` console channel, so this is the DAP analogue of `monitor avros`: `avrosdb/fsmList` shall reply `{"fsms":[{"id","name","state","active"}]}`, `avrosdb/eventList` shall reply `{"events":[{"name","status"}]}` (a null status when the descriptor's status pointer is null), and `avrosdb/queueList` shall reply `{"queues":[{"id","capacity","elemSize"}]}`. The FSM list shall reuse the FSM-thread snapshot (`fsm_build_thread_list()` in `src/fsm_mapper.c`) — the same data the GDB-RSP front-end surfaces as virtual threads — so a slot with a null state-machine pointer is skipped rather than listed. The event and queue lists shall decode the avrOS `EVNT_TABLE` / `QUE_TABLE` FLASH descriptor tables. To implement that decode in one place and keep the DAP front-end from depending on the GDB-RSP one, the event/queue table reader shall live in a protocol-agnostic introspection core (`src/avros.c`) that depends only on the UPDI and ELF layers; both these DAP custom requests and the GDB-RSP `monitor avros events|queues` formatter shall call it, per the SDD §2.2 layered-architecture rule (downward-only calls, no front-end → front-end dependency). Each request shall degrade gracefully — with no target link or no avrOS symbol tables it shall return an empty array rather than an error — and all target access shall be guarded by `updi_fd >= 0` so the dispatch is unit-testable without hardware. A null event-name pointer shall render the name as `<null>`, preserving the existing monitor output. The `--no-introspect` switch shall disable these custom requests on the DAP front-end exactly as it disables avrOS introspection on the GDB-RSP front-end: when introspection is disabled the server passes a NULL symbol index (and NULL FSM context) to `dap_serve()`, so all three requests return empty arrays.]]></text>
         <traces>
           <trace target="SDD" ref="2.2"/>
           <trace target="SDD" ref="10.1"/>
@@ -2305,7 +2313,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-MAIN-23">
-        <text><![CDATA[`parse_args()` shall recognise `--log-rsp` as a boolean flag (no argument) and set `cfg->log_rsp = true` when present. The default initialiser shall set the flag to `false`. The main orchestrator shall pass this flag to `rsp_set_logging()` before entering the event loop.]]></text>
+        <text><![CDATA[`parse_args()` shall recognise `--log` as a boolean flag (no argument) and set `cfg->log = true` when present. The default initialiser shall set the flag to `false`. The main orchestrator shall pass this flag to `rsp_set_logging()` (RSP front-end) and as the `log` argument to `dap_serve()` (DAP front-end), and `run_prog_mode()` shall emit per-phase programming diagnostics to `stderr` when it is set.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-068" name="Detailed RSP Traffic Logging"/>
         </traces>
@@ -2329,6 +2337,20 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <text><![CDATA[`MAIN_NAME()` shall, before `parse_args()` and any device/ELF handling, scan `argv` for `--emit-vscode-config`; when present it shall call `emit_vscode_config()` — which writes a VS Code `launch.json` with a self-starting `request: "launch"` config (`avrosdb` type + `program`/`serial`/`elf`/`port`) and a `request: "attach"` alternative to stdout — and return 0 without touching the target.  The usage/`--help` text shall document the flag.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-085" name="VS Code Launch-Config Helper"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MAIN-27">
+        <text><![CDATA[`parse_args()` shall recognise `--start` and `--stop` as boolean flags setting `cfg->start_cpu` / `cfg->stop_cpu` (defaulting false), alongside the existing `--reset` (`cfg->reset_cpu`).  When more than one of `--reset` / `--start` / `--stop` is given it shall print a diagnostic ("--reset, --start and --stop are mutually exclusive") and `exit(1)`.  Each of the three modes shall make the `<elf-file>` operand optional (only `<serial-device>` is required); the missing-operand check shall therefore permit a single positional argument when any of `device_info`, `reset_cpu`, `start_cpu`, or `stop_cpu` is set.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-089" name="CPU Run-State One-Shot Modes"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MAIN-28">
+        <text><![CDATA[`run_start_mode()` and `run_stop_mode()` shall each `updi_open()` the serial device (returning 1 with a wiring diagnostic on failure), then `updi_enter_debug()` to take OCD control; `run_start_mode()` shall then `updi_run()` the CPU and `run_stop_mode()` shall `updi_halt()` it.  Both shall tear the link down with `updi_detach()` (LLR-UPDI-37) — leaving the target running / halted respectively rather than reset-and-released — print a one-line `start: OK (CPU running)` / `stop: OK (CPU halted)` confirmation to stdout, and return 0 (or 1 if the enter-debug/run/halt sequence failed).  `MAIN_NAME()` shall dispatch to these after the `--device`, `--prog`, and `--reset` short-circuits and before installing signal handlers.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-089" name="CPU Run-State One-Shot Modes"/>
         </traces>
       </llr>
 
@@ -2603,6 +2625,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <text><![CDATA[`updi_save_peripherals(fd, buf)` and `updi_restore_peripherals(fd, buf)` shall snapshot and restore the target peripheral I/O register window `[UPDI_PERIPH_BASE, UPDI_PERIPH_BASE + UPDI_PERIPH_LEN)` = `[0x0040, 0x0C00)` via `updi_mem_read()` / `updi_mem_write()`, so the firmware's configured `SLEEP` wake source survives the NVMPROG system reset of a SW-breakpoint flash patch (HLR-077). The window spans the extended-I/O peripherals (RSTCTRL, SLPCTRL, CLKCTRL, CPUINT, RTC, EVSYS, PORTMUX, PORTs, TCA/TCB, USART, SPI, TWI, AC/ADC/DAC); the low I/O `0x00..0x3F` (CPU core registers + VPORTs — restored separately via the OCD register file and the PORT registers) and NVMCTRL (`0x1000`) are excluded. Both functions shall be gated by the debug-in-sleep flag (LLR-UPDI-35): when disabled (`--sleep`) each shall return 0 immediately without any UPDI traffic. They return 0 on success or −1 on a UPDI link error.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-077" name="Debug-in-Sleep (preserve the wake source across the SW-breakpoint reset)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-UPDI-37">
+        <text><![CDATA[`updi_detach(fd)` shall tear down the serial link WITHOUT pulsing a system reset: it shall `tcdrain()` and `close()` the fd but shall NOT touch `ASI_RESET_REQ` or `ASI_CTRLB`/UPDIDIS.  This leaves the target in its current OCD run state (e.g. halted under OCD) so `--stop` keeps the CPU halted after the tool exits, in contrast to `updi_close()` which asserts/releases reset (letting the CPU run) and disables UPDI.  A NULL/negative fd shall be a no-op.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-089" name="CPU Run-State One-Shot Modes"/>
         </traces>
       </llr>
     </function>
@@ -3537,7 +3566,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/main.c unit tests                                        -->
     <!-- ============================================================ -->
-    <file path="tests/test_main.c" role="unit" count="37">
+    <file path="tests/test_main.c" role="unit" count="41">
       <header><![CDATA[Unit tests for `src/main.c`: argument parsing, event loop, signal handling, and resource teardown. Uses `fork()`/`waitpid()` to test `exit()` paths and a mock UPDI/RSP layer to exercise the event loop without real hardware.]]></header>
 
       <test name="parse_args_valid_positional_args_populate_config">
@@ -3700,9 +3729,27 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces><trace target="LLR" ref="LLR-MAIN-17"/></traces>
       </test>
 
-      <test name="test_parse_args_log_rsp_sets_flag">
-        <purpose><![CDATA[Call `parse_args()` with argv `{ "prog", "--log-rsp", "/dev/x", "a.elf" }` and assert `cfg.log_rsp == true` — confirming the logging flag is recognised by the option parser.]]></purpose>
+      <test name="test_parse_args_log_sets_flag">
+        <purpose><![CDATA[Call `parse_args()` with argv `{ "prog", "--log", "/dev/x", "a.elf" }` and assert `cfg.log == true` — confirming the logging flag is recognised by the option parser.]]></purpose>
         <traces><trace target="LLR" ref="LLR-MAIN-23"/></traces>
+      </test>
+
+      <test name="test_parse_args_start_sets_flag">
+        <purpose><![CDATA[Call `parse_args()` with argv `{ "prog", "--start", "/dev/x" }` (no ELF) and assert `cfg.start_cpu == true`, `cfg.stop_cpu == false`, and `cfg.elf_path == NULL` — confirming `--start` is recognised and makes the `<elf-file>` operand optional.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-27"/></traces>
+      </test>
+      <test name="test_parse_args_stop_sets_flag">
+        <purpose><![CDATA[Call `parse_args()` with argv `{ "prog", "--stop", "/dev/x" }` (no ELF) and assert `cfg.stop_cpu == true`, `cfg.start_cpu == false`, and `cfg.elf_path == NULL` — confirming `--stop` is recognised and makes the `<elf-file>` operand optional.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-27"/></traces>
+      </test>
+
+      <test name="test_run_start_mode_runs_cpu_and_detaches">
+        <purpose><![CDATA[With wrapped UPDI primitives, call `run_start_mode()` and assert it returns 0 having called `updi_open` → `updi_enter_debug` → `updi_run` once each and `updi_detach` once, with `updi_halt` and `updi_close` never called — i.e. it takes OCD control, runs the CPU, and detaches WITHOUT a reset so the target keeps running.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-28"/></traces>
+      </test>
+      <test name="test_run_stop_mode_halts_cpu_and_detaches">
+        <purpose><![CDATA[With wrapped UPDI primitives, call `run_stop_mode()` and assert it returns 0 having called `updi_open` → `updi_enter_debug` → `updi_halt` once each and `updi_detach` once, with `updi_run` and `updi_close` never called — i.e. it takes OCD control, halts the CPU, and detaches WITHOUT a reset so the target stays halted.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-28"/></traces>
       </test>
 
       <test name="parse_args_allow_erase_sets_flag">
@@ -3729,8 +3776,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/updi.c unit tests                                        -->
     <!-- ============================================================ -->
-    <file path="tests/test_updi.c" role="unit" count="50">
-      <header><![CDATA[Unit tests for `src/updi.c`: UART configuration, BREAK/SYNCH/LDCS link initialisation, three-frame block memory read/write, NVM flash programming, OCD-mode entry, OCD execution-control primitives (halt/run/step + poll_halted), OCD register-file access (GPR/SREG/SP/PC) and hardware-breakpoint comparator programming, and console polling. A loopback PTY pair substitutes for real UART hardware; a `--wrap=select` linker shim lets tests inject `select()` timeouts.]]></header>
+    <file path="tests/test_updi.c" role="unit" count="51">
+      <header><![CDATA[Unit tests for `src/updi.c`: UART configuration, BREAK/SYNCH/LDCS link initialisation, three-frame block memory read/write, NVM flash programming, OCD-mode entry, OCD execution-control primitives (halt/run/step + poll_halted), OCD register-file access (GPR/SREG/SP/PC) and hardware-breakpoint comparator programming, link detach, and console polling. A loopback PTY pair substitutes for real UART hardware; a `--wrap=select` linker shim lets tests inject `select()` timeouts.]]></header>
+
+      <test name="updi_detach_closes_fd_and_ignores_negative">
+        <purpose><![CDATA[Create a pipe, call `updi_detach(fds[1])`, and assert a subsequent `write()` to that fd fails with `EBADF` — proving the link was closed without a reset pulse. A second call `updi_detach(-1)` must be a harmless no-op. Per LLR-UPDI-37.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-37"/></traces>
+      </test>
 
       <test name="updi_open_sets_8e2_raw_half_duplex_via_termios">
         <purpose><![CDATA[Open a PTY pair, call `updi_open()` on the slave side, and inspect the resulting `termios` structure to confirm `CS8`, `CSTOPB` (2 stop bits), even-parity intent (`PARODD` clear), and raw mode (no `ICANON`/`ECHO`/`ISIG`/`OPOST`). PARENB itself is not asserted because Linux PTYs strip parity on slave reopen; parity is verified on real serial hardware in Phase 3 integration.]]></purpose>
@@ -4478,12 +4530,12 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </test>
 
       <test name="rsp_logging_enabled_emits_tx_and_rx_markers_to_stderr">
-        <purpose><![CDATA[Verify --log-rsp traffic logging. Call `rsp_set_logging(true)`, then capture fd-level stderr (pipe + dup2 of STDERR_FILENO) across each call. `rsp_send_packet(fd, "qSupported")` must emit a line containing `RSP > qSupported` before sending; after framing `g` to the peer, `rsp_recv_packet()` must return 1 with payload `g` and emit a line containing `RSP < g` after receipt. Confirms both the TX and RX markers and the `rsp_set_logging()` setter wired to `g_log_rsp`. Per LLR-RSP-49.]]></purpose>
+        <purpose><![CDATA[Verify --log RSP traffic logging. Call `rsp_set_logging(true)`, then capture fd-level stderr (pipe + dup2 of STDERR_FILENO) across each call. `rsp_send_packet(fd, "qSupported")` must emit a line containing `RSP > qSupported` before sending; after framing `g` to the peer, `rsp_recv_packet()` must return 1 with payload `g` and emit a line containing `RSP < g` after receipt. Confirms both the TX and RX markers and the `rsp_set_logging()` setter wired to `g_log_rsp`. Per LLR-RSP-49.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-49"/></traces>
       </test>
 
       <test name="rsp_logging_disabled_emits_no_markers">
-        <purpose><![CDATA[Negative companion: with `rsp_set_logging(false)` (the default), `rsp_send_packet(fd, "OK")` writes nothing to the captured stderr (captured length is 0), proving the `RSP > ` / `RSP < ` markers are gated entirely on `g_log_rsp`. Per LLR-RSP-49.]]></purpose>
+        <purpose><![CDATA[Negative companion: with `rsp_set_logging(false)` (the default, i.e. no `--log`), `rsp_send_packet(fd, "OK")` writes nothing to the captured stderr (captured length is 0), proving the `RSP > ` / `RSP < ` markers are gated entirely on `g_log_rsp`. Per LLR-RSP-49.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-49"/></traces>
       </test>
     </file>

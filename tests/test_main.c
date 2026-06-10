@@ -64,6 +64,11 @@ static int mk_updi_nvm_ret;
 static int mk_updi_nvm_calls;
 static int mk_updi_enter_debug_ret;
 static int mk_updi_enter_debug_calls;
+static int mk_updi_halt_ret;
+static int mk_updi_halt_calls;
+static int mk_updi_run_ret;
+static int mk_updi_run_calls;
+static int mk_updi_detach_calls;
 
 /* Phase 8: non-FLASH NVM wrap state.  Each wrap records the count, the
  * last (addr, len) pair seen, and a configurable return value.        */
@@ -136,6 +141,14 @@ void __wrap_updi_close(int fd)
     LOG(CALL_UPDI_CLOSE);
 }
 
+/* updi_detach(): no-reset link teardown used by --start / --stop. */
+void __wrap_updi_detach(int fd);
+void __wrap_updi_detach(int fd)
+{
+    (void)fd;
+    mk_updi_detach_calls++;
+}
+
 int __wrap_updi_console_poll(int fd, char *buf, size_t cap);
 int __wrap_updi_console_poll(int fd, char *buf, size_t cap)
 {
@@ -199,14 +212,16 @@ int __wrap_updi_halt(int fd);
 int __wrap_updi_halt(int fd)
 {
     (void)fd;
-    return 0;
+    mk_updi_halt_calls++;
+    return mk_updi_halt_ret;
 }
 
 int __wrap_updi_run(int fd);
 int __wrap_updi_run(int fd)
 {
     (void)fd;
-    return 0;
+    mk_updi_run_calls++;
+    return mk_updi_run_ret;
 }
 
 /* dap.c is linked into this unit (DAP mode dispatch); its Phase-17 execution
@@ -555,6 +570,9 @@ void setUp(void)
     mk_updi_close_calls = 0;
     mk_updi_nvm_ret = 0;        mk_updi_nvm_calls = 0;
     mk_updi_enter_debug_ret = 0; mk_updi_enter_debug_calls = 0;
+    mk_updi_halt_ret = 0; mk_updi_halt_calls = 0;
+    mk_updi_run_ret = 0;  mk_updi_run_calls = 0;
+    mk_updi_detach_calls = 0;
 
     mk_updi_eeprom_ret   = 0; mk_updi_eeprom_calls   = 0;
     mk_updi_userrow_ret  = 0; mk_updi_userrow_calls  = 0;
@@ -982,13 +1000,78 @@ static void test_parse_args_allow_erase_sets_flag(void)
 
 /* HLR-055 / LLR-MAIN-21: --allow-erase defaults to false when absent. */
 
-static void test_parse_args_log_rsp_sets_flag(void)
+static void test_parse_args_log_sets_flag(void)
 {
-    char *argv[] = { (char*)"prog", (char*)"--log-rsp", (char*)"/dev/x",
+    char *argv[] = { (char*)"prog", (char*)"--log", (char*)"/dev/x",
                      (char*)"a.elf" };
     AppConfig cfg;
     parse_args(4, argv, &cfg);
-    TEST_ASSERT_TRUE(cfg.log_rsp);
+    TEST_ASSERT_TRUE(cfg.log);
+}
+
+/* --start / --stop are one-shot run-state modes; <elf-file> is optional. */
+static void test_parse_args_start_sets_flag(void)
+{
+    char *argv[] = { (char*)"prog", (char*)"--start", (char*)"/dev/x" };
+    AppConfig cfg;
+    parse_args(3, argv, &cfg);
+    TEST_ASSERT_TRUE(cfg.start_cpu);
+    TEST_ASSERT_FALSE(cfg.stop_cpu);
+    TEST_ASSERT_NULL(cfg.elf_path);   /* ELF optional for --start */
+}
+
+static void test_parse_args_stop_sets_flag(void)
+{
+    char *argv[] = { (char*)"prog", (char*)"--stop", (char*)"/dev/x" };
+    AppConfig cfg;
+    parse_args(3, argv, &cfg);
+    TEST_ASSERT_TRUE(cfg.stop_cpu);
+    TEST_ASSERT_FALSE(cfg.start_cpu);
+    TEST_ASSERT_NULL(cfg.elf_path);   /* ELF optional for --stop */
+}
+
+/* LLR-MAIN-28: --start opens UPDI, enters OCD, runs the CPU, and detaches
+ * WITHOUT a reset (must not updi_close), returning 0. */
+static void test_run_start_mode_runs_cpu_and_detaches(void)
+{
+    AppConfig cfg;
+    char *argv[] = { (char*)"prog", (char*)"--start", (char*)"/dev/x" };
+    parse_args(3, argv, &cfg);
+    mk_updi_open_ret = 7;
+    mk_updi_enter_debug_ret = 0;
+    mk_updi_run_ret = 0;
+
+    int rc = run_start_mode(&cfg);
+
+    TEST_ASSERT_EQUAL_INT(0, rc);
+    TEST_ASSERT_EQUAL_INT(1, mk_updi_open_calls);
+    TEST_ASSERT_EQUAL_INT(1, mk_updi_enter_debug_calls);
+    TEST_ASSERT_EQUAL_INT(1, mk_updi_run_calls);
+    TEST_ASSERT_EQUAL_INT(0, mk_updi_halt_calls);
+    TEST_ASSERT_EQUAL_INT(1, mk_updi_detach_calls);
+    TEST_ASSERT_EQUAL_INT(0, mk_updi_close_calls);   /* no reset on exit */
+}
+
+/* LLR-MAIN-28: --stop opens UPDI, enters OCD, halts the CPU, and detaches
+ * WITHOUT a reset (leaves the target halted), returning 0. */
+static void test_run_stop_mode_halts_cpu_and_detaches(void)
+{
+    AppConfig cfg;
+    char *argv[] = { (char*)"prog", (char*)"--stop", (char*)"/dev/x" };
+    parse_args(3, argv, &cfg);
+    mk_updi_open_ret = 7;
+    mk_updi_enter_debug_ret = 0;
+    mk_updi_halt_ret = 0;
+
+    int rc = run_stop_mode(&cfg);
+
+    TEST_ASSERT_EQUAL_INT(0, rc);
+    TEST_ASSERT_EQUAL_INT(1, mk_updi_open_calls);
+    TEST_ASSERT_EQUAL_INT(1, mk_updi_enter_debug_calls);
+    TEST_ASSERT_EQUAL_INT(1, mk_updi_halt_calls);
+    TEST_ASSERT_EQUAL_INT(0, mk_updi_run_calls);
+    TEST_ASSERT_EQUAL_INT(1, mk_updi_detach_calls);
+    TEST_ASSERT_EQUAL_INT(0, mk_updi_close_calls);   /* no reset on exit */
 }
 
 static void test_parse_args_allow_erase_defaults_false(void)
@@ -1237,7 +1320,11 @@ int main(void)
     RUN_TEST(test_parse_args_no_verify_sets_flag);
     RUN_TEST(test_parse_args_no_autobaud_sets_flag);
     RUN_TEST(test_parse_args_allow_erase_sets_flag);
-    RUN_TEST(test_parse_args_log_rsp_sets_flag);
+    RUN_TEST(test_parse_args_log_sets_flag);
+    RUN_TEST(test_parse_args_start_sets_flag);
+    RUN_TEST(test_parse_args_stop_sets_flag);
+    RUN_TEST(test_run_start_mode_runs_cpu_and_detaches);
+    RUN_TEST(test_run_stop_mode_halts_cpu_and_detaches);
     RUN_TEST(test_parse_args_allow_erase_defaults_false);
     RUN_TEST(test_load_segments_dispatches_eeprom_segment_to_eeprom_writer);
     RUN_TEST(test_load_segments_dispatches_fuses_segment_to_fuses_writer);

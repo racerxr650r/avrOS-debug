@@ -796,6 +796,19 @@ void updi_close(int fd)
     close(fd);
 }
 
+/* Detach without the reset pulse — leave the target in its current OCD state
+ * (see updi.h).  We deliberately do NOT touch ASI_RESET_REQ (which would let
+ * the CPU run) nor ASI_CTRLB/UPDIDIS; we just drain and close the fd so a
+ * halted target stays halted after `--stop`.  The next updi_open() re-syncs
+ * and re-pulses reset to clear any latched mode. */
+void updi_detach(int fd)
+{
+    if (fd < 0)
+        return;
+    tcdrain(fd);
+    close(fd);
+}
+
 /*
  * mem_read: split into three frames per block (datasheet §35.3.3.3,
  * §35.3.3.4, §35.3.3.7):
