@@ -696,8 +696,8 @@ was started with `--allow-erase`.
 
 `avrOSdb` exposes two client protocols, sharing one debug core. The **native
 DAP** front-end (`avrOSdb --dap`) is the primary, full-featured path: VS Code
-(via the bundled companion extension) and DAP-native editors such as Neovim talk
-to it directly, with **no `avr-gdb` in the loop**. The **GDB RSP** front-end
+(via the bundled companion extension) and DAP-native editors such as Neovim and
+Zed talk to it directly, with **no `avr-gdb` in the loop**. The **GDB RSP** front-end
 remains available for VS Code through an external `avr-gdb` and the Cortex-Debug
 extension.
 
@@ -941,6 +941,85 @@ build/avrOSdb --dap --port 1234 /dev/ttyAMA2 firmware.elf
 
 An automated on-target acceptance harness drives this same path headlessly:
 `make hw-test-dap` (see §7 / the Makefile).
+
+### 6.4 Zed (native DAP)
+
+Zed debugs through `avrOSdb --dap` directly. As with VS Code, Zed only talks to
+a DAP server through a *registered debug adapter*, so a small companion
+extension is provided in [`tools/zed/avrosdb/`](../tools/zed/avrosdb/)
+registering the `avrosdb` adapter. With a `request: "launch"` entry the
+extension **starts `avrOSdb --dap` for you** and connects over TCP; a
+`request: "attach"` entry connects to a server you run yourself.
+
+> [!NOTE]
+> Zed does not let an extension contribute custom side-bar tree views, so —
+> unlike the VS Code companion (§6.1) — the Zed extension does **not** surface
+> the avrOS **State Machines / Events / Queues** introspection. You get
+> launch/attach plus Zed's built-in **Variables / Call Stack / Breakpoints**
+> panes over the same debug core. For avrOS runtime introspection use the VS
+> Code extension or `monitor avros …` on the GDB-RSP path (§6.2).
+
+**Install the companion extension.** Zed compiles the extension's Rust to
+WebAssembly on install, so you only need the Rust toolchain:
+
+```bash
+rustup target add wasm32-wasip1     # one-time
+```
+
+Then in Zed: **Extensions → Install Dev Extension…** and pick the
+`tools/zed/avrosdb` directory. (From the repo root, `make package-zed`
+pre-builds the `wasm32` artefact as a local compile check — `cargo` plus the
+`wasm32-wasip1` target are a development-only dependency, never required by
+`make`/`make test`.)
+
+**Add a debug configuration** — create `.zed/debug.json` in your firmware
+project:
+
+```json
+[
+  {
+    "label": "Debug with avrOSdb",
+    "adapter": "avrosdb",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/build/avrOSdb",
+    "serial": "/dev/ttyAMA2",
+    "elf": "$ZED_WORKTREE_ROOT/firmware.elf",
+    "port": 1234
+  },
+  {
+    "label": "Attach to avrOSdb",
+    "adapter": "avrosdb",
+    "request": "attach",
+    "host": "127.0.0.1",
+    "port": 1234
+  }
+]
+```
+
+`program` defaults to `avrOSdb` on `PATH`; `serial` to `/dev/ttyAMA2`; `port`
+to `1234`. `extraArgs` (e.g. `["--baud","230400"]`) are inserted before the
+serial/elf operands. The `launch` entry spawns
+`avrOSdb --dap --port 1234 <serial> <elf>` and connects to `127.0.0.1:1234`.
+
+**No-extension alternative.** You can skip the extension entirely: start the
+server yourself and point a `tcp_connection` block at it.
+
+```bash
+build/avrOSdb --dap --port 1234 /dev/ttyAMA2 firmware.elf
+```
+
+```json
+[
+  {
+    "label": "avrOSdb (manual server)",
+    "request": "attach",
+    "tcp_connection": { "host": "127.0.0.1", "port": 1234 }
+  }
+]
+```
+
+Zed connects to the running server over TCP — no adapter binary is spawned.
+This mirrors the VS Code `"debugServer"` quick-test path in §6.1.
 
 ---
 
