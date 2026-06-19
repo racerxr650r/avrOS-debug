@@ -1191,8 +1191,9 @@ This is not a fixable detail — it is a **model mismatch**. avrOS is a cooperat
 | 3 | Debug sub-views | **VARIABLES**, **CALL STACK**, **BREAKPOINTS** `TreeView`s that mirror the Run-and-Debug view by proxying the active `avrosdb` session (`customRequest('scopes'/'variables'/'stackTrace')` + the `vscode.debug.breakpoints` API), refreshing on the `stopped` event and frame selection; expand structs/arrays and set values route back through the session | extension |
 | 4 | avrOS sub-views | **STATE MACHINES**, **EVENTS**, **QUEUES** `TreeView`s backed by the §1 custom requests — per-FSM current state, per-event status, per-queue capacity/usage — refreshing on stop and on a manual refresh, operating like the §3 views | extension |
 | 5 | Turnkey install + F5 | A `DebugConfigurationProvider` that auto-provides/resolves the `avrosdb` launch config (program/serial/elf, prompting when unset) so F5 works with no `launch.json`; a first-run step that locates `avrOSdb` (PATH → configured path → offer to `make`/install); workspace settings for serial/elf/program | extension, `package.json` |
-| 6 | Build / package / docs | A build+package step for the extension (`vsce`, e.g. a `make vscode-ext` target); User-Manual §6.3 rewrite with the new view + first-run flow | `Makefile`, `doc/UserManual.md` |
+| 6 | Build / package / docs | Package targets for the extension (`make package-vscode` via `vsce`/`npx`); User-Manual §6.1 rewrite with the new view + turnkey flow; a manual VS Code acceptance checklist | `Makefile`, `doc/UserManual.md`, `tools/vscode/avrosdb-dap/ACCEPTANCE.md` |
 | 7 | Spec + tests | HLR-086/087/088 + LLRs (LLR-DAP-17.. for the custom requests; shared FSM/MON readers); STP host `test_dap` cases + a hardware introspection case | `doc/Project.xml`, `tests/` |
+| 8 | Zed companion (added scope) | A Zed debug-adapter extension registering the `avrosdb` adapter for launch/attach over the shared DAP core (no avrOS tree views — Zed forbids them); a `make package-zed` `wasm32` compile-check target; User-Manual §6.4 + the no-extension `.zed/debug.json` `tcp_connection` path; HLR-090 + LLR-INST-11 + a static `test_install` case | `tools/zed/avrosdb/`, `Makefile`, `doc/UserManual.md`, `doc/Project.xml`, `tests/test_install.c` |
 
 **Implementation steps.**
 
@@ -1208,6 +1209,9 @@ This is not a fixable detail — it is a **model mismatch**. avrOS is a cooperat
 7. Add the `DebugConfigurationProvider` (turnkey F5, no `launch.json`) and the install/locate-avrOSdb first-run flow + settings.
 8. Build/package target + docs.
 
+*Zed side (added scope, HLR-090):*
+9. A Rust/`wasm32` Zed extension under `tools/zed/avrosdb` implementing the `zed::Extension` DAP hooks (`get_dap_binary`/`dap_request_kind`/`dap_config_to_scenario`): `launch` spawns `avrOSdb --dap --port <port> <serial> <elf>` and connects over TCP; `attach` is connect-only. No avrOS tree views (Zed forbids them). A `make package-zed` `wasm32` compile-check target, a static `test_install` case, and User-Manual §6.4 incl. the no-extension `.zed/debug.json` `tcp_connection` path.
+
 **Per-test / fixture notes.** The DAP introspection requests are exercised against `gdb_target.elf` — the avrOS example with FSM/event/queue tables already used by Group-G G10 and the `monitor` tests — on hardware, and with stubbed readers in host `test_dap`. The extension's `TreeView`s are GUI surfaces that the headless nvim/Python harnesses cannot drive, so their acceptance is a **documented manual checklist** (with screenshots); the automated coverage lives on the avrOSdb side (the `avrosdb/*List` requests). New host tests derive any addresses from source lines (Phase-18 portability lesson); hardware cases never enter `make test`.
 
 **Open questions / risks.**
@@ -1219,7 +1223,8 @@ This is not a fixable detail — it is a **model mismatch**. avrOS is a cooperat
 - Selecting the avrOS activity-bar icon shows the **avrOS Debug** container with VARIABLES, CALL STACK, BREAKPOINTS, STATE MACHINES, EVENTS, and QUEUES views.
 - During an `avrosdb` session the first three mirror the stock Run-and-Debug view (update on stop, expand aggregates, set values); the avrOS three list the running application's state machines / events / queues with live values and refresh on stop.
 - **F5** with no hand-written `launch.json` starts `avrOSdb` and attaches (the extension supplies the config); a first run locates or installs `avrOSdb`.
-- **Gate:** `make` 0 warnings; `make test` all pass; `python3 tools/lint_project.py` 0/0; the new `avrosdb/*List` requests covered by host + hardware tests.
+- The **Zed** extension (added scope) launches/attaches an `avrosdb` session from `.zed/debug.json` with no hand-written wiring, and the no-extension `tcp_connection` path connects to a manually-started server; `make package-zed` compiles the `wasm32` artefact when the Rust toolchain is present.
+- **Gate:** `make` 0 warnings; `make test` all pass; `python3 tools/lint_project.py` 0/0; the new `avrosdb/*List` requests covered by host + hardware tests; the GUI views verified against the manual acceptance checklist (`tools/vscode/avrosdb-dap/ACCEPTANCE.md`).
 
 ## 9. Risks & Open Questions
 
