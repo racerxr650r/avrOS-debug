@@ -3,6 +3,7 @@
 avrOSdb \- UPDI-to-GDB debug stub with avrOS FSM awareness
 .SH SYNOPSIS
 .B avrOSdb
+.RB [ \-\-rsp | \-\-dap ]
 .RB [ \-\-port
 .IR port ]
 .RB [ \-\-baud
@@ -11,8 +12,12 @@ avrOSdb \- UPDI-to-GDB debug stub with avrOS FSM awareness
 .RB [ \-\-load ]
 .RB [ \-\-no\-verify ]
 .RB [ \-\-allow\-lock\-updi ]
+.RB [ \-\-allow\-erase ]
 .RB [ \-\-force\-device
 .IR family ]
+.RB [ \-\-no\-introspect ]
+.RB [ \-\-sleep ]
+.RB [ \-\-log ]
 .I serial-device
 .I elf-file
 .br
@@ -37,6 +42,15 @@ avrOSdb \- UPDI-to-GDB debug stub with avrOS FSM awareness
 .IR family ]
 .I serial-device
 .RI [ elf-file ]
+.br
+.B avrOSdb
+.BR { \-\-reset | \-\-start | \-\-stop }
+.RB [ \-\-baud
+.IR baud ]
+.I serial-device
+.br
+.B avrOSdb
+.B \-\-emit\-vscode\-config
 .SH DESCRIPTION
 .B avrOSdb
 is a host-side GDB Remote Serial Protocol (RSP) server that bridges
@@ -56,6 +70,14 @@ as the UPDI UART, and listens on a TCP port for a single
 .BR avr-gdb (1)
 client. All UPDI memory access is non-intrusive when the CPU is
 halted by GDB; no heap allocation occurs on the hot path.
+.PP
+Two client protocols share one debug core: the GDB Remote Serial
+Protocol front-end
+.RB ( \-\-rsp ,
+the default) and a native Debug Adapter Protocol front-end
+.RB ( \-\-dap )
+for DAP-native editors such as VS Code (via the bundled companion
+extension) and Neovim. The two are mutually exclusive.
 .SH OPTIONS
 .TP
 .BI \-\-port " port"
@@ -201,6 +223,76 @@ Pass
 .B \-\-sleep
 to disable this and restore native sleep/power behaviour when debugging
 power paths.
+.TP
+.B \-\-log
+Log detailed activity to standard error, selected by the active mode: GDB
+RSP packets in
+.B \-\-rsp
+mode (each prefixed
+.RB ` "RSP < " '
+or
+.RB ` "RSP > " '),
+DAP connection and message activity in
+.B \-\-dap
+mode, or the programming phases in
+.BR \-\-load / \-\-prog
+mode.
+.TP
+.B \-\-reset
+One-shot: pulse the UPDI system reset and exit, leaving the target running.
+Requires only
+.IR serial-device .
+Mutually exclusive with
+.BR \-\-start / \-\-stop .
+.TP
+.B \-\-start
+One-shot: take OCD control and run the CPU, then exit leaving the target
+running. Because taking OCD control pulses a reset, the CPU runs from the
+reset vector. Requires only
+.IR serial-device .
+Mutually exclusive with
+.BR \-\-reset / \-\-stop .
+.TP
+.B \-\-stop
+One-shot: take OCD control and halt the CPU, then exit leaving the target
+stopped. Detaches without a reset pulse so the CPU stays halted. Requires
+only
+.IR serial-device .
+Mutually exclusive with
+.BR \-\-reset / \-\-start .
+.TP
+.B \-\-rsp
+Serve the GDB Remote Serial Protocol front-end. This is the default when
+neither
+.B \-\-rsp
+nor
+.B \-\-dap
+is given. Mutually exclusive with
+.BR \-\-dap .
+.TP
+.B \-\-dap
+Serve the Debug Adapter Protocol front-end for DAP-native editors (the
+bundled VS Code companion extension, Neovim nvim-dap). Mutually exclusive
+with
+.BR \-\-rsp .
+.TP
+.B \-\-no\-introspect
+Disable avrOS FSM introspection (the
+.B monitor avros
+task/event/queue view on the RSP path, and the
+.BR avrosdb/fsmList , avrosdb/eventList ,
+and
+.B avrosdb/queueList
+custom requests on the DAP path). The live CPU remains the sole GDB thread
+either way. Use for non-avrOS firmware or to avoid the background UPDI reads.
+.TP
+.B \-\-emit\-vscode\-config
+Print a ready-to-use VS Code
+.I launch.json
+for the
+.B \-\-dap
+front-end to standard output and exit \(em needs no target or ELF. E.g.
+.RB ` "avrOSdb \-\-emit\-vscode\-config > .vscode/launch.json" '.
 .SH DEVICE FAMILY SELECTION
 When
 .B \-\-force\-device

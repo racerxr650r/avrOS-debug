@@ -133,9 +133,14 @@ CP210x) or `/dev/ttyACM0` (CDC ACM); on a Raspberry Pi's built-in UART it is
 ## 4. Command-Line Invocation
 
 ```
-avrOSdb [--port <port>] [--baud <baud>] [--erase] [--load] [--no-verify] [--allow-lock-updi] [--allow-erase] [--force-device <family>] <serial-device> <elf-file>
-avrOSdb --prog [--baud <baud>] [--erase] [--no-verify] [--allow-lock-updi] [--force-device <family>] <serial-device> <elf-file>
+avrOSdb [--rsp | --dap] [--port <port>] [--baud <baud>] [--erase] [--load]
+        [--no-verify] [--allow-lock-updi] [--allow-erase] [--force-device <family>]
+        [--no-introspect] [--sleep] [--log] <serial-device> <elf-file>
+avrOSdb --prog [--baud <baud>] [--erase] [--no-verify] [--allow-lock-updi]
+        [--force-device <family>] [--log] <serial-device> <elf-file>
 avrOSdb --device [--baud <baud>] [--no-autobaud] [--force-device <family>] <serial-device> [elf-file]
+avrOSdb {--reset | --start | --stop} [--baud <baud>] <serial-device>
+avrOSdb --emit-vscode-config
 ```
 
 ### Options
@@ -154,6 +159,14 @@ avrOSdb --device [--baud <baud>] [--no-autobaud] [--force-device <family>] <seri
 | `--device` | flag | unset | One-shot diagnostic: open UPDI, run an auto-baud link-quality probe (unless `--no-autobaud`), read the SIGROW signature + serial number, ASI status bytes, FUSES, and LOCK byte, print a human-readable report (including the per-rung baud table and a decoded fuse listing) to stdout, then exit. No TCP listener is opened, no ELF is loaded, the target CPU is not halted. Mutually exclusive with `--load` and `--prog`. Makes `<elf-file>` optional. |
 | `--force-device <family>` | string | unset | Override automatic family detection. Accepts one of `AVR-DA`, `AVR-DB`, `AVR-DD`, `AVR-DU`, `AVR-SD` (case-insensitive). When set, this string is passed verbatim to the UPDI device-table selector and suppresses the ELF-vs-silicon family mismatch check (see §4.1 below). Use this when you knowingly want to debug an ELF against a different silicon family. |
 | `--no-introspect` | flag | unset | Disable the avrOS FSM introspection reads behind `monitor avros tasks` / `events` / `queues`. The GDB thread model is unaffected — the live CPU is always the sole GDB thread either way. Use when debugging non-avrOS firmware or to avoid the background UPDI reads. |
+| `--rsp` | flag | *(default)* | Serve the **GDB Remote Serial Protocol** front-end. This is the default when neither `--rsp` nor `--dap` is given. Mutually exclusive with `--dap`. Drives an external `avr-gdb` / Cortex-Debug (see §6.2). |
+| `--dap` | flag | unset | Serve the **Debug Adapter Protocol** front-end for DAP-native editors — the VS Code companion extension (§6.1) and Neovim nvim-dap (§6.3). Mutually exclusive with `--rsp`. |
+| `--sleep` | flag | unset | Allow the target to sleep natively. By default the debugger snapshots and restores the firmware's peripheral state across the software-breakpoint NVMPROG reset (and asserts `CLK_REQ`) so the configured SLEEP wake source survives and breakpoints still fire after the firmware sleeps. Pass `--sleep` to restore native sleep/power behaviour (for power-path debugging). (HLR-077.) |
+| `--log` | flag | unset | Log detailed activity to `stderr`, selected by the active mode: GDB RSP packets (`--rsp`, each prefixed `RSP < ` / `RSP > `), DAP connection/message activity (`--dap`), or the programming phases (`--load` / `--prog`). The primary wire-level trace for debugging. (Renamed from the earlier RSP-only `--log-rsp`.) |
+| `--reset` | flag | unset | One-shot: pulse the UPDI system reset and exit, leaving the target running. Requires only `<serial-device>` — no ELF needed. Mutually exclusive with `--start` / `--stop`. Redundant when combined with `--prog`. |
+| `--start` | flag | unset | One-shot: take OCD control and run the CPU, then exit leaving the target running. Requires only `<serial-device>`. Because taking OCD control pulses a reset, the CPU runs from the reset vector. Mutually exclusive with `--reset` / `--stop`. |
+| `--stop` | flag | unset | One-shot: take OCD control and halt the CPU, then exit leaving the target stopped. Requires only `<serial-device>`. Detaches without a reset pulse so the CPU stays halted. Mutually exclusive with `--reset` / `--start`. |
+| `--emit-vscode-config` | flag | unset | Print a ready-to-use VS Code `launch.json` for the `--dap` front-end to stdout and exit — needs no target or ELF. E.g. `avrOSdb --emit-vscode-config > .vscode/launch.json` (see §6.1). |
 
 ### 4.1 Exit Status
 
@@ -681,11 +694,137 @@ was started with `--allow-erase`.
 
 ## 6. Editor Integration
 
-`avrOSdb` supports two editor paths: **VS Code** over GDB RSP today (via an
-external `avr-gdb`), and an in-development **native DAP** front-end
-(`avrOSdb --dap`) that DAP-native editors such as Neovim talk to directly.
+`avrOSdb` exposes two client protocols, sharing one debug core. The **native
+DAP** front-end (`avrOSdb --dap`) is the primary, full-featured path: VS Code
+(via the bundled companion extension) and DAP-native editors such as Neovim and
+Zed talk to it directly, with **no `avr-gdb` in the loop**. The **GDB RSP** front-end
+remains available for VS Code through an external `avr-gdb` and the Cortex-Debug
+extension.
 
-### 6.1 VS Code (Cortex-Debug, via GDB RSP)
+### 6.1 VS Code (native DAP)
+
+VS Code debugs through `avrOSdb --dap` directly. Unlike Neovim, VS Code
+only talks to a DAP server through a *contributed debug type*, so a small
+companion extension is provided in
+[`tools/vscode/avrosdb-dap/`](../tools/vscode/avrosdb-dap/) contributing the
+`avrosdb` type. With a `request: "launch"` config the extension **starts
+`avrOSdb --dap` for you** (spawns it, waits for its "listening on" banner, then
+connects) — one **F5**, no separate terminal. A `request: "attach"` config is
+also provided for connecting to a server you run yourself (e.g. on a remote
+target host).
+
+> [!NOTE]
+> The native DAP front-end is full-featured: attach, execution control
+> (continue / pause / step), source + instruction + **conditional** breakpoints,
+> a DWARF multi-frame call stack, **variables** (Locals / Registers / Globals
+> with struct & array expansion), **watch/REPL `evaluate`** (including
+> `g_cfg.base` / `g_arr[2]`), **read/write memory**, and **set variable**. The
+> GDB-RSP path (§6.2) remains available and shares the same debug core.
+
+> [!TIP]
+> `avrOSdb --emit-vscode-config` prints a ready-to-use `launch.json` (the
+> self-starting `launch` config + an `attach` alternative) to stdout — e.g.
+> `avrOSdb --emit-vscode-config > .vscode/launch.json`.
+
+**Install the companion extension** (one of):
+
+```bash
+# Package a .vsix and install it (needs Node tooling: @vscode/vsce or npx)
+make package-vscode
+code --install-extension dist/avrosdb-dap-0.3.0.vsix   # named for the extension version
+
+# …or, for development: open the folder in VS Code and press F5
+code tools/vscode/avrosdb-dap
+
+# …or install it for all workspaces by copying it into the extensions dir
+cp -r tools/vscode/avrosdb-dap ~/.vscode/extensions/avrosdb-dap-0.3.0
+#   (VS Code Remote-SSH: use ~/.vscode-server/extensions/ on the remote host)
+```
+
+Reload VS Code after installing. The extension contributes the `avrosdb` debug
+type with a self-starting *launch* configuration (and an *attach* alternative),
+a **turnkey F5** flow, and an **avrOS Debug View** in the activity bar.
+
+**Add a launch configuration** — copy
+[`tools/vscode/launch.json`](../tools/vscode/launch.json) to your project's
+`.vscode/launch.json` and edit the paths:
+
+```jsonc
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "avrosdb",
+      "request": "launch",
+      "name": "Debug with avrOSdb (--dap)",
+      "program": "${workspaceFolder}/build/avrOSdb",
+      "serial": "/dev/ttyAMA2",
+      "elf": "${workspaceFolder}/firmware.elf",
+      "port": 1234
+      // "extraArgs": ["--baud", "230400"]   // optional avrOSdb flags
+    },
+    {
+      "type": "avrosdb",
+      "request": "attach",
+      "name": "Attach to running avrOSdb (--dap)",
+      "host": "127.0.0.1",
+      "port": 1234
+    }
+  ]
+}
+```
+
+**Use it:** pick **“Debug with avrOSdb (--dap)”** in the Run and Debug view and
+press **F5**. The extension launches `avrOSdb --dap --port 1234 <serial> <elf>`,
+waits for it to listen, attaches, and the target stops at entry — and it stops
+the server when you end the session. No separate terminal is needed.
+
+For a target on a remote Pi, run VS Code over Remote-SSH (the `launch` config
+then spawns avrOSdb on the Pi), or start avrOSdb on the Pi yourself and use the
+`attach` config with a forwarded port — e.g. `ssh -L 1234:localhost:1234 pi`,
+keeping `"host": "127.0.0.1"`.
+
+#### Zero-config F5 (turnkey)
+
+You can skip `launch.json` entirely. With the extension installed, pressing
+**F5** in a workspace with no debug configuration offers the **avrOSdb (--dap)**
+debugger and starts with a sensible default (`build/avrOSdb`, `/dev/ttyAMA2`,
+`firmware.elf`, port 1234). If the `avrOSdb` binary is not found at
+`build/avrOSdb`, the extension offers to **build it** (`make`) or fall back to
+`avrOSdb` on your `PATH`, then spawns the server and attaches. Edit the paths in
+`launch.json` (or use `--emit-vscode-config`) once your serial port and ELF
+differ from the defaults.
+
+#### avrOS Debug View (activity bar)
+
+The extension adds an **avrOS** icon to the activity bar. Selecting it opens a
+side bar with six views that populate while an `avrosdb` debug session is
+stopped:
+
+| View | Source | Shows |
+| ---- | ------ | ----- |
+| **Variables** | DAP `scopes`/`variables` | Locals / Registers / Globals of the current frame, with struct & array drill-down — the same data as the Run-and-Debug *Variables* view |
+| **Call Stack** | DAP `stackTrace` | The DWARF-unwound call stack, frame names and `file:line` |
+| **Breakpoints** | workspace breakpoints | Every source/function breakpoint and its condition |
+| **State Machines** | `avrosdb/fsmList` | Each avrOS FSM task, its current state, and whether it is the active task |
+| **Events** | `avrosdb/eventList` | Each registered avrOS event and its status flag |
+| **Queues** | `avrosdb/queueList` | Each avrOS queue's capacity and element size |
+
+The first three mirror the built-in Run-and-Debug side bar (VS Code does not let
+those views be moved, so the extension re-renders them here); the last three are
+the avrOS-specific introspection that `avrOSdb --dap` exposes through custom
+requests — the DAP analogue of `monitor avros tasks|events|queues` on the
+GDB-RSP path (§6.2). The views refresh automatically each time the target halts;
+the **↻** title-bar button forces a manual refresh.
+
+> [!TIP]
+> Prefer a no-extension quick test? Start `avrOSdb --dap --port 1234 …` yourself
+> and add `"debugServer": 1234` to a configuration whose `type` belongs to an
+> already-installed debugger (e.g. `cppdbg`); VS Code connects to that port
+> instead of spawning an adapter. The companion extension above is the clean,
+> type-correct route.
+
+### 6.2 VS Code (Cortex-Debug, via avr-gdb)
 
 `avrOSdb` speaks standard GDB RSP. While many debug adapters support RSP, the **cortex-debug** extension is the only officially tested extension for `avrOSdb` integration in VS Code.
 
@@ -754,7 +893,7 @@ extension can be configured similarly with `"servertype": "external"`
 and `"gdbTarget": "localhost:1234"` — useful when an external GDB
 launch script already manages the stub.
 
-### 6.2 Neovim (nvim-dap) — native DAP front-end
+### 6.3 Neovim (nvim-dap, native DAP)
 
 `avrOSdb --dap` serves the Debug Adapter Protocol directly, so Neovim's
 [nvim-dap](https://github.com/mfussenegger/nvim-dap) plugin can debug the target
@@ -765,7 +904,7 @@ with **no `avr-gdb` in the loop**.
 > source / instruction / conditional breakpoints, a DWARF multi-frame call
 > stack, variables (Locals / Registers / Globals with struct & array
 > expansion), watch/REPL `evaluate`, read/write memory, and set variable. The
-> RSP path (§6.1) shares the same debug core and remains available.
+> RSP path (§6.2) shares the same debug core and remains available.
 
 **One-time setup.** `make prereqs` (or just `make prereqs-nvim`) installs
 nvim-dap as a native Neovim package and installs the avrOSdb DAP config into
@@ -803,90 +942,84 @@ build/avrOSdb --dap --port 1234 /dev/ttyAMA2 firmware.elf
 An automated on-target acceptance harness drives this same path headlessly:
 `make hw-test-dap` (see §7 / the Makefile).
 
-### 6.3 VS Code (native DAP)
+### 6.4 Zed (native DAP)
 
-VS Code can also debug through `avrOSdb --dap` directly. Unlike Neovim, VS Code
-only talks to a DAP server through a *contributed debug type*, so a small
-companion extension is provided in
-[`tools/vscode/avrosdb-dap/`](../tools/vscode/avrosdb-dap/) contributing the
-`avrosdb` type. With a `request: "launch"` config the extension **starts
-`avrOSdb --dap` for you** (spawns it, waits for its "listening on" banner, then
-connects) — one **F5**, no separate terminal. A `request: "attach"` config is
-also provided for connecting to a server you run yourself (e.g. on a remote
-target host).
+Zed debugs through `avrOSdb --dap` directly. As with VS Code, Zed only talks to
+a DAP server through a *registered debug adapter*, so a small companion
+extension is provided in [`tools/zed/avrosdb/`](../tools/zed/avrosdb/)
+registering the `avrosdb` adapter. With a `request: "launch"` entry the
+extension **starts `avrOSdb --dap` for you** and connects over TCP; a
+`request: "attach"` entry connects to a server you run yourself.
 
 > [!NOTE]
-> The native DAP front-end is now full-featured: attach, execution control
-> (continue / pause / step), source + instruction + **conditional** breakpoints,
-> a DWARF multi-frame call stack, **variables** (Locals / Registers / Globals
-> with struct & array expansion), **watch/REPL `evaluate`** (including
-> `g_cfg.base` / `g_arr[2]`), **read/write memory**, and **set variable**. The
-> GDB-RSP path (§6.1) remains available and shares the same debug core.
+> Zed does not let an extension contribute custom side-bar tree views, so —
+> unlike the VS Code companion (§6.1) — the Zed extension does **not** surface
+> the avrOS **State Machines / Events / Queues** introspection. You get
+> launch/attach plus Zed's built-in **Variables / Call Stack / Breakpoints**
+> panes over the same debug core. For avrOS runtime introspection use the VS
+> Code extension or `monitor avros …` on the GDB-RSP path (§6.2).
 
-> [!TIP]
-> `avrOSdb --emit-vscode-config` prints a ready-to-use `launch.json` (the
-> self-starting `launch` config + an `attach` alternative) to stdout — e.g.
-> `avrOSdb --emit-vscode-config > .vscode/launch.json`.
-
-**Install the companion extension** (one of):
+**Install the companion extension.** Zed compiles the extension's Rust to
+WebAssembly on install, so you only need the Rust toolchain:
 
 ```bash
-# Development Host: open the folder in VS Code and press F5
-code tools/vscode/avrosdb-dap
-
-# …or install it for all workspaces by copying it into the extensions dir
-cp -r tools/vscode/avrosdb-dap ~/.vscode/extensions/avrosdb-dap-0.2.0
-#   (VS Code Remote-SSH: use ~/.vscode-server/extensions/ on the remote host)
+rustup target add wasm32-wasip1     # one-time
 ```
 
-Reload VS Code after copying. The extension contributes the `avrosdb` debug type
-with a self-starting *launch* configuration (and an *attach* alternative).
+Then in Zed: **Extensions → Install Dev Extension…** and pick the
+`tools/zed/avrosdb` directory. (From the repo root, `make package-zed`
+pre-builds the `wasm32` artefact as a local compile check — `cargo` plus the
+`wasm32-wasip1` target are a development-only dependency, never required by
+`make`/`make test`.)
 
-**Add a launch configuration** — copy
-[`tools/vscode/launch.json`](../tools/vscode/launch.json) to your project's
-`.vscode/launch.json` and edit the paths:
+**Add a debug configuration** — create `.zed/debug.json` in your firmware
+project:
 
-```jsonc
-{
-  "version": "0.2.0",
-  "configurations": [
-    {
-      "type": "avrosdb",
-      "request": "launch",
-      "name": "Debug with avrOSdb (--dap)",
-      "program": "${workspaceFolder}/build/avrOSdb",
-      "serial": "/dev/ttyAMA2",
-      "elf": "${workspaceFolder}/firmware.elf",
-      "port": 1234
-      // "extraArgs": ["--baud", "230400"]   // optional avrOSdb flags
-    },
-    {
-      "type": "avrosdb",
-      "request": "attach",
-      "name": "Attach to running avrOSdb (--dap)",
-      "host": "127.0.0.1",
-      "port": 1234
-    }
-  ]
-}
+```json
+[
+  {
+    "label": "Debug with avrOSdb",
+    "adapter": "avrosdb",
+    "request": "launch",
+    "program": "$ZED_WORKTREE_ROOT/build/avrOSdb",
+    "serial": "/dev/ttyAMA2",
+    "elf": "$ZED_WORKTREE_ROOT/firmware.elf",
+    "port": 1234
+  },
+  {
+    "label": "Attach to avrOSdb",
+    "adapter": "avrosdb",
+    "request": "attach",
+    "host": "127.0.0.1",
+    "port": 1234
+  }
+]
 ```
 
-**Use it:** pick **“Debug with avrOSdb (--dap)”** in the Run and Debug view and
-press **F5**. The extension launches `avrOSdb --dap --port 1234 <serial> <elf>`,
-waits for it to listen, attaches, and the target stops at entry — and it stops
-the server when you end the session. No separate terminal is needed.
+`program` defaults to `avrOSdb` on `PATH`; `serial` to `/dev/ttyAMA2`; `port`
+to `1234`. `extraArgs` (e.g. `["--baud","230400"]`) are inserted before the
+serial/elf operands. The `launch` entry spawns
+`avrOSdb --dap --port 1234 <serial> <elf>` and connects to `127.0.0.1:1234`.
 
-For a target on a remote Pi, run VS Code over Remote-SSH (the `launch` config
-then spawns avrOSdb on the Pi), or start avrOSdb on the Pi yourself and use the
-`attach` config with a forwarded port — e.g. `ssh -L 1234:localhost:1234 pi`,
-keeping `"host": "127.0.0.1"`.
+**No-extension alternative.** You can skip the extension entirely: start the
+server yourself and point a `tcp_connection` block at it.
 
-> [!TIP]
-> Prefer a no-extension quick test? Start `avrOSdb --dap --port 1234 …` yourself
-> and add `"debugServer": 1234` to a configuration whose `type` belongs to an
-> already-installed debugger (e.g. `cppdbg`); VS Code connects to that port
-> instead of spawning an adapter. The companion extension above is the clean,
-> type-correct route.
+```bash
+build/avrOSdb --dap --port 1234 /dev/ttyAMA2 firmware.elf
+```
+
+```json
+[
+  {
+    "label": "avrOSdb (manual server)",
+    "request": "attach",
+    "tcp_connection": { "host": "127.0.0.1", "port": 1234 }
+  }
+]
+```
+
+Zed connects to the running server over TCP — no adapter binary is spawned.
+This mirrors the VS Code `"debugServer"` quick-test path in §6.1.
 
 ---
 
@@ -1467,7 +1600,7 @@ OCD, then iterates: get the CFA rule, read the return word and caller Y from
 target SRAM, and repeat with `PC = caller`, `SP = CFA`, `Y = caller Y`. It stops
 at a zero/out-of-FLASH return address, at a PC no FDE covers (the C-runtime
 frame that called `main`), or at a frame cap. Set `AVROSDB_DAP_UNWIND_LOG=1` to
-dump each frame's CFA and the surrounding stack bytes — the same way `--log-rsp`
+dump each frame's CFA and the surrounding stack bytes — the same way `--log`
 exposes the GDB wire. `make hw-test-dap-unwind` validates the whole chain end to
 end on hardware (the DAP analogue of the GDB G18 backtrace test).
 

@@ -2,6 +2,7 @@
  * the JSON codec (dj_* tokenizer + accessors + escaper) and the
  * Content-Length message framing. Both are target-independent and exercised
  * here without hardware (framing over an anonymous pipe). */
+#include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -445,6 +446,87 @@ void test_dap_set_variable_unknown_ref_errors(void)
     close(sp[0]); close(sp[1]);
 }
 
+/* ── Phase 21: avrOS introspection custom requests ────────────────────────── */
+
+/* Each avrosdb/*List request returns a well-formed empty array with no target /
+ * symbol index (the socketpair unit-test path). */
+static void check_introspect_empty(const char *command, const char *key)
+{
+    int sp[2];
+    TEST_ASSERT_EQUAL_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sp));
+    dap_session s = { sp[1], -1, NULL, NULL, NULL, false, 0 };
+
+    char req[96];
+    snprintf(req, sizeof req, "{\"seq\":40,\"command\":\"%s\"}", command);
+    TEST_ASSERT_EQUAL_INT(0, dap_dispatch(&s, req, strlen(req)));
+
+    char buf[512]; size_t len;
+    TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+    char needle[64];
+    snprintf(needle, sizeof needle, "\"command\":\"%s\"", command);
+    TEST_ASSERT_NOT_NULL(strstr(buf, needle));
+    snprintf(needle, sizeof needle, "\"%s\":[]", key);
+    TEST_ASSERT_NOT_NULL(strstr(buf, needle));
+
+    close(sp[0]); close(sp[1]);
+}
+
+void test_dap_fsm_list_empty_without_target(void)   { check_introspect_empty("avrosdb/fsmList", "fsms"); }
+void test_dap_event_list_empty_without_target(void) { check_introspect_empty("avrosdb/eventList", "events"); }
+void test_dap_queue_list_empty_without_target(void) { check_introspect_empty("avrosdb/queueList", "queues"); }
+
+/* ── source request (fallback file content) ───────────────────────────────── */
+
+/* A `source` request for a readable host file returns its content. */
+void test_dap_source_returns_file_content(void)
+{
+    char path[64];
+    snprintf(path, sizeof path, "/tmp/aod_dap_src_%d.c", (int)getpid());
+    FILE *fp = fopen(path, "wb");
+    TEST_ASSERT_NOT_NULL(fp);
+    fputs("int main(void){return 0;}\n", fp);
+    fclose(fp);
+
+    int sp[2];
+    TEST_ASSERT_EQUAL_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sp));
+    dap_session s = { sp[1], -1, NULL, NULL, NULL, false, 0 };
+
+    char req[160];
+    snprintf(req, sizeof req,
+             "{\"seq\":50,\"command\":\"source\","
+             "\"arguments\":{\"source\":{\"path\":\"%s\"}}}", path);
+    TEST_ASSERT_EQUAL_INT(0, dap_dispatch(&s, req, strlen(req)));
+
+    char buf[512]; size_t len;
+    TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"command\":\"source\""));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"success\":true"));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "int main(void){return 0;}"));
+
+    close(sp[0]); close(sp[1]);
+    remove(path);
+}
+
+/* A `source` request for a missing file fails cleanly (success:false). */
+void test_dap_source_missing_file_fails(void)
+{
+    int sp[2];
+    TEST_ASSERT_EQUAL_INT(0, socketpair(AF_UNIX, SOCK_STREAM, 0, sp));
+    dap_session s = { sp[1], -1, NULL, NULL, NULL, false, 0 };
+
+    const char *req =
+        "{\"seq\":51,\"command\":\"source\","
+        "\"arguments\":{\"source\":{\"path\":\"/no/such/avrosdb/file.c\"}}}";
+    TEST_ASSERT_EQUAL_INT(0, dap_dispatch(&s, req, strlen(req)));
+
+    char buf[512]; size_t len;
+    TEST_ASSERT_EQUAL_INT(1, dap_read_message(sp[0], buf, sizeof buf, &len));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"command\":\"source\""));
+    TEST_ASSERT_NOT_NULL(strstr(buf, "\"success\":false"));
+
+    close(sp[0]); close(sp[1]);
+}
+
 /* ── Phase 18: source breakpoints ─────────────────────────────────────────── */
 
 void test_dap_set_breakpoints_responds_with_per_line_entries(void)
@@ -598,6 +680,11 @@ int main(void)
     RUN_TEST(test_dap_evaluate_unresolved_is_error);
     RUN_TEST(test_dap_read_memory_responds_with_data_field);
     RUN_TEST(test_dap_set_variable_unknown_ref_errors);
+    RUN_TEST(test_dap_fsm_list_empty_without_target);
+    RUN_TEST(test_dap_event_list_empty_without_target);
+    RUN_TEST(test_dap_queue_list_empty_without_target);
+    RUN_TEST(test_dap_source_returns_file_content);
+    RUN_TEST(test_dap_source_missing_file_fails);
     RUN_TEST(test_dap_set_breakpoints_responds_with_per_line_entries);
     RUN_TEST(test_dap_set_breakpoints_replaces_prior_set_for_source);
     RUN_TEST(test_dap_set_instruction_breakpoints_responds_with_refs);

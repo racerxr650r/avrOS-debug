@@ -151,6 +151,7 @@ SRCS     := $(SRCDIR)/main.c \
              $(SRCDIR)/updi.c \
              $(SRCDIR)/elf_parser.c \
              $(SRCDIR)/fsm_mapper.c \
+             $(SRCDIR)/avros.c \
              $(SRCDIR)/monitor.c \
              $(SRCDIR)/debug_bp.c \
              $(SRCDIR)/gdb_rsp.c \
@@ -223,7 +224,8 @@ TEST_WRAP_test_elf  :=
 TEST_EXTRA_LDFLAGS_test_elf :=
 
 # test_dap  (DAP transport: JSON codec + Content-Length framing)
-TEST_SRCS_test_dap  := $(TESTDIR)/test_dap.c $(SRCDIR)/dap.c $(SRCDIR)/debug_bp.c $(TESTDIR)/ocd_stubs.c
+TEST_SRCS_test_dap  := $(TESTDIR)/test_dap.c $(SRCDIR)/dap.c $(SRCDIR)/debug_bp.c \
+                       $(SRCDIR)/fsm_mapper.c $(SRCDIR)/avros.c $(TESTDIR)/ocd_stubs.c
 TEST_WRAP_test_dap  :=
 TEST_EXTRA_LDFLAGS_test_dap :=
 
@@ -240,6 +242,7 @@ TEST_EXTRA_LDFLAGS_test_fsm :=
 # test_monitor
 TEST_SRCS_test_monitor := $(TESTDIR)/test_monitor.c \
                            $(SRCDIR)/monitor.c \
+                           $(SRCDIR)/avros.c \
                            $(SRCDIR)/elf_parser.c
 TEST_WRAP_test_monitor  := updi_mem_read rsp_send_packet \
                             updi_enter_debug updi_halt updi_run \
@@ -255,6 +258,7 @@ TEST_SRCS_test_rsp := $(TESTDIR)/test_rsp.c \
                        $(SRCDIR)/gdb_rsp.c \
                        $(SRCDIR)/debug_bp.c \
                        $(SRCDIR)/fsm_mapper.c \
+                       $(SRCDIR)/avros.c \
                        $(SRCDIR)/monitor.c
 TEST_WRAP_test_rsp  := updi_mem_read updi_mem_write updi_halt updi_run updi_step \
 					   updi_step_32bit \
@@ -278,8 +282,9 @@ TEST_EXTRA_LDFLAGS_test_rsp :=
 
 # test_main — test_main.c #includes src/main.c so it can reach the
 # static parse_args() / event_loop() / load_flash_segments() helpers.
-TEST_SRCS_test_main := $(TESTDIR)/test_main.c $(SRCDIR)/dap.c $(SRCDIR)/debug_bp.c $(TESTDIR)/ocd_stubs.c
-TEST_WRAP_test_main  := updi_open updi_close updi_console_poll \
+TEST_SRCS_test_main := $(TESTDIR)/test_main.c $(SRCDIR)/dap.c $(SRCDIR)/debug_bp.c \
+                       $(SRCDIR)/avros.c $(TESTDIR)/ocd_stubs.c
+TEST_WRAP_test_main  := updi_open updi_close updi_detach updi_console_poll \
                         updi_select_device updi_get_device \
                         updi_nvm_write_flash updi_nvm_flash_patch \
                         updi_nvm_write_eeprom updi_nvm_write_userrow \
@@ -310,7 +315,8 @@ TEST_EXTRA_LDFLAGS_test_install :=
 # updi.c is linked in real so updi_read_device_info exercises the PTY
 # harness; updi_open / updi_close are wrapped to substitute a pre-opened
 # PTY slave fd.
-TEST_SRCS_test_device := $(TESTDIR)/test_device.c $(SRCDIR)/updi.c $(SRCDIR)/dap.c $(SRCDIR)/debug_bp.c
+TEST_SRCS_test_device := $(TESTDIR)/test_device.c $(SRCDIR)/updi.c $(SRCDIR)/dap.c $(SRCDIR)/debug_bp.c \
+                         $(SRCDIR)/avros.c
 TEST_WRAP_test_device  := select updi_open updi_close \
                           updi_nvm_write_flash updi_console_poll \
                           updi_probe_baud updi_nvm_read \
@@ -577,7 +583,7 @@ $(HW_TEST_BIN): $(HW_TEST_SRC) $(BUILDDIR)/updi.o
 	$(Q)$(CC) $(CFLAGS) -I$(SRCDIR) -o $@ $^ $(LUTIL)
 	@echo "  LD  $@"
 
-.PHONY: hw-test hw-test-nvm hw-test-rsp hw-test-gdb hw-test-all hw-test-dap hw-test-dap-unwind hw-test-dap-cond hw-test-dap-vars
+.PHONY: hw-test hw-test-nvm hw-test-rsp hw-test-gdb hw-test-all hw-test-dap hw-test-dap-unwind hw-test-dap-cond hw-test-dap-vars hw-test-dap-introspect hw-test-start-stop hw-test-dap-step
 hw-test: $(HW_TEST_BIN)
 	$(Q)$(HW_ENV) $(HW_TEST_BIN)
 
@@ -691,6 +697,36 @@ hw-test-dap-cond: $(GDB_DBG_SESSION_ELF) all
 	    python3 tests/hw/dap_cond.py --port '$(HW_PORT)' \
 	        --dap-port '$(HW_DAP_PORT)' --elf '$(GDB_DBG_SESSION_ELF)'
 
+# hw-test-dap-introspect — DAP avrOS introspection acceptance (Phase 21).
+# Spawns avrOSdb --dap against the avros_full fixture (whose FSM/event/queue
+# table sections hold one descriptor each) and verifies the avrosdb/fsmList,
+# eventList, queueList custom requests read the tables off silicon.
+HW_INTROSPECT_ELF ?= $(FIXBINDIR)/avros_full.elf
+hw-test-dap-introspect: $(HW_INTROSPECT_ELF) all
+	$(Q)$(BUILDDIR)/$(TARGET) --prog --erase $(HW_PORT) $(HW_INTROSPECT_ELF)
+	$(Q)AVROSDB_BIN='$(BUILDDIR)/$(TARGET)' HW_PORT='$(HW_PORT)' \
+	    DAP_PORT='$(HW_DAP_PORT)' \
+	    python3 tests/hw/dap_introspect.py --port '$(HW_PORT)' \
+	        --dap-port '$(HW_DAP_PORT)' --elf '$(HW_INTROSPECT_ELF)'
+
+# hw-test-dap-step — DAP source-line stepping acceptance (HLR-078).  Spawns
+# avrOSdb --dap against the gdb_debug_session fixture and verifies stepIn/next/
+# stepOut have source-line granularity and distinct semantics on silicon.
+hw-test-dap-step: $(GDB_DBG_SESSION_ELF) all
+	$(Q)$(BUILDDIR)/$(TARGET) --prog --erase $(HW_PORT) $(GDB_DBG_SESSION_ELF)
+	$(Q)AVROSDB_BIN='$(BUILDDIR)/$(TARGET)' HW_PORT='$(HW_PORT)' \
+	    DAP_PORT='$(HW_DAP_PORT)' \
+	    python3 tests/hw/dap_step.py --port '$(HW_PORT)' \
+	        --dap-port '$(HW_DAP_PORT)' --elf '$(GDB_DBG_SESSION_ELF)'
+
+# hw-test-start-stop — --start / --stop / --reset one-shot run-state modes
+# (HLR-089).  Spawns avrOSdb in each CPU run-state mode against live silicon and
+# checks it takes OCD control and exits cleanly with its banner, and that the
+# UPDI link stays healthy across the attach/detach cycles.  Needs no ELF.
+hw-test-start-stop: all
+	$(Q)AVROSDB_BIN='$(BUILDDIR)/$(TARGET)' HW_PORT='$(HW_PORT)' \
+	    python3 tests/hw/start_stop.py --serial '$(HW_PORT)'
+
 # hw-test-dap-vars — DAP variables / evaluate / memory acceptance (Phase 19,
 # the DAP analogue of GDB Group-G state inspection).  Spawns avrOSdb --dap
 # against the gdb_debug_session fixture and verifies scopes, variables (struct/
@@ -784,6 +820,54 @@ bundle-brew: $(BUILDDIR)/$(TARGET) $(MANPAGE)
 	@mkdir -p $(DISTDIR)
 	$(Q)printf 'class Avrosdb < Formula\n  desc "UPDI-to-GDB debug stub with avrOS FSM awareness"\n  homepage "https://github.com/racerxr650r/avrOS-debug"\n  url "https://github.com/racerxr650r/avrOS-debug/archive/refs/tags/v%s.tar.gz"\n  sha256 "0000000000000000000000000000000000000000000000000000000000000000"\n  version "%s"\n  license "MIT"\n\n  def install\n    system "make"\n    bin.install "build/avrOSdb"\n    man1.install "doc/avrOSdb.1"\n  end\n\n  test do\n    assert_match "avrOSdb", shell_output("#{bin}/avrOSdb --help 2>&1", 1)\n  end\nend\n' $(VERSION) $(VERSION) > $(BREW_FILE)
 	@echo "  BUNDLE  $(BREW_FILE)"
+
+# ── package-vscode target ────────────────────────────────────────────────────
+# Package the VS Code companion extension (tools/vscode/avrosdb-dap) into a
+# .vsix in dist/.  Requires Node tooling: `vsce` (@vscode/vsce) on PATH, or
+# `npx` to fetch it on demand.  Manual/dev-only — Node is not a build or CI
+# dependency of avrOSdb itself, so this target is never invoked by `make` or
+# `make test`.  The .vsix is named after the extension's own version (from its
+# package.json), independent of the project $(VERSION), so the artefact name is
+# stable across commits.  Install the extension with:
+#   code --install-extension dist/avrosdb-dap-<ver>.vsix
+VSCODE_EXT_DIR := tools/vscode/avrosdb-dap
+VSCODE_EXT_VER := $(shell sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' $(VSCODE_EXT_DIR)/package.json | head -1)
+VSIX_FILE      := $(DISTDIR)/avrosdb-dap-$(VSCODE_EXT_VER).vsix
+.PHONY: package-vscode
+package-vscode:
+	@mkdir -p $(DISTDIR)
+	@command -v vsce >/dev/null 2>&1 || command -v npx >/dev/null 2>&1 || { \
+	    echo "ERROR: need 'vsce' (npm i -g @vscode/vsce) or 'npx' on PATH"; exit 1; }
+	$(Q)cd $(VSCODE_EXT_DIR) && \
+	    if command -v vsce >/dev/null 2>&1; then \
+	        vsce package --out "$(abspath $(VSIX_FILE))"; \
+	    else \
+	        npx --yes @vscode/vsce package --out "$(abspath $(VSIX_FILE))"; \
+	    fi
+	@echo "  BUNDLE  $(VSIX_FILE)"
+
+# ── package-zed target ───────────────────────────────────────────────────────
+# Build the Zed debug-adapter extension (tools/zed/avrosdb) to its wasm32
+# artefact in dist/, validating that the Rust source compiles.  Requires the
+# Rust toolchain: `cargo` plus the `wasm32-wasip1` target
+# (`rustup target add wasm32-wasip1`).  Manual/dev-only — Rust is not a build or
+# CI dependency of avrOSdb itself, so this target is never invoked by `make` or
+# `make test`.  In normal use Zed compiles the extension itself when it is
+# installed via "Install Dev Extension…"; this target is a local compile check.
+# The artefact is named after the extension's own version (from extension.toml).
+ZED_EXT_DIR := tools/zed/avrosdb
+ZED_EXT_VER := $(shell sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' $(ZED_EXT_DIR)/extension.toml | head -1)
+ZED_WASM    := $(DISTDIR)/avrosdb-zed-$(ZED_EXT_VER).wasm
+.PHONY: package-zed
+package-zed:
+	@mkdir -p $(DISTDIR)
+	@command -v cargo >/dev/null 2>&1 || { \
+	    echo "ERROR: need 'cargo' (https://rustup.rs) on PATH"; exit 1; }
+	$(Q)cd $(ZED_EXT_DIR) && cargo build --release --target wasm32-wasip1
+	$(Q)cp $(ZED_EXT_DIR)/target/wasm32-wasip1/release/zed_avrosdb.wasm \
+	    $(abspath $(ZED_WASM))
+	@echo "  BUNDLE  $(ZED_WASM)"
+
 # ── prereqs target ───────────────────────────────────────────────────────────
 # Install all development prerequisites (Debian/Ubuntu; requires sudo).
 # Installs host build tools via apt, then downloads and installs the

@@ -1052,7 +1052,7 @@ def main() -> int:
     )
 
     # 1) Spawn avrOSdb.
-    current_extra_args = ["--log-rsp"]
+    current_extra_args = ["--log"]
     current_elf = args.elf
     server_log = "/tmp/avrosdb_gdb_g.log"
     server = spawn_server(args.avros_bin, args.port, args.rsp_port,
@@ -1070,12 +1070,12 @@ def main() -> int:
         selected = sorted(n for n in VERDICTS if not args.only or n in args.only)
         for n in selected:
             if n == 9:
-                desired_extra_args = ["--log-rsp", "--no-introspect"]
+                desired_extra_args = ["--log", "--no-introspect"]
             elif n in (10, 11, 12, 13, 14, 15, 16, 17,
                        18, 19, 20, 21, 22, 23, 24, 25):
-                desired_extra_args = ["--log-rsp", "--load"]
+                desired_extra_args = ["--log", "--load"]
             else:
-                desired_extra_args = ["--log-rsp"]
+                desired_extra_args = ["--log"]
             if n in (18, 19, 20, 21, 22, 23, 24):
                 desired_elf = args.dbg_elf
             elif n == 17:

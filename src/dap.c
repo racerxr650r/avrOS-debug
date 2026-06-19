@@ -11,6 +11,8 @@
  */
 #include "dap.h"
 #include "gdb_rsp.h"   /* rsp_accept / rsp_close — shared TCP transport helpers */
+#include "fsm_mapper.h" /* fsm_build_thread_list — avrosdb/fsmList */
+#include "avros.h"      /* avros_read_events/queues — avrosdb/eventList/queueList */
 
 #include <ctype.h>
 #include <errno.h>
@@ -519,16 +521,24 @@ static void dap_format_frame(dap_session *s, int id, uint32_t pc,
     /* Frame name: the enclosing function (DWARF), falling back to the raw PC
      * hex when no subprogram covers it (e.g. the C runtime above main). */
     char fname[128], nesc[260];
-    if (s->elf != NULL &&
-        elf_addr_to_func(s->elf, pc, fname, sizeof fname) == 0) {
+    int  have_func = (s->elf != NULL &&
+                      elf_addr_to_func(s->elf, pc, fname, sizeof fname) == 0);
+    if (have_func) {
         dj_escape(fname, nesc, sizeof nesc);
     } else {
         (void)snprintf(nesc, sizeof nesc, "0x%06lx", (unsigned long)pc);
     }
 
+    /* Only attach a source object when the PC is inside a real function.  A PC
+     * with no enclosing subprogram (the reset vector / C-runtime, or a stub) is
+     * not a C source location — yet libdw's line table can still hand back a
+     * stale row for it (e.g. a `--gc-sections`-discarded function whose
+     * `.debug_line` entry was relocated to address 0), which would make VS Code
+     * show a misleading file:line.  Gating on `have_func` suppresses that and
+     * lets the client show the instruction address instead. */
     char file[256];
     int  line = 0;
-    if (s->elf != NULL &&
+    if (have_func && s->elf != NULL &&
         elf_addr_to_line(s->elf, pc, file, sizeof file, &line) == 0) {
         const char *base = strrchr(file, '/');
         base = base ? base + 1 : file;
@@ -1055,6 +1065,157 @@ static int dap_handle_set_variable(dap_session *s, const char *msg,
     return dap_send_response(s, req_seq, "setVariable", ok, body);
 }
 
+/* ── avrOS introspection custom requests (Phase 21) ──────────────────────────
+ *
+ * `avrosdb/fsmList`, `avrosdb/eventList`, `avrosdb/queueList` surface the avrOS
+ * runtime tables (the same data as `monitor avros tasks/events/queues`) as JSON
+ * for the VS Code avrOS view.  They reuse the shared FSM/monitor readers and
+ * the symbol index / FSM context already on the session; with no target or no
+ * avrOS tables they return an empty list (never an error).  Non-intrusive —
+ * background UPDI reads, no CPU halt. */
+
+static int dap_handle_fsm_list(dap_session *s, long req_seq)
+{
+    char   body[4096];
+    size_t off   = (size_t)snprintf(body, sizeof body, "{\"fsms\":[");
+    int    first = 1;
+    if (s->updi_fd >= 0 && s->idx != NULL && s->fsm != NULL &&
+        fsm_build_thread_list(s->fsm, s->idx, s->updi_fd) >= 0) {
+        for (int i = 0; i < s->fsm->thread_count; i++) {
+            const FsmThread *t = &s->fsm->threads[i];
+            char ne[80], se[80];
+            dj_escape(t->name, ne, sizeof ne);
+            dj_escape(t->state_name, se, sizeof se);
+            int w = snprintf(body + off, sizeof body - off,
+                "%s{\"id\":%d,\"name\":\"%s\",\"state\":\"%s\",\"active\":%s}",
+                first ? "" : ",", t->gdb_id, ne, se,
+                t->is_active ? "true" : "false");
+            if (w < 0 || (size_t)w >= sizeof body - off) break;
+            off += (size_t)w; first = 0;
+        }
+    }
+    (void)snprintf(body + off, sizeof body - off, "]}");
+    return dap_send_response(s, req_seq, "avrosdb/fsmList", true, body);
+}
+
+static int dap_handle_event_list(dap_session *s, long req_seq)
+{
+    AvrosEvent ev[256];
+    int n = (s->updi_fd >= 0 && s->idx != NULL)
+        ? avros_read_events(s->idx, s->updi_fd, ev,
+                            (int)(sizeof ev / sizeof ev[0])) : 0;
+    if (n < 0) n = 0;
+
+    char   body[4096];
+    size_t off = (size_t)snprintf(body, sizeof body, "{\"events\":[");
+    for (int i = 0; i < n; i++) {
+        char ne[80];
+        dj_escape(ev[i].name, ne, sizeof ne);
+        int w;
+        if (ev[i].has_status)
+            w = snprintf(body + off, sizeof body - off,
+                "%s{\"name\":\"%s\",\"status\":%u}", i ? "," : "", ne,
+                ev[i].status);
+        else
+            w = snprintf(body + off, sizeof body - off,
+                "%s{\"name\":\"%s\",\"status\":null}", i ? "," : "", ne);
+        if (w < 0 || (size_t)w >= sizeof body - off) break;
+        off += (size_t)w;
+    }
+    (void)snprintf(body + off, sizeof body - off, "]}");
+    return dap_send_response(s, req_seq, "avrosdb/eventList", true, body);
+}
+
+static int dap_handle_queue_list(dap_session *s, long req_seq)
+{
+    AvrosQueue q[256];
+    int n = (s->updi_fd >= 0 && s->idx != NULL)
+        ? avros_read_queues(s->idx, s->updi_fd, q,
+                            (int)(sizeof q / sizeof q[0])) : 0;
+    if (n < 0) n = 0;
+
+    char   body[4096];
+    size_t off = (size_t)snprintf(body, sizeof body, "{\"queues\":[");
+    for (int i = 0; i < n; i++) {
+        int w = snprintf(body + off, sizeof body - off,
+            "%s{\"id\":%d,\"capacity\":%u,\"elemSize\":%u}",
+            i ? "," : "", i, q[i].capacity, q[i].elem_size);
+        if (w < 0 || (size_t)w >= sizeof body - off) break;
+        off += (size_t)w;
+    }
+    (void)snprintf(body + off, sizeof body - off, "]}");
+    return dap_send_response(s, req_seq, "avrosdb/queueList", true, body);
+}
+
+/* ── source request ──────────────────────────────────────────────────────────
+ *
+ * VS Code falls back to the DAP `source` request when it cannot open a frame's
+ * `Source.path` itself.  stackTrace now emits absolute paths (LLR-ELF-13), so a
+ * source present on the debug host is opened directly and this request is not
+ * issued; we still serve it here as a robust fallback, reading
+ * `arguments.source.path` from the host filesystem.  A file that is absent, or
+ * too large to frame under DAP_MSG_MAX, gets a clean `success:false` rather than
+ * a stub error. */
+static int dap_handle_source(dap_session *s, const char *msg,
+                             const dj_tok_t *t, long req_seq)
+{
+    char path[512] = "";
+    int  args   = dj_member(msg, t, 0, "arguments");
+    int  srcobj = (args >= 0) ? dj_member(msg, t, args, "source") : -1;
+    if (srcobj >= 0) {
+        int p = dj_member(msg, t, srcobj, "path");
+        if (p >= 0) dj_strcpy(msg, t, p, path, sizeof path);
+    }
+
+    FILE *fp = (path[0] != '\0') ? fopen(path, "rb") : NULL;
+    if (fp == NULL)
+        return dap_send_error(s, req_seq, "source",
+            "source file is not available on the debug host") < 0 ? -1 : 0;
+
+    enum { SRC_RAW_MAX = 56u * 1024u };
+    char *raw = malloc(SRC_RAW_MAX + 1u);
+    if (raw == NULL) {
+        fclose(fp);
+        return dap_send_error(s, req_seq, "source", "out of memory") < 0 ? -1 : 0;
+    }
+    size_t n        = fread(raw, 1, SRC_RAW_MAX, fp);
+    int    overflow = (fgetc(fp) != EOF);          /* more bytes than the cap */
+    fclose(fp);
+    raw[n] = '\0';
+    if (overflow) {
+        free(raw);
+        return dap_send_error(s, req_seq, "source",
+            "source too large to stream over DAP; open it from the workspace")
+            < 0 ? -1 : 0;
+    }
+
+    /* Worst-case JSON escape is 6 bytes per input byte (\uXXXX). */
+    size_t esccap = n * 6u + 1u;
+    char  *esc    = malloc(esccap);
+    char  *out    = malloc(DAP_MSG_MAX);
+    if (esc == NULL || out == NULL) {
+        free(raw); free(esc); free(out);
+        return dap_send_error(s, req_seq, "source", "out of memory") < 0 ? -1 : 0;
+    }
+    dj_escape(raw, esc, esccap);
+    free(raw);
+
+    int w = snprintf(out, DAP_MSG_MAX,
+        "{\"seq\":%ld,\"type\":\"response\",\"request_seq\":%ld,"
+        "\"success\":true,\"command\":\"source\",\"body\":{\"content\":\"%s\"}}",
+        dap_next_seq(s), req_seq, esc);
+    free(esc);
+    if (w < 0 || (size_t)w >= DAP_MSG_MAX) {
+        free(out);
+        return dap_send_error(s, req_seq, "source",
+            "source too large to stream over DAP; open it from the workspace")
+            < 0 ? -1 : 0;
+    }
+    int rc = dap_write_message(s->fd, out, (size_t)w);
+    free(out);
+    return rc < 0 ? -1 : 0;
+}
+
 /* ── Breakpoints (Phase 18) ───────────────────────────────────────────────── */
 
 void dap_bp_reset(dap_session *s)
@@ -1334,6 +1495,162 @@ static int dap_eval_condition(dap_session *s, uint32_t pc,
     return -1;
 }
 
+/* ── Source-line stepping (HLR-078) ───────────────────────────────────────────
+ *
+ * VS Code sends next/stepIn/stepOut with no address range — unlike GDB, which
+ * computes the source line's range and drives the server's `vCont;r`.  So the
+ * DAP front-end orchestrates source-line stepping itself, but over the SAME
+ * core primitives the GDB-RSP range-step uses: `bp_step_range()` single-steps
+ * within a line's address range (`elf_line_range`), and the reserved stepping
+ * comparator (`RSP_HW_BP_STEP_SLOT`) runs to a return address to step over / out
+ * of calls without touching user breakpoints. */
+#define DAP_STEP_LINE_MAX 4096      /* max line-table rows traversed per step   */
+#define DAP_RUN_TO_POLLS  1200      /* 1200 × 50 ms = 60 s run-to-return budget  */
+
+static int dap_pc_line(dap_session *s, uint32_t pc, char *file, size_t cap, int *line)
+{
+    if (s->elf == NULL) return -1;
+    return elf_addr_to_line(s->elf, pc, file, cap, line);
+}
+
+/* Run the target until it halts at `target` with SP >= `min_sp` (so a recursive
+ * re-entry of the same address at a deeper level is skipped), via the reserved
+ * stepping comparator so user breakpoints are untouched.  Returns 0 when it
+ * reaches the target (or stops at another breakpoint), -1 on a UPDI error or a
+ * poll timeout (target left halted wherever it stopped). */
+static int dap_run_to(dap_session *s, uint32_t target, uint16_t min_sp)
+{
+    if (updi_ocd_set_hw_bp(s->updi_fd, RSP_HW_BP_STEP_SLOT, target) < 0)
+        return -1;
+    int rc = -1;
+    for (int run = 0; run < 64; run++) {
+        if (updi_run(s->updi_fd) < 0) break;
+        /* updi_ocd_poll_halted(): 0 = halted, 1 = still running (timeout),
+         * -1 = UPDI error. */
+        int halted = 0;
+        for (int w = 0; w < DAP_RUN_TO_POLLS; w++) {
+            int h = updi_ocd_poll_halted(s->updi_fd, 50);
+            if (h < 0) { halted = -1; break; }
+            if (h == 0) { halted = 1; break; }   /* STOPPED bit set */
+            /* h > 0: still running within the budget → keep polling */
+        }
+        if (halted != 1) { (void)updi_halt(s->updi_fd); break; }
+        uint32_t pc = 0; uint16_t sp = 0;
+        (void)updi_ocd_read_pc(s->updi_fd, &pc);
+        (void)updi_ocd_read_sp(s->updi_fd, &sp);
+        if (pc != target)  { rc = 0; break; }   /* stopped at another (user) bp */
+        if (sp >= min_sp)  { rc = 0; break; }    /* returned to our frame */
+        /* same address but a deeper frame (recursion) → run again */
+    }
+    (void)updi_ocd_clear_hw_bp(s->updi_fd, RSP_HW_BP_STEP_SLOT);
+    return rc;
+}
+
+/* stepIn: advance to a different source line, descending into calls. */
+static void dap_step_line(dap_session *s)
+{
+    uint32_t pc = 0;
+    if (updi_ocd_read_pc(s->updi_fd, &pc) < 0) return;
+    char f0[256] = ""; int l0 = -1;
+    int have0 = (dap_pc_line(s, pc, f0, sizeof f0, &l0) == 0);
+
+    for (int g = 0; g < DAP_STEP_LINE_MAX; g++) {
+        uint32_t lo = 0, hi = 0;
+        if (s->elf != NULL && elf_line_range(s->elf, pc, &lo, &hi) == 0) {
+            if (bp_step_range(s->updi_fd, lo, hi, NULL, NULL) < 0) return;
+        } else if (updi_step(s->updi_fd) < 0) {
+            return;                          /* no line info → single instr step */
+        }
+        if (updi_ocd_read_pc(s->updi_fd, &pc) < 0) return;
+        char f[256] = ""; int l = -1;
+        if (dap_pc_line(s, pc, f, sizeof f, &l) == 0
+            && (!have0 || l != l0 || strcmp(f, f0) != 0))
+            return;                          /* reached a different source line */
+        /* same line (multi-row) or no line yet → keep stepping */
+    }
+}
+
+/* next: like stepIn, but step OVER calls — run to the return rather than
+ * single-stepping through (so stepping over a delay/loop is instant). */
+static void dap_step_over(dap_session *s)
+{
+    uint32_t pc = 0; uint16_t sp0 = 0;
+    if (updi_ocd_read_pc(s->updi_fd, &pc) < 0) return;
+    if (updi_ocd_read_sp(s->updi_fd, &sp0) < 0) return;
+    char f0[256] = ""; int l0 = -1;
+    int have0 = (dap_pc_line(s, pc, f0, sizeof f0, &l0) == 0);
+    char fn0[128] = "";
+    int havef0 = (s->elf != NULL && elf_addr_to_func(s->elf, pc, fn0, sizeof fn0) == 0);
+
+    for (int g = 0; g < DAP_STEP_LINE_MAX; g++) {
+        uint32_t lo = 0, hi = 0;
+        if (s->elf != NULL && elf_line_range(s->elf, pc, &lo, &hi) == 0) {
+            if (bp_step_range(s->updi_fd, lo, hi, NULL, NULL) < 0) return;
+        } else if (updi_step(s->updi_fd) < 0) {
+            return;
+        }
+        uint32_t npc = 0; uint16_t sp = 0;
+        if (updi_ocd_read_pc(s->updi_fd, &npc) < 0) return;
+        (void)updi_ocd_read_sp(s->updi_fd, &sp);
+
+        /* Descended into a call? (stack grew AND we left our function.)  Run to
+         * the return address in our frame instead of stepping through the callee. */
+        char fn[128] = "";
+        int havef = (s->elf != NULL && elf_addr_to_func(s->elf, npc, fn, sizeof fn) == 0);
+        if (sp < sp0 && (!havef0 || !havef || strcmp(fn, fn0) != 0)) {
+            if (dap_unwind(s) >= 2) {        /* frames[1] = our frame (the return) */
+                if (dap_run_to(s, s->frames[1].pc, sp0) != 0) return;
+                if (updi_ocd_read_pc(s->updi_fd, &pc) < 0) return;
+                continue;                    /* back in our frame; re-evaluate */
+            }
+            return;                          /* no unwind → stop here */
+        }
+        pc = npc;
+        char f[256] = ""; int l = -1;
+        if (dap_pc_line(s, pc, f, sizeof f, &l) == 0
+            && (!have0 || l != l0 || strcmp(f, f0) != 0))
+            return;
+    }
+}
+
+/* stepOut: run until the current function returns to its caller. */
+static void dap_step_out(dap_session *s)
+{
+    if (dap_unwind(s) < 2) { (void)updi_step(s->updi_fd); return; }  /* no caller */
+    uint32_t ret    = s->frames[1].pc;            /* caller's return PC */
+    uint16_t min_sp = (uint16_t)s->frames[0].fr.cfa;  /* SP once we return */
+    (void)dap_run_to(s, ret, min_sp);
+}
+
+/* Run to main()'s first statement, GDB-style, on the entry stop: locate main in
+ * the symbol table, skip its prologue (advance to the first line-table row whose
+ * line differs from main's declaration line), and run there.  This makes the
+ * client highlight the first source line in main instead of leaving the PC at
+ * the reset vector with no source.  Returns 0 if it ran to main, -1 if main
+ * could not be located (caller keeps the plain reset-vector entry stop). */
+static int dap_run_to_main(dap_session *s)
+{
+    if (s->updi_fd < 0 || s->elf == NULL) return -1;
+    uint32_t main_lo = 0;
+    if (elf_func_entry(s->elf, "main", &main_lo) != 0) return -1;
+
+    /* Skip the prologue: from main's entry, advance over line-table rows that
+     * share main's declaration line until the line changes (the first real
+     * statement).  Falls back to the entry address if the line table is thin. */
+    uint32_t target = main_lo;
+    int entry_line = -1;
+    int have_entry = (elf_addr_to_line(s->elf, main_lo, NULL, 0, &entry_line) == 0);
+    for (int g = 0; g < 64; g++) {
+        uint32_t lo = 0, hi = 0;
+        if (elf_line_range(s->elf, target, &lo, &hi) != 0) break;
+        int l = -1;
+        int ok = (elf_addr_to_line(s->elf, hi, NULL, 0, &l) == 0);
+        target = hi;
+        if (!have_entry || !ok || l != entry_line) break;   /* first statement */
+    }
+    return dap_run_to(s, target, 0);
+}
+
 /* Step over every breakpoint installed at the current PC and resume — the GDB
  * remove/single-step/insert dance — so a conditional breakpoint whose condition
  * was false (or a plain resume parked on a breakpoint) does not immediately
@@ -1438,8 +1755,15 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
         return dap_handle_set_instruction_breakpoints(s, msg, t, req_seq) < 0 ? -1 : 0;
 
     if (strcmp(cmd, "configurationDone") == 0) {
-        if (s->updi_fd >= 0)
+        if (s->updi_fd >= 0) {
             (void)updi_halt(s->updi_fd);
+            /* GDB-like run-to-main: when halted at the reset vector (PC 0),
+             * advance to main's first statement so the client highlights it
+             * rather than showing the source-less reset vector. */
+            uint32_t pc = 0;
+            if (updi_ocd_read_pc(s->updi_fd, &pc) == 0 && pc == 0)
+                (void)dap_run_to_main(s);
+        }
         s->running = false;
         if (dap_send_response(s, req_seq, cmd, true, NULL) < 0)
             return -1;
@@ -1480,15 +1804,19 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
         return dap_emit_stopped(s, "pause") < 0 ? -1 : 0;
     }
 
-    /* next / stepIn / stepOut map to a single OCD instruction step (the core
-     * execution verb); source-line granularity and true step-over/step-out
-     * are a later refinement.  Either way the resulting PC resolves to the
-     * correct source line via the shallow stackTrace.                      */
-    if (strcmp(cmd, "next") == 0 || strcmp(cmd, "stepIn") == 0 ||
+    /* Source-line stepping (HLR-078): stepIn advances one source line into
+     * calls; next steps over calls (run-to-return); stepOut runs to the caller.
+     * All are built on the shared bp_step_range() core + the reserved stepping
+     * comparator, so a line of several instructions is one step and a stepped-
+     * over call (even a delay/loop) returns at once. */
+    if (strcmp(cmd, "stepIn") == 0 || strcmp(cmd, "next") == 0 ||
         strcmp(cmd, "stepOut") == 0) {
         dap_varref_reset(s);         /* frame/var handles go stale on step */
-        if (s->updi_fd >= 0)
-            (void)updi_step(s->updi_fd);
+        if (s->updi_fd >= 0) {
+            if (strcmp(cmd, "stepIn") == 0)       dap_step_line(s);
+            else if (strcmp(cmd, "next") == 0)    dap_step_over(s);
+            else                                  dap_step_out(s);
+        }
         s->running = false;
         if (dap_send_response(s, req_seq, cmd, true, NULL) < 0)
             return -1;
@@ -1516,6 +1844,14 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
     if (strcmp(cmd, "setVariable") == 0)
         return dap_handle_set_variable(s, msg, t, req_seq) < 0 ? -1 : 0;
 
+    /* avrOS introspection custom requests (Phase 21). */
+    if (strcmp(cmd, "avrosdb/fsmList") == 0)
+        return dap_handle_fsm_list(s, req_seq) < 0 ? -1 : 0;
+    if (strcmp(cmd, "avrosdb/eventList") == 0)
+        return dap_handle_event_list(s, req_seq) < 0 ? -1 : 0;
+    if (strcmp(cmd, "avrosdb/queueList") == 0)
+        return dap_handle_queue_list(s, req_seq) < 0 ? -1 : 0;
+
     if (strcmp(cmd, "disconnect") == 0 || strcmp(cmd, "terminate") == 0) {
         /* Remove all installed breakpoints from silicon before resuming, so
          * the target runs free (and is not left halted on an armed comparator
@@ -1539,9 +1875,12 @@ int dap_dispatch(dap_session *s, const char *msg, size_t len)
         return 1;                                /* close the session */
     }
 
-    /* Variables, memory, evaluate, and breakpoint installation: Phases 18–19. */
+    if (strcmp(cmd, "source") == 0)
+        return dap_handle_source(s, msg, t, req_seq);
+
+    /* Any request we do not model: a clean success:false (never a hang). */
     return dap_send_error(s, req_seq, cmd,
-                          "request not implemented yet (Phase 18+)") < 0 ? -1 : 0;
+                          "request not supported by avrOSdb") < 0 ? -1 : 0;
 }
 
 /* ── Server entry: accept one client, then dispatch on the event loop ─────── */

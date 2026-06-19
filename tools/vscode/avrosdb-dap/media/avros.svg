@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+  <!-- avrOS activity-bar glyph: three FSM state nodes joined by transition
+       arrows. Single-colour (uses currentColor) so VS Code recolours it for
+       the active/inactive activity-bar states. -->
+  <g fill="none" stroke="currentColor" stroke-width="1.6"
+     stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="6"  cy="7"  r="3"/>
+    <circle cx="18" cy="7"  r="3"/>
+    <circle cx="12" cy="18" r="3"/>
+    <path d="M9 7 h6"/>
+    <path d="M16.4 9.6 L13.6 15.4"/>
+    <path d="M10.4 15.4 L7.6 9.6"/>
+  </g>
+</svg>

@@ -153,6 +153,14 @@
 
 int  updi_open(const char *device, int baud);
 void updi_close(int fd);
+
+/* Tear down the serial link WITHOUT pulsing a system reset, leaving the target
+ * in whatever OCD run state it is in (e.g. halted under OCD).  Unlike
+ * updi_close(), which asserts/releases ASI_RESET_REQ — letting the CPU run from
+ * the reset vector — this detaches cleanly so `--stop` can leave the CPU halted.
+ * The next updi_open() re-pulses reset to clear any latched OCD/NVMPROG mode. */
+void updi_detach(int fd);
+
 int  updi_mem_read(int fd, uint32_t addr, uint8_t *buf, size_t len);
 int  updi_mem_write(int fd, uint32_t addr, const uint8_t *buf, size_t len);
 

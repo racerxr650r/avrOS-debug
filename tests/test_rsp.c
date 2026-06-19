@@ -403,7 +403,7 @@ static size_t drain(int fd, char *buf, size_t cap)
 }
 
 /* LLR-RSP-49: capture fd-level stderr across a single operation so the
- * --log-rsp `RSP < ` / `RSP > ` traffic markers (written with
+ * --log `RSP < ` / `RSP > ` traffic markers (written with
  * fprintf(stderr,...) inside gdb_rsp.c) can be asserted.  Uses a pipe +
  * dup2 of STDERR_FILENO; the captured payload here is a few bytes, well
  * under the pipe buffer, so no reader is needed before restore.        */
@@ -607,7 +607,7 @@ static void rsp_recv_packet_sends_minus_and_returns_minus1_on_bad_checksum(void)
     TEST_ASSERT_EQUAL('-', ack);
 }
 
-/* ── LLR-RSP-49 / HLR-068: --log-rsp traffic logging ─────────────────── */
+/* ── LLR-RSP-49 / HLR-068: --log traffic logging ─────────────────── */
 
 /* rsp_set_logging(true) makes rsp_send_packet() emit "RSP > <payload>"
  * before sending and rsp_recv_packet() emit "RSP < <packet>" after

@@ -330,6 +330,12 @@ int elf_addr_to_line(const ElfContext *ctx, uint32_t byte_addr,
     if (ln == NULL)
         return -1;
 
+    /* Reject an end-of-sequence row: it marks the address one past a code
+     * range and carries a stale (last-seen) line number, not a real statement. */
+    bool end_seq = false;
+    if (dwarf_lineendsequence(ln, &end_seq) == 0 && end_seq)
+        return -1;
+
     if (line != NULL) {
         int n = 0;
         if (dwarf_lineno(ln, &n) != 0)
@@ -340,8 +346,28 @@ int elf_addr_to_line(const ElfContext *ctx, uint32_t byte_addr,
         const char *src = dwarf_linesrc(ln, NULL, NULL);
         if (src == NULL)
             return -1;
-        strncpy(file, src, file_cap - 1);
-        file[file_cap - 1] = '\0';
+        /* DWARF often records the source path relative to the compilation
+         * directory (e.g. "../../sys/fsm.c").  A DAP client cannot open a
+         * relative path and falls back to the `source` request, so resolve it
+         * to an absolute path against the CU's DW_AT_comp_dir.  The lexical
+         * join may retain `..` segments (e.g. ".../build/../../sys/fsm.c");
+         * that is still a valid absolute path the client/OS normalises when it
+         * opens the file. */
+        if (src[0] == '/') {
+            strncpy(file, src, file_cap - 1);
+            file[file_cap - 1] = '\0';
+        } else {
+            const char     *comp_dir = NULL;
+            Dwarf_Attribute attr;
+            if (dwarf_attr(&cu, DW_AT_comp_dir, &attr) != NULL)
+                comp_dir = dwarf_formstring(&attr);
+            if (comp_dir != NULL)
+                (void)snprintf(file, file_cap, "%s/%s", comp_dir, src);
+            else {
+                strncpy(file, src, file_cap - 1);
+                file[file_cap - 1] = '\0';
+            }
+        }
     }
     return 0;
 }
@@ -384,6 +410,77 @@ int elf_line_to_addr(const ElfContext *ctx, const char *want_file,
             }
         }
         off = next_off;
+    }
+    return -1;
+}
+
+int elf_line_range(const ElfContext *ctx, uint32_t byte_addr,
+                   uint32_t *lo, uint32_t *hi)
+{
+    if (ctx == NULL || ctx->dwarf == NULL)
+        return -1;
+
+    Dwarf    *dw = (Dwarf *)ctx->dwarf;
+    Dwarf_Die cu;
+    if (dwarf_addrdie(dw, (Dwarf_Addr)byte_addr, &cu) == NULL)
+        return -1;
+
+    Dwarf_Lines *lines  = NULL;
+    size_t       nlines = 0;
+    if (dwarf_getsrclines(&cu, &lines, &nlines) != 0 || nlines == 0)
+        return -1;
+
+    /* The row covering `byte_addr` spans [greatest addr <= it, smallest addr >
+     * it).  Scan for both bounds without assuming the table is address-sorted. */
+    uint32_t lo_best = 0, hi_best = 0;
+    int      have_lo = 0, have_hi = 0;
+    for (size_t i = 0; i < nlines; i++) {
+        Dwarf_Line *ln = dwarf_onesrcline(lines, i);
+        Dwarf_Addr  a  = 0;
+        if (ln == NULL || dwarf_lineaddr(ln, &a) != 0)
+            continue;
+        uint32_t ua = (uint32_t)a;
+        if (ua <= byte_addr) {
+            if (!have_lo || ua > lo_best) { lo_best = ua; have_lo = 1; }
+        } else {
+            if (!have_hi || ua < hi_best) { hi_best = ua; have_hi = 1; }
+        }
+    }
+    if (!have_lo || !have_hi || hi_best <= lo_best)
+        return -1;
+
+    if (lo != NULL) *lo = lo_best;
+    if (hi != NULL) *hi = hi_best;
+    return 0;
+}
+
+int elf_func_entry(const ElfContext *ctx, const char *name, uint32_t *addr)
+{
+    if (ctx == NULL || ctx->elf == NULL || name == NULL)
+        return -1;
+
+    Elf     *e   = (Elf *)ctx->elf;
+    Elf_Scn *scn = NULL;
+    while ((scn = elf_nextscn(e, scn)) != NULL) {
+        GElf_Shdr sh;
+        if (gelf_getshdr(scn, &sh) == NULL)  continue;
+        if (sh.sh_type != SHT_SYMTAB)        continue;
+
+        Elf_Data *d = elf_getdata(scn, NULL);
+        if (d == NULL)  break;
+        size_t count = (sh.sh_entsize != 0) ? sh.sh_size / sh.sh_entsize : 0;
+        for (size_t i = 0; i < count; i++) {
+            GElf_Sym sym;
+            if (gelf_getsym(d, (int)i, &sym) == NULL)             continue;
+            if (sym.st_shndx == SHN_UNDEF || sym.st_name == 0)    continue;
+            if (GELF_ST_TYPE(sym.st_info) != STT_FUNC)            continue;
+            const char *sn = elf_strptr(e, sh.sh_link, sym.st_name);
+            if (sn != NULL && strcmp(sn, name) == 0) {
+                if (addr != NULL) *addr = (uint32_t)sym.st_value;
+                return 0;
+            }
+        }
+        break;  /* first symtab only */
     }
     return -1;
 }

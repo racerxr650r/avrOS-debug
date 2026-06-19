@@ -131,6 +131,7 @@ Layer 1 (`src/main.c`) is the orchestrator and is permitted to reach into any mo
       <component path="src/elf_parser.c"><![CDATA[ELF parser; produces the `AvrOsSymbolIndex` (FLASH addresses of avrOS system tables) at attach time.]]></component>
       <component path="src/fsm_mapper.c"><![CDATA[FSM mapper; reads UPDI memory using the symbol index and exposes avrOS FSM state as introspection.]]></component>
       <component path="src/monitor.c"><![CDATA[Monitor handler; implements the custom `monitor avros events|queues` introspection commands without halting the CPU.]]></component>
+      <component path="src/avros.c"><![CDATA[avrOS introspection core; the single home for decoding the avrOS event/queue descriptor tables off the target. Both front-ends call it — the GDB-RSP `monitor avros` formatter and the DAP `avrosdb/*List` custom requests — so the table-decode logic is not duplicated and the DAP front-end does not depend on the RSP one.]]></component>
       <flow>
         <intro>The startup and attach sequence proceeds as follows:</intro>
         <step><![CDATA[`main()` parses argv, opens the UART serial device, and starts the GDB TCP listener socket.]]></step>
@@ -1204,6 +1205,63 @@ For source-level state inspection (Phase 19) `dap_session` also holds `frames[DA
           <case name="Message framing / read error"><![CDATA[Log and tear down the connection; the server returns to accept the next client.]]></case>
         </error_handling>
       </module>
+
+      <module path="src/avros.c">
+        <purpose><![CDATA[the single, protocol-agnostic home for decoding the avrOS event and queue descriptor tables off a running target. It exists so the table-decode logic lives in exactly one place: both client front-ends — the GDB-RSP `monitor avros events|queues` formatter (§8) and the DAP `avrosdb/eventList` / `avrosdb/queueList` custom requests (§10) — call these readers and apply their own wire formatting, so neither front-end depends on the other.]]></purpose>
+        <responsibility><![CDATA[Read the avrOS `EVNT_TABLE` / `QUE_TABLE` FLASH descriptor tables via non-intrusive UPDI background reads, using the addresses and counts from the `AvrOsSymbolIndex`.]]></responsibility>
+        <responsibility>Decode each descriptor into a small, wire-neutral C struct, following FLASH name pointers into the mapped-flash window and SRAM status pointers as needed.</responsibility>
+        <responsibility>Depend only on the UPDI and ELF layers — never on a client-protocol front-end — honouring the §2.2 downward-only layering rule.</responsibility>
+        <interfaces>
+          <interface title="Public C API (src/avros.h)"><![CDATA[```c
+typedef struct { char name[32]; uint8_t status; bool has_status; } AvrosEvent;
+typedef struct { uint16_t capacity; uint16_t elem_size; } AvrosQueue;
+
+int avros_read_events(const AvrOsSymbolIndex *idx, int updi_fd,
+                      AvrosEvent *out, int max);
+int avros_read_queues(const AvrOsSymbolIndex *idx, int updi_fd,
+                      AvrosQueue *out, int max);
+```
+
+Each reader fills at most `max` entries and returns the number decoded (0 when the corresponding table is empty), or -1 on a bad argument or a UPDI read error. FSM introspection is intentionally not duplicated here — it lives in `src/fsm_mapper.c` (§7), which both front-ends also call directly.]]></interface>
+        </interfaces>
+        <data_structures><![CDATA[`src/avros.c` holds no persistent state — it decodes the target's FLASH-resident registration tables on demand. The two descriptor layouts it decodes (addresses and counts come from the `AvrOsSymbolIndex`, §6) are the canonical definitions for the whole server:
+
+**`evntDescriptor_t`** (4 bytes, `EVNT_TABLE`): a FLASH `char *name` pointer (2 bytes) and an SRAM `event_t *status` pointer (2 bytes). The name pointer is followed into the mapped-flash window for the human-readable name (a null pointer yields `<null>`); a non-null status pointer is read from SRAM for the current 1-byte flag (a null pointer leaves `has_status` false).
+
+**`queDescriptor_t`** (10 bytes, `QUE_TABLE`): three pointers (queue / buffer / event, 2 bytes each) plus a 2-byte `capacity` and a 2-byte `sizeOfElement`; only the last two fields are reported.]]></data_structures>
+        <functions>
+          <function signature="int avros_read_events(const AvrOsSymbolIndex *idx, int updi_fd, AvrosEvent *out, int max)">
+            <purpose>Decode the avrOS `EVNT_TABLE` into the caller's array.</purpose>
+            <returns>The number of events decoded (0 when `event_count` is 0); -1 on a bad argument or a UPDI read failure.</returns>
+            <logic>
+              <step><![CDATA[Return 0 immediately when `idx->event_count` is 0; else read `event_count` × 4-byte records from `flash_to_updi(idx->event_table_addr)` with `updi_mem_read()`.]]></step>
+              <step><![CDATA[For each record, extract the little-endian FLASH `name` and SRAM `status` pointers. A null name pointer renders `<null>`; otherwise follow it into the mapped-flash window with the private `read_target_string()` helper (NUL-terminated read via `updi_mem_read`, non-printable bytes rendered as `?`).]]></step>
+              <step><![CDATA[A non-null status pointer is read as one byte and flagged `has_status`; a null pointer leaves the status absent. Fill at most `max` entries and return the count.]]></step>
+            </logic>
+          </function>
+          <function signature="int avros_read_queues(const AvrOsSymbolIndex *idx, int updi_fd, AvrosQueue *out, int max)">
+            <purpose>Decode the avrOS `QUE_TABLE` into the caller's array.</purpose>
+            <returns>The number of queues decoded (0 when `queue_count` is 0); -1 on a bad argument or a UPDI read failure.</returns>
+            <logic>
+              <step><![CDATA[Return 0 when `idx->queue_count` is 0; else read `queue_count` × 10-byte records from `flash_to_updi(idx->queue_table_addr)` with `updi_mem_read()`.]]></step>
+              <step><![CDATA[From each record report the little-endian `capacity` (bytes 6–7) and `sizeOfElement` (bytes 8–9), filling at most `max` entries and returning the count.]]></step>
+            </logic>
+          </function>
+        </functions>
+        <algorithm><![CDATA[**Non-intrusive reads:** Both readers use `updi_mem_read()` exclusively and never halt the CPU, so a DAP client or a `monitor` command can sample avrOS objects while the target runs (at the cost of a possible read-during-write race for a multi-byte field — acceptable for observational introspection).
+
+**One spot, two front-ends:** Before this module, the table decode lived in `src/monitor.c`; the DAP front-end needed the same data but must not depend on the RSP front-end. The decode therefore moved here so `src/monitor.c` (§8) and `src/dap.c` (§10) both call `avros_read_events()` / `avros_read_queues()` and only differ in how they format the result (hex-encoded O-packets vs. JSON). FSM data is shared the same way through `src/fsm_mapper.c` (§7).
+
+**Test approach for `src/avros.c`:** Unit-testable by linking the real module against a mock `updi_mem_read()` that returns canned `EVNT_TABLE` / `QUE_TABLE` bytes; the `test_monitor` and `test_dap` suites exercise it through their respective front-ends, and the on-target `dap_introspect.py` harness validates it against live silicon.]]></algorithm>
+        <dependencies>
+          <dep><![CDATA[`src/updi.c` — `updi_mem_read()` and `flash_to_updi()` for non-intrusive mapped-flash/SRAM reads.]]></dep>
+          <dep><![CDATA[`src/elf_parser.c` — `AvrOsSymbolIndex` for table addresses and entry counts.]]></dep>
+        </dependencies>
+        <error_handling>
+          <case name="Bad argument"><![CDATA[Return -1 when `idx`/`out` is NULL or `max <= 0`; the caller reports an empty list.]]></case>
+          <case name="UPDI read failure">Return -1; the front-end surfaces the failure without aborting the server.</case>
+        </error_handling>
+      </module>
     </modules>
 
     <data_dictionary>
@@ -1391,6 +1449,7 @@ Errors are propagated upward through the module stack without retrying:
       <theme name="System Introspection"              sections="§8 (src/monitor.c)"/>
       <theme name="Shared Breakpoint Core"            sections="§9 (src/debug_bp.c)"/>
       <theme name="DAP Server"                        sections="§10 (src/dap.c)"/>
+      <theme name="avrOS Introspection Core"          sections="§11 (src/avros.c)"/>
       <theme name="Flash Programming"                 sections="§4 (src/updi.c)"/>
       <theme name="Console Bridge"                    sections="§4 (src/updi.c)"/>
     </traceability>
@@ -1406,8 +1465,8 @@ Errors are propagated upward through the module stack without retrying:
     <section number="1" title="System Startup and Command-Line Interface">
       <intro><![CDATA[Requirements in this section govern how `avrOSdb` is invoked, how it initialises its resources, and how quickly it becomes ready for a GDB connection.]]></intro>
 
-      <hlr id="HLR-068" name="Detailed RSP Traffic Logging">
-        <text><![CDATA[The application shall accept a `--log-rsp` command line flag that enables detailed logging of all GDB Remote Serial Protocol requests and responses to `stderr`. It shall be parsed via `--log-rsp` and set an internal logging flag. When this flag is enabled, every RSP packet received from or sent to the GDB client shall be printed to `stderr` prefixed with `RSP &lt; ` or `RSP &gt; ` respectively.]]></text>
+      <hlr id="HLR-068" name="Detailed Activity Logging">
+        <text><![CDATA[The application shall accept a `--log` command line flag that enables detailed activity logging to `stderr`, with the logged activity selected by the active mode: in the GDB-RSP front-end (`--rsp`) every RSP packet received from or sent to the client shall be printed prefixed with `RSP &lt; ` or `RSP &gt; ` respectively; in the DAP front-end (`--dap`) the connection lifecycle and per-message activity shall be logged; and in the programming pipeline (`--load` / `--prog`) the resolved target, baud, erase/verify settings, and per-phase progress shall be logged. The flag shall set an internal logging flag passed to the selected front-end. (Renamed from the earlier RSP-only `--log-rsp`.)]]></text>
         <traces>
           <trace target="SDD" ref="1.1"/>
           <trace target="SDD" ref="3.2.2"/>
@@ -1418,6 +1477,14 @@ Errors are propagated upward through the module stack without retrying:
         <text><![CDATA[The application shall accept the following command-line arguments: a required positional `<serial-device>` path, a required positional `<elf-file>` path, an optional `--port <port>` TCP port (default `1234`), an optional `--baud <baud>` UART baud rate (default `115200`), and an optional `--load` flag. Any unrecognised argument shall cause the application to print a usage message to `stderr` and exit with a non-zero status.]]></text>
         <traces>
           <trace target="SDD" ref="3.2.2"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-089" name="CPU Run-State One-Shot Modes">
+        <text><![CDATA[The application shall provide three one-shot CPU run-state command-line modes that open the UPDI link, perform a single action, and exit without opening a GDB/DAP listener or entering the event loop — each requiring only `<serial-device>` (the `<elf-file>` operand is optional): `--reset` shall pulse the UPDI system reset and let the target run; `--start` shall take OCD control and run the CPU (`updi_enter_debug()` then `updi_run()`), leaving the target running; and `--stop` shall take OCD control and halt the CPU (`updi_enter_debug()` then `updi_halt()`), leaving the target halted. `--reset`, `--start`, and `--stop` shall be mutually exclusive with one another; supplying more than one shall print a diagnostic and exit non-zero. Because taking OCD control pulses a system reset, `--start` and `--stop` act from the reset vector. To leave the CPU in the requested run state after the tool exits, `--start` and `--stop` shall detach the link with `updi_detach()` — a teardown that does NOT pulse `ASI_RESET_REQ` (unlike `updi_close()`, which resets and releases the CPU), so a `--stop` target stays halted rather than running free on exit.]]></text>
+        <traces>
+          <trace target="SDD" ref="3.2.2"/>
+          <trace target="SDD" ref="4.1"/>
         </traces>
       </hlr>
 
@@ -1744,6 +1811,29 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="SDD" ref="2.2"/>
         </traces>
       </hlr>
+
+      <hlr id="HLR-087" name="VS Code avrOS Debug View">
+        <text><![CDATA[The project shall provide a VS Code companion extension (`tools/vscode/avrosdb-dap`) that contributes an **avrOS** activity-bar view container presenting avrOS application-debug information while an `avrosdb` DAP session is stopped. The container shall hold six tree views: **Variables**, **Call Stack**, and **Breakpoints** that mirror the built-in Run-and-Debug side bar by re-rendering the active session's DAP data (scopes/variables, stackTrace, and the workspace breakpoint set — VS Code does not permit its built-in views to be re-parented into another container); and **State Machines**, **Events**, and **Queues** that present the avrOS-specific introspection the server exposes through the custom requests of HLR-086 (`avrosdb/fsmList`, `avrosdb/eventList`, `avrosdb/queueList`) — the DAP analogue of `monitor avros tasks|events|queues` on the GDB-RSP path. The views shall refresh when the target halts (on the DAP `stopped` event) and offer a manual refresh command; with no active `avrosdb` session they shall be empty. The extension shall ship a single-colour activity-bar icon and shall be packageable into an installable `.vsix`.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+          <trace target="SDD" ref="10.1"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-088" name="VS Code Turnkey Debug Configuration">
+        <text><![CDATA[The VS Code companion extension shall provide a turnkey debug flow so a user can start debugging with no prior `launch.json`. A `DebugConfigurationProvider` for the `avrosdb` type shall, on F5, supply a ready-to-run `launch` configuration (defaults `program = ${workspaceFolder}/build/avrOSdb`, `serial = /dev/ttyAMA2`, `elf = ${workspaceFolder}/firmware.elf`, `port = 1234`) and shall resolve an empty configuration to that default. Before the session starts it shall locate the `avrOSdb` binary; when the binary is absent at the configured path it shall offer to build it (`make`) or fall back to `avrOSdb` on `PATH`, aborting the launch when neither is available. On a `launch` request the extension shall spawn `avrOSdb --dap --port <port> <serial> <elf>`, wait for its `listening on` banner, attach over TCP, and terminate the spawned server when the session ends (the spawn-and-attach behaviour introduced with the launch-config helper, HLR-085). The Makefile shall provide a `package-vscode` target that packages the extension into `dist/avrosdb-dap-$(VERSION).vsix` using `vsce`/`npx`; Node tooling is a manual/development dependency only and shall never be required by `make` or `make test`.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-090" name="Zed Turnkey Debug Configuration">
+        <text><![CDATA[The project shall provide a Zed debug-adapter extension (`tools/zed/avrosdb`) that registers an `avrosdb` debug adapter so a user can launch-and-attach, or attach to a running server, and start a debug session from Zed's native DAP debugger — without hand-writing a debug configuration. The extension shall be a Rust crate compiled to WebAssembly against the `zed_extension_api`, declaring `[debug_adapters.avrosdb]` in `extension.toml` with a JSON schema (`debug_adapter_schemas/avrosdb.json`) describing the configuration fields (`request`, `program`, `serial`, `elf`, `port`, `host`, `extraArgs`). On a `launch` request the extension shall return a debug-adapter binary that spawns `avrOSdb --dap --port <port> <serial> <elf>` (honouring a user-provided binary path, else falling back to `avrOSdb` on `PATH`) and a TCP connection (`127.0.0.1:<port>`, default port 1234) so Zed connects to the spawned server over the socket; on an `attach` request it shall return a connect-only TCP descriptor for an already-running server. Unlike the VS Code companion (HLR-087), the extension shall NOT present avrOS state-machine / event / queue introspection — Zed does not allow an extension to contribute the bespoke tree views that surface the HLR-086 custom requests — so the Zed integration is limited to launch/attach plus Zed's built-in Variables / Call Stack / Breakpoints debugger panes over the shared DAP core. The User Manual shall additionally document a no-extension path: start the server manually and connect from a `.zed/debug.json` entry whose `tcp_connection` block points at it. The Makefile shall provide a `package-zed` target that builds the extension's `wasm32` artefact using `cargo`; the Rust/`cargo` toolchain is a manual/development dependency only and shall never be required by `make` or `make test`.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+          <trace target="SDD" ref="10.1"/>
+        </traces>
+      </hlr>
     </section>
 
     <section number="9" title="Diagnostics and Bring-up">
@@ -1843,7 +1933,7 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-076" name="DAP Connection Lifecycle">
-        <text><![CDATA[The DAP front-end (`dap_serve()`, reached when the server is started with `--dap`) shall accept one client on the shared TCP listener and service it on the single `select()`-based event loop, honouring the global quit flag between messages. Over that connection it shall implement the DAP connection lifecycle: `initialize` (reply with the adapter capabilities — at minimum `supportsConfigurationDoneRequest` — then emit the `initialized` event); `launch` and `attach` (reply success; the target is already connected and in OCD debug mode, so attach/launch are equivalent here); `setBreakpoints` and `setExceptionBreakpoints` during the configuration phase (reply success — real breakpoint installation is Phase 18); `configurationDone` (halt the target and emit a `stopped` event with reason `entry` for thread 1, reaching the stopped-at-entry state); `threads` (report the single live CPU thread); and `disconnect`/`terminate` (resume the target and close the session). Every reply shall be a well-formed DAP `response` carrying the request's `seq` as `request_seq`, the `command`, and a `success` flag; a request the build does not yet implement shall receive a `success:false` response with a `message` (rather than silence), so the client is never left waiting. Each emitted message shall carry a monotonically increasing `seq`. UPDI side effects shall be skipped when no target link is present so the dispatch is unit-testable without hardware.]]></text>
+        <text><![CDATA[The DAP front-end (`dap_serve()`, reached when the server is started with `--dap`) shall accept one client on the shared TCP listener and service it on the single `select()`-based event loop, honouring the global quit flag between messages. Over that connection it shall implement the DAP connection lifecycle: `initialize` (reply with the adapter capabilities — at minimum `supportsConfigurationDoneRequest` — then emit the `initialized` event); `launch` and `attach` (reply success; the target is already connected and in OCD debug mode, so attach/launch are equivalent here); `setBreakpoints` and `setExceptionBreakpoints` during the configuration phase (reply success — real breakpoint installation is Phase 18); `configurationDone` (halt the target and emit a `stopped` event with reason `entry` for thread 1, reaching the stopped-at-entry state; when the target is halted at the reset vector — PC 0 — it shall first run to `main`'s first statement, GDB-style, so the client highlights the first source line in `main` rather than the source-less reset vector, falling back to the plain reset-vector stop when `main` cannot be located — LLR-DAP-20); `threads` (report the single live CPU thread); and `disconnect`/`terminate` (resume the target and close the session). Every reply shall be a well-formed DAP `response` carrying the request's `seq` as `request_seq`, the `command`, and a `success` flag; a request the build does not yet implement shall receive a `success:false` response with a `message` (rather than silence), so the client is never left waiting. Each emitted message shall carry a monotonically increasing `seq`. UPDI side effects shall be skipped when no target link is present so the dispatch is unit-testable without hardware.]]></text>
         <traces>
           <trace target="SDD" ref="2.2"/>
           <trace target="SDD" ref="10.1"/>
@@ -1858,7 +1948,7 @@ Errors are propagated upward through the module stack without retrying:
       </hlr>
 
       <hlr id="HLR-078" name="DAP Execution Control, Stop Events &amp; Shallow stackTrace">
-        <text><![CDATA[Over a connected DAP session (HLR-076), the DAP front-end shall expose run control and the run-state event stream, mapping each request to the debug-core execution verbs (the same OCD primitives the GDB-RSP front-end composes, HLR-073). It shall implement: `continue` — reply `{allThreadsContinued:true}`, emit a `continued` event, and resume the target (`updi_run()`); the server's idle event-loop tick shall then poll the OCD STOPPED status (`updi_ocd_poll_halted()`) and, on halt, emit a `stopped` event. `pause` — halt the target (`updi_halt()`) and emit `stopped` with reason `pause`. `next` / `stepIn` / `stepOut` — advance the target by one OCD instruction step (`updi_step()`) and emit `stopped` with reason `step`; true source-line-granular step-over and step-out are a deferred refinement, but the resulting PC still resolves to the correct source line. `threads` — report the single live CPU thread (`{id:1,name:"cpu"}`); avrOS FSM tasks remain `monitor`-style introspection, surfaced in a later refinement. Every `stopped` event shall carry `threadId:1` and `allThreadsStopped:true`; the defined reasons are `entry` (configurationDone, HLR-076), `step`, `breakpoint` (a halt detected while the target was running), and `pause`. `terminate` shall additionally emit a `terminated` event before closing. The front-end shall also serve a **shallow `stackTrace`** — frame 0 only: the live PC read over OCD (`updi_ocd_read_pc()`), resolved to `file:line` via libdw (`elf_addr_to_line()`, HLR-072) and returned with a `source` object; when no target or no DWARF line is available it shall still return one frame so the client has a valid stack. `scopes` shall return an empty array (frame variables are Phase 19); deeper frames via DWARF CFI unwinding and real function names are Phase 18. All target side effects shall be guarded (`updi_fd >= 0`) so the dispatch is unit-testable over a socketpair without hardware.]]></text>
+        <text><![CDATA[Over a connected DAP session (HLR-076), the DAP front-end shall expose run control and the run-state event stream, mapping each request to the debug-core execution verbs (the same OCD primitives the GDB-RSP front-end composes, HLR-073). It shall implement: `continue` — reply `{allThreadsContinued:true}`, emit a `continued` event, and resume the target (`updi_run()`); the server's idle event-loop tick shall then poll the OCD STOPPED status (`updi_ocd_poll_halted()`) and, on halt, emit a `stopped` event. `pause` — halt the target (`updi_halt()`) and emit `stopped` with reason `pause`. `stepIn` / `next` / `stepOut` — perform **source-line-granular** stepping (not a single OCD instruction) and emit `stopped` with reason `step`: `stepIn` advances to the next source line, descending into calls; `next` advances to the next source line in the current frame, stepping *over* calls (running to the return rather than into the callee, so stepping over a delay/loop is immediate); `stepOut` runs until the current function returns to its caller. These are built on the shared debug-core stepping primitives — `bp_step_range()` (single-step while the PC stays in a source line's address range, the same loop the GDB-RSP `vCont;r` uses) and the reserved stepping comparator (`RSP_HW_BP_STEP_SLOT`) to run to a return address without disturbing user breakpoints — with the line's address range from `elf_line_range()` and the return address from the CFI unwinder. `threads` — report the single live CPU thread (`{id:1,name:"cpu"}`); avrOS FSM tasks remain `monitor`-style introspection, surfaced in a later refinement. Every `stopped` event shall carry `threadId:1` and `allThreadsStopped:true`; the defined reasons are `entry` (configurationDone, HLR-076), `step`, `breakpoint` (a halt detected while the target was running), and `pause`. `terminate` shall additionally emit a `terminated` event before closing. The front-end shall also serve a **shallow `stackTrace`** — frame 0 only: the live PC read over OCD (`updi_ocd_read_pc()`), resolved to `file:line` via libdw (`elf_addr_to_line()`, HLR-072) and returned with a `source` object; when no target or no DWARF line is available it shall still return one frame so the client has a valid stack. `scopes` shall return an empty array (frame variables are Phase 19); deeper frames via DWARF CFI unwinding and real function names are Phase 18. All target side effects shall be guarded (`updi_fd >= 0`) so the dispatch is unit-testable over a socketpair without hardware.]]></text>
         <traces>
           <trace target="SDD" ref="2.2"/>
           <trace target="SDD" ref="10.1"/>
@@ -1924,6 +2014,15 @@ Errors are propagated upward through the module stack without retrying:
         <traces>
           <trace target="SDD" ref="3.1"/>
           <trace target="SDD" ref="3.2.2"/>
+        </traces>
+      </hlr>
+
+      <hlr id="HLR-086" name="avrOS Introspection over DAP Custom Requests">
+        <text><![CDATA[The DAP front-end shall expose the target's avrOS runtime objects to a DAP client through three custom requests — DAP has no `monitor` console channel, so this is the DAP analogue of `monitor avros`: `avrosdb/fsmList` shall reply `{"fsms":[{"id","name","state","active"}]}`, `avrosdb/eventList` shall reply `{"events":[{"name","status"}]}` (a null status when the descriptor's status pointer is null), and `avrosdb/queueList` shall reply `{"queues":[{"id","capacity","elemSize"}]}`. The FSM list shall reuse the FSM-thread snapshot (`fsm_build_thread_list()` in `src/fsm_mapper.c`) — the same data the GDB-RSP front-end surfaces as virtual threads — so a slot with a null state-machine pointer is skipped rather than listed. The event and queue lists shall decode the avrOS `EVNT_TABLE` / `QUE_TABLE` FLASH descriptor tables. To implement that decode in one place and keep the DAP front-end from depending on the GDB-RSP one, the event/queue table reader shall live in a protocol-agnostic introspection core (`src/avros.c`) that depends only on the UPDI and ELF layers; both these DAP custom requests and the GDB-RSP `monitor avros events|queues` formatter shall call it, per the SDD §2.2 layered-architecture rule (downward-only calls, no front-end → front-end dependency). Each request shall degrade gracefully — with no target link or no avrOS symbol tables it shall return an empty array rather than an error — and all target access shall be guarded by `updi_fd >= 0` so the dispatch is unit-testable without hardware. A null event-name pointer shall render the name as `<null>`, preserving the existing monitor output. The `--no-introspect` switch shall disable these custom requests on the DAP front-end exactly as it disables avrOS introspection on the GDB-RSP front-end: when introspection is disabled the server passes a NULL symbol index (and NULL FSM context) to `dap_serve()`, so all three requests return empty arrays.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+          <trace target="SDD" ref="10.1"/>
+          <trace target="SDD" ref="11.1"/>
         </traces>
       </hlr>
     </section>
@@ -2222,7 +2321,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-MAIN-23">
-        <text><![CDATA[`parse_args()` shall recognise `--log-rsp` as a boolean flag (no argument) and set `cfg->log_rsp = true` when present. The default initialiser shall set the flag to `false`. The main orchestrator shall pass this flag to `rsp_set_logging()` before entering the event loop.]]></text>
+        <text><![CDATA[`parse_args()` shall recognise `--log` as a boolean flag (no argument) and set `cfg->log = true` when present. The default initialiser shall set the flag to `false`. The main orchestrator shall pass this flag to `rsp_set_logging()` (RSP front-end) and as the `log` argument to `dap_serve()` (DAP front-end), and `run_prog_mode()` shall emit per-phase programming diagnostics to `stderr` when it is set.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-068" name="Detailed RSP Traffic Logging"/>
         </traces>
@@ -2246,6 +2345,20 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <text><![CDATA[`MAIN_NAME()` shall, before `parse_args()` and any device/ELF handling, scan `argv` for `--emit-vscode-config`; when present it shall call `emit_vscode_config()` — which writes a VS Code `launch.json` with a self-starting `request: "launch"` config (`avrosdb` type + `program`/`serial`/`elf`/`port`) and a `request: "attach"` alternative to stdout — and return 0 without touching the target.  The usage/`--help` text shall document the flag.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-085" name="VS Code Launch-Config Helper"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MAIN-27">
+        <text><![CDATA[`parse_args()` shall recognise `--start` and `--stop` as boolean flags setting `cfg->start_cpu` / `cfg->stop_cpu` (defaulting false), alongside the existing `--reset` (`cfg->reset_cpu`).  When more than one of `--reset` / `--start` / `--stop` is given it shall print a diagnostic ("--reset, --start and --stop are mutually exclusive") and `exit(1)`.  Each of the three modes shall make the `<elf-file>` operand optional (only `<serial-device>` is required); the missing-operand check shall therefore permit a single positional argument when any of `device_info`, `reset_cpu`, `start_cpu`, or `stop_cpu` is set.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-089" name="CPU Run-State One-Shot Modes"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-MAIN-28">
+        <text><![CDATA[`run_start_mode()` and `run_stop_mode()` shall each `updi_open()` the serial device (returning 1 with a wiring diagnostic on failure), then `updi_enter_debug()` to take OCD control; `run_start_mode()` shall then `updi_run()` the CPU and `run_stop_mode()` shall `updi_halt()` it.  Both shall tear the link down with `updi_detach()` (LLR-UPDI-37) — leaving the target running / halted respectively rather than reset-and-released — print a one-line `start: OK (CPU running)` / `stop: OK (CPU halted)` confirmation to stdout, and return 0 (or 1 if the enter-debug/run/halt sequence failed).  `MAIN_NAME()` shall dispatch to these after the `--device`, `--prog`, and `--reset` short-circuits and before installing signal handlers.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-089" name="CPU Run-State One-Shot Modes"/>
         </traces>
       </llr>
 
@@ -2520,6 +2633,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <text><![CDATA[`updi_save_peripherals(fd, buf)` and `updi_restore_peripherals(fd, buf)` shall snapshot and restore the target peripheral I/O register window `[UPDI_PERIPH_BASE, UPDI_PERIPH_BASE + UPDI_PERIPH_LEN)` = `[0x0040, 0x0C00)` via `updi_mem_read()` / `updi_mem_write()`, so the firmware's configured `SLEEP` wake source survives the NVMPROG system reset of a SW-breakpoint flash patch (HLR-077). The window spans the extended-I/O peripherals (RSTCTRL, SLPCTRL, CLKCTRL, CPUINT, RTC, EVSYS, PORTMUX, PORTs, TCA/TCB, USART, SPI, TWI, AC/ADC/DAC); the low I/O `0x00..0x3F` (CPU core registers + VPORTs — restored separately via the OCD register file and the PORT registers) and NVMCTRL (`0x1000`) are excluded. Both functions shall be gated by the debug-in-sleep flag (LLR-UPDI-35): when disabled (`--sleep`) each shall return 0 immediately without any UPDI traffic. They return 0 on success or −1 on a UPDI link error.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-077" name="Debug-in-Sleep (preserve the wake source across the SW-breakpoint reset)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-UPDI-37">
+        <text><![CDATA[`updi_detach(fd)` shall tear down the serial link WITHOUT pulsing a system reset: it shall `tcdrain()` and `close()` the fd but shall NOT touch `ASI_RESET_REQ` or `ASI_CTRLB`/UPDIDIS.  This leaves the target in its current OCD run state (e.g. halted under OCD) so `--stop` keeps the CPU halted after the tool exits, in contrast to `updi_close()` which asserts/releases reset (letting the CPU run) and disables UPDI.  A NULL/negative fd shall be a no-op.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-089" name="CPU Run-State One-Shot Modes"/>
         </traces>
       </llr>
     </function>
@@ -2809,7 +2929,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-RSP-46">
-        <text><![CDATA[`rsp_dispatch()` shall recognise packets that begin with the literal prefix `vCont;r` (after the seven-byte `vCont;r` and before any `:<thread>` suffix) and route them to a new private handler `static int dh_range_step(int fd, const char *pkt, void *vctx)`. The handler shall: (1) parse two comma-separated 32-bit hex fields `start,end` immediately after the `r`; on parse failure reply `E22`; (2) reset `ctx->last_stop_cause = SC_NONE`; (3) loop up to `RSP_RANGE_STEP_MAX = 100000` iterations: read live PC via `updi_ocd_read_pc()`, exit the loop when `pc < start || pc >= end` (range-exit) or on UPDI failure, otherwise call `updi_step()` and check the GDB socket via `select()` for a Ctrl-C (`\x03`) byte using the same 0 ms-timeout pattern as `dh_continue` so the user can interrupt; on Ctrl-C set a local `got_ctrl_c = true` and exit the loop; (4) call `fsm_invalidate(ctx->fsm)` and `fsm_build_thread_list()` after the loop; (5) classify and emit via the LLR-RSP-45 formatter: `ctx->last_stop_cause = classify_stop_cause(ctx, got_ctrl_c ? SC_INTR : SC_STEP); return format_stop_reply(fd, ctx, got_ctrl_c ? 2 : 5, ctx->last_stop_cause);`. The `vCont?` reply shall be extended from `"vCont;c;s"` to `"vCont;c;s;r"`. The new handler shall be wired into the dispatcher in `rsp_dispatch()` as `if (strncmp(packet, "vCont;r", 7) == 0) return dh_range_step(fd, packet, h->ctx);` placed immediately after the existing `vCont;s` route (so `vCont;c` and `vCont;s` continue to match first by virtue of having distinct seventh bytes). The handler shall live alongside `dh_continue` / `dh_step` in `src/gdb_rsp.c` and shall not be added to the `RspHandlers` vtable (the dispatcher invokes it directly because it has no per-test override use case).]]></text>
+        <text><![CDATA[`rsp_dispatch()` shall recognise packets that begin with the literal prefix `vCont;r` (after the seven-byte `vCont;r` and before any `:<thread>` suffix) and route them to a new private handler `static int dh_range_step(int fd, const char *pkt, void *vctx)`. The handler shall: (1) parse two comma-separated 32-bit hex fields `start,end` immediately after the `r`; on parse failure reply `E22`; (2) reset `ctx->last_stop_cause = SC_NONE`; (3) run the shared core step loop `bp_step_range(ctx->updi_fd, start, end, rsp_step_abort_cb, &ab)` (LLR-RSP-53) — single-step while `start <= pc < end`, bounded by the core's `BP_STEP_RANGE_MAX = 100000` — passing an abort callback that peeks the GDB socket via `select()` (0 ms timeout) for a Ctrl-C (`\x03`) or a peer disconnect; on its return, a UPDI error replies `E01`, a disconnect (`ab.disconnected`) halts and returns -1, and an abort-but-connected sets `got_ctrl_c = true` (range-exit and the cap are ordinary step stops); (4) call `fsm_invalidate(ctx->fsm)` and `fsm_build_thread_list()` after the loop; (5) classify and emit via the LLR-RSP-45 formatter: `ctx->last_stop_cause = classify_stop_cause(ctx, got_ctrl_c ? SC_INTR : SC_STEP); return format_stop_reply(fd, ctx, got_ctrl_c ? 2 : 5, ctx->last_stop_cause);`. The `vCont?` reply shall be extended from `"vCont;c;s"` to `"vCont;c;s;r"`. The new handler shall be wired into the dispatcher in `rsp_dispatch()` as `if (strncmp(packet, "vCont;r", 7) == 0) return dh_range_step(fd, packet, h->ctx);` placed immediately after the existing `vCont;s` route (so `vCont;c` and `vCont;s` continue to match first by virtue of having distinct seventh bytes). The handler shall live alongside `dh_continue` / `dh_step` in `src/gdb_rsp.c` and shall not be added to the `RspHandlers` vtable (the dispatcher invokes it directly because it has no per-test override use case).]]></text>
         <traces>
           <trace target="HLR" ref="HLR-066" name="vCont;r Range Step"/>
         </traces>
@@ -2855,6 +2975,14 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <text><![CDATA[`dh_read_mem()` shall, after parsing and length-validating the `m<addr>,<len>` packet, detect a read in the AVR-Dx mapped-flash data window — `(addr & GDB_AVR_DATA_FLAG) != 0` and `(addr & 0xFFFF) >= AVR_MAPPED_FLASH_OFF` (0x8000) and `ctx->idx != NULL` — and, for such a read, compute the UPDI address as `flash_to_updi((addr & 0xFFFF) + ctx->idx->flash_lma_off)` (the 16-bit mapped VMA translated to its physical flash LMA, then routed through the UPDI flash mirror), exactly as `read_flash_string()` in `fsm_mapper.c` does. This branch shall be taken before the LLR-RSP-48 advertised-region check (the window is read-only FLASH and always present, so it is exempt from the SRAM-fault gate). When the read is not a mapped-flash read, the existing behaviour is unchanged: the LLR-RSP-48 bounds check runs and, on success, the GDB↔UPDI bit-23 translation selects `addr & GDB_AVR_ADDR_MASK` for data-space reads or `addr | UPDI_FLASH_BASE` for program-space reads. The constants `AVR_MAPPED_FLASH_OFF = 0x8000` and `AVR_MAPPED_FLASH_LEN = 0x8000` shall be defined file-private in `src/gdb_rsp.c`. This makes a flash-resident `.rodata` string reachable through a generic `char *` (e.g. `print stateMachine->currStateName`), which GDB reads as data at `0x80_8xxx`; without the translation such a read returned `E14` (window undescribed) or, if forced, FLMAP-dependent garbage. The capability is avrOS-session only (it requires `flash_lma_off` from the ELF index).]]></text>
         <traces>
           <trace target="HLR" ref="HLR-067" name="Memory-Map Honesty for `m`-Reads"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-RSP-53">
+        <text><![CDATA[`bp_step_range(int updi_fd, uint32_t lo, uint32_t hi, bool (*should_abort)(void *), void *abort_ctx)` (in the shared core, `src/debug_bp.c`) shall single-step the target while the live PC stays in the half-open byte-address range `[lo, hi)`: each iteration reads the PC (`updi_ocd_read_pc`), returns 0 when `pc < lo || pc >= hi`, returns 1 when the `BP_STEP_RANGE_MAX = 100000` safety cap is reached, else single-steps (`updi_step`) — on a step error it halts the target and returns -1 — and, when `should_abort` is non-NULL, returns 2 if `should_abort(abort_ctx)` is true. It is the protocol-agnostic step loop shared by the GDB-RSP `vCont;r` handler (LLR-RSP-46, which supplies a Ctrl-C/disconnect probe) and the DAP source-line step handlers (LLR-DAP-19, which pass NULL).]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-066" name="vCont;r Range Step"/>
+          <trace target="HLR" ref="HLR-078" name="DAP Execution Control, Stop Events &amp; Shallow stackTrace"/>
         </traces>
       </llr>
     </function>
@@ -2949,7 +3077,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-ELF-12">
-        <text><![CDATA[`elf_addr_to_line()` shall map a code-space byte address to its source `file:line` using libdw: `dwarf_addrdie()` to find the compilation-unit DIE containing the address, then `dwarf_getsrc_die()` and `dwarf_lineno()`/`dwarf_linesrc()`. On success it shall return 0, store the 1-based line in `*line` (when non-NULL), and copy the NUL-terminated source path (truncated to `file_cap`) into `file` (when non-NULL). It shall return -1 — leaving the outputs untouched and never aborting — when `ctx->dwarf` is NULL or the address has no line-table entry.]]></text>
+        <text><![CDATA[`elf_addr_to_line()` shall map a code-space byte address to its source `file:line` using libdw: `dwarf_addrdie()` to find the compilation-unit DIE containing the address, then `dwarf_getsrc_die()` and `dwarf_lineno()`/`dwarf_linesrc()`. On success it shall return 0, store the 1-based line in `*line` (when non-NULL), and copy the NUL-terminated source path (truncated to `file_cap`) into `file` (when non-NULL). The source path shall be made **absolute**: DWARF frequently records it relative to the compilation directory (e.g. `../../sys/fsm.c`), which a DAP client cannot open — so when `dwarf_linesrc()` returns a relative path it shall be joined to the CU's `DW_AT_comp_dir` (`dwarf_attr()`/`dwarf_formstring()`); an already-absolute path is copied verbatim. (The lexical join may retain `..` segments, which the client/OS normalises on open.) It shall reject an end-of-sequence row (`dwarf_lineendsequence()`) — which marks the address one past a code range and carries a stale last-seen line number — returning -1.  It shall return -1 — leaving the outputs untouched and never aborting — when `ctx->dwarf` is NULL or the address has no line-table entry.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-072" name="DWARF Source-Level Lookup (DAP Groundwork)"/>
         </traces>
@@ -3015,6 +3143,20 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <text><![CDATA[`elf_type_size()` shall return the byte size of the peeled type at `type_off` (`dwarf_bytesize`), clamped to 1..4 and defaulting to 2 for an absent/unknown type, so `setVariable` writes the correct scalar width.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-084" name="DAP Memory &amp; Set Variable"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-ELF-22">
+        <text><![CDATA[`elf_line_range()` shall return the half-open code-space byte-address range `[*lo, *hi)` of the line-table row covering `byte_addr`: it locates the CU with `dwarf_addrdie()`, enumerates the rows with `dwarf_getsrclines()` / `dwarf_onesrcline()` / `dwarf_lineaddr()`, and sets `*lo` to the greatest row address `<= byte_addr` and `*hi` to the smallest row address `> byte_addr` (computed without assuming the table is address-sorted). It shall return 0 on success, or -1 when the ELF lacks DWARF, the address is in no CU, or no following row bounds the range (the caller then falls back to a single step). This is the address span a DAP source-line step single-steps within — the analogue of the range GDB sends on `vCont;r`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-072" name="DWARF Source-Level Lookup (DAP Groundwork)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-ELF-23">
+        <text><![CDATA[`elf_func_entry()` shall resolve a function's entry byte-address from the ELF symbol table: it scans the first `SHT_SYMTAB` section (`gelf_getsym()`) for a defined `STT_FUNC` symbol whose name (`elf_strptr()`) equals the requested name, and on a match stores `sym.st_value` in `*addr` and returns 0.  It shall return -1 when there is no symbol table or no matching function symbol.  The DAP run-to-main (LLR-DAP-20) uses it to locate `main`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-076" name="DAP Connection Lifecycle"/>
         </traces>
       </llr>
     </function>
@@ -3212,6 +3354,27 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
           <trace target="HLR" ref="HLR-043" name="Distribution Package Bundle"/>
         </traces>
       </llr>
+
+      <llr id="LLR-INST-09">
+        <text><![CDATA[The VS Code companion extension (`tools/vscode/avrosdb-dap`) shall, in `package.json`, contribute a `viewsContainers.activitybar` entry `avrosDebug` (title "avrOS", icon `media/avros.svg`) and six `views` under it: `avrosVariables`, `avrosCallStack`, `avrosBreakpoints`, `avrosStateMachines`, `avrosEvents`, `avrosQueues`. `extension.js` shall register a `TreeDataProvider` for each (`registerTreeDataProvider`): the State Machines / Events / Queues providers shall populate from `session.customRequest("avrosdb/fsmList" | "avrosdb/eventList" | "avrosdb/queueList")` on the active `avrosdb` session; the Variables provider shall proxy `threads`→`stackTrace`→`scopes`→`variables` with lazy aggregate expansion; the Call Stack provider shall proxy `threads`→`stackTrace`; and the Breakpoints provider shall list `vscode.debug.breakpoints`. A `DebugAdapterTracker` shall refresh the views on the DAP `stopped` event and clear the stack/variables snapshots on `continued`; an `avrosdb.refresh` command shall force a manual refresh. The activity-bar icon asset `media/avros.svg` shall be present in the extension.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-087" name="VS Code avrOS Debug View"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-INST-10">
+        <text><![CDATA[`extension.js` shall register (`registerDebugConfigurationProvider`) a `DebugConfigurationProvider` for the `avrosdb` type whose `provideDebugConfigurations()` returns a self-starting `launch` configuration and whose `resolveDebugConfiguration()` seeds that default for an empty config and resolves the `avrOSdb` binary path — building it with `make` or falling back to `PATH` when it is absent, aborting the launch when unresolved. A `DebugAdapterDescriptorFactory` (`registerDebugAdapterDescriptorFactory`) shall, for a `launch` request, spawn `avrOSdb --dap --port <port> <serial> <elf>`, wait for the `listening on` banner (with a timeout fallback), connect via `DebugAdapterServer`, and kill the spawned server when the session terminates. The Makefile shall provide a `package-vscode` target that builds `dist/avrosdb-dap-$(VERSION).vsix` via `vsce`/`npx`, requiring no Node tooling from `make` or `make test`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-088" name="VS Code Turnkey Debug Configuration"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-INST-11">
+        <text><![CDATA[The project shall provide a Zed debug-adapter extension under `tools/zed/avrosdb`. `extension.toml` shall declare `[debug_adapters.avrosdb]` with `schema_path = "debug_adapter_schemas/avrosdb.json"`, and the named schema file (a JSON Schema for the `request`/`program`/`serial`/`elf`/`port`/`host` fields) shall exist. `Cargo.toml` shall build a `cdylib` depending on `zed_extension_api`. `src/lib.rs` shall implement the `zed::Extension` trait — `get_dap_binary`, `dap_request_kind`, and `dap_config_to_scenario` — registered via `register_extension!`: on a `launch` request `get_dap_binary` shall return a `DebugAdapterBinary` whose `command` runs the avrOSdb binary (config `program`, else `avrOSdb` on `PATH`) with arguments `--dap --port <port> <serial> <elf>` and whose `connection` is a `TcpArguments` to `host:port` (default `127.0.0.1:1234`); on an `attach` request it shall return a connect-only TCP descriptor (`command = None`). The Makefile shall provide a `package-zed` target that builds the extension's `wasm32` artefact via `cargo`, requiring no Rust toolchain from `make` or `make test`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-090" name="Zed Turnkey Debug Configuration"/>
+        </traces>
+      </llr>
     </function>
 
     <function number="9" title="tests/hw/hw_test.c — On-Target Hardware Integration Test Harness" name="hwtest" source="tests/hw/hw_test.c">
@@ -3333,14 +3496,14 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-DAP-07">
-        <text><![CDATA[`dap_dispatch()` shall implement the Phase-16 lifecycle commands: `initialize` → a capabilities response (`supportsConfigurationDoneRequest:true`) followed by the `initialized` event; `launch` / `attach` → success; `setExceptionBreakpoints` → success; `setBreakpoints` → success with an empty `breakpoints` array (real installation deferred to Phase 18); `configurationDone` → halt the target (`updi_halt()` when `updi_fd >= 0`) and emit a `stopped` event (`reason:"entry"`, `threadId:1`, `allThreadsStopped:true`); `threads` → one thread `{id:1,name:"cpu"}`; `disconnect` / `terminate` → resume the target (`updi_run()` when `updi_fd >= 0`), reply success, and return 1. Any other command shall receive a `success:false` response with an explanatory `message`. All UPDI side effects shall be guarded by `updi_fd >= 0` so the dispatch is exercisable without hardware.]]></text>
+        <text><![CDATA[`dap_dispatch()` shall implement the Phase-16 lifecycle commands: `initialize` → a capabilities response (`supportsConfigurationDoneRequest:true`) followed by the `initialized` event; `launch` / `attach` → success; `setExceptionBreakpoints` → success; `setBreakpoints` → success with an empty `breakpoints` array (real installation deferred to Phase 18); `configurationDone` → halt the target (`updi_halt()` when `updi_fd >= 0`), then — when the live PC is the reset vector (0) — run to `main` via `dap_run_to_main()` (LLR-DAP-20), and emit a `stopped` event (`reason:"entry"`, `threadId:1`, `allThreadsStopped:true`); `threads` → one thread `{id:1,name:"cpu"}`; `disconnect` / `terminate` → resume the target (`updi_run()` when `updi_fd >= 0`), reply success, and return 1. Any other command shall receive a `success:false` response with an explanatory `message`. All UPDI side effects shall be guarded by `updi_fd >= 0` so the dispatch is exercisable without hardware.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-076" name="DAP Connection Lifecycle"/>
         </traces>
       </llr>
 
       <llr id="LLR-DAP-08">
-        <text><![CDATA[`dap_dispatch()` shall implement the Phase-17 execution-control commands. `continue`: send a `{allThreadsContinued:true}` response and a `continued` event (`{threadId:1,allThreadsContinued:true}`), then — when `updi_fd >= 0` — call `updi_run()`; on success set `dap_session.running = true` (so `dap_serve()` polls for the halt), and on a run failure emit `stopped` (reason `breakpoint`) instead. `pause`: call `updi_halt()` (when `updi_fd >= 0`), clear `running`, reply success, and emit `stopped` reason `pause`. `next` / `stepIn` / `stepOut`: call `updi_step()` (when `updi_fd >= 0`), clear `running`, reply success, and emit `stopped` reason `step`. `threads`: reply one thread `{id:1,name:"cpu"}`. `configurationDone` shall additionally clear `running` and emit its `stopped` via the shared helper with reason `entry`. `terminate` shall emit a `terminated` event before its success response (then return 1); `disconnect` returns 1 without the event. A shared `dap_emit_stopped(reason)` helper shall format the `stopped` event body (`{reason,threadId:1,allThreadsStopped:true}`) for all reasons. `dap_serve()` shall, on an idle `select()` tick while `running` and `updi_fd >= 0`, call `updi_ocd_poll_halted(updi_fd, 1)` and — on a halted result — clear `running` and emit `stopped` reason `breakpoint`; a poll I/O error shall end the session with a diagnostic. The idle tick shall be shortened while `running` so a halt surfaces promptly. All UPDI side effects shall be guarded by `updi_fd >= 0`.]]></text>
+        <text><![CDATA[`dap_dispatch()` shall implement the Phase-17 execution-control commands. `continue`: send a `{allThreadsContinued:true}` response and a `continued` event (`{threadId:1,allThreadsContinued:true}`), then — when `updi_fd >= 0` — call `updi_run()`; on success set `dap_session.running = true` (so `dap_serve()` polls for the halt), and on a run failure emit `stopped` (reason `breakpoint`) instead. `pause`: call `updi_halt()` (when `updi_fd >= 0`), clear `running`, reply success, and emit `stopped` reason `pause`. `stepIn` / `next` / `stepOut`: clear `running`, reply success, perform source-line-granular stepping via `dap_step_line()` / `dap_step_over()` / `dap_step_out()` (LLR-DAP-19) when `updi_fd >= 0`, and emit `stopped` reason `step`. `threads`: reply one thread `{id:1,name:"cpu"}`. `configurationDone` shall additionally clear `running` and emit its `stopped` via the shared helper with reason `entry`. `terminate` shall emit a `terminated` event before its success response (then return 1); `disconnect` returns 1 without the event. A shared `dap_emit_stopped(reason)` helper shall format the `stopped` event body (`{reason,threadId:1,allThreadsStopped:true}`) for all reasons. `dap_serve()` shall, on an idle `select()` tick while `running` and `updi_fd >= 0`, call `updi_ocd_poll_halted(updi_fd, 1)` and — on a halted result — clear `running` and emit `stopped` reason `breakpoint`; a poll I/O error shall end the session with a diagnostic. The idle tick shall be shortened while `running` so a halt surfaces promptly. All UPDI side effects shall be guarded by `updi_fd >= 0`.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-078" name="DAP Execution Control, Stop Events &amp; Shallow stackTrace"/>
         </traces>
@@ -3363,7 +3526,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </llr>
 
       <llr id="LLR-DAP-11">
-        <text><![CDATA[`dap_handle_stack_trace()` shall return the full call stack by unwinding through `.debug_frame` CFI via a private `dap_unwind()` helper.  `dap_unwind()` shall read the innermost frame's live state — PC (`updi_ocd_read_pc`), SP (`updi_ocd_read_sp`), and the Y pair r28/r29 (`updi_ocd_read_gpr`) — then iterate: obtain the CFA rule at the current PC with `elf_cfi_cfa()` (LLR-ELF-14), compute `CFA = (cfa_reg == 32 ? SP : Y) + cfa_offset` (16-bit SRAM address), and recover the caller from target memory (`updi_mem_read`) using AVR conventions — the return-address word at [CFA-1, CFA] (high byte at CFA-1, low at CFA; caller byte PC = word << 1) and the caller's saved Y as r28@CFA-2 / r29@CFA-3.  Each iteration sets the next frame's PC = caller byte PC, SP = CFA, Y = caller Y.  It shall stop when the return word is 0, when the byte PC is outside `[0, flash_size)`, when no CFI covers the PC (`elf_cfi_cfa` returns -1 — e.g. the C-runtime frame above `main`), when the CFA fails to advance, or at `DAP_MAX_FRAMES`.  `dap_handle_stack_trace()` shall format each recovered PC with `dap_format_frame()` — the frame `name` is the enclosing function from `elf_addr_to_func()` (LLR-ELF-16; the raw `0x…` address when no subprogram covers it) and the source is `file:line` via `elf_addr_to_line()`, both JSON-escaped — into `{stackFrames:[…],totalFrames:n}`, frame ids ascending from 0.  With no target or no DWARF (`dap_unwind()` returns 0) it shall fall back to the single innermost frame so the client always has a valid stack.  When `AVROSDB_DAP_UNWIND_LOG` is set, `dap_unwind()` shall emit a per-frame diagnostic to stderr.]]></text>
+        <text><![CDATA[`dap_handle_stack_trace()` shall return the full call stack by unwinding through `.debug_frame` CFI via a private `dap_unwind()` helper.  `dap_unwind()` shall read the innermost frame's live state — PC (`updi_ocd_read_pc`), SP (`updi_ocd_read_sp`), and the Y pair r28/r29 (`updi_ocd_read_gpr`) — then iterate: obtain the CFA rule at the current PC with `elf_cfi_cfa()` (LLR-ELF-14), compute `CFA = (cfa_reg == 32 ? SP : Y) + cfa_offset` (16-bit SRAM address), and recover the caller from target memory (`updi_mem_read`) using AVR conventions — the return-address word at [CFA-1, CFA] (high byte at CFA-1, low at CFA; caller byte PC = word << 1) and the caller's saved Y as r28@CFA-2 / r29@CFA-3.  Each iteration sets the next frame's PC = caller byte PC, SP = CFA, Y = caller Y.  It shall stop when the return word is 0, when the byte PC is outside `[0, flash_size)`, when no CFI covers the PC (`elf_cfi_cfa` returns -1 — e.g. the C-runtime frame above `main`), when the CFA fails to advance, or at `DAP_MAX_FRAMES`.  `dap_handle_stack_trace()` shall format each recovered PC with `dap_format_frame()` — the frame `name` is the enclosing function from `elf_addr_to_func()` (LLR-ELF-16; the raw `0x…` address when no subprogram covers it) and the source is `file:line` via `elf_addr_to_line()`, both JSON-escaped — into `{stackFrames:[…],totalFrames:n}`, frame ids ascending from 0.  The `source` object shall be attached only when the PC is inside a real function (`elf_addr_to_func()` succeeded): a PC with no enclosing subprogram (the reset vector / C-runtime at the entry stop, or a stub) is not a C source location, so emitting a `file:line` for it would be misleading — libdw can still return a stale line-table row there (e.g. a `--gc-sections`-discarded function whose `.debug_line` entry was relocated to address 0), so the frame is emitted with the hex name, `line:0`, and no `source`, and the client shows the instruction address instead.  With no target or no DWARF (`dap_unwind()` returns 0) it shall fall back to the single innermost frame so the client always has a valid stack.  When `AVROSDB_DAP_UNWIND_LOG` is set, `dap_unwind()` shall emit a per-frame diagnostic to stderr.]]></text>
         <traces>
           <trace target="HLR" ref="HLR-080" name="DAP Multi-Frame Stack Trace"/>
           <trace target="HLR" ref="HLR-072" name="DWARF Source-Level Lookup (DAP Groundwork)"/>
@@ -3406,6 +3569,54 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
           <trace target="HLR" ref="HLR-084" name="DAP Memory &amp; Set Variable"/>
         </traces>
       </llr>
+
+      <llr id="LLR-DAP-17">
+        <text><![CDATA[`dap_dispatch()` shall serve three avrOS-introspection custom requests through private handlers, each guarded by `updi_fd >= 0` and degrading to an empty array when no target link or no avrOS symbol index is present. `dap_handle_fsm_list()` (`avrosdb/fsmList`) shall, when the FSM context and symbol index are present, rebuild the thread list with `fsm_build_thread_list()` and reply `{"fsms":[{"id":<gdb_id>,"name":"…","state":"…","active":<bool>}]}` from each `FsmThread`'s `gdb_id` / `name` / `state_name` / `is_active`. `dap_handle_event_list()` (`avrosdb/eventList`) shall read the event table with `avros_read_events()` (LLR-AVROS-01) and reply `{"events":[{"name":"…","status":<n|null>}]}` — `status` is the JSON null literal when the descriptor carries no status pointer (`has_status` false). `dap_handle_queue_list()` (`avrosdb/queueList`) shall read the queue table with `avros_read_queues()` (LLR-AVROS-02) and reply `{"queues":[{"id":<i>,"capacity":<n>,"elemSize":<n>}]}`. All dynamic strings shall be JSON-escaped via `dj_escape()`; the handlers shall touch no target when `updi_fd < 0`, so dispatch is unit-testable over a socketpair.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-086" name="avrOS Introspection over DAP Custom Requests"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-DAP-18">
+        <text><![CDATA[`dap_dispatch()` shall serve the DAP `source` request via a private `dap_handle_source()` helper, so a client that cannot open a frame's `Source.path` (now emitted absolute, LLR-ELF-12) still gets a clean answer rather than the generic unsupported-request error. The handler shall read `arguments.source.path`, open it on the debug host, and reply `{"content":"<file>"}` (`success:true`) with the file's text JSON-escaped via `dj_escape()`; because a source file can exceed the standard `DAP_OUT_MAX` response buffer it shall frame the reply through a heap buffer bounded by `DAP_MSG_MAX`. A path that is absent/unreadable, or whose content would not fit the frame, shall reply `success:false` with an explanatory message (e.g. "source file is not available on the debug host" / "source too large to stream over DAP; open it from the workspace"). Any request the adapter does not model shall likewise receive a `success:false` response (never silence/hang).]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-078" name="DAP Execution Control, Stop Events &amp; Shallow stackTrace"/>
+          <trace target="HLR" ref="HLR-072" name="DWARF Source-Level Lookup (DAP Groundwork)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-DAP-19">
+        <text><![CDATA[Source-line stepping shall be served by three private handlers built on the shared core primitives (so the DAP front-end reuses the same stepping calls as the GDB-RSP path rather than duplicating them). `dap_step_line()` (stepIn) shall record the start `(file,line)` and repeatedly `bp_step_range()` (LLR-RSP-53) over the current line's address range from `elf_line_range()`, stopping when the live PC maps to a *different* source line — descending into calls naturally; when a PC has no line range it shall fall back to a single `updi_step()`. `dap_step_over()` (next) shall do the same but, when a range-step leaves the current line by descending into a callee (SP dropped below the line's start SP *and* the enclosing function from `elf_addr_to_func()` changed), shall run to the return address in the original frame — `dap_unwind()` gives `frames[1].pc` — via `dap_run_to()` instead of stepping through the callee, then continue, so stepping over a call (even a delay/loop) is immediate. `dap_step_out()` (stepOut) shall `dap_unwind()` and run to the caller's return (`frames[1].pc`) with a stop guard of `frames[0].fr.cfa` (the SP once the function returns). `dap_run_to(target, min_sp)` shall arm the reserved stepping comparator (`RSP_HW_BP_STEP_SLOT`) — never a user breakpoint slot — `updi_run()`, poll `updi_ocd_poll_halted()`, and stop when the target is reached with `SP >= min_sp` (re-running past a recursive re-entry at a deeper frame) or at any other breakpoint; it clears the comparator before returning. All paths are guarded so dispatch stays unit-testable without hardware (the handlers are only entered when `updi_fd >= 0`).]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-078" name="DAP Execution Control, Stop Events &amp; Shallow stackTrace"/>
+          <trace target="HLR" ref="HLR-072" name="DWARF Source-Level Lookup (DAP Groundwork)"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-DAP-20">
+        <text><![CDATA[`dap_run_to_main()` shall, on the `configurationDone` entry stop when the live PC is the reset vector (0), advance the target to `main`'s first statement so the client highlights it (GDB-style run-to-main).  It shall locate `main`'s entry via `elf_func_entry()` (LLR-ELF-23); returning -1 (caller keeps the plain reset-vector stop) when `main` is absent or no target/ELF is present.  It shall skip the prologue by walking line-table rows from `main`'s entry (via `elf_line_range()` + `elf_addr_to_line()`) until the line differs from `main`'s declaration line — the first executable statement — then run there with `dap_run_to()` (LLR-DAP-19, the reserved stepping comparator).  `dap_dispatch()` shall invoke it from `configurationDone` only when `updi_ocd_read_pc()` reports PC 0, so attaching to an already-running target (PC ≠ 0) is left where it stopped.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-076" name="DAP Connection Lifecycle"/>
+        </traces>
+      </llr>
+    </function>
+
+    <function number="11" title="src/avros.c — avrOS Introspection Core" name="avros" source="src/avros.c">
+      <intro><![CDATA[Requirements for the protocol-agnostic avrOS introspection core (`src/avros.c`): the single home for decoding the avrOS event/queue descriptor tables off the target, called by both the GDB-RSP `monitor avros` formatter and the DAP `avrosdb/*List` custom requests. Depends only on the UPDI and ELF layers (no front-end dependency).]]></intro>
+
+      <llr id="LLR-AVROS-01">
+        <text><![CDATA[`avros_read_events()` shall decode the avrOS `EVNT_TABLE` event descriptors into a caller-supplied `AvrosEvent` array. It shall return -1 on a bad argument (`idx`/`out` NULL or `max <= 0`) and 0 immediately when `idx->event_count` is 0; otherwise it shall read `event_count` × 4-byte `evntDescriptor_t` records from `flash_to_updi(idx->event_table_addr)` with a single `updi_mem_read()`. For each record it shall extract the little-endian FLASH `name` pointer and SRAM `status` pointer: a null name pointer yields the name `<null>`, otherwise the name is followed (with `idx->flash_lma_off` applied) into the mapped-flash window by the private `read_target_string()` helper — a NUL-terminated `updi_mem_read()` loop that renders non-printable bytes as `?` and bounds the copy to the field width. A non-null status pointer shall be read as one byte and flagged `has_status`; a null pointer shall leave `has_status` false. It shall fill at most `max` entries and return the count, or -1 on any UPDI read error.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-086" name="avrOS Introspection over DAP Custom Requests"/>
+        </traces>
+      </llr>
+
+      <llr id="LLR-AVROS-02">
+        <text><![CDATA[`avros_read_queues()` shall decode the avrOS `QUE_TABLE` queue descriptors into a caller-supplied `AvrosQueue` array. It shall return -1 on a bad argument and 0 when `idx->queue_count` is 0; otherwise it shall read `queue_count` × 10-byte `queDescriptor_t` records from `flash_to_updi(idx->queue_table_addr)` with a single `updi_mem_read()`. From each record — three pointers (queue / buffer / event, 2 bytes each) followed by a 2-byte `capacity` and a 2-byte `sizeOfElement` — it shall report the little-endian `capacity` (offset 6) and `elem_size` (offset 8), filling at most `max` entries and returning the count, or -1 on a UPDI read error.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-086" name="avrOS Introspection over DAP Custom Requests"/>
+        </traces>
+      </llr>
     </function>
   </llrs>
 
@@ -3415,7 +3626,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/main.c unit tests                                        -->
     <!-- ============================================================ -->
-    <file path="tests/test_main.c" role="unit" count="37">
+    <file path="tests/test_main.c" role="unit" count="41">
       <header><![CDATA[Unit tests for `src/main.c`: argument parsing, event loop, signal handling, and resource teardown. Uses `fork()`/`waitpid()` to test `exit()` paths and a mock UPDI/RSP layer to exercise the event loop without real hardware.]]></header>
 
       <test name="parse_args_valid_positional_args_populate_config">
@@ -3578,9 +3789,27 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces><trace target="LLR" ref="LLR-MAIN-17"/></traces>
       </test>
 
-      <test name="test_parse_args_log_rsp_sets_flag">
-        <purpose><![CDATA[Call `parse_args()` with argv `{ "prog", "--log-rsp", "/dev/x", "a.elf" }` and assert `cfg.log_rsp == true` — confirming the logging flag is recognised by the option parser.]]></purpose>
+      <test name="test_parse_args_log_sets_flag">
+        <purpose><![CDATA[Call `parse_args()` with argv `{ "prog", "--log", "/dev/x", "a.elf" }` and assert `cfg.log == true` — confirming the logging flag is recognised by the option parser.]]></purpose>
         <traces><trace target="LLR" ref="LLR-MAIN-23"/></traces>
+      </test>
+
+      <test name="test_parse_args_start_sets_flag">
+        <purpose><![CDATA[Call `parse_args()` with argv `{ "prog", "--start", "/dev/x" }` (no ELF) and assert `cfg.start_cpu == true`, `cfg.stop_cpu == false`, and `cfg.elf_path == NULL` — confirming `--start` is recognised and makes the `<elf-file>` operand optional.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-27"/></traces>
+      </test>
+      <test name="test_parse_args_stop_sets_flag">
+        <purpose><![CDATA[Call `parse_args()` with argv `{ "prog", "--stop", "/dev/x" }` (no ELF) and assert `cfg.stop_cpu == true`, `cfg.start_cpu == false`, and `cfg.elf_path == NULL` — confirming `--stop` is recognised and makes the `<elf-file>` operand optional.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-27"/></traces>
+      </test>
+
+      <test name="test_run_start_mode_runs_cpu_and_detaches">
+        <purpose><![CDATA[With wrapped UPDI primitives, call `run_start_mode()` and assert it returns 0 having called `updi_open` → `updi_enter_debug` → `updi_run` once each and `updi_detach` once, with `updi_halt` and `updi_close` never called — i.e. it takes OCD control, runs the CPU, and detaches WITHOUT a reset so the target keeps running.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-28"/></traces>
+      </test>
+      <test name="test_run_stop_mode_halts_cpu_and_detaches">
+        <purpose><![CDATA[With wrapped UPDI primitives, call `run_stop_mode()` and assert it returns 0 having called `updi_open` → `updi_enter_debug` → `updi_halt` once each and `updi_detach` once, with `updi_run` and `updi_close` never called — i.e. it takes OCD control, halts the CPU, and detaches WITHOUT a reset so the target stays halted.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-MAIN-28"/></traces>
       </test>
 
       <test name="parse_args_allow_erase_sets_flag">
@@ -3607,8 +3836,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/updi.c unit tests                                        -->
     <!-- ============================================================ -->
-    <file path="tests/test_updi.c" role="unit" count="50">
-      <header><![CDATA[Unit tests for `src/updi.c`: UART configuration, BREAK/SYNCH/LDCS link initialisation, three-frame block memory read/write, NVM flash programming, OCD-mode entry, OCD execution-control primitives (halt/run/step + poll_halted), OCD register-file access (GPR/SREG/SP/PC) and hardware-breakpoint comparator programming, and console polling. A loopback PTY pair substitutes for real UART hardware; a `--wrap=select` linker shim lets tests inject `select()` timeouts.]]></header>
+    <file path="tests/test_updi.c" role="unit" count="51">
+      <header><![CDATA[Unit tests for `src/updi.c`: UART configuration, BREAK/SYNCH/LDCS link initialisation, three-frame block memory read/write, NVM flash programming, OCD-mode entry, OCD execution-control primitives (halt/run/step + poll_halted), OCD register-file access (GPR/SREG/SP/PC) and hardware-breakpoint comparator programming, link detach, and console polling. A loopback PTY pair substitutes for real UART hardware; a `--wrap=select` linker shim lets tests inject `select()` timeouts.]]></header>
+
+      <test name="updi_detach_closes_fd_and_ignores_negative">
+        <purpose><![CDATA[Create a pipe, call `updi_detach(fds[1])`, and assert a subsequent `write()` to that fd fails with `EBADF` — proving the link was closed without a reset pulse. A second call `updi_detach(-1)` must be a harmless no-op. Per LLR-UPDI-37.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-UPDI-37"/></traces>
+      </test>
 
       <test name="updi_open_sets_8e2_raw_half_duplex_via_termios">
         <purpose><![CDATA[Open a PTY pair, call `updi_open()` on the slave side, and inspect the resulting `termios` structure to confirm `CS8`, `CSTOPB` (2 stop bits), even-parity intent (`PARODD` clear), and raw mode (no `ICANON`/`ECHO`/`ISIG`/`OPOST`). PARENB itself is not asserted because Linux PTYs strip parity on slave reopen; parity is verified on real serial hardware in Phase 3 integration.]]></purpose>
@@ -4286,8 +4520,8 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </test>
 
       <test name="vCont_range_step_steps_until_pc_leaves_range">
-        <purpose><![CDATA[Build the context, set `mock_ocd_pc = 0x100`, arrange `__wrap_updi_step` to advance `mock_ocd_pc` by 2 each call (script: 0x100, 0x102, 0x104, 0x200), dispatch `vCont;r100,200`, drain, assert the payload begins with `T05` (no `swbreak:`/`hwbreak:` tag because PC 0x200 matches no shadow) and that `mock_step_calls >= 1` (the loop must call `updi_step` at least once before exiting). Per LLR-RSP-46.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-RSP-46"/></traces>
+        <purpose><![CDATA[Build the context, set `mock_ocd_pc = 0x100`, arrange `__wrap_updi_step` to advance `mock_ocd_pc` by 2 each call (script: 0x100, 0x102, 0x104, 0x200), dispatch `vCont;r100,200`, drain, assert the payload begins with `T05` (no `swbreak:`/`hwbreak:` tag because PC 0x200 matches no shadow) and that `mock_step_calls >= 1` (the loop must call `updi_step` at least once before exiting). Exercises the shared `bp_step_range()` core via the RSP handler. Per LLR-RSP-46 / LLR-RSP-53.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-RSP-46"/><trace target="LLR" ref="LLR-RSP-53"/></traces>
       </test>
 
       <test name="vCont_range_step_returns_immediately_when_pc_already_outside">
@@ -4356,12 +4590,12 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </test>
 
       <test name="rsp_logging_enabled_emits_tx_and_rx_markers_to_stderr">
-        <purpose><![CDATA[Verify --log-rsp traffic logging. Call `rsp_set_logging(true)`, then capture fd-level stderr (pipe + dup2 of STDERR_FILENO) across each call. `rsp_send_packet(fd, "qSupported")` must emit a line containing `RSP > qSupported` before sending; after framing `g` to the peer, `rsp_recv_packet()` must return 1 with payload `g` and emit a line containing `RSP < g` after receipt. Confirms both the TX and RX markers and the `rsp_set_logging()` setter wired to `g_log_rsp`. Per LLR-RSP-49.]]></purpose>
+        <purpose><![CDATA[Verify --log RSP traffic logging. Call `rsp_set_logging(true)`, then capture fd-level stderr (pipe + dup2 of STDERR_FILENO) across each call. `rsp_send_packet(fd, "qSupported")` must emit a line containing `RSP > qSupported` before sending; after framing `g` to the peer, `rsp_recv_packet()` must return 1 with payload `g` and emit a line containing `RSP < g` after receipt. Confirms both the TX and RX markers and the `rsp_set_logging()` setter wired to `g_log_rsp`. Per LLR-RSP-49.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-49"/></traces>
       </test>
 
       <test name="rsp_logging_disabled_emits_no_markers">
-        <purpose><![CDATA[Negative companion: with `rsp_set_logging(false)` (the default), `rsp_send_packet(fd, "OK")` writes nothing to the captured stderr (captured length is 0), proving the `RSP > ` / `RSP < ` markers are gated entirely on `g_log_rsp`. Per LLR-RSP-49.]]></purpose>
+        <purpose><![CDATA[Negative companion: with `rsp_set_logging(false)` (the default, i.e. no `--log`), `rsp_send_packet(fd, "OK")` writes nothing to the captured stderr (captured length is 0), proving the `RSP > ` / `RSP < ` markers are gated entirely on `g_log_rsp`. Per LLR-RSP-49.]]></purpose>
         <traces><trace target="LLR" ref="LLR-RSP-49"/></traces>
       </test>
     </file>
@@ -4443,8 +4677,8 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </test>
 
       <test name="elf_dwarf_accessors_round_trip">
-        <purpose><![CDATA[On a `-g` fixture, verify `elf_dwarf_available()` returns 1; map the entry-point code address to a source `file:line` via `elf_addr_to_line()` (when it resolves, assert line > 0 and a non-empty file, and that `elf_line_to_addr()` returns a real address for that `file:line`); and verify `elf_addr_to_line()` on an address far outside any CU returns -1 without crashing.]]></purpose>
-        <traces><trace target="LLR" ref="LLR-ELF-11"/><trace target="LLR" ref="LLR-ELF-12"/><trace target="LLR" ref="LLR-ELF-13"/></traces>
+        <purpose><![CDATA[On a `-g` fixture, verify `elf_dwarf_available()` returns 1; map the entry-point code address to a source `file:line` via `elf_addr_to_line()` (when it resolves, assert line > 0 and a non-empty file, and that `elf_line_to_addr()` returns a real address for that `file:line`); verify `elf_line_range()` brackets the entry address with a non-empty half-open range (`lo <= addr < hi`); verify `elf_func_entry("main")` resolves to a function address and an unknown symbol returns -1; and verify both `elf_addr_to_line()` and `elf_line_range()` on an address far outside any CU return -1 without crashing.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-ELF-11"/><trace target="LLR" ref="LLR-ELF-12"/><trace target="LLR" ref="LLR-ELF-13"/><trace target="LLR" ref="LLR-ELF-22"/><trace target="LLR" ref="LLR-ELF-23"/></traces>
       </test>
 
       <test name="elf_cfi_cfa_extracts_avr_frame_rules">
@@ -4653,7 +4887,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- Installation and documentation tests                         -->
     <!-- ============================================================ -->
-    <file path="tests/test_install.c" role="integration" count="8">
+    <file path="tests/test_install.c" role="integration" count="11">
       <header><![CDATA[Verification tests for the Makefile install/uninstall targets, the `check-tools` pre-flight target, and the Unix man page. Tests fork a subprocess or invoke `make` directly and inspect the resulting file-system state or exit codes.]]></header>
 
       <test name="check_tools_exits_nonzero_when_required_tool_is_absent">
@@ -4694,6 +4928,19 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="make_bundle_produces_homebrew_formula">
         <purpose><![CDATA[Run `make bundle VERSION=0.1.0` and verify that `dist/avrOSdb.rb` exists, is valid Ruby syntax (parseable by `ruby -c`), and contains the required fields: `desc`, `url`, `sha256`, `version`, and an `install` block.]]></purpose>
         <traces><trace target="LLR" ref="LLR-INST-08"/></traces>
+      </test>
+
+      <test name="test_vscode_extension_declares_avros_debug_view">
+        <purpose><![CDATA[Statically verify the VS Code companion extension declares the avrOS Debug View: `tools/vscode/avrosdb-dap/package.json` contributes the `avrosDebug` activity-bar container, all six views (`avrosVariables`/`avrosCallStack`/`avrosBreakpoints`/`avrosStateMachines`/`avrosEvents`/`avrosQueues`) and the `media/avros.svg` icon (which must exist on disk); `extension.js` references the three introspection custom requests (`avrosdb/fsmList|eventList|queueList`) and `registerTreeDataProvider`. When `node` is available, `extension.js` additionally passes `node --check`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-INST-09"/></traces>
+      </test>
+      <test name="test_vscode_extension_provides_turnkey_launch_config">
+        <purpose><![CDATA[Statically verify the extension's turnkey debug flow: `package.json` declares an `initialConfigurations` entry with `request:"launch"` plus `program`/`serial`/`elf`, and `extension.js` registers the configuration provider and adapter-descriptor factory (`registerDebugConfigurationProvider`, `registerDebugAdapterDescriptorFactory`, `resolveDebugConfiguration`) and waits for the server's `listening on` banner.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-INST-10"/></traces>
+      </test>
+      <test name="test_zed_extension_provides_turnkey_dap">
+        <purpose><![CDATA[Statically verify the Zed debug-adapter extension under `tools/zed/avrosdb`: `extension.toml` declares `[debug_adapters.avrosdb]` with the schema path, and the referenced `debug_adapter_schemas/avrosdb.json` exists and is valid JSON; `Cargo.toml` declares a `cdylib` depending on `zed_extension_api`; and `src/lib.rs` registers the extension (`register_extension!`), implements `get_dap_binary`/`dap_request_kind`, and forms the launch invocation (`--dap`, `--port`) plus a `TcpArguments` connection. When `cargo` is available, the crate additionally passes `cargo verify-project`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-INST-11"/></traces>
       </test>
     </file>
 
@@ -4961,7 +5208,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- src/dap.c DAP wire-transport tests (Phase 16)                -->
     <!-- ============================================================ -->
-    <file path="tests/test_dap.c" role="unit" count="25">
+    <file path="tests/test_dap.c" role="unit" count="30">
       <header><![CDATA[Unit tests for the DAP front-end: the wire transport (HLR-075) — the JSON codec (`dj_*` recursive-descent tokenizer, member/string/number accessors, escape decode, and the emission escaper) and the Content-Length message framing (`dap_read_message` / `dap_write_message`) — and the connection lifecycle dispatch (HLR-076) driven over a `socketpair` with `updi_fd = -1` so no hardware is touched. Framing is exercised over an anonymous pipe.]]></header>
 
       <test name="dj_parse_extracts_request_fields">
@@ -5084,9 +5331,31 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
         <traces><trace target="LLR" ref="LLR-DAP-10"/></traces>
       </test>
 
+      <test name="test_dap_source_returns_file_content">
+        <purpose><![CDATA[Write a small temp `.c` file, then dispatch a `source` request with `arguments.source.path` set to it; assert the response is `success:true` for command `source` and its `body.content` carries the file text — confirming the DAP source fallback streams host file content.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-18"/></traces>
+      </test>
+      <test name="test_dap_source_missing_file_fails">
+        <purpose><![CDATA[Dispatch a `source` request for a non-existent path and assert the response is `success:false` for command `source` — a clean failure rather than the generic unsupported-request error or a hang.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-18"/></traces>
+      </test>
+
       <test name="dap_serve_runs_handshake_to_disconnect">
         <purpose><![CDATA[Drive `dap_serve()` end-to-end without hardware: a stubbed `rsp_accept()` hands it a pre-connected socketpair end whose request stream is pre-loaded with `initialize` then `disconnect`. Verify the accept/select/read/dispatch loop processes both (emitting the initialize response, the `initialized` event, and the disconnect response) and returns 0 when the client disconnects.]]></purpose>
         <traces><trace target="LLR" ref="LLR-DAP-05"/></traces>
+      </test>
+
+      <test name="test_dap_fsm_list_empty_without_target">
+        <purpose><![CDATA[The `avrosdb/fsmList` custom request, dispatched with `updi_fd = -1` (no target), returns a successful response whose body carries an empty `"fsms":[]` array — graceful degradation, no hardware touched.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-17"/></traces>
+      </test>
+      <test name="test_dap_event_list_empty_without_target">
+        <purpose><![CDATA[The `avrosdb/eventList` custom request, dispatched with `updi_fd = -1`, returns a successful response whose body carries an empty `"events":[]` array.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-17"/></traces>
+      </test>
+      <test name="test_dap_queue_list_empty_without_target">
+        <purpose><![CDATA[The `avrosdb/queueList` custom request, dispatched with `updi_fd = -1`, returns a successful response whose body carries an empty `"queues":[]` array.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-DAP-17"/></traces>
       </test>
     </file>
 
@@ -5195,7 +5464,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       </test>
     </file>
 
-    <file path="tests/hw/dap_vars.py" role="hardware" count="8">
+    <file path="tests/hw/dap_vars.py" role="hardware" count="10">
       <header><![CDATA[On-target DAP variables / evaluate / memory acceptance harness (Phase 19, the DAP analogue of GDB Group-G state inspection — G17/G22/G23). A pure-Python DAP client spawns `avrOSdb --dap` against live AVR-Dx silicon running the `gdb_debug_session` fixture, breaks inside `leaf`, and verifies scopes, variables (with struct/array expansion), per-frame locals, evaluate, read/write memory, and setVariable against the fixture's documented values. Manual-only (`make hw-test-dap-vars`) — never wired into `make test`.]]></header>
 
       <test name="DAP_V1_scopes_locals_registers_globals">
@@ -5229,6 +5498,98 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="DAP_V8_set_variable_writes_back">
         <purpose><![CDATA[`setVariable` writes `g_counter = 1234`; a subsequent `evaluate` reads back 1234 — proving the write reached silicon at the right address and width. Per HLR-084 / LLR-DAP-16.]]></purpose>
         <traces><trace target="HLR" ref="HLR-084"/><trace target="LLR" ref="LLR-DAP-16"/></traces>
+      </test>
+      <test name="DAP_V9_frame_source_path_absolute">
+        <purpose><![CDATA[Stopped inside `leaf`, the `stackTrace` frame's `source.path` is an absolute path that exists on the debug host (resolved from the CU `comp_dir`), so a DAP client opens the source directly instead of falling back to the `source` request. Per LLR-ELF-12.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-072"/><trace target="LLR" ref="LLR-ELF-12"/></traces>
+      </test>
+      <test name="DAP_V10_source_request_returns_content">
+        <purpose><![CDATA[A `source` request for that frame's path returns `success:true` with non-empty `body.content` — the source fallback streams the host file content over DAP. Per LLR-DAP-18.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-078"/><trace target="LLR" ref="LLR-DAP-18"/></traces>
+      </test>
+    </file>
+
+    <!-- ============================================================ -->
+    <!-- src DAP on-target avrOS-introspection acceptance harness     -->
+    <!-- ============================================================ -->
+    <file path="tests/hw/dap_introspect.py" role="hardware" count="3">
+      <header><![CDATA[On-target DAP avrOS-introspection acceptance harness (Phase 21): a pure-Python DAP client spawns `avrOSdb --dap` against live AVR-Dx silicon and drives the `avrosdb/fsmList` / `avrosdb/eventList` / `avrosdb/queueList` custom requests that feed the VS Code avrOS view, confirming they read the avrOS descriptor tables off the target and return well-formed JSON. Run against the `avros_full` fixture, whose FSM/event/queue table sections hold one zero-filled descriptor each — enough to exercise the count>0 reader path on silicon deterministically. Manual-only (`make hw-test-dap-introspect`) — never wired into `make test`.]]></header>
+
+      <test name="DAP_I1_fsm_list_well_formed">
+        <purpose><![CDATA[`avrosdb/fsmList` returns a well-formed `fsms` array (the zero descriptor's null state-machine pointer is skipped, so 0 entries — graceful). Per HLR-086 / LLR-DAP-17.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-086"/><trace target="LLR" ref="LLR-DAP-17"/></traces>
+      </test>
+      <test name="DAP_I2_event_list_reads_table">
+        <purpose><![CDATA[`avrosdb/eventList` reads the `EVNT_TABLE` off silicon: against `avros_full` it returns one event whose name is `<null>` (null name pointer) and whose status is the JSON null literal (null status pointer) — exercising the count>0 decode and the null-pointer rendering. Per HLR-086 / LLR-AVROS-01.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-086"/><trace target="LLR" ref="LLR-AVROS-01"/></traces>
+      </test>
+      <test name="DAP_I3_queue_list_reads_table">
+        <purpose><![CDATA[`avrosdb/queueList` reads the `QUE_TABLE` off silicon: against `avros_full` it returns one queue with `capacity = 0` (the zero descriptor) — exercising the count>0 decode path on hardware. Per HLR-086 / LLR-AVROS-02.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-086"/><trace target="LLR" ref="LLR-AVROS-02"/></traces>
+      </test>
+    </file>
+
+    <!-- ============================================================ -->
+    <!-- src CPU run-state one-shot mode acceptance (start/stop/reset) -->
+    <!-- ============================================================ -->
+    <file path="tests/hw/start_stop.py" role="hardware" count="6">
+      <header><![CDATA[On-target acceptance for the `--start` / `--stop` / `--reset` one-shot CPU run-state modes (HLR-089). Spawns the real `avrOSdb` binary against live AVR-Dx silicon and drives each run-state mode in turn, asserting it takes OCD control and exits cleanly with its success banner, and that the UPDI link stays healthy across the repeated attach/detach cycles — exercising the on-silicon `updi_open` → `updi_enter_debug` → `updi_run`/`updi_halt` → `updi_detach` path the host unit tests can only stub. Manual-only (`make hw-test-start-stop`) — never wired into `make test`. Needs only the serial device.]]></header>
+
+      <test name="SS0_start_stop_mutually_exclusive">
+        <purpose><![CDATA[`avrOSdb --start --stop <serial>` exits non-zero with a "mutually exclusive" diagnostic — the run-state modes reject combination before touching hardware. Per LLR-MAIN-27.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-089"/><trace target="LLR" ref="LLR-MAIN-27"/></traces>
+      </test>
+      <test name="SS1_stop_halts_cpu">
+        <purpose><![CDATA[`avrOSdb --stop <serial>` takes OCD control, halts the CPU on live silicon, and exits 0 printing `stop: OK`. Per HLR-089 / LLR-MAIN-28.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-089"/><trace target="LLR" ref="LLR-MAIN-28"/></traces>
+      </test>
+      <test name="SS2_start_runs_cpu">
+        <purpose><![CDATA[`avrOSdb --start <serial>` takes OCD control, runs the CPU on live silicon, and exits 0 printing `start: OK`. Per HLR-089 / LLR-MAIN-28.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-089"/><trace target="LLR" ref="LLR-MAIN-28"/></traces>
+      </test>
+      <test name="SS3_reset_sibling">
+        <purpose><![CDATA[`avrOSdb --reset <serial>` pulses the UPDI system reset and exits 0 printing `reset: OK`, confirming the sibling run-state mode still works after a start/stop cycle. Per HLR-089.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-089"/></traces>
+      </test>
+      <test name="SS4_link_healthy_after_cycle">
+        <purpose><![CDATA[After the start/stop/reset cycle, a fresh `avrOSdb --device <serial>` re-opens the link and reads the SIGROW report (exit 0) — proving `updi_detach()` left the link in a re-openable state. Per HLR-089 / LLR-UPDI-37.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-089"/><trace target="LLR" ref="LLR-UPDI-37"/></traces>
+      </test>
+      <test name="SS5_stop_repeatable">
+        <purpose><![CDATA[A second `avrOSdb --stop <serial>` after the full cycle still succeeds (exit 0, `stop: OK`), confirming repeated OCD attach/detach cycles are stable. Per HLR-089 / LLR-MAIN-28.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-089"/><trace target="LLR" ref="LLR-MAIN-28"/></traces>
+      </test>
+    </file>
+
+    <!-- ============================================================ -->
+    <!-- src DAP source-line stepping acceptance (stepIn/next/stepOut) -->
+    <!-- ============================================================ -->
+    <file path="tests/hw/dap_step.py" role="hardware" count="6">
+      <header><![CDATA[On-target DAP source-line stepping acceptance (HLR-078). Spawns `avrOSdb --dap` against live AVR-Dx silicon running the `gdb_debug_session` fixture (call chain main -> top -> mid -> leaf) and verifies stepIn/next/stepOut have source-line granularity and distinct semantics — the regression being that all three single-stepped one instruction. Breakpoints are set at function entries via `setInstructionBreakpoints` (addresses from `avr-nm`). Manual-only (`make hw-test-dap-step`) — never wired into `make test`.]]></header>
+
+      <test name="ST0_entry_stop_lands_in_main">
+        <purpose><![CDATA[After `configurationDone` the entry stop's frame 0 is in `main` at a real source line (line > 0) — confirming the GDB-style run-to-main so the client highlights main's first statement instead of the source-less reset vector. Per HLR-076 / LLR-DAP-20.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-076"/><trace target="LLR" ref="LLR-DAP-20"/></traces>
+      </test>
+      <test name="ST1_stepIn_advances_one_source_line">
+        <purpose><![CDATA[From `top`'s entry, one `stepIn` advances a whole source line within `top` (the reported line changes in a single step) — proving source-line, not single-instruction, granularity. Per HLR-078 / LLR-DAP-19.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-078"/><trace target="LLR" ref="LLR-DAP-19"/></traces>
+      </test>
+      <test name="ST2_stepIn_descends_into_callee">
+        <purpose><![CDATA[Continued `stepIn` at the `mid()` call line descends into the callee — the stackTrace frame name becomes `mid`. Per HLR-078 / LLR-DAP-19.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-078"/><trace target="LLR" ref="LLR-DAP-19"/></traces>
+      </test>
+      <test name="ST3_stepOut_returns_to_caller">
+        <purpose><![CDATA[`stepOut` from `mid` runs to the return and stops back in the caller `top` (frame name `top`) — distinct from stepIn. Per HLR-078 / LLR-DAP-19.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-078"/><trace target="LLR" ref="LLR-DAP-19"/></traces>
+      </test>
+      <test name="ST4a_next_steps_over_calls">
+        <purpose><![CDATA[From `mid`'s entry, repeated `next` walks mid's body and never enters `leaf` — `next` steps OVER the two `leaf()` calls (running to the return) rather than descending. Per HLR-078 / LLR-DAP-19.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-078"/><trace target="LLR" ref="LLR-DAP-19"/></traces>
+      </test>
+      <test name="ST4b_next_is_line_granular">
+        <purpose><![CDATA[Successive `next` within `mid` advance exactly one source line per step — the recorded lines are strictly increasing with no repeats, including on the call lines `acc += leaf(n,2)` / `(n,3)` (each crossed in a single `next`, the run-to-return completing in one press). Per HLR-078 / LLR-DAP-19.]]></purpose>
+        <traces><trace target="HLR" ref="HLR-078"/><trace target="LLR" ref="LLR-DAP-19"/></traces>
       </test>
     </file>
 
