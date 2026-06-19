@@ -303,7 +303,7 @@ Role: **integration**. **4 test(s).**
 
 ### 3.8. [tests/test_install.c](../tests/test_install.c)
 
-Role: **integration**. **10 test(s).**
+Role: **integration**. **11 test(s).**
 
 | # | Test | Verifies | Purpose |
 | - | ---- | -------- | ------- |
@@ -317,6 +317,7 @@ Role: **integration**. **10 test(s).**
 | 8 | <a id="make_bundle_produces_homebrew_formula"></a>`make_bundle_produces_homebrew_formula` | `LLR-INST-08` | Run `make bundle VERSION=0.1.0` and verify that `dist/avrOSdb.rb` exists, is valid Ruby syntax (parseable by `ruby -c`), and contains the required fields: `desc`, `url`, `sha256`, `version`, and an `install` block. |
 | 9 | <a id="test_vscode_extension_declares_avros_debug_view"></a>`test_vscode_extension_declares_avros_debug_view` | `LLR-INST-09` | Statically verify the VS Code companion extension declares the avrOS Debug View: `tools/vscode/avrosdb-dap/package.json` contributes the `avrosDebug` activity-bar container, all six views (`avrosVariables`/`avrosCallStack`/`avrosBreakpoints`/`avrosStateMachines`/`avrosEvents`/`avrosQueues`) and the `media/avros.svg` icon (which must exist on disk); `extension.js` references the three introspection custom requests (`avrosdb/fsmList|eventList|queueList`) and `registerTreeDataProvider`. When `node` is available, `extension.js` additionally passes `node --check`. |
 | 10 | <a id="test_vscode_extension_provides_turnkey_launch_config"></a>`test_vscode_extension_provides_turnkey_launch_config` | `LLR-INST-10` | Statically verify the extension's turnkey debug flow: `package.json` declares an `initialConfigurations` entry with `request:"launch"` plus `program`/`serial`/`elf`, and `extension.js` registers the configuration provider and adapter-descriptor factory (`registerDebugConfigurationProvider`, `registerDebugAdapterDescriptorFactory`, `resolveDebugConfiguration`) and waits for the server's `listening on` banner. |
+| 11 | <a id="test_zed_extension_provides_turnkey_dap"></a>`test_zed_extension_provides_turnkey_dap` | `LLR-INST-11` | Statically verify the Zed debug-adapter extension under `tools/zed/avrosdb`: `extension.toml` declares `[debug_adapters.avrosdb]` with the schema path, and the referenced `debug_adapter_schemas/avrosdb.json` exists and is valid JSON; `Cargo.toml` declares a `cdylib` depending on `zed_extension_api`; and `src/lib.rs` registers the extension (`register_extension!`), implements `get_dap_binary`/`dap_request_kind`, and forms the launch invocation (`--dap`, `--port`) plus a `TcpArguments` connection. When `cargo` is available, the crate additionally passes `cargo verify-project`. |
 
 ### 3.9. [tests/test_device.c](../tests/test_device.c)
 
@@ -683,6 +684,7 @@ verified by code review — see
 | `LLR-INST-08` | `inst` | `HLR-043` | `make_bundle_produces_homebrew_formula` |
 | `LLR-INST-09` | `inst` | `HLR-087` | `test_vscode_extension_declares_avros_debug_view` |
 | `LLR-INST-10` | `inst` | `HLR-088` | `test_vscode_extension_provides_turnkey_launch_config` |
+| `LLR-INST-11` | `inst` | `HLR-090` | `test_zed_extension_provides_turnkey_dap` |
 | `LLR-HWTEST-01` | `hwtest` | `HLR-045` | `A1_port_open_and_cold_start_handshake` |
 | `LLR-HWTEST-02` | `hwtest` | `HLR-045`, `HLR-044` | `A1_port_open_and_cold_start_handshake`, `A2_read_device_info`, `A3_deviceid_matches_expected`, `A4_signature_non_zero_non_ff`, `A5_revid_non_zero`, `A6_sernum_non_zero_non_ff`, `A7_nvmprog_bit_clear` |
 | `LLR-HWTEST-03` | `hwtest` | `HLR-045`, `HLR-011` | `B0_sram_single_byte_round_trip`, `B1_sram_64_byte_round_trip`, `B1a_sigrow_read_repeatability`, `B1b_sram_constant_0xAA_round_trip`, `B1c_sram_write_once_read_twice`, `B2_sram_600_byte_round_trip`, `B3_flash_24bit_addressing_smoke` |

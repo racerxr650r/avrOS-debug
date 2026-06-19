@@ -1826,6 +1826,14 @@ Errors are propagated upward through the module stack without retrying:
           <trace target="SDD" ref="2.2"/>
         </traces>
       </hlr>
+
+      <hlr id="HLR-090" name="Zed Turnkey Debug Configuration">
+        <text><![CDATA[The project shall provide a Zed debug-adapter extension (`tools/zed/avrosdb`) that registers an `avrosdb` debug adapter so a user can launch-and-attach, or attach to a running server, and start a debug session from Zed's native DAP debugger — without hand-writing a debug configuration. The extension shall be a Rust crate compiled to WebAssembly against the `zed_extension_api`, declaring `[debug_adapters.avrosdb]` in `extension.toml` with a JSON schema (`debug_adapter_schemas/avrosdb.json`) describing the configuration fields (`request`, `program`, `serial`, `elf`, `port`, `host`, `extraArgs`). On a `launch` request the extension shall return a debug-adapter binary that spawns `avrOSdb --dap --port <port> <serial> <elf>` (honouring a user-provided binary path, else falling back to `avrOSdb` on `PATH`) and a TCP connection (`127.0.0.1:<port>`, default port 1234) so Zed connects to the spawned server over the socket; on an `attach` request it shall return a connect-only TCP descriptor for an already-running server. Unlike the VS Code companion (HLR-087), the extension shall NOT present avrOS state-machine / event / queue introspection — Zed does not allow an extension to contribute the bespoke tree views that surface the HLR-086 custom requests — so the Zed integration is limited to launch/attach plus Zed's built-in Variables / Call Stack / Breakpoints debugger panes over the shared DAP core. The User Manual shall additionally document a no-extension path: start the server manually and connect from a `.zed/debug.json` entry whose `tcp_connection` block points at it. The Makefile shall provide a `package-zed` target that builds the extension's `wasm32` artefact using `cargo`; the Rust/`cargo` toolchain is a manual/development dependency only and shall never be required by `make` or `make test`.]]></text>
+        <traces>
+          <trace target="SDD" ref="2.2"/>
+          <trace target="SDD" ref="10.1"/>
+        </traces>
+      </hlr>
     </section>
 
     <section number="9" title="Diagnostics and Bring-up">
@@ -3360,6 +3368,13 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
           <trace target="HLR" ref="HLR-088" name="VS Code Turnkey Debug Configuration"/>
         </traces>
       </llr>
+
+      <llr id="LLR-INST-11">
+        <text><![CDATA[The project shall provide a Zed debug-adapter extension under `tools/zed/avrosdb`. `extension.toml` shall declare `[debug_adapters.avrosdb]` with `schema_path = "debug_adapter_schemas/avrosdb.json"`, and the named schema file (a JSON Schema for the `request`/`program`/`serial`/`elf`/`port`/`host` fields) shall exist. `Cargo.toml` shall build a `cdylib` depending on `zed_extension_api`. `src/lib.rs` shall implement the `zed::Extension` trait — `get_dap_binary`, `dap_request_kind`, and `dap_config_to_scenario` — registered via `register_extension!`: on a `launch` request `get_dap_binary` shall return a `DebugAdapterBinary` whose `command` runs the avrOSdb binary (config `program`, else `avrOSdb` on `PATH`) with arguments `--dap --port <port> <serial> <elf>` and whose `connection` is a `TcpArguments` to `host:port` (default `127.0.0.1:1234`); on an `attach` request it shall return a connect-only TCP descriptor (`command = None`). The Makefile shall provide a `package-zed` target that builds the extension's `wasm32` artefact via `cargo`, requiring no Rust toolchain from `make` or `make test`.]]></text>
+        <traces>
+          <trace target="HLR" ref="HLR-090" name="Zed Turnkey Debug Configuration"/>
+        </traces>
+      </llr>
     </function>
 
     <function number="9" title="tests/hw/hw_test.c — On-Target Hardware Integration Test Harness" name="hwtest" source="tests/hw/hw_test.c">
@@ -4872,7 +4887,7 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
     <!-- ============================================================ -->
     <!-- Installation and documentation tests                         -->
     <!-- ============================================================ -->
-    <file path="tests/test_install.c" role="integration" count="10">
+    <file path="tests/test_install.c" role="integration" count="11">
       <header><![CDATA[Verification tests for the Makefile install/uninstall targets, the `check-tools` pre-flight target, and the Unix man page. Tests fork a subprocess or invoke `make` directly and inspect the resulting file-system state or exit codes.]]></header>
 
       <test name="check_tools_exits_nonzero_when_required_tool_is_absent">
@@ -4922,6 +4937,10 @@ No new CLI flag shall gate these emissions; they are always-on and route to `std
       <test name="test_vscode_extension_provides_turnkey_launch_config">
         <purpose><![CDATA[Statically verify the extension's turnkey debug flow: `package.json` declares an `initialConfigurations` entry with `request:"launch"` plus `program`/`serial`/`elf`, and `extension.js` registers the configuration provider and adapter-descriptor factory (`registerDebugConfigurationProvider`, `registerDebugAdapterDescriptorFactory`, `resolveDebugConfiguration`) and waits for the server's `listening on` banner.]]></purpose>
         <traces><trace target="LLR" ref="LLR-INST-10"/></traces>
+      </test>
+      <test name="test_zed_extension_provides_turnkey_dap">
+        <purpose><![CDATA[Statically verify the Zed debug-adapter extension under `tools/zed/avrosdb`: `extension.toml` declares `[debug_adapters.avrosdb]` with the schema path, and the referenced `debug_adapter_schemas/avrosdb.json` exists and is valid JSON; `Cargo.toml` declares a `cdylib` depending on `zed_extension_api`; and `src/lib.rs` registers the extension (`register_extension!`), implements `get_dap_binary`/`dap_request_kind`, and forms the launch invocation (`--dap`, `--port`) plus a `TcpArguments` connection. When `cargo` is available, the crate additionally passes `cargo verify-project`.]]></purpose>
+        <traces><trace target="LLR" ref="LLR-INST-11"/></traces>
       </test>
     </file>
 

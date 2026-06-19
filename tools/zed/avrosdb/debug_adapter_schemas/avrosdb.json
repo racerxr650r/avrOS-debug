@@ -1,0 +1,54 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "avrOSdb DAP configuration",
+  "description": "Configuration fields for an `avrosdb` debug session in Zed's .zed/debug.json. On `launch`, Zed spawns `avrOSdb --dap --port <port> <serial> <elf>` and connects over TCP; on `attach`, Zed connects to an already-running server.",
+  "type": "object",
+  "properties": {
+    "request": {
+      "description": "launch: spawn avrOSdb and connect. attach: connect to a running server.",
+      "type": "string",
+      "enum": ["launch", "attach"],
+      "default": "launch"
+    },
+    "program": {
+      "description": "Path to the avrOSdb binary to launch. Defaults to `avrOSdb` on PATH. (launch only)",
+      "type": "string"
+    },
+    "serial": {
+      "description": "Serial device connected to the target's UPDI pin. (launch only)",
+      "type": "string",
+      "default": "/dev/ttyAMA2"
+    },
+    "elf": {
+      "description": "ELF to debug; its DWARF drives source and variables. (launch only)",
+      "type": "string",
+      "default": "firmware.elf"
+    },
+    "port": {
+      "description": "TCP port the avrOSdb --dap server listens on.",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535,
+      "default": 1234
+    },
+    "host": {
+      "description": "IPv4 address of the avrOSdb --dap server.",
+      "type": "string",
+      "default": "127.0.0.1"
+    },
+    "server": {
+      "description": "Optional `host:port` of an externally-started server; forces connect-only (no spawn).",
+      "type": "string"
+    },
+    "extraArgs": {
+      "description": "Extra avrOSdb flags inserted before the serial/elf operands, e.g. [\"--baud\",\"230400\"]. (launch only)",
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "cwd": {
+      "description": "Working directory for the spawned avrOSdb server. (launch only)",
+      "type": "string"
+    }
+  }
+}

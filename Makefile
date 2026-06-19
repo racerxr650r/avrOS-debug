@@ -846,6 +846,28 @@ package-vscode:
 	    fi
 	@echo "  BUNDLE  $(VSIX_FILE)"
 
+# ── package-zed target ───────────────────────────────────────────────────────
+# Build the Zed debug-adapter extension (tools/zed/avrosdb) to its wasm32
+# artefact in dist/, validating that the Rust source compiles.  Requires the
+# Rust toolchain: `cargo` plus the `wasm32-wasip1` target
+# (`rustup target add wasm32-wasip1`).  Manual/dev-only — Rust is not a build or
+# CI dependency of avrOSdb itself, so this target is never invoked by `make` or
+# `make test`.  In normal use Zed compiles the extension itself when it is
+# installed via "Install Dev Extension…"; this target is a local compile check.
+# The artefact is named after the extension's own version (from extension.toml).
+ZED_EXT_DIR := tools/zed/avrosdb
+ZED_EXT_VER := $(shell sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' $(ZED_EXT_DIR)/extension.toml | head -1)
+ZED_WASM    := $(DISTDIR)/avrosdb-zed-$(ZED_EXT_VER).wasm
+.PHONY: package-zed
+package-zed:
+	@mkdir -p $(DISTDIR)
+	@command -v cargo >/dev/null 2>&1 || { \
+	    echo "ERROR: need 'cargo' (https://rustup.rs) on PATH"; exit 1; }
+	$(Q)cd $(ZED_EXT_DIR) && cargo build --release --target wasm32-wasip1
+	$(Q)cp $(ZED_EXT_DIR)/target/wasm32-wasip1/release/zed_avrosdb.wasm \
+	    $(abspath $(ZED_WASM))
+	@echo "  BUNDLE  $(ZED_WASM)"
+
 # ── prereqs target ───────────────────────────────────────────────────────────
 # Install all development prerequisites (Debian/Ubuntu; requires sudo).
 # Installs host build tools via apt, then downloads and installs the

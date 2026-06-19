@@ -443,6 +443,76 @@ static void test_vscode_extension_provides_turnkey_launch_config(void)
     free(ext);
 }
 
+/* ── (k) LLR-INST-11 — Zed debug-adapter extension turnkey launch/attach ── */
+static void test_zed_extension_provides_turnkey_dap(void)
+{
+    /* extension.toml registers the avrosdb adapter and points at its schema. */
+    const char *toml = "tools/zed/avrosdb/extension.toml";
+    TEST_ASSERT_TRUE_MESSAGE(file_exists(toml),
+        "Zed extension.toml must exist");
+    char *t = slurp(toml);
+    static const char *const toml_tokens[] = {
+        "[debug_adapters.avrosdb]", "debug_adapter_schemas/avrosdb.json",
+    };
+    for (size_t i = 0; i < sizeof toml_tokens / sizeof toml_tokens[0]; ++i) {
+        char msg[160];
+        snprintf(msg, sizeof msg,
+                 "extension.toml missing Zed adapter token: %s", toml_tokens[i]);
+        TEST_ASSERT_NOT_NULL_MESSAGE(strstr(t, toml_tokens[i]), msg);
+    }
+    free(t);
+
+    /* The referenced config schema must exist (and parse, when a JSON tool is
+     * available). */
+    const char *schema = "tools/zed/avrosdb/debug_adapter_schemas/avrosdb.json";
+    TEST_ASSERT_TRUE_MESSAGE(file_exists(schema),
+        "Zed adapter config schema must exist");
+    if (tool_available("python3")) {
+        char cmd[256];
+        snprintf(cmd, sizeof cmd, "python3 -m json.tool '%s' >/dev/null 2>&1",
+                 schema);
+        TEST_ASSERT_EQUAL_INT_MESSAGE(0, run_shell(cmd),
+            "Zed adapter config schema must be valid JSON");
+    } else {
+        TEST_MESSAGE("python3 not installed; skipping schema JSON check");
+    }
+
+    /* Cargo.toml builds a cdylib against the Zed extension API. */
+    char *cargo = slurp("tools/zed/avrosdb/Cargo.toml");
+    static const char *const cargo_tokens[] = { "cdylib", "zed_extension_api" };
+    for (size_t i = 0; i < sizeof cargo_tokens / sizeof cargo_tokens[0]; ++i) {
+        char msg[160];
+        snprintf(msg, sizeof msg,
+                 "Zed Cargo.toml missing token: %s", cargo_tokens[i]);
+        TEST_ASSERT_NOT_NULL_MESSAGE(strstr(cargo, cargo_tokens[i]), msg);
+    }
+    free(cargo);
+
+    /* lib.rs implements the trait and forms the launch invocation + TCP link. */
+    char *lib = slurp("tools/zed/avrosdb/src/lib.rs");
+    static const char *const lib_tokens[] = {
+        "register_extension!", "get_dap_binary", "dap_request_kind",
+        "\"--dap\"", "\"--port\"", "TcpArguments",
+    };
+    for (size_t i = 0; i < sizeof lib_tokens / sizeof lib_tokens[0]; ++i) {
+        char msg[160];
+        snprintf(msg, sizeof msg, "Zed lib.rs missing token: %s", lib_tokens[i]);
+        TEST_ASSERT_NOT_NULL_MESSAGE(strstr(lib, lib_tokens[i]), msg);
+    }
+    free(lib);
+
+    /* If the Rust toolchain is present, validate the manifest. */
+    if (tool_available("cargo")) {
+        TEST_ASSERT_EQUAL_INT_MESSAGE(0,
+            run_shell("cargo verify-project "
+                      "--manifest-path tools/zed/avrosdb/Cargo.toml "
+                      ">/dev/null 2>&1"),
+            "Zed extension Cargo.toml must be a valid manifest");
+    } else {
+        TEST_MESSAGE("cargo not installed; skipping Cargo.toml manifest check");
+    }
+}
+
 /* ── runner ─────────────────────────────────────────────────────────── */
 int main(void)
 {
@@ -457,5 +527,6 @@ int main(void)
     RUN_TEST(test_make_bundle_produces_homebrew_formula);
     RUN_TEST(test_vscode_extension_declares_avros_debug_view);
     RUN_TEST(test_vscode_extension_provides_turnkey_launch_config);
+    RUN_TEST(test_zed_extension_provides_turnkey_dap);
     return UNITY_END();
 }
